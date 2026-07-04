@@ -68,6 +68,7 @@ def refine_blueprint(
         )},
     ]
 
+    last_error_feedback = ""
     for attempt in range(MAX_RETRIES):
         response = client.chat.completions.create(
             model=model,
@@ -80,10 +81,14 @@ def refine_blueprint(
 
         result = compiler.check_blueprint(lean_code, blueprint.target_theorem)
         if result.success or result.validation_successful:
+            print(f"  [refine] attempt {attempt + 1}/{MAX_RETRIES}: check_blueprint OK", flush=True)
             return _parse_blueprint(lean_code, blueprint.target_theorem)
 
         # Feed compile errors back for next attempt
         error_feedback = "\n".join(result.errors) or result.raw_output[-2000:]
+        last_error_feedback = error_feedback
+        print(f"  [refine] attempt {attempt + 1}/{MAX_RETRIES}: check_blueprint FAILED - "
+              f"{error_feedback[:300]!r}", flush=True)
         messages.append({"role": "assistant", "content": content})
         messages.append({
             "role": "user",
@@ -94,7 +99,10 @@ def refine_blueprint(
             ),
         })
 
-    raise RuntimeError(f"Refinement failed after {MAX_RETRIES} attempts")
+    raise RuntimeError(
+        f"Refinement failed after {MAX_RETRIES} attempts. "
+        f"Last check_blueprint error:\n{last_error_feedback[-2000:]}"
+    )
 
 
 def _annotate_with_verdicts(blueprint: Blueprint, orch_result: OrchestratorResult) -> str:

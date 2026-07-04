@@ -150,8 +150,12 @@ class RepoRetrieval:
         meta_path = self.cache_dir / f"{cache_key}.json"
 
         if emb_path.exists() and meta_path.exists():
-            self._embeddings = np.load(str(emb_path))
-            return
+            meta = json.loads(meta_path.read_text())
+            if meta.get("n") == len(self._decls):
+                self._embeddings = np.load(str(emb_path))
+                return
+            print(f"[repo_retrieval] Cache for {self.repo_root.name} is stale "
+                  f"(cached n={meta.get('n')}, live n={len(self._decls)}) - rebuilding.")
 
         # Build index
         print(f"[repo_retrieval] Building embedding index for {self.repo_root.name} "
