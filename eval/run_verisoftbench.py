@@ -15,6 +15,8 @@ import argparse
 import json
 import sys
 import time
+import threading
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -107,6 +109,7 @@ def evaluate_theorem(
         "thm_stmt": thm_stmt, "success": False,
         "proof": None, "aux_lemmas": None, "error": None,
         "wall_time_s": 0.0, "blueprint_used": use_blueprint,
+        "model": model, "mode": mode,
     }
 
     t0 = time.monotonic()
@@ -229,6 +232,25 @@ def summarise(results: list[dict]) -> dict:
     }
 
 
+def load_done_results(results_file: Path, model: str, mode: str, blueprint: bool) -> list[dict]:
+    """Results already recorded in results_file under the same
+    model/mode/blueprint config — used by --resume to skip re-running
+    theorems a prior (possibly interrupted) run already finished, and to
+    fold their outcome back into this run's final summary."""
+    done: list[dict] = []
+    if not results_file.exists():
+        return done
+    with open(results_file) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            if (r.get("model") == model and r.get("mode") == mode
+                    and r.get("blueprint_used") == blueprint):
+                done.append(r)
+    return done
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -240,8 +262,13 @@ def main() -> None:
     parser.add_argument("--repo",    default=None)
     parser.add_argument("--thm",     default=None, help="Run a single theorem by name")
     parser.add_argument("--workers", type=int, default=1,
-                        help="Parallel workers (default 1 for local mode — "
-                             "`lake build` is not safe to parallelize on a shared repo)")
+                        help="Parallel workers, sharded by repo (theorems from the "
+                             "same repo always run sequentially within one worker — "
+                             "`lake build`/compilation is not safe to parallelize on "
+                             "a shared repo; different repos may run concurrently)")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip theorems already recorded in the output "
+                             "results.jsonl under the same model/mode/blueprint config")
     parser.add_argument("--output",  default="results/verisoftbench/")
     parser.add_argument("--mode",    default="filtered_context",
                         choices=["filtered_context", "full_context"])
@@ -297,9 +324,38 @@ def main() -> None:
             else:
                 repo_retrievals[repo] = None
 
-    print(f"Running with model={args.model}, workers={args.workers} ...")
+    results_file = output_dir / "results.jsonl"
 
+    # Resume: skip theorems already recorded under the same run config, and
+    # keep prior results (from this or earlier interrupted runs) in the file
+    # and in the final summary.
     all_results: list[dict] = []
+    if args.resume:
+        prior = load_done_results(results_file, args.model, args.mode, args.blueprint)
+        if prior:
+            done_keys = {(r.get("thm_name", ""), r.get("lean_root", "")) for r in prior}
+            before = len(problems)
+            problems = [p for p in problems
+                        if (p["thm_name"], p.get("lean_root", "")) not in done_keys]
+            all_results.extend(prior)
+            print(f"  --resume: skipping {before - len(problems)} already-done theorem(s)")
+    else:
+        results_file.unlink(missing_ok=True)  # fresh run overwrites prior results
+
+    # Group by repo: theorems from the same repo must run sequentially (a
+    # shared `lake`/compiler working directory is not safe to touch from two
+    # threads at once), but different repos can run fully in parallel.
+    by_repo: dict[str, list[dict]] = defaultdict(list)
+    for entry in problems:
+        by_repo[entry.get("lean_root", "")].append(entry)
+
+    num_workers = max(1, min(args.workers, len(by_repo))) if by_repo else 0
+    print(f"Running with model={args.model}, workers={num_workers} "
+          f"(sharded across {len(by_repo)} repo(s)) ...")
+
+    results_lock = threading.Lock()
+    total = len(problems)  # theorems being run this invocation (excludes --resume skips)
+    completed = 0
 
     def run_one(entry: dict) -> dict:
         return evaluate_theorem(
@@ -315,27 +371,36 @@ def main() -> None:
             verbose=args.verbose,
         )
 
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {pool.submit(run_one, p): p["thm_name"] for p in problems}
-        for i, fut in enumerate(as_completed(futures), 1):
-            thm_name = futures[fut]
+    def run_repo_queue(repo_problems: list[dict]) -> None:
+        nonlocal completed
+        for entry in repo_problems:
+            thm_name = entry["thm_name"]
             try:
-                res = fut.result()
+                res = run_one(entry)
             except Exception as exc:
-                res = {"thm_name": thm_name, "success": False,
-                       "error": str(exc), "wall_time_s": 0.0}
-            all_results.append(res)
+                res = {"thm_name": thm_name, "lean_root": entry.get("lean_root", ""),
+                       "success": False, "error": str(exc), "wall_time_s": 0.0,
+                       "model": args.model, "mode": args.mode, "blueprint_used": args.blueprint}
+            with results_lock:
+                all_results.append(res)
+                completed += 1
+                i = completed
+                with open(results_file, "a") as f:
+                    f.write(json.dumps(res) + "\n")
             status = "PASS" if res["success"] else "FAIL"
-            print(f"  [{i}/{len(problems)}] {status} {thm_name} ({res.get('wall_time_s',0):.1f}s)")
+            print(f"  [{i}/{total}] {status} {thm_name} ({res.get('wall_time_s',0):.1f}s)")
+
+    if by_repo:
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            futures = [pool.submit(run_repo_queue, repo_problems)
+                       for repo_problems in by_repo.values()]
+            for fut in as_completed(futures):
+                fut.result()  # surface any unexpected exception from run_repo_queue itself
 
     summary = summarise(all_results)
     print(f"\nResults: {summary['proved']}/{summary['total']} proved "
           f"({summary['pass_rate']*100:.1f}%), avg {summary['avg_wall_time_s']:.1f}s/theorem")
 
-    results_file = output_dir / "results.jsonl"
-    with open(results_file, "w") as f:
-        for r in all_results:
-            f.write(json.dumps(r) + "\n")
     with open(output_dir / "summary.json", "w") as f:
         json.dump({**summary, "model": args.model, "mode": args.mode,
                    "blueprint": args.blueprint}, f, indent=2)
