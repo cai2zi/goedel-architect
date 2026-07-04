@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 import time
 import threading
@@ -59,7 +60,15 @@ def load_dataset(
     limit: int | None = None,
     repo_filter: str | None = None,
     thm_filter: str | None = None,
+    subset: int | None = None,
+    seed: int = 0,
 ) -> list[dict]:
+    """
+    subset: random sample of `subset` tasks spanning the whole (filtered)
+        dataset, rather than `limit`'s first-N-in-file-order (which clusters
+        entirely on one repo — the jsonl is grouped by lean_root, e.g. the
+        first 60 rows are all ArkLib). Use subset for a repo-diverse pilot.
+    """
     problems = []
     with open(VSB_DATA) as f:
         for line in f:
@@ -70,8 +79,12 @@ def load_dataset(
                 if thm_filter and thm_filter not in entry.get("thm_name", ""):
                     continue
                 problems.append(entry)
-                if limit and len(problems) >= limit:
+                if subset is None and limit and len(problems) >= limit:
                     break
+    if subset is not None:
+        rng = random.Random(seed)
+        problems = rng.sample(problems, min(subset, len(problems)))
+        problems.sort(key=lambda e: e.get("id", 0))
     return problems
 
 
@@ -259,6 +272,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Goedel-Architect on VeriSoftBench")
     parser.add_argument("--model",    default="gpt-4o")
     parser.add_argument("--limit",   type=int, default=None)
+    parser.add_argument("--subset",  type=int, default=None,
+                        help="Random sample of N tasks spanning all repos "
+                             "(unlike --limit, which takes the first N in "
+                             "file order and clusters on one repo)")
+    parser.add_argument("--seed",    type=int, default=0, help="--subset sample seed")
     parser.add_argument("--repo",    default=None)
     parser.add_argument("--thm",     default=None, help="Run a single theorem by name")
     parser.add_argument("--workers", type=int, default=1,
@@ -297,11 +315,13 @@ def main() -> None:
     tracer = JsonlTracer(trace_path) if trace_path else NullTracer()
 
     print("Loading VeriSoftBench dataset ...")
-    problems = load_dataset(limit=args.limit, repo_filter=args.repo, thm_filter=args.thm)
+    problems = load_dataset(limit=args.limit, repo_filter=args.repo, thm_filter=args.thm,
+                             subset=args.subset, seed=args.seed)
     print(f"  {len(problems)} problems"
           + (f" (repo={args.repo})" if args.repo else "")
           + (f" (thm={args.thm})" if args.thm else "")
-          + (f" (limit={args.limit})" if args.limit else ""))
+          + (f" (limit={args.limit})" if args.limit else "")
+          + (f" (subset={args.subset}, seed={args.seed})" if args.subset else ""))
     if trace_path:
         print(f"  Tracing to: {trace_path}")
     if args.blueprint:
