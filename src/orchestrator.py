@@ -175,4 +175,16 @@ async def _prove_one(
             signal=ProofSignal.PROOF_TOO_HARD,
             analysis=f"Node timed out after {node_timeout_s}s (orchestrator bound).",
         )
+    except Exception as exc:
+        # An unhandled exception here (network blip, rate limit, etc.) would
+        # otherwise propagate through asyncio.gather and take down the whole
+        # wave - including sibling nodes that were succeeding - so it's
+        # caught per-node the same way a timeout is.
+        dt = time.monotonic() - t0
+        print(f"    [node {name}] ERRORED after {dt:.1f}s -> {exc!r} "
+              f"- marked proof_too_hard so the wave can proceed", flush=True)
+        result = ProverResult(
+            signal=ProofSignal.PROOF_TOO_HARD,
+            analysis=f"Node raised {type(exc).__name__}: {exc}",
+        )
     return NodeResult(node=node, result=result)
