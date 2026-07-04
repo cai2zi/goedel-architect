@@ -40,6 +40,21 @@ class BlueprintNode:
     dependencies: list[str] = field(default_factory=list)
     lean_declaration: str = ""
 
+    def signature(self) -> str:
+        """Strip the @[blueprint ...] attribute and sorry_using proof body,
+        returning just the declaration up to (not including) ':='.
+
+        Used to re-declare an already-proved dependency as a real, standalone
+        lemma (signature + its actual proof) so sibling nodes can reference it
+        by name instead of hitting "unknown identifier" - proven dependencies
+        are otherwise only ever shown to the model as prompt text, never
+        actually compiled into scope.
+        """
+        text = re.sub(r"@\[blueprint\b[^\]]*\]", "", self.lean_declaration, flags=re.DOTALL)
+        # `lemma` needs Mathlib/Batteries; `theorem` works in every environment.
+        text = re.sub(r"(?m)^(\s*)lemma\b", r"\1theorem", text)
+        return text.split(":=", 1)[0].strip()
+
 
 @dataclass
 class Blueprint:

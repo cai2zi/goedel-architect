@@ -203,12 +203,14 @@ class GoedelProver:
         nl_statement: str = "",
         nl_proof_sketch: str = "",
         repo_retrieval=None,
+        parent_lemma_decls: str = "",
     ) -> ProverResult:
         """Attempt to prove a single node, timing it and emitting a final_verify trace event."""
         t0 = time.time()
         result = self._prove_node_inner(
             compiler, node_name, node_stmt, sys_prompt, user_prompt,
             nl_statement, nl_proof_sketch, repo_retrieval,
+            parent_lemma_decls=parent_lemma_decls,
         )
         self.tracer.emit(TraceEvent(
             kind="final_verify",
@@ -232,8 +234,13 @@ class GoedelProver:
         nl_statement: str = "",
         nl_proof_sketch: str = "",
         repo_retrieval=None,
+        parent_lemma_decls: str = "",
     ) -> ProverResult:
         """Attempt to prove a single node using the Responses API tool loop."""
+        # Stashed on self rather than threaded through every _process_response /
+        # _probe_negation call - one GoedelProver instance proves exactly one
+        # node (see the module-level prove_node() factory), so this is safe.
+        self._parent_lemma_decls = parent_lemma_decls
         augmented_sys = (sys_prompt or PROVER_SYSTEM_PROMPT).strip() + "\n\n" + SYSTEM_SUFFIX.strip()
 
         if not user_prompt:
@@ -325,7 +332,7 @@ class GoedelProver:
             response = self.client.responses.create(
                 model=self.model_id,
                 previous_response_id=response.id,
-                input="Output your best proof: <lean4_proof>\nby\n  ...\n</lean4_proof>",
+                input="Output your best proof: <lean4_proof>:= by\n  ...\n</lean4_proof>",
                 max_output_tokens=MAX_TOKENS,
                 **_responses_reasoning_kwargs(self.model_id),
             )
@@ -379,7 +386,12 @@ class GoedelProver:
                 if fn == "lean_compile":
                     proof_body = args.get("proof_body", "")
                     aux = args.get("aux_lemmas", "")
-                    cr = compiler.check(proof_body, aux_lemmas=aux, node_decl=node_decl)
+                    # Splice in already-proved sibling lemmas as real declarations
+                    # (see BlueprintNode.signature) so the model can reference them
+                    # by name instead of hitting "unknown identifier".
+                    parent_decls = getattr(self, "_parent_lemma_decls", "")
+                    full_aux = f"{parent_decls}\n\n{aux}".strip() if parent_decls else aux
+                    cr = compiler.check(proof_body, aux_lemmas=full_aux, node_decl=node_decl)
                     if cr.success:
                         result = "Compilation SUCCESSFUL. Proof is correct."
                         any_compile_ok = True
@@ -464,7 +476,8 @@ class GoedelProver:
                     continue
                 args = json.loads(item.arguments)
                 if item.name == "lean_compile":
-                    cr = compiler.check(args.get("proof_body", ""))
+                    parent_decls = getattr(self, "_parent_lemma_decls", "")
+                    cr = compiler.check(args.get("proof_body", ""), aux_lemmas=parent_decls)
                     if cr.success:
                         return ProverResult(
                             signal=ProofSignal.FORMALLY_NEGATED,
@@ -517,6 +530,7 @@ def prove_node(
     node_name: str,
     canonical_stmt: str,
     parent_proofs: dict[str, str],
+    parent_lemma_decls: str,
     compiler: AbstractLeanCompiler,
     retrieval: MathlibRetrieval,
     model: str = "gpt-4o",
@@ -543,4 +557,5 @@ def prove_node(
         node_stmt=canonical_stmt,
         user_prompt=user_prompt,
         repo_retrieval=repo_retrieval,
+        parent_lemma_decls=parent_lemma_decls,
     )

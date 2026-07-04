@@ -141,6 +141,16 @@ async def _prove_one(
     active_compiler = compiler_factory() if compiler_factory else compiler
     assert active_compiler is not None
 
+    # Proven dependencies are otherwise only shown to the model as prompt
+    # text - re-declare them as real lemmas so `exact evalFuel_ret_sound h`
+    # style references to already-solved siblings actually resolve instead of
+    # hitting "unknown identifier".
+    parent_lemma_decls = "\n\n".join(
+        f"{dep_node.signature()} {body}"
+        for dep, body in parent_proofs.items()
+        if (dep_node := blueprint.node_by_name(dep)) is not None
+    )
+
     t0 = time.monotonic()
     print(f"    [node {name}] started", flush=True)
 
@@ -151,6 +161,7 @@ async def _prove_one(
         name,
         node.lean_declaration,
         parent_proofs,
+        parent_lemma_decls,
         active_compiler,
         retrieval,
         model,
