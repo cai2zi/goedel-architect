@@ -1,0 +1,18 @@
+name = "GoedelArch"
+version = "0.1.0"
+defaultTargets = ["GoedelArch"]
+
+# The real LeanArchitect package — provides @[blueprint], sorry_using, CollectUsed
+[[require]]
+name = "LeanArchitect"
+git = "https://github.com/hanwenzhu/LeanArchitect.git"
+rev = "main"
+
+# mathlib last so its versions take precedence over LeanArchitect's deps
+[[require]]
+name = "mathlib"
+git = "https://github.com/leanprover-community/mathlib4"
+rev = "master"
+
+[[lean_lib]]
+name = "GoedelArch"
