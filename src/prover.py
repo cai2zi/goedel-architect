@@ -60,13 +60,15 @@ likely already visible.
 
 Workflow:
 1. Draft a proof using the visible repo definitions.
-2. Call lean_compile with your proof_body (tactics only, starting with `by`).
+2. Call lean_compile with your proof_body (starting with `:= by` — the harness
+   appends proof_body directly after the bare theorem signature, so the leading
+   `:=` is required or the submission fails to parse).
 3. Read errors, adjust, call lean_compile again.
 4. When you need a lemma whose name you do NOT already know:
    - call repo_search for project-specific lemmas
    - call mathlib_search for general Mathlib lemmas
 5. Once lean_compile returns SUCCESSFUL, output:
-   <lean4_proof>by\n  ...\n</lean4_proof>
+   <lean4_proof>:= by\n  ...\n</lean4_proof>
 
 Prefer lean_compile over search — faster to try a tactic and read the error.
 """
@@ -84,7 +86,11 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "proof_body": {
                     "type": "string",
-                    "description": "Proof tactics starting with 'by'. Do NOT include the theorem declaration.",
+                    "description": (
+                        "Proof term starting with ':= by' (the leading ':=' is required — "
+                        "this gets appended directly after the bare theorem signature). "
+                        "Do NOT include the theorem declaration."
+                    ),
                 },
                 "aux_lemmas": {
                     "type": "string",
