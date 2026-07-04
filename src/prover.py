@@ -45,8 +45,13 @@ PROVER_USER_TEMPLATE = load("prover_user")
 # multi-turn conversation), so this matches the stated budget number, not
 # the exact retry semantics — a true match would need a different loop shape.
 # Token budget capped to 32,000 (below the paper's 65,536) to control cost.
+#
+# MAX_TOOL_CALLS raised 4 -> 8 (above the paper's own number) after observing
+# twice in VSB smoke tests that the model converged on a materially better
+# proof strategy right as the 4-call budget ran out, with the improved draft
+# never reaching lean_compile at all.
 MAX_TOKENS = 32_000
-MAX_TOOL_CALLS = 4
+MAX_TOOL_CALLS = 8
 NEGATION_PROBE_CALLS = 4
 
 SYSTEM_SUFFIX = """
