@@ -19,6 +19,8 @@ When the diagnosis is `PROOF_TOO_HARD`, the prover believes the goal is provable
 
 Leave `-- PROVED` nodes untouched unless a downstream revision forces a signature change: their proof bodies will carry forward automatically as long as the signature stays byte-identical.
 
+If earlier rounds are shown to you, check whether an `-- UNPROVED` node's diagnosis is substantively the same problem you already tried to fix before, just under a different name or a cosmetic re-split. Renaming a stuck node without changing the underlying mathematical approach costs a full proving-budget attempt for no benefit. When you recognize a repeat, either commit to a genuinely different strategy (different induction principle, different case split, different helper shape) or leave the node as an explicit unresolved `sorry_using [...]` gap and direct your revision effort at branches that are actually progressing.
+
 After every edit, call `lean_compile`. The tool reports pre-compile safeguard violations, real Lean compile errors, the skeleton-out invariant (every theorem/lemma body must remain `:= by sorry_using [...]`), graph-validity issues (cycles, missing fields, dead nodes, etc.), and on a clean compile a per-declaration proof-reuse check. Iterate until `lean_compile` reports `Compilation SUCCESSFUL. Validation SUCCESSFUL.`
 
 ## Diagnosing and fixing Lean 4 compile errors

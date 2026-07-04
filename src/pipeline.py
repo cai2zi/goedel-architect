@@ -93,6 +93,7 @@ def prove_theorem(
 
     proved_cache: dict[str, str] = {}
     orch_result: OrchestratorResult | None = None
+    refinement_history: list[str] = []
 
     for iteration in range(max_iterations):
         # Phase 2: Parallel proving
@@ -153,6 +154,9 @@ def prove_theorem(
                 compiler=refinement_compiler,
                 model=model,
                 repo_context=repo_context,
+                history=refinement_history,
+                iteration=iteration,
+                max_iterations=max_iterations,
             )
             print(f"  new blueprint has {len(blueprint.nodes)} nodes: {[n.name for n in blueprint.nodes]}", flush=True)
         except RuntimeError as e:

@@ -31,19 +31,41 @@ def refine_blueprint(
     compiler: AbstractLeanCompiler,
     model: str = "gpt-4o",
     repo_context: str | None = None,
+    history: list[str] | None = None,
+    iteration: int = 0,
+    max_iterations: int = 0,
 ) -> Blueprint:
     """
     Produce a revised blueprint by feeding failure diagnostics back to the LLM.
 
     Returns a new Blueprint with the revised Lean file.
     Uses the verbatim Appendix C.3 system prompt.
+
+    history: mutable list of every prior round's annotated blueprint, owned by
+        the caller (pipeline.py) and shared across the whole refinement loop
+        for one theorem. Refinement renames nodes round to round, so there's
+        no reliable way to detect "this is the same sub-goal that already
+        failed twice under a different name" by matching identifiers - instead
+        of building that matching heuristic, the full history is handed to the
+        model so it can recognize repetition itself and decide whether to
+        change strategy or accept a node as an unresolved gap, rather than
+        cosmetically re-decomposing the same stuck problem every round.
     """
     client = OpenAI()
 
     annotated_lean = _annotate_with_verdicts(blueprint, orch_result)
+    if history is not None:
+        history.append(annotated_lean)
+        prior_rounds = history[:-1]
+    else:
+        prior_rounds = []
+
     messages = [
         {"role": "system", "content": REFINEMENT_SYSTEM_PROMPT},
-        {"role": "user", "content": _build_refinement_user_prompt(annotated_lean, repo_context)},
+        {"role": "user", "content": _build_refinement_user_prompt(
+            annotated_lean, repo_context, prior_rounds=prior_rounds,
+            iteration=iteration, max_iterations=max_iterations,
+        )},
     ]
 
     for attempt in range(MAX_RETRIES):
@@ -110,8 +132,36 @@ def _annotate_with_verdicts(blueprint: Blueprint, orch_result: OrchestratorResul
     return "\n".join(output_lines)
 
 
-def _build_refinement_user_prompt(annotated_lean: str, repo_context: str | None = None) -> str:
-    return render(REFINEMENT_USER_TEMPLATE, annotated_lean=annotated_lean, repo_context=repo_context or "")
+def _build_refinement_user_prompt(
+    annotated_lean: str,
+    repo_context: str | None = None,
+    prior_rounds: list[str] | None = None,
+    iteration: int = 0,
+    max_iterations: int = 0,
+) -> str:
+    prior_rounds_text = ""
+    if prior_rounds:
+        blocks = [
+            f"### Round {i + 1}\n\n```lean\n{text}\n```"
+            for i, text in enumerate(prior_rounds)
+        ]
+        prior_rounds_text = "\n\n".join(blocks)
+
+    round_info = ""
+    if max_iterations:
+        round_info = (
+            f"This is refinement round {iteration + 1} of {max_iterations}. "
+            f"{len(prior_rounds)} earlier round(s) already attempted this theorem "
+            "(see 'Earlier rounds' below, if present)."
+        )
+
+    return render(
+        REFINEMENT_USER_TEMPLATE,
+        annotated_lean=annotated_lean,
+        repo_context=repo_context or "",
+        prior_rounds=prior_rounds_text,
+        round_info=round_info,
+    )
 
 
 def _extract_lean_code(content: str) -> str:
