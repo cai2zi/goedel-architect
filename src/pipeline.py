@@ -72,7 +72,7 @@ def prove_theorem(
     tracer = tracer or NullTracer()
 
     if compiler is None and compiler_factory is None:
-        root = project_root or Path(__file__).parent.parent / "LeanArchitect"
+        root = project_root or Path(__file__).parent.parent / "goedel_lean"
         compiler = LeanCompiler(root)
 
     retrieval = retrieval or MathlibRetrieval()

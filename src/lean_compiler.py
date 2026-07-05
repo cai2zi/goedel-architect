@@ -10,8 +10,9 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# LeanArchitect project root — where lakefile.toml lives
-LEAN_PROJECT_ROOT = Path(__file__).parent.parent / "LeanArchitect"
+# goedel_lean project root — where lakefile.toml lives (depends on the real
+# LeanArchitect package, see goedel_lean/lakefile.toml)
+LEAN_PROJECT_ROOT = Path(__file__).parent.parent / "goedel_lean"
 
 # Standard imports prepended to snippet-mode compilation.
 # GoedelArch provides #validate_blueprint; Architect provides @[blueprint] / sorry_using.
