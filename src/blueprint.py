@@ -124,7 +124,27 @@ def generate_blueprint(
             target = _extract_target_name(lean_code, theorem_stmt)
             result = compiler.check_blueprint(lean_code, target)
             if result.success or result.validation_successful:
-                return _parse_blueprint(lean_code, _extract_target_name(lean_code, theorem_stmt))
+                parsed = _parse_blueprint(lean_code, target)
+                if parsed.nodes:
+                    return parsed
+                # Compiles, but has zero @[blueprint]-annotated declarations —
+                # e.g. the model wrote a plain (already-complete or sorry-free)
+                # theorem with no blueprint/sorry_using annotations at all.
+                # Downstream, an empty node set makes all_proved() vacuously
+                # true with no actual proof recorded, so this must be retried
+                # rather than accepted as a usable blueprint.
+                messages.append({"role": "assistant", "content": response.choices[0].message.content})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"The file compiled, but contains no `@[blueprint ...]`-annotated "
+                        f"declarations (attempt {attempt + 1}/{MAX_RETRIES}). You must "
+                        "annotate the target theorem (and any helper lemmas) with "
+                        "`@[blueprint ...]` and give each a `sorry_using [...]` proof body. "
+                        "Re-emit the blueprint with proper annotations."
+                    ),
+                })
+                continue
             # Feed errors back to the model for the next attempt
             error_feedback = "\n".join(result.errors) or result.raw_output[-2000:]
             messages.append({"role": "assistant", "content": response.choices[0].message.content})
@@ -139,11 +159,20 @@ def generate_blueprint(
         else:
             return _parse_blueprint(lean_code, _extract_target_name(lean_code, theorem_stmt))
 
-    # All attempts failed compilation — use the last generated blueprint anyway.
-    # Phase 2/3 will encounter and surface type errors during node proving.
+    # All attempts failed compilation — use the last generated blueprint anyway
+    # if it has real nodes (Phase 2/3 will encounter and surface type errors
+    # during node proving). But an empty node set is never usable: it makes
+    # all_proved() vacuously true downstream with no actual proof recorded,
+    # so that must be a hard failure rather than a silent fake success.
     if last_lean_code:
-        return _parse_blueprint(last_lean_code, _extract_target_name(last_lean_code, theorem_stmt))
-    raise RuntimeError(f"Blueprint generation failed after {MAX_RETRIES} attempts")
+        target = _extract_target_name(last_lean_code, theorem_stmt)
+        parsed = _parse_blueprint(last_lean_code, target)
+        if parsed.nodes:
+            return parsed
+    raise RuntimeError(
+        f"Blueprint generation failed after {MAX_RETRIES} attempts "
+        "(no attempt produced any @[blueprint]-annotated nodes)"
+    )
 
 
 def _build_user_prompt(theorem_stmt: str, nl_proof: str | None, repo_context: str | None = None) -> str:
