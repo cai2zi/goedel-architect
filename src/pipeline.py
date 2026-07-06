@@ -45,25 +45,33 @@ class ProofResult:
 
 
 def _invalidate_stale_proofs(
-    old_blueprint: Blueprint, new_blueprint: Blueprint, proved_cache: dict[str, str],
+    new_blueprint: Blueprint,
+    proved_cache: dict[str, str],
+    proof_cache_keys: dict[str, str],
 ) -> dict[str, str]:
-    """Drop cached proofs whose node signature changed across refinement.
+    """Drop cached proofs that no longer match the node they were compiled against.
 
     proved_cache tracks nodes by NAME only. Refinement (Phase 3) can reuse a
-    node's name while restructuring its signature (e.g. splitting a
-    hypothesis, changing its goal shape) - the paper's rule only promises
+    node's name while restructuring its signature or dependency list (e.g.
+    splitting a hypothesis, changing its goal shape, adding a new
+    sorry_using [...] dependency) - the paper's rule only promises
     SOLVED/FORMALLY_NEGATED nodes carry forward byte-identical, but nothing
     enforces that, and a name collision with a differently-shaped node would
-    otherwise leave a proof compiled against the OLD signature marked
-    "already solved" forever, never recompiled against the new one.
+    otherwise leave a proof compiled against the OLD shape marked "already
+    solved" forever, never recompiled against the new one.
+
+    Rather than diffing the immediately-previous blueprint (which misses a
+    node deleted at round N and reintroduced with a different shape at round
+    N+2 - neither adjacent diff N->N+1 or N+1->N+2 ever sees both shapes at
+    once), this compares against `proof_cache_keys[name]`: the exact
+    BlueprintNode.cache_key() recorded at the moment the proof was accepted.
+    A name missing from `proof_cache_keys` (e.g. an older checkpoint written
+    before this field existed) is treated as stale and re-checked once.
     """
     pruned = dict(proved_cache)
     for name in list(pruned):
-        old_node = old_blueprint.node_by_name(name)
         new_node = new_blueprint.node_by_name(name)
-        if old_node is None or new_node is None:
-            continue
-        if old_node.signature() != new_node.signature():
+        if new_node is None or proof_cache_keys.get(name) != new_node.cache_key():
             del pruned[name]
     return pruned
 
@@ -124,6 +132,20 @@ def prove_theorem(
 
     state = CheckpointState.load_or_none(checkpoint_path)
 
+    if state and state.theorem_stmt and state.theorem_stmt != theorem_stmt:
+        # checkpoint_path is normally keyed by theorem name (see
+        # path_for_theorem), so this should never fire in normal use - a
+        # mismatch means something unusual happened (a manually-overridden
+        # checkpoint_path, a copy/paste error). Silently resuming or
+        # returning a cached result for the WRONG theorem statement is worse
+        # than refusing outright.
+        raise ValueError(
+            f"Checkpoint {checkpoint_path} was created for a different "
+            f"theorem_stmt than requested - refusing to resume/reuse it.\n"
+            f"  checkpoint theorem_stmt: {state.theorem_stmt!r}\n"
+            f"  requested theorem_stmt:  {theorem_stmt!r}"
+        )
+
     if state and state.done:
         # A prior run already finished this theorem (success or exhausted
         # all iterations) — reconstruct the result from the checkpoint
@@ -138,6 +160,7 @@ def prove_theorem(
     if resumed_blueprint is not None:
         blueprint = resumed_blueprint
         proved_cache: dict[str, str] = dict(state.proved_cache)
+        proof_cache_keys: dict[str, str] = dict(state.proof_cache_keys)
         refinement_history: list[str] = list(state.refinement_history)
         start_iteration = state.iteration
         print(f"[Resume] loaded checkpoint at iteration {start_iteration + 1}, "
@@ -157,6 +180,7 @@ def prove_theorem(
             repo_context=repo_context,
         )
         proved_cache = {}
+        proof_cache_keys = {}
         refinement_history = []
         start_iteration = 0
         state = CheckpointState(theorem_stmt=theorem_stmt, model=model, repo_context=repo_context or "")
@@ -192,12 +216,16 @@ def prove_theorem(
             print(f"  node '{name}': {status} {proof_preview}", flush=True)
             if status == "solved":
                 proved_cache[name] = nr.result.proof_body
+                node = blueprint.node_by_name(name)
+                if node:
+                    proof_cache_keys[name] = node.cache_key()
 
         print(f"  proved so far: {sorted(proved_cache.keys())}", flush=True)
 
         if checkpoint_path:
             state.iteration = iteration
             state.proved_cache = dict(proved_cache)
+            state.proof_cache_keys = dict(proof_cache_keys)
             state.set_node_results(orch_result.node_results)
 
         if orch_result.all_proved():
@@ -231,7 +259,6 @@ def prove_theorem(
         refinement_compiler = compiler or (compiler_factory() if compiler_factory else None)
         if refinement_compiler is None:
             break
-        old_blueprint = blueprint
         try:
             blueprint = refine_blueprint(
                 blueprint=blueprint,
@@ -246,18 +273,28 @@ def prove_theorem(
             print(f"  new blueprint has {len(blueprint.nodes)} nodes: {[n.name for n in blueprint.nodes]}", flush=True)
         except RuntimeError as e:
             print(f"  refinement failed: {e}", flush=True)
+            # refine_blueprint mutates `history` in place before its own
+            # retry loop, so this round's attempt is already in memory even
+            # though refinement ultimately failed - persist it so the
+            # checkpoint's refinement_history isn't silently shorter than
+            # what was actually tried (matters for post-mortem diagnosis).
+            if checkpoint_path:
+                state.refinement_history = list(refinement_history)
+                state.save(checkpoint_path)
             break  # refinement failed, stop iterations
 
-        stale = set(proved_cache) - set(_invalidate_stale_proofs(old_blueprint, blueprint, proved_cache))
+        stale = set(proved_cache) - set(_invalidate_stale_proofs(blueprint, proved_cache, proof_cache_keys))
         if stale:
-            print(f"  invalidated stale proof(s) (signature changed under the same name): {sorted(stale)}", flush=True)
-        proved_cache = _invalidate_stale_proofs(old_blueprint, blueprint, proved_cache)
+            print(f"  invalidated stale proof(s) (no longer match the current node shape): {sorted(stale)}", flush=True)
+        proved_cache = _invalidate_stale_proofs(blueprint, proved_cache, proof_cache_keys)
+        proof_cache_keys = {name: key for name, key in proof_cache_keys.items() if name in proved_cache}
 
         if checkpoint_path:
             state.set_blueprint(blueprint)
             state.refinement_history = list(refinement_history)
             state.iteration = iteration + 1
             state.proved_cache = dict(proved_cache)
+            state.proof_cache_keys = dict(proof_cache_keys)
             state.node_results = {}  # stale against the new blueprint
             state.save(checkpoint_path)
 
@@ -335,6 +372,7 @@ def run_phase2(
 
     retrieval = retrieval or MathlibRetrieval()
     proved_cache = dict(state.proved_cache)
+    proof_cache_keys = dict(state.proof_cache_keys)
     nodes_to_try = set(blueprint.nodes_by_name()) - set(proved_cache)
 
     orch_result = asyncio.run(
@@ -355,8 +393,12 @@ def run_phase2(
     for name, nr in orch_result.node_results.items():
         if nr.result.signal.value == "solved":
             proved_cache[name] = nr.result.proof_body
+            node = blueprint.node_by_name(name)
+            if node:
+                proof_cache_keys[name] = node.cache_key()
 
     state.proved_cache = proved_cache
+    state.proof_cache_keys = proof_cache_keys
     state.set_node_results(orch_result.node_results)
     state.done = orch_result.all_proved()
     state.success = state.done
@@ -384,6 +426,16 @@ def run_phase3(
         raise RuntimeError(f"No blueprint in checkpoint {checkpoint_path} — run Phase 1 first.")
     if not state.node_results:
         raise RuntimeError(f"No node results in checkpoint {checkpoint_path} — run Phase 2 first.")
+    if state.iteration >= max_iterations:
+        # prove_theorem's own all-in-one loop already self-limits at
+        # max_iterations; standalone Phase 3 calls (this function) had no
+        # equivalent check, so a caller driving Phase 1/2/3 by hand via
+        # checkpoints could refine past the paper's bound indefinitely.
+        raise RuntimeError(
+            f"Checkpoint {checkpoint_path} is already at iteration "
+            f"{state.iteration} >= max_iterations={max_iterations} — "
+            "refusing another refinement round."
+        )
 
     orch_result = _orch_result_from_checkpoint(state, blueprint)
     if orch_result.all_proved():
@@ -401,7 +453,11 @@ def run_phase3(
         max_iterations=max_iterations,
     )
 
-    state.proved_cache = _invalidate_stale_proofs(blueprint, new_blueprint, state.proved_cache)
+    new_proved_cache = _invalidate_stale_proofs(new_blueprint, state.proved_cache, state.proof_cache_keys)
+    state.proved_cache = new_proved_cache
+    state.proof_cache_keys = {
+        name: key for name, key in state.proof_cache_keys.items() if name in new_proved_cache
+    }
     state.set_blueprint(new_blueprint)
     state.refinement_history = refinement_history
     state.iteration += 1

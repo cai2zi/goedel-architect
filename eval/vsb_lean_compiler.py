@@ -19,12 +19,9 @@ sys.path.insert(0, str(VSB_ROOT))
 
 from core.lean_interface import LeanREPL
 from lean_compiler import AbstractLeanCompiler, CompilerResult
+from blueprint import strip_blueprint_attr, lemma_to_theorem
 
 BLUEPRINT_COMPILE_TIMEOUT = 120  # seconds
-
-_BLUEPRINT_ATTR_RE = re.compile(r"@\[blueprint\b[^\]]*\]", re.DOTALL)
-_LEMMA_KW_RE = re.compile(r"(?m)^(\s*)lemma\b")
-
 
 _SORRY_WARNING_RE = re.compile(r":(\d+):\d+:\s*warning:\s*declaration uses '(?:sorry|admit)'")
 
@@ -41,12 +38,12 @@ def _own_declaration_uses_sorry(combined_output: str, target_line: int) -> bool:
 
 def _node_signature(node_decl: str) -> str:
     """Bare theorem/lemma signature (no body) for a blueprint node's own
-    declaration, mirroring BlueprintNode.signature() in src/blueprint.py:
-    strip the `@[blueprint ...]` attribute, normalize `lemma` to `theorem`
-    (not every repo has Mathlib/Batteries), and cut off at the `:=` that
-    starts the `sorry_using [...]` body."""
-    text = _BLUEPRINT_ATTR_RE.sub("", node_decl)
-    text = _LEMMA_KW_RE.sub(r"\1theorem", text)
+    declaration - shares BlueprintNode.signature()'s exact helpers
+    (src/blueprint.py) so a fix to one can't silently leave the other
+    unfixed: strip the `@[blueprint ...]` attribute, normalize `lemma` to
+    `theorem` (not every repo has Mathlib/Batteries), and cut off at the
+    `:=` that starts the `sorry_using [...]` body."""
+    text = lemma_to_theorem(strip_blueprint_attr(node_decl))
     return text.split(":=", 1)[0].strip()
 
 
@@ -95,11 +92,14 @@ class VSBLeanCompiler(AbstractLeanCompiler):
         lean_root = entry.get("lean_root", "")
         repo_root = VSB_LEAN_SRC / lean_root
         if not repo_root.exists():
-            # Fall back to structural check if repo not found
+            # Fall back to structural check if repo not found. This is a
+            # regex/structural sanity check, NOT a real Lean compile -
+            # validated=False so callers can tell this apart from a genuine
+            # `lake env lean` pass.
             errors = _validate_blueprint_structure(lean_code, target_name)
             if errors:
-                return CompilerResult(success=False, errors=errors)
-            return CompilerResult(success=True)
+                return CompilerResult(success=False, errors=errors, validated=False)
+            return CompilerResult(success=True, validated=False)
 
         # Build a self-contained file: deduplicated imports + blueprint body
         local_ctx = entry.get("verif_local_ctxs") or entry.get("local_ctx", "")
@@ -248,7 +248,7 @@ def _build_blueprint_file(lean_code: str, local_ctx: str, rel_path: str = "", ta
     Falls back to inlining local_ctx when rel_path is unavailable (repo not on disk).
     """
     # 1. Strip @[blueprint ...] attribute blocks from the blueprint code
-    stripped = re.sub(r"@\[blueprint\b[^\]]*\]", "", lean_code, flags=re.DOTALL)
+    stripped = strip_blueprint_attr(lean_code)
 
     # 2. Replace sorry_using [...] with plain sorry (handles `by sorry_using [...]`
     #    and any other position)
@@ -274,7 +274,7 @@ def _build_blueprint_file(lean_code: str, local_ctx: str, rel_path: str = "", ta
     # 4b. `lemma` is a Mathlib/Batteries syntax extension, not core Lean. When we import
     #     only the repo module (which may be core-only, importing no mathlib), `lemma`
     #     will not parse. `theorem` is the core equivalent, so normalise declarations.
-    body = re.sub(r"(?m)^(\s*)lemma\b", r"\1theorem", body)
+    body = lemma_to_theorem(body)
 
     # 5. Build the header. Import ONLY the built repo module: this reproduces the exact
     #    environment the target theorem lives in (the module's own imports plus its local

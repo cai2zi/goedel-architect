@@ -9,7 +9,7 @@ import re
 
 from openai import OpenAI
 
-from blueprint import Blueprint, _parse_blueprint, _reasoning_kwargs
+from blueprint import Blueprint, _extract_lean_code, _parse_blueprint, _reasoning_kwargs
 from lean_compiler import AbstractLeanCompiler
 from orchestrator import OrchestratorResult
 from goedel_prompts import load, render
@@ -80,9 +80,27 @@ def refine_blueprint(
         lean_code = _extract_lean_code(content)
 
         result = compiler.check_blueprint(lean_code, blueprint.target_theorem)
-        if result.success or result.validation_successful:
-            print(f"  [refine] attempt {attempt + 1}/{MAX_RETRIES}: check_blueprint OK", flush=True)
-            return _parse_blueprint(lean_code, blueprint.target_theorem)
+        if result.success:
+            parsed = _parse_blueprint(lean_code, blueprint.target_theorem)
+            if parsed.nodes:
+                parsed.fully_validated = result.validated
+                print(f"  [refine] attempt {attempt + 1}/{MAX_RETRIES}: check_blueprint OK", flush=True)
+                return parsed
+            # Compiles, but has zero @[blueprint]-annotated declarations - an
+            # empty node set would make all_proved() vacuously true downstream
+            # with no actual proof recorded, so this must be retried rather
+            # than accepted (mirrors generate_blueprint's same guard).
+            print(f"  [refine] attempt {attempt + 1}/{MAX_RETRIES}: check_blueprint OK but zero nodes, retrying", flush=True)
+            messages.append({"role": "assistant", "content": content})
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"The file compiled, but contains no `@[blueprint ...]`-annotated "
+                    f"declarations (attempt {attempt + 1}/{MAX_RETRIES}). Re-emit the "
+                    "blueprint with proper annotations."
+                ),
+            })
+            continue
 
         # Feed compile errors back for next attempt
         error_feedback = "\n".join(result.errors) or result.raw_output[-2000:]
@@ -132,6 +150,16 @@ def _annotate_with_verdicts(blueprint: Blueprint, orch_result: OrchestratorResul
                     # Distinct red-node marker (Section 4.3 / Figure 1)
                     output_lines.append("-- FORMALLY_NEGATED")
                     output_lines.append(nr.result.diagnosis_block(name))
+                elif nr.result.signal == ProofSignal.INFRA_ERROR:
+                    # Infrastructure/tooling failure (timeout, exception), not
+                    # a genuine proof-difficulty verdict - flagged distinctly
+                    # so the refinement model doesn't treat it as evidence the
+                    # sub-goal itself needs re-decomposing.
+                    output_lines.append(
+                        "-- INFRA_ERROR (infrastructure/tooling failure, not a "
+                        "genuine proof-difficulty signal)"
+                    )
+                    output_lines.append(nr.result.diagnosis_block(name))
                 else:
                     output_lines.append("-- UNPROVED")
                     output_lines.append(nr.result.diagnosis_block(name))
@@ -170,10 +198,3 @@ def _build_refinement_user_prompt(
         prior_rounds=prior_rounds_text,
         round_info=round_info,
     )
-
-
-def _extract_lean_code(content: str) -> str:
-    match = re.search(r"```(?:lean)?\n(.*?)```", content, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return content.strip()

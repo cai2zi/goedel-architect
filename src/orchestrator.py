@@ -38,7 +38,10 @@ class OrchestratorResult:
         return {n: r for n, r in self.node_results.items() if r.result.signal != ProofSignal.SOLVED}
 
     def all_proved(self) -> bool:
-        return not self.failed
+        # bool(self.node_results) guards against an empty result set being
+        # vacuously "all proved" - a blueprint/refinement fallback that
+        # produces zero nodes must never be reported as a successful proof.
+        return bool(self.node_results) and not self.failed
 
 
 def _transitive_deps(node: BlueprintNode, blueprint: Blueprint) -> set[str]:
@@ -94,7 +97,7 @@ async def prove_dag(
 
     compiler_factory: if provided, called once per node to get a fresh compiler.
     node_timeout_s: wall-clock bound per node (covers the whole multi-turn tool
-        loop). A node that exceeds this comes back as PROOF_TOO_HARD instead of
+        loop). A node that exceeds this comes back as INFRA_ERROR instead of
         blocking the rest of the wave indefinitely. None disables the bound.
     """
     dag = _build_dag(blueprint)
@@ -245,24 +248,28 @@ async def _prove_one(
         dt = time.monotonic() - t0
         print(f"    [node {name}] TIMED OUT after {dt:.1f}s (bound={node_timeout_s}s) "
               f"- the underlying call keeps running in its worker thread, "
-              f"but this node is marked proof_too_hard so the wave can proceed", flush=True)
+              f"but this node is marked infra_error so the wave can proceed", flush=True)
         # Note: run_in_executor uses a real OS thread, which asyncio.wait_for
         # cannot forcibly kill - GoedelProver's own api_timeout_s (client-level
         # request timeout) is what actually bounds the underlying OpenAI call.
+        # INFRA_ERROR (not PROOF_TOO_HARD): a timeout says nothing about
+        # whether the sub-goal is actually hard, so it must not be fed to
+        # Phase 3 refinement as if the model had genuinely tried and failed.
         result = ProverResult(
-            signal=ProofSignal.PROOF_TOO_HARD,
+            signal=ProofSignal.INFRA_ERROR,
             analysis=f"Node timed out after {node_timeout_s}s (orchestrator bound).",
         )
     except Exception as exc:
         # An unhandled exception here (network blip, rate limit, etc.) would
         # otherwise propagate through asyncio.gather and take down the whole
         # wave - including sibling nodes that were succeeding - so it's
-        # caught per-node the same way a timeout is.
+        # caught per-node the same way a timeout is. INFRA_ERROR, not
+        # PROOF_TOO_HARD - see comment above.
         dt = time.monotonic() - t0
         print(f"    [node {name}] ERRORED after {dt:.1f}s -> {exc!r} "
-              f"- marked proof_too_hard so the wave can proceed", flush=True)
+              f"- marked infra_error so the wave can proceed", flush=True)
         result = ProverResult(
-            signal=ProofSignal.PROOF_TOO_HARD,
+            signal=ProofSignal.INFRA_ERROR,
             analysis=f"Node raised {type(exc).__name__}: {exc}",
         )
     return NodeResult(node=node, result=result)

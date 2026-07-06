@@ -27,10 +27,12 @@ class CompilerResult:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     raw_output: str = ""
-
-    @property
-    def validation_successful(self) -> bool:
-        return "Compilation SUCCESSFUL. Validation SUCCESSFUL." in self.raw_output
+    # True only when `success` came from an actual Lean compile (`lake env
+    # lean` / LeanREPL). Some fallback paths (e.g. a structural-only check
+    # when the target repo isn't on disk) report success without ever
+    # invoking Lean - those must set this to False so callers can tell a
+    # genuinely-validated result from a give-up/best-effort one.
+    validated: bool = True
 
     @property
     def safeguard_rejected(self) -> bool:
@@ -38,11 +40,14 @@ class CompilerResult:
 
     @property
     def has_sorry(self) -> bool:
-        return any("declaration uses" in w and "sorry" in w for w in self.warnings)
+        return any(
+            "declaration uses" in w and ("sorry" in w or "admit" in w)
+            for w in self.warnings
+        )
 
 
 _DECL_RE = re.compile(r"\b(?:noncomputable\s+def|def|lemma|theorem|abbrev)\s+\w+.*", re.DOTALL)
-_SORRY_USING_RE = re.compile(r":=\s*by\s*sorry_using\s*\[[^\]]*\]\s*\Z", re.DOTALL)
+_SORRY_USING_RE = re.compile(r":=\s*by\s*sorry_using\s*\[[^\]]*\]", re.DOTALL)
 
 # Both prover_system.md and blueprint_system.md tell the model these are
 # forbidden — `axiom` lets it assert its own goal as true with zero proof,
@@ -59,7 +64,7 @@ def _assemble_node_attempt(node_decl: str, aux_lemmas: str, proof_body: str) -> 
     """
     m = _DECL_RE.search(node_decl)
     decl_text = m.group(0) if m else node_decl
-    decl_text = _SORRY_USING_RE.sub(f":= {proof_body}", decl_text)
+    decl_text = _SORRY_USING_RE.sub(f":= {proof_body}", decl_text, count=1)
     parts = [MATHLIB_HEADER.rstrip("\n")]
     if aux_lemmas.strip():
         parts.append(aux_lemmas.strip())

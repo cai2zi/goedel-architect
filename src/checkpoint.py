@@ -35,7 +35,15 @@ class CheckpointState:
     iteration: int = 0
     blueprint_lean_file: str = ""
     blueprint_target: str = ""
+    blueprint_fully_validated: bool = False
     proved_cache: dict[str, str] = field(default_factory=dict)
+    # name -> BlueprintNode.cache_key() recorded at the moment the proof was
+    # accepted into proved_cache. Lets a later refinement round tell whether
+    # a cached proof still matches the node it was compiled against (see
+    # pipeline._invalidate_stale_proofs). Missing entries (e.g. a checkpoint
+    # written before this field existed) are treated as stale on first use -
+    # a safe, one-time re-check rather than trusting an unrecorded cache.
+    proof_cache_keys: dict[str, str] = field(default_factory=dict)
     # name -> serialized ProverResult (signal/proof_body/analysis/suggested_fix/lean_errors)
     node_results: dict[str, dict] = field(default_factory=dict)
     refinement_history: list[str] = field(default_factory=list)
@@ -47,11 +55,14 @@ class CheckpointState:
     def set_blueprint(self, blueprint: Blueprint) -> None:
         self.blueprint_lean_file = blueprint.lean_file
         self.blueprint_target = blueprint.target_theorem
+        self.blueprint_fully_validated = blueprint.fully_validated
 
     def get_blueprint(self) -> Blueprint | None:
         if not self.blueprint_lean_file:
             return None
-        return _parse_blueprint(self.blueprint_lean_file, self.blueprint_target)
+        bp = _parse_blueprint(self.blueprint_lean_file, self.blueprint_target)
+        bp.fully_validated = self.blueprint_fully_validated
+        return bp
 
     # -- Node results (de)serialization ----------------------------------
 

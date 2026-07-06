@@ -306,7 +306,10 @@ def evaluate_theorem_phase(
                 theorem_stmt=thm_stmt, model=model, compiler=make_compiler(),
                 repo_context=verif_ctx, checkpoint_path=checkpoint_path,
             )
-            result.update(ok=True, nodes=[n.name for n in blueprint.nodes])
+            result.update(
+                ok=True, validated=blueprint.fully_validated,
+                nodes=[n.name for n in blueprint.nodes],
+            )
 
         elif phase == 2:
             orch_result = run_phase2(
@@ -315,6 +318,7 @@ def evaluate_theorem_phase(
             )
             result.update(
                 ok=True,
+                validated=orch_result.all_proved(),
                 all_proved=orch_result.all_proved(),
                 proved=sorted(orch_result.proved),
                 failed=sorted(orch_result.failed.keys()),
@@ -325,7 +329,10 @@ def evaluate_theorem_phase(
                 checkpoint_path=checkpoint_path, compiler=make_compiler(),
                 model=model, repo_context=verif_ctx,
             )
-            result.update(ok=True, nodes=[n.name for n in blueprint.nodes])
+            result.update(
+                ok=True, validated=blueprint.fully_validated,
+                nodes=[n.name for n in blueprint.nodes],
+            )
 
         else:
             raise ValueError(f"Unknown phase {phase}")
@@ -411,7 +418,12 @@ def _run_phase_only(
                 i = completed
                 with open(phase_results_file, "a") as f:
                     f.write(json.dumps(res) + "\n")
-            status = "OK" if res["ok"] else "FAIL"
+            # "validated" (real compile/proof signal) is the ground truth for
+            # OK/FAIL when present; "ok" (didn't raise) is only a fallback for
+            # phases/paths that don't yet set it, so a give-up/best-effort
+            # result is never reported as a pass.
+            validated = res.get("validated", res["ok"])
+            status = "OK" if validated else "FAIL"
             print(f"  [{i}/{total}] {status} {thm_name} ({res.get('wall_time_s', 0):.1f}s)"
                   + (f" — {res['error']}" if not res["ok"] else ""))
 
@@ -422,7 +434,7 @@ def _run_phase_only(
             for fut in as_completed(futures):
                 fut.result()
 
-    ok_count = sum(1 for r in all_results if r["ok"])
+    ok_count = sum(1 for r in all_results if r.get("validated", r["ok"]))
     print(f"\nPhase {args.phase}: {ok_count}/{total} succeeded")
     print(f"Results saved to {phase_results_file}")
     print(f"Checkpoints saved to {checkpoint_dir}")

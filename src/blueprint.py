@@ -30,6 +30,23 @@ BLUEPRINT_USER_TEMPLATE = load("blueprint_user")
 MAX_TOKENS = 64_000
 MAX_RETRIES = 8
 
+# Shared text-surgery helpers for the `@[blueprint]` grammar. Previously
+# reimplemented independently (with subtly different regexes) in
+# eval/vsb_lean_compiler.py's `_node_signature()`/`_build_blueprint_file()` -
+# consolidated here as the single canonical version so a fix in one place
+# can't silently leave a copy elsewhere unfixed.
+_BLUEPRINT_ATTR_RE = re.compile(r"@\[blueprint\b[^\]]*\]", re.DOTALL)
+_LEMMA_KW_RE = re.compile(r"(?m)^(\s*)lemma\b")
+
+
+def strip_blueprint_attr(text: str) -> str:
+    return _BLUEPRINT_ATTR_RE.sub("", text)
+
+
+def lemma_to_theorem(text: str) -> str:
+    """`lemma` needs Mathlib/Batteries; `theorem` works in every environment."""
+    return _LEMMA_KW_RE.sub(r"\1theorem", text)
+
 
 @dataclass
 class BlueprintNode:
@@ -50,10 +67,19 @@ class BlueprintNode:
         are otherwise only ever shown to the model as prompt text, never
         actually compiled into scope.
         """
-        text = re.sub(r"@\[blueprint\b[^\]]*\]", "", self.lean_declaration, flags=re.DOTALL)
-        # `lemma` needs Mathlib/Batteries; `theorem` works in every environment.
-        text = re.sub(r"(?m)^(\s*)lemma\b", r"\1theorem", text)
+        text = lemma_to_theorem(strip_blueprint_attr(self.lean_declaration))
         return text.split(":=", 1)[0].strip()
+
+    def cache_key(self) -> str:
+        """Signature plus dependency set: a cached proof is only valid for
+        the exact (signature, dependencies) shape it was compiled against.
+        `signature()` alone only covers the text before `:=`, so a node
+        whose sorry_using [...] dependency list changes (text AFTER `:=`)
+        while its exposed statement stays byte-identical would otherwise be
+        invisible to staleness checks, even though its cached proof was
+        spliced together with the OLD set of sibling declarations in scope.
+        """
+        return self.signature() + "\x00deps:" + ",".join(sorted(self.dependencies))
 
 
 @dataclass
@@ -61,6 +87,11 @@ class Blueprint:
     nodes: list[BlueprintNode]
     lean_file: str  # full compilable @[blueprint]-annotated Lean file
     target_theorem: str
+    # True only when this exact lean_file was confirmed to compile by a real
+    # Lean invocation (not a structural-only fallback, and not a give-up
+    # after MAX_RETRIES). Defaults to False so any code path that forgets to
+    # set it explicitly fails safe rather than silently claiming validation.
+    fully_validated: bool = False
 
     def node_by_name(self, name: str) -> BlueprintNode | None:
         return next((n for n in self.nodes if n.name == name), None)
@@ -123,9 +154,10 @@ def generate_blueprint(
         if compiler is not None:
             target = _extract_target_name(lean_code, theorem_stmt)
             result = compiler.check_blueprint(lean_code, target)
-            if result.success or result.validation_successful:
+            if result.success:
                 parsed = _parse_blueprint(lean_code, target)
                 if parsed.nodes:
+                    parsed.fully_validated = result.validated
                     return parsed
                 # Compiles, but has zero @[blueprint]-annotated declarations —
                 # e.g. the model wrote a plain (already-complete or sorry-free)
@@ -164,6 +196,8 @@ def generate_blueprint(
     # during node proving). But an empty node set is never usable: it makes
     # all_proved() vacuously true downstream with no actual proof recorded,
     # so that must be a hard failure rather than a silent fake success.
+    # `parsed.fully_validated` is deliberately left at its default False here -
+    # this blueprint was never actually accepted by a real compile.
     if last_lean_code:
         target = _extract_target_name(last_lean_code, theorem_stmt)
         parsed = _parse_blueprint(last_lean_code, target)
@@ -179,12 +213,28 @@ def _build_user_prompt(theorem_stmt: str, nl_proof: str | None, repo_context: st
     return render(BLUEPRINT_USER_TEMPLATE, theorem_stmt=theorem_stmt, nl_proof=nl_proof or "", repo_context=repo_context or "")
 
 
+# Matches the first line that looks like real Lean source, used to strip a
+# leaked non-Lean preamble (e.g. a model hallucinating a tool-call-style tag
+# like `<lean_compile>` instead of a code fence) when there's no fence to
+# delimit the code block.
+_LEAN_START_RE = re.compile(
+    r"^\s*(?:import\b|@\[blueprint\b|theorem\b|lemma\b|noncomputable\s+def\b|def\b|abbrev\b)",
+    re.MULTILINE,
+)
+
+
 def _extract_lean_code(content: str) -> str:
     """Extract the Lean code block from the LLM response."""
     match = re.search(r"```(?:lean)?\n(.*?)```", content, re.DOTALL)
     if match:
         return match.group(1).strip()
-    # If the model didn't use a code fence, treat the whole response as Lean
+    # No fence - the model may still have prefixed its response with
+    # non-Lean text (a leaked tag, an apology, etc.). Start at the first
+    # line that looks like real Lean rather than treating the raw response
+    # as Lean verbatim.
+    start_match = _LEAN_START_RE.search(content)
+    if start_match:
+        return content[start_match.start():].strip()
     return content.strip()
 
 

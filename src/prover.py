@@ -147,6 +147,11 @@ class ProofSignal(str, Enum):
     STATEMENT_WRONG = "statement_wrong"
     PROOF_TOO_HARD = "proof_too_hard"
     FORMALLY_NEGATED = "formally_negated"
+    # Not one of the paper's four signals: an infra/tooling failure (timeout,
+    # unhandled exception) rather than a genuine "the model tried and
+    # couldn't" verdict. Kept distinct so refinement (and human diagnosis)
+    # doesn't treat a broken harness as evidence the sub-goal is hard.
+    INFRA_ERROR = "infra_error"
 
 
 @dataclass
