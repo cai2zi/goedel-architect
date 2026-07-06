@@ -164,6 +164,10 @@ def evaluate_theorem(
             # Use only the root-node proof body — final_lean_file is a full Lean
             # file with import statements, not a proof body VSBLeanCompiler can verify.
             raw_output = proof_result.proof_body
+            # proof_body is JUST the root node's own tactic block; anything it
+            # references by name (a proved sibling node) only exists as prompt
+            # text unless re-declared as a real lemma here.
+            aux_lemmas = proof_result.aux_lemma_decls
         else:
             # Phase 2 only (direct per-theorem proving, no blueprint)
             prover = GoedelProver(model_id=model, retrieval=retrieval, tracer=tracer)
@@ -176,14 +180,23 @@ def evaluate_theorem(
                 repo_retrieval=repo_retrieval,
             )
             raw_output = result_obj.proof_body
+            aux_lemmas = utils.get_lemmas_from_llm_output(raw_output)
 
-        proof     = utils.get_proof_from_llm_output(raw_output) or raw_output.strip()
-        aux_lemmas = utils.get_lemmas_from_llm_output(raw_output)
+        proof = utils.get_proof_from_llm_output(raw_output) or raw_output.strip()
 
         if not proof:
             result["error"] = "No proof found in prover output."
             result["wall_time_s"] = round(time.monotonic() - t0, 2)
             return result
+
+        # thm_stmt (via _clean_thm_stmt) always ends in a bare ':=' expecting a
+        # proof with no separator of its own, but GoedelProver's prover always
+        # emits proof bodies starting with ':=' (see SYSTEM_SUFFIX in
+        # prover.py) - concatenating both left a literal "... :=\n:= by ..."
+        # in the compiled file, a hard parse error unrelated to proof
+        # correctness. Drop the redundant leading ':=' before it's appended.
+        if thm_stmt.rstrip().endswith(":=") and proof.lstrip().startswith(":="):
+            proof = proof.lstrip()[2:].lstrip()
 
         name_mapping = utils.find_conflicting_names_from_local_context(verif_ctx, aux_lemmas)
         aux_lemmas, proof = utils.apply_name_replacements(aux_lemmas, proof, name_mapping)

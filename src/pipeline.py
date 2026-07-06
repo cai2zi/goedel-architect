@@ -33,9 +33,23 @@ class ProofResult:
     theorem_name: str
     proof_body: str = ""        # proof body of the root node if solved
     final_lean_file: str = ""   # full assembled Lean file
+    aux_lemma_decls: str = ""   # every other proved node, re-declared as a real
+                                # lemma/theorem, so a caller compiling just
+                                # proof_body against the root's bare signature
+                                # (e.g. VeriSoftBench's own verify_proof) can
+                                # still resolve the root proof's references to
+                                # its dependencies by name
     iterations: int = 0
     proved_nodes: list[str] = field(default_factory=list)
     failed_nodes: list[str] = field(default_factory=list)
+
+
+def _aux_lemma_decls(blueprint: Blueprint, proved_cache: dict[str, str], root_name: str) -> str:
+    return "\n\n".join(
+        f"{node.signature()} {proved_cache[node.name]}"
+        for node in blueprint.dependency_order()
+        if node.name != root_name and node.name in proved_cache
+    )
 
 
 def prove_theorem(
@@ -174,6 +188,7 @@ def prove_theorem(
                 theorem_name=root_name,
                 proof_body=root_proof,
                 final_lean_file=_assemble_final_file(blueprint, orch_result),
+                aux_lemma_decls=_aux_lemma_decls(blueprint, proved_cache, root_name),
                 iterations=iteration + 1,
                 proved_nodes=list(orch_result.proved),
                 failed_nodes=[],
@@ -227,6 +242,7 @@ def prove_theorem(
         theorem_name=blueprint.target_theorem,
         proof_body=root_proof,
         final_lean_file=_assemble_partial_file(blueprint, orch_result, proved_cache),
+        aux_lemma_decls=_aux_lemma_decls(blueprint, proved_cache, blueprint.target_theorem),
         iterations=max_iterations,
         proved_nodes=proved,
         failed_nodes=failed,
@@ -385,6 +401,7 @@ def _proof_result_from_checkpoint(state: CheckpointState) -> ProofResult:
             theorem_name=root_name,
             proof_body=root_proof,
             final_lean_file=_assemble_final_file(blueprint, orch_result),
+            aux_lemma_decls=_aux_lemma_decls(blueprint, proved_cache, root_name),
             iterations=state.iteration + 1,
             proved_nodes=list(orch_result.proved),
             failed_nodes=[],
@@ -394,6 +411,7 @@ def _proof_result_from_checkpoint(state: CheckpointState) -> ProofResult:
         theorem_name=root_name,
         proof_body=root_proof,
         final_lean_file=_assemble_partial_file(blueprint, orch_result, proved_cache),
+        aux_lemma_decls=_aux_lemma_decls(blueprint, proved_cache, root_name),
         iterations=state.iteration + 1,
         proved_nodes=list(orch_result.proved),
         failed_nodes=list(orch_result.failed.keys()),
