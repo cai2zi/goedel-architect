@@ -82,9 +82,51 @@ Key flags:
 | `--resume` | Skip theorems already recorded in the output dir's `results.jsonl` under the same model/mode/blueprint config, and append new results incrementally instead of overwriting |
 | `--repo` / `--thm` | Filter to one repo or theorem name, for smoke testing |
 | `--trace` | Write a JSONL trace of every tool call/compile attempt, viewable via `eval/serve_viz.py` |
+| `--phase {1,2,3}` | Run exactly one phase per theorem instead of the full loop (see below) |
+| `--checkpoint-dir` | Where per-theorem checkpoint files live (default `<output>/checkpoints/`) |
 
 Results land in `<output>/results.jsonl` (one line per theorem) and
 `<output>/summary.json` (pass rate, average wall time).
+
+#### Checkpointing and resuming mid-theorem
+
+With `--blueprint`, every theorem gets a checkpoint file at
+`<output>/checkpoints/<thm_name>.json`, rewritten after each phase. It holds
+the current blueprint (as raw Lean text — cheaply re-parsed, so nothing
+fancier is stored), which nodes are already proved, that iteration's failure
+diagnostics, and the refinement history.
+
+This makes `--blueprint` runs resumable for free: if a run is killed and you
+rerun the *same command*, each theorem picks back up from its last completed
+phase — no re-generating a blueprint that already compiled, no re-proving a
+node that already succeeded, no re-paying for API calls on a theorem that had
+already finished (success or exhausted retries) in a prior invocation.
+`--resume` (skipping whole theorems via `results.jsonl`) and checkpointing
+(resuming *within* a theorem) are complementary — use both for a long run.
+
+For finer control, `--phase N` runs a single phase across the selected
+theorems and stops, so you can drive Phase 1/2/3 as separate invocations
+instead of one continuous loop:
+
+```bash
+# Phase 1 alone: generate and checkpoint a blueprint for one theorem
+python eval/run_verisoftbench.py --thm add_comm --repo lean-formal-reasoning-program --phase 1
+
+# Phase 2 alone: prove nodes against that checkpoint (requires Phase 1 to have run at some point)
+python eval/run_verisoftbench.py --thm add_comm --repo lean-formal-reasoning-program --phase 2
+
+# Phase 3 alone: refine the blueprint from Phase 2's failure diagnostics (requires Phase 2 to have run)
+python eval/run_verisoftbench.py --thm add_comm --repo lean-formal-reasoning-program --phase 3
+```
+
+Each `--phase` invocation is a separate process reading/writing the same
+checkpoint file — Phase 2 refuses to run without a blueprint already in the
+checkpoint, and Phase 3 refuses to run without Phase 2's node results (both
+raise a clear error rather than silently doing nothing). Results land in
+`<output>/phase{N}_results.jsonl`; the mutated checkpoint itself is the real
+output. This is mainly useful for debugging one theorem's decomposition or
+manually driving refinement rounds — for normal runs, plain `--blueprint`
+already checkpoints and resumes automatically.
 
 ### PutnamBench / miniF2F
 

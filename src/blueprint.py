@@ -26,8 +26,8 @@ BLUEPRINT_USER_TEMPLATE = load("blueprint_user")
 
 # Appendix A specifies 262,144 (matches DeepSeek-V4-Flash's completion budget).
 # OpenAI's chat.completions API hard-caps max_completion_tokens at 128,000
-# regardless of model, and this is capped further to 32,000 to control cost.
-MAX_TOKENS = 32_000
+# regardless of model, and this is capped further to 64,000 to control cost.
+MAX_TOKENS = 64_000
 MAX_RETRIES = 8
 
 
@@ -91,7 +91,7 @@ class Blueprint:
 def generate_blueprint(
     theorem_stmt: str,
     nl_proof: str | None = None,
-    model: str = "gpt-4o",
+    model: str = "gpt-5.5",
     compiler: AbstractLeanCompiler | None = None,
     repo_context: str | None = None,
 ) -> Blueprint:

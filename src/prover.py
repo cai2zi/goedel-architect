@@ -12,6 +12,7 @@ Returns one of four structured signals per the paper:
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -50,7 +51,7 @@ PROVER_USER_TEMPLATE = load("prover_user")
 # twice in VSB smoke tests that the model converged on a materially better
 # proof strategy right as the 4-call budget ran out, with the improved draft
 # never reaching lean_compile at all.
-MAX_TOKENS = 32_000
+MAX_TOKENS = 64_000
 MAX_TOOL_CALLS = 8
 NEGATION_PROBE_CALLS = 4
 
@@ -279,11 +280,13 @@ class GoedelProver:
         last_text = ""
         tool_results: list[dict] = []
         last_compile_ok = False
+        all_lean_errors: list[str] = []
 
         while tool_calls_used < MAX_TOOL_CALLS:
-            tool_results, text, proof, compile_ok, tools_called = self._process_response(
+            tool_results, text, proof, compile_ok, tools_called, compile_errors = self._process_response(
                 response, compiler, node_name, repo_retrieval, tool_calls_used, node_decl=node_stmt
             )
+            all_lean_errors.extend(compile_errors)
             if text:
                 last_text = text
             if proof:
@@ -324,9 +327,10 @@ class GoedelProver:
                 max_output_tokens=MAX_TOKENS,
                 **_responses_reasoning_kwargs(self.model_id),
             )
-            _, drain_text, drain_proof, _, _ = self._process_response(
+            _, drain_text, drain_proof, _, _, drain_errors = self._process_response(
                 response, compiler, node_name, repo_retrieval, tool_calls_used
             )
+            all_lean_errors.extend(drain_errors)
             if drain_text:
                 last_text = drain_text
             if drain_proof:
@@ -341,9 +345,10 @@ class GoedelProver:
                 max_output_tokens=MAX_TOKENS,
                 **_responses_reasoning_kwargs(self.model_id),
             )
-            _, last_text, best_proof_body, _, _ = self._process_response(
+            _, last_text, best_proof_body, _, _, final_errors = self._process_response(
                 response, compiler, node_name, repo_retrieval, tool_calls_used
             )
+            all_lean_errors.extend(final_errors)
 
         # Probe negation if we couldn't prove it
         negation = self._probe_negation(compiler, node_name, response.id, MAX_TOKENS)
@@ -351,10 +356,11 @@ class GoedelProver:
             return negation
 
         if best_proof_body:
-            signal = _classify_failure([], last_text)
+            signal = _classify_failure(all_lean_errors, last_text)
             return ProverResult(signal=signal, proof_body=best_proof_body,
-                                analysis=last_text[:500])
-        return ProverResult(signal=_classify_failure([], last_text), analysis=last_text[:500])
+                                analysis=last_text[:500], lean_errors=all_lean_errors)
+        return ProverResult(signal=_classify_failure(all_lean_errors, last_text),
+                            analysis=last_text[:500], lean_errors=all_lean_errors)
 
     # ------------------------------------------------------------------
     # Response processing
@@ -368,13 +374,14 @@ class GoedelProver:
         repo_retrieval,
         tool_calls_so_far: int,
         node_decl: str = "",
-    ) -> tuple[list[dict], str, str, bool, list[str]]:
+    ) -> tuple[list[dict], str, str, bool, list[str], list[str]]:
         tool_results: list[dict] = []
         last_text = ""
         best_proof = ""
         compiled_proof = ""   # proof body that actually compiled — never overwritten by message text
         any_compile_ok = False
         tools_called: list[str] = []
+        compile_errors: list[str] = []
         turn = tool_calls_so_far + 1
 
         for item in response.output:
@@ -405,6 +412,7 @@ class GoedelProver:
                     else:
                         errs = "\n".join(cr.errors)
                         result = f"Compilation FAILED.\n{errs}\n\nFix errors and call lean_compile again."
+                        compile_errors.extend(cr.errors)
 
                 elif fn == "repo_search" and repo_retrieval is not None:
                     hits = repo_retrieval.search(args["query"], args.get("k", 10))
@@ -445,7 +453,7 @@ class GoedelProver:
                         ))
 
         # Prefer the proof that actually compiled over anything extracted from text
-        return tool_results, last_text, compiled_proof or best_proof, any_compile_ok, tools_called
+        return tool_results, last_text, compiled_proof or best_proof, any_compile_ok, tools_called, compile_errors
 
     # ------------------------------------------------------------------
     # Negation probe (Section 4.3 / Figure 1)
@@ -521,8 +529,18 @@ def _extract_proof_body(text: str) -> str:
 
 
 def _classify_failure(errors: list[str], analysis: str) -> ProofSignal:
-    combined = " ".join(errors).lower() + analysis.lower()
-    if any(p in combined for p in ["type mismatch", "false", "counterexample"]):
+    """Real compiler errors are checked first since they're authoritative; the
+    model's own commentary (`analysis`) is a weaker fallback signal and must
+    use word-boundary matching so identifiers like `t_false`/`progress_false`
+    don't false-positive on the bare substring "false"."""
+    errors_text = " ".join(errors).lower()
+    if "type mismatch" in errors_text:
+        return ProofSignal.STATEMENT_WRONG
+
+    analysis_lower = analysis.lower()
+    if "type mismatch" in analysis_lower:
+        return ProofSignal.STATEMENT_WRONG
+    if re.search(r"\b(false|counterexample)\b", analysis_lower):
         return ProofSignal.STATEMENT_WRONG
     return ProofSignal.PROOF_TOO_HARD
 

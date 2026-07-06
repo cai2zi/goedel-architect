@@ -37,9 +37,10 @@ from core.lean_interface import LeanREPL
 from prompts.prompt_builder import PromptBuilder
 import utils.utils as utils
 
+from checkpoint import CheckpointState, path_for_theorem
 from lean_compiler import AbstractLeanCompiler
 from mathlib_retrieval import MathlibRetrieval
-from pipeline import prove_theorem, ProofResult
+from pipeline import prove_theorem, ProofResult, run_phase1, run_phase2, run_phase3
 from prover import GoedelProver
 from repo_retrieval import RepoRetrieval
 from tracer import JsonlTracer, NullTracer, TraceEvent
@@ -62,6 +63,7 @@ def load_dataset(
     thm_filter: str | None = None,
     subset: int | None = None,
     seed: int = 0,
+    exclude_repos: set[str] | None = None,
 ) -> list[dict]:
     """
     subset: random sample of `subset` tasks spanning the whole (filtered)
@@ -75,6 +77,8 @@ def load_dataset(
             if line.strip():
                 entry = json.loads(line)
                 if repo_filter and entry.get("lean_root") != repo_filter:
+                    continue
+                if exclude_repos and entry.get("lean_root") in exclude_repos:
                     continue
                 if thm_filter and thm_filter not in entry.get("thm_name", ""):
                     continue
@@ -103,6 +107,7 @@ def evaluate_theorem(
     model: str,
     tracer,
     verbose: bool,
+    checkpoint_dir: Path | None = None,
 ) -> dict:
     thm_name  = theorem_entry["thm_name"]
     lean_root = theorem_entry["lean_root"]
@@ -142,7 +147,10 @@ def evaluate_theorem(
             return VSBLeanCompiler(lean_repl, theorem_entry, call_prefix="ga")
 
         if use_blueprint:
-            # Full 3-phase pipeline
+            # Full 3-phase pipeline. checkpoint_path lets a killed/restarted
+            # run resume mid-theorem (skip Phase 1, skip already-proved
+            # nodes) instead of starting over — see src/checkpoint.py.
+            checkpoint_path = path_for_theorem(checkpoint_dir, thm_name) if checkpoint_dir else None
             proof_result: ProofResult = prove_theorem(
                 theorem_stmt=thm_stmt,
                 model=model,
@@ -151,6 +159,7 @@ def evaluate_theorem(
                 repo_retrieval=repo_retrieval,
                 tracer=tracer,
                 repo_context=verif_ctx,
+                checkpoint_path=checkpoint_path,
             )
             # Use only the root-node proof body — final_lean_file is a full Lean
             # file with import statements, not a proof body VSBLeanCompiler can verify.
@@ -234,6 +243,87 @@ def _build_verif_context(lean_repl, entry, lean_root, rel_path,
     return fallback
 
 
+def evaluate_theorem_phase(
+    theorem_entry: dict,
+    lean_repl: LeanREPL,
+    retrieval: MathlibRetrieval,
+    repo_retrieval: RepoRetrieval | None,
+    phase: int,
+    checkpoint_dir: Path,
+    model: str,
+    tracer,
+) -> dict:
+    """Run exactly one of Phase 1/2/3 against this theorem's checkpoint file.
+
+    Phase 2 requires a checkpoint already holding a blueprint (i.e. Phase 1
+    ran at some point, in this process or an earlier one). Phase 3 requires
+    that checkpoint to also hold node_results (i.e. Phase 2 ran). Neither
+    phase re-runs what came before it — see src/checkpoint.py.
+    """
+    thm_name  = theorem_entry["thm_name"]
+    lean_root = theorem_entry["lean_root"]
+    rel_path  = theorem_entry["rel_path"]
+    imports   = theorem_entry.get("imports", [])
+    local_ctx = theorem_entry.get("local_ctx", "")
+
+    thm_stmt = _clean_thm_stmt(
+        theorem_entry["thm_stmt"],
+        gt_proof=theorem_entry.get("ground_truth_proof", ""),
+    )
+    theorem_entry["thm_stmt"] = thm_stmt
+
+    checkpoint_path = path_for_theorem(checkpoint_dir, thm_name)
+
+    result = {
+        "thm_name": thm_name, "lean_root": lean_root, "rel_path": rel_path,
+        "phase": phase, "checkpoint": str(checkpoint_path), "ok": False,
+    }
+
+    def make_compiler() -> AbstractLeanCompiler:
+        return VSBLeanCompiler(lean_repl, theorem_entry, call_prefix="ga")
+
+    t0 = time.monotonic()
+    try:
+        verif_ctx = _build_verif_context(lean_repl, theorem_entry, lean_root,
+                                          rel_path, imports, local_ctx, thm_stmt, thm_name)
+        theorem_entry["verif_local_ctxs"] = verif_ctx
+
+        if phase == 1:
+            blueprint = run_phase1(
+                theorem_stmt=thm_stmt, model=model, compiler=make_compiler(),
+                repo_context=verif_ctx, checkpoint_path=checkpoint_path,
+            )
+            result.update(ok=True, nodes=[n.name for n in blueprint.nodes])
+
+        elif phase == 2:
+            orch_result = run_phase2(
+                checkpoint_path=checkpoint_path, compiler_factory=make_compiler,
+                retrieval=retrieval, repo_retrieval=repo_retrieval, tracer=tracer,
+            )
+            result.update(
+                ok=True,
+                all_proved=orch_result.all_proved(),
+                proved=sorted(orch_result.proved),
+                failed=sorted(orch_result.failed.keys()),
+            )
+
+        elif phase == 3:
+            blueprint = run_phase3(
+                checkpoint_path=checkpoint_path, compiler=make_compiler(),
+                model=model, repo_context=verif_ctx,
+            )
+            result.update(ok=True, nodes=[n.name for n in blueprint.nodes])
+
+        else:
+            raise ValueError(f"Unknown phase {phase}")
+
+    except Exception as exc:
+        result["error"] = str(exc)
+
+    result["wall_time_s"] = round(time.monotonic() - t0, 2)
+    return result
+
+
 def summarise(results: list[dict]) -> dict:
     total  = len(results)
     proved = sum(1 for r in results if r["success"])
@@ -264,6 +354,67 @@ def load_done_results(results_file: Path, model: str, mode: str, blueprint: bool
     return done
 
 
+def _run_phase_only(
+    problems: list[dict],
+    lean_repl: LeanREPL,
+    retrieval: MathlibRetrieval,
+    repo_retrievals: dict[str, RepoRetrieval | None],
+    args: argparse.Namespace,
+    output_dir: Path,
+    checkpoint_dir: Path,
+    tracer,
+) -> None:
+    """Run --phase N over `problems`, one theorem at a time per repo (same
+    lake-safety constraint as the full pipeline — see run_repo_queue)."""
+    phase_results_file = output_dir / f"phase{args.phase}_results.jsonl"
+
+    by_repo: dict[str, list[dict]] = defaultdict(list)
+    for entry in problems:
+        by_repo[entry.get("lean_root", "")].append(entry)
+
+    num_workers = max(1, min(args.workers, len(by_repo))) if by_repo else 0
+    total = len(problems)
+    completed = 0
+    results_lock = threading.Lock()
+    all_results: list[dict] = []
+
+    def run_repo_queue(repo_problems: list[dict]) -> None:
+        nonlocal completed
+        for entry in repo_problems:
+            thm_name = entry["thm_name"]
+            res = evaluate_theorem_phase(
+                theorem_entry=entry,
+                lean_repl=lean_repl,
+                retrieval=retrieval,
+                repo_retrieval=repo_retrievals.get(entry.get("lean_root", "")),
+                phase=args.phase,
+                checkpoint_dir=checkpoint_dir,
+                model=args.model,
+                tracer=tracer,
+            )
+            with results_lock:
+                all_results.append(res)
+                completed += 1
+                i = completed
+                with open(phase_results_file, "a") as f:
+                    f.write(json.dumps(res) + "\n")
+            status = "OK" if res["ok"] else "FAIL"
+            print(f"  [{i}/{total}] {status} {thm_name} ({res.get('wall_time_s', 0):.1f}s)"
+                  + (f" — {res['error']}" if not res["ok"] else ""))
+
+    if by_repo:
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            futures = [pool.submit(run_repo_queue, repo_problems)
+                       for repo_problems in by_repo.values()]
+            for fut in as_completed(futures):
+                fut.result()
+
+    ok_count = sum(1 for r in all_results if r["ok"])
+    print(f"\nPhase {args.phase}: {ok_count}/{total} succeeded")
+    print(f"Results saved to {phase_results_file}")
+    print(f"Checkpoints saved to {checkpoint_dir}")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -278,6 +429,8 @@ def main() -> None:
                              "file order and clusters on one repo)")
     parser.add_argument("--seed",    type=int, default=0, help="--subset sample seed")
     parser.add_argument("--repo",    default=None)
+    parser.add_argument("--exclude-repo", default=None,
+                        help="Comma-separated repo names to skip (e.g. known-broken builds)")
     parser.add_argument("--thm",     default=None, help="Run a single theorem by name")
     parser.add_argument("--workers", type=int, default=1,
                         help="Parallel workers, sharded by repo (theorems from the "
@@ -294,6 +447,18 @@ def main() -> None:
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--blueprint", action="store_true",
                         help="Use full 3-phase pipeline (Phase 1 + 2 + 3)")
+    parser.add_argument("--phase", type=int, choices=[1, 2, 3], default=None,
+                        help="Run exactly one phase per theorem instead of the "
+                             "full pipeline, persisting/reading state from "
+                             "--checkpoint-dir so a later invocation can pick "
+                             "up where this one left off. Phase 2 requires a "
+                             "checkpoint with a blueprint (run --phase 1 first, "
+                             "any time before); Phase 3 requires a checkpoint "
+                             "with node results (run --phase 2 first). Neither "
+                             "re-runs the phase(s) before it.")
+    parser.add_argument("--checkpoint-dir", default=None,
+                        help="Directory for per-theorem checkpoint files used "
+                             "by --phase (default: <output>/checkpoints/)")
     parser.add_argument("--trace", metavar="PATH", nargs="?", const="",
                         help="Write JSONL trace (default: results/verisoftbench/trace.jsonl)")
     args = parser.parse_args()
@@ -314,11 +479,14 @@ def main() -> None:
         trace_path.unlink(missing_ok=True)
     tracer = JsonlTracer(trace_path) if trace_path else NullTracer()
 
+    exclude_repos = set(r.strip() for r in args.exclude_repo.split(",") if r.strip()) if args.exclude_repo else None
+
     print("Loading VeriSoftBench dataset ...")
     problems = load_dataset(limit=args.limit, repo_filter=args.repo, thm_filter=args.thm,
-                             subset=args.subset, seed=args.seed)
+                             subset=args.subset, seed=args.seed, exclude_repos=exclude_repos)
     print(f"  {len(problems)} problems"
           + (f" (repo={args.repo})" if args.repo else "")
+          + (f" (exclude_repo={sorted(exclude_repos)})" if exclude_repos else "")
           + (f" (thm={args.thm})" if args.thm else "")
           + (f" (limit={args.limit})" if args.limit else "")
           + (f" (subset={args.subset}, seed={args.seed})" if args.subset else ""))
@@ -343,6 +511,18 @@ def main() -> None:
                 repo_retrievals[repo] = RepoRetrieval(repo_root, cache_dir=CACHE_DIR)
             else:
                 repo_retrievals[repo] = None
+
+    checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else output_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.phase is not None:
+        print(f"  Phase-only mode: Phase {args.phase}, checkpoints in {checkpoint_dir}")
+        _run_phase_only(problems, lean_repl, retrieval, repo_retrievals, args, output_dir, checkpoint_dir, tracer)
+        return
+
+    if args.blueprint:
+        print(f"  Checkpoints in {checkpoint_dir} — a killed/restarted run resumes "
+              f"mid-theorem automatically (skips Phase 1, skips already-proved nodes)")
 
     results_file = output_dir / "results.jsonl"
 
@@ -389,6 +569,7 @@ def main() -> None:
             model=args.model,
             tracer=tracer,
             verbose=args.verbose,
+            checkpoint_dir=checkpoint_dir if args.blueprint else None,
         )
 
     def run_repo_queue(repo_problems: list[dict]) -> None:

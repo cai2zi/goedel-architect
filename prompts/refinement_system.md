@@ -2,22 +2,26 @@
 You are revising a Lean 4 dependency graph for a single mathematical problem. The input is a sequence of `@[blueprint ...]`-annotated declarations -- definitions, lemmas, and one main theorem -- each lemma or theorem with body `:= by sorry_using [deps]`. Your job is to emit a revised dependency graph -- again all `sorry_using` declarations -- that, when handed back to the same Lean 4 theorem prover, is more likely to close the previously-unsolved nodes while still proving the same main theorem.
 
 ## Input format
-Each lemma or theorem in the input carries a one-line marker recording the previous prover pass's verdict on that node, and -- when the prover failed -- a follow-up review block describing what went wrong. There are two markers.
+Each lemma or theorem in the input carries a one-line marker recording the previous prover pass's verdict on that node, and -- when relevant -- a follow-up review block. There are three markers.
 
 A `-- PROVED` marker means the prover proved the node.
 
-A `-- UNPROVED` marker indicates that the prover failed on the node, and is followed by exactly one `/- Diagnosis ... -/` review block. The block has three sections. `## Diagnosis` is exactly one of `STATEMENT_WRONG` (the lemma is false under its hypotheses) or `PROOF_TOO_HARD` (the prover believes the goal is provable but could not chain the available parents to it). `## Analysis` is a forensic account of what the prover tried, what compiled, what errors remained, and where the gap is. `## Suggested Fix` is conditional on the diagnosis: for `STATEMENT_WRONG`, why the statement is false and how to repair it; for `PROOF_TOO_HARD`, a helper-lemma decomposition.
+A `-- FORMALLY_NEGATED` marker means the prover machine-checked a proof of the *negation* of the node's stated lemma -- the statement as written is false, not merely hard to prove. It is followed by a `/- Diagnosis ... -/` block: `## Diagnosis` reads `FORMALLY_NEGATED`, `## Analysis` explains the counterexample, `## Counterexample Proof` is the actual Lean proof of the negation, and `## Suggested Fix` describes how the statement should change.
+
+A `-- UNPROVED` marker indicates that the prover failed on the node without a machine-checked counterexample, and is followed by exactly one `/- Diagnosis ... -/` review block. The block has three sections. `## Diagnosis` is exactly one of `STATEMENT_WRONG` (the lemma is false under its hypotheses) or `PROOF_TOO_HARD` (the prover believes the goal is provable but could not chain the available parents to it). `## Analysis` is a forensic account of what the prover tried, what compiled, what errors remained, and where the gap is. `## Suggested Fix` is conditional on the diagnosis: for `STATEMENT_WRONG`, why the statement is false and how to repair it; for `PROOF_TOO_HARD`, a helper-lemma decomposition.
 
 These markers and review blocks are input-only -- do NOT copy them into your revised dependency graph.
 
 ## Guidance
+A `-- FORMALLY_NEGATED` node is locked, exactly like `-- PROVED`: the prover machine-checked that the statement is false, so its declaration carries forward byte-identical -- do not edit, re-decompose, or attempt to fix its statement. Instead fix whatever depended on it: remove it from every `sorry_using [...]` list that referenced it, and revise those parent nodes' strategy (new helper lemmas, a different case split, etc.) so the main theorem no longer routes through a claim that is confirmed false.
+
 Each `-- UNPROVED` node falls into one of two buckets, decided by the `## Diagnosis` label.
 
 When the diagnosis is `STATEMENT_WRONG`, the lemma's formal statement is false under its hypotheses. Fix the statement (strengthen hypotheses, weaken the conclusion, fix a quantifier or coercion, etc.) and re-emit it. If the lemma is structurally unfixable, drop it and re-route the nodes that depended on it.
 
 When the diagnosis is `PROOF_TOO_HARD`, the prover believes the goal is provable but could not chain the available parents to it. Read the `## Suggested Fix` for the prover's proposed helper-lemma decomposition and add new parent lemmas (each as a fresh `@[blueprint ...]` declaration with body `:= by sorry_using [...]`) that bridge the gap. Wire the failing node's `sorry_using [...]` to include the new helpers. If the analysis instead reads as though the statement itself is suspect, treat it as `STATEMENT_WRONG` instead -- fix or drop the statement.
 
-Leave `-- PROVED` nodes untouched unless a downstream revision forces a signature change: their proof bodies will carry forward automatically as long as the signature stays byte-identical.
+Leave `-- PROVED` and `-- FORMALLY_NEGATED` nodes untouched unless a downstream revision forces a signature change on a `-- PROVED` node (its proof body will carry forward automatically as long as the signature stays byte-identical). A `-- FORMALLY_NEGATED` node's signature must never change -- it is a fixed record of a disproven claim, not a target for repair.
 
 If earlier rounds are shown to you, check whether an `-- UNPROVED` node's diagnosis is substantively the same problem you already tried to fix before, just under a different name or a cosmetic re-split. Renaming a stuck node without changing the underlying mathematical approach costs a full proving-budget attempt for no benefit. When you recognize a repeat, either commit to a genuinely different strategy (different induction principle, different case split, different helper shape) or leave the node as an explicit unresolved `sorry_using [...]` gap and direct your revision effort at branches that are actually progressing.
 

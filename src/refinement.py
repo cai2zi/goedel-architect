@@ -20,8 +20,8 @@ REFINEMENT_USER_TEMPLATE = load("refinement_user")
 
 # Appendix A specifies 262,144 (matches DeepSeek-V4-Flash's completion budget).
 # OpenAI's chat.completions API hard-caps max_completion_tokens at 128,000
-# regardless of model, and this is capped further to 32,000 to control cost.
-MAX_TOKENS = 32_000
+# regardless of model, and this is capped further to 64,000 to control cost.
+MAX_TOKENS = 64_000
 MAX_RETRIES = 8
 
 

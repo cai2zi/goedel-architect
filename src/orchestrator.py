@@ -41,6 +41,30 @@ class OrchestratorResult:
         return not self.failed
 
 
+def _transitive_deps(node: BlueprintNode, blueprint: Blueprint) -> set[str]:
+    """All ancestor dependencies of `node`, direct and transitive.
+
+    A node's own proof only ever references its *direct* `sorry_using [...]`
+    deps by name, but a direct dependency's spliced-in proof body can itself
+    reference ITS OWN dependencies (e.g. `add_comm_succ_case`'s proof calls
+    `add_comm_succ_left_rewrite`, which is add_comm_succ_case's dependency,
+    not add_comm's). Splicing only direct deps as aux lemmas leaves those
+    transitive references unresolved - "unknown identifier" - even though
+    the underlying lemma is fully proved.
+    """
+    seen: set[str] = set()
+    stack = list(node.dependencies)
+    while stack:
+        dep = stack.pop()
+        if dep in seen:
+            continue
+        seen.add(dep)
+        dep_node = blueprint.node_by_name(dep)
+        if dep_node:
+            stack.extend(dep_node.dependencies)
+    return seen
+
+
 def _build_dag(blueprint: Blueprint) -> nx.DiGraph:
     dag = nx.DiGraph()
     node_names = {node.name for node in blueprint.nodes}
@@ -74,6 +98,7 @@ async def prove_dag(
         blocking the rest of the wave indefinitely. None disables the bound.
     """
     dag = _build_dag(blueprint)
+    dag_node_names = set(dag.nodes)
     orch_result = OrchestratorResult()
     proof_bodies: dict[str, str] = dict(proved_cache or {})
     tracer = tracer or NullTracer()
@@ -87,11 +112,46 @@ async def prove_dag(
             )
 
     for generation in nx.topological_generations(dag):
-        wave = [
+        candidates = [
             name for name in generation
             if name not in proof_bodies
             and (nodes_to_retry is None or name in nodes_to_retry)
         ]
+        if not candidates:
+            continue
+
+        # A node whose blueprint-graph dependency isn't solved yet will always
+        # compile against an unresolved `sorry` stand-in for that dependency,
+        # so it is guaranteed to fail with a generic "declaration uses 'sorry'"
+        # error no matter what proof the model writes - and that error message
+        # is indistinguishable from "your own tactic left a hole", so the model
+        # can't tell it's structurally stuck and burns its whole tool-call
+        # budget guessing tactics. Skip the doomed attempt entirely instead.
+        wave: list[str] = []
+        for name in candidates:
+            node = blueprint.node_by_name(name)
+            unresolved_deps = sorted(
+                dep for dep in node.dependencies
+                if dep in dag_node_names and dep not in proof_bodies
+            )
+            if unresolved_deps:
+                print(f"    [node {name}] skipped - blocked on unresolved "
+                      f"dependency {'/'.join(unresolved_deps)}", flush=True)
+                orch_result.node_results[name] = NodeResult(
+                    node=node,
+                    result=ProverResult(
+                        signal=ProofSignal.PROOF_TOO_HARD,
+                        analysis=(
+                            f"Skipped without attempting a proof: dependency "
+                            f"{'/'.join(unresolved_deps)} is not yet proved, so "
+                            "this node would compile against an unresolved "
+                            "`sorry` stand-in regardless of its own tactic."
+                        ),
+                    ),
+                )
+            else:
+                wave.append(name)
+
         if not wave:
             continue
 
@@ -137,7 +197,14 @@ async def _prove_one(
     node = blueprint.node_by_name(name)
     assert node is not None
 
-    parent_proofs = {dep: proof_bodies[dep] for dep in node.dependencies if dep in proof_bodies}
+    ancestor_deps = _transitive_deps(node, blueprint)
+    # Splice order must be topological - Lean rejects forward references, and
+    # a set (from _transitive_deps) has no defined iteration order.
+    ordered_deps = [
+        n.name for n in blueprint.dependency_order()
+        if n.name in ancestor_deps and n.name in proof_bodies
+    ]
+    parent_proofs = {dep: proof_bodies[dep] for dep in ordered_deps}
     active_compiler = compiler_factory() if compiler_factory else compiler
     assert active_compiler is not None
 

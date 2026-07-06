@@ -22,6 +22,33 @@ from lean_compiler import AbstractLeanCompiler, CompilerResult
 
 BLUEPRINT_COMPILE_TIMEOUT = 120  # seconds
 
+_BLUEPRINT_ATTR_RE = re.compile(r"@\[blueprint\b[^\]]*\]", re.DOTALL)
+_LEMMA_KW_RE = re.compile(r"(?m)^(\s*)lemma\b")
+
+
+_SORRY_WARNING_RE = re.compile(r":(\d+):\d+:\s*warning:\s*declaration uses '(?:sorry|admit)'")
+
+
+def _own_declaration_uses_sorry(combined_output: str, target_line: int) -> bool:
+    """True only if a sorry/admit warning's line number is at or after
+    `target_line` (where our own declaration starts) - warnings for earlier,
+    unrelated content in the file don't count."""
+    return any(
+        int(m.group(1)) >= target_line
+        for m in _SORRY_WARNING_RE.finditer(combined_output)
+    )
+
+
+def _node_signature(node_decl: str) -> str:
+    """Bare theorem/lemma signature (no body) for a blueprint node's own
+    declaration, mirroring BlueprintNode.signature() in src/blueprint.py:
+    strip the `@[blueprint ...]` attribute, normalize `lemma` to `theorem`
+    (not every repo has Mathlib/Batteries), and cut off at the `:=` that
+    starts the `sorry_using [...]` body."""
+    text = _BLUEPRINT_ATTR_RE.sub("", node_decl)
+    text = _LEMMA_KW_RE.sub(r"\1theorem", text)
+    return text.split(":=", 1)[0].strip()
+
 
 class VSBLeanCompiler(AbstractLeanCompiler):
     """
@@ -46,6 +73,15 @@ class VSBLeanCompiler(AbstractLeanCompiler):
         self.theorem_entry = theorem_entry
         self.call_prefix = call_prefix
         self._count = 0
+        # Each blueprint node gets its own VSBLeanCompiler instance (see
+        # compiler_factory in orchestrator._prove_one), but the temp filename
+        # was built only from entry["thm_name"] (the same for every node)
+        # plus a per-instance counter that restarts at 1 for each node - two
+        # nodes proving concurrently could collide on the exact same temp
+        # file path and corrupt each other's compile. uuid4 makes every
+        # instance's temp files unique regardless of concurrency.
+        import uuid
+        self._instance_id = uuid.uuid4().hex[:8]
 
     def check_blueprint(self, lean_code: str, target_name: str) -> CompilerResult:
         """
@@ -98,11 +134,17 @@ class VSBLeanCompiler(AbstractLeanCompiler):
         finally:
             tmp.unlink(missing_ok=True)
 
-    def check(self, proof_body: str, aux_lemmas: str = "", **_) -> CompilerResult:
+    def check(self, proof_body: str, aux_lemmas: str = "", node_decl: str = "", **_) -> CompilerResult:
         """Verify proof_body against the configured theorem entry.
 
         Uses `lake env lean <file>` directly (not `lake build`) to avoid
         replaying thousands of cached modules on every call.
+
+        `node_decl` (if given) is the specific blueprint node's own
+        declaration - its signature is what actually gets checked. Without
+        it, every node would be checked against `entry["thm_stmt"]` (the
+        *root* theorem's statement) regardless of which sub-lemma is being
+        proven, which silently checks the wrong goal for every non-root node.
         """
         if not proof_body.strip():
             return CompilerResult(success=False, errors=["proof_body is empty"])
@@ -111,6 +153,7 @@ class VSBLeanCompiler(AbstractLeanCompiler):
         entry = self.theorem_entry
         lean_root = entry.get("lean_root", "")
         repo_root = VSB_LEAN_SRC / lean_root
+        thm_stmt = _node_signature(node_decl) if node_decl.strip() else entry["thm_stmt"]
 
         if not repo_root.exists():
             # Fall back to LeanREPL if repo not on disk
@@ -120,9 +163,9 @@ class VSBLeanCompiler(AbstractLeanCompiler):
                     repo_name=lean_root,
                     rel_path=entry["rel_path"],
                     local_context=entry.get("verif_local_ctxs") or entry.get("local_ctx", ""),
-                    theorem_stmt=entry["thm_stmt"],
+                    theorem_stmt=thm_stmt,
                     theorem_proof=proof_body,
-                    proof_id=f"{self.call_prefix}_{self._count}",
+                    proof_id=f"{self.call_prefix}_{self._instance_id}_{self._count}",
                     aux_lemmas=aux_lemmas or "",
                     suffix=entry.get("suffix", ""),
                 )
@@ -137,14 +180,13 @@ class VSBLeanCompiler(AbstractLeanCompiler):
         # and only elaborates the single file in the lake environment.
         import utils.utils as vsb_utils
         local_ctx = entry.get("verif_local_ctxs") or entry.get("local_ctx", "")
-        thm_stmt  = entry["thm_stmt"]
         suffix    = entry.get("suffix", "")
 
         content = vsb_utils.format_generated_lean(
             local_ctx, thm_stmt, proof_body, aux_lemmas or "", suffix
         )
 
-        proof_id = f"{self.call_prefix}_{self._count}"
+        proof_id = f"{self.call_prefix}_{self._instance_id}_{self._count}"
         from pathlib import Path as _Path
         rel = _Path(entry["rel_path"])
         tmp_name = f"{rel.stem}_{vsb_utils.clean_thm_name(entry['thm_name'])}_v{proof_id}.lean"
@@ -160,9 +202,16 @@ class VSBLeanCompiler(AbstractLeanCompiler):
                 timeout=120,
             )
             combined = result.stdout + result.stderr
-            # Check for sorry/admit (VeriSoftBench semantic check)
-            if "declaration uses 'sorry'" in combined or "declaration uses 'admit'" in combined:
-                return CompilerResult(success=False, errors=["declaration uses 'sorry'"])
+            # Check for sorry/admit in OUR target declaration only. `local_ctx`
+            # is the real file's preceding content and can itself contain
+            # unrelated pre-existing `sorry`s (e.g. an earlier unsolved
+            # example in a course-style repo) - a blanket substring search
+            # over the whole compiler output would treat those as if our own
+            # proof failed, even when our declaration compiled cleanly.
+            target_pos = content.rfind(thm_stmt)
+            target_line = content[:target_pos].count("\n") + 1 if target_pos != -1 else 0
+            if _own_declaration_uses_sorry(combined, target_line):
+                return CompilerResult(success=False, errors=["declaration uses 'sorry' — proof incomplete"])
             errors = [l for l in combined.splitlines() if re.search(r": error[\(:]", l)]
             if errors:
                 return CompilerResult(success=False, errors=errors)
