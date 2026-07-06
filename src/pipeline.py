@@ -44,6 +44,30 @@ class ProofResult:
     failed_nodes: list[str] = field(default_factory=list)
 
 
+def _invalidate_stale_proofs(
+    old_blueprint: Blueprint, new_blueprint: Blueprint, proved_cache: dict[str, str],
+) -> dict[str, str]:
+    """Drop cached proofs whose node signature changed across refinement.
+
+    proved_cache tracks nodes by NAME only. Refinement (Phase 3) can reuse a
+    node's name while restructuring its signature (e.g. splitting a
+    hypothesis, changing its goal shape) - the paper's rule only promises
+    SOLVED/FORMALLY_NEGATED nodes carry forward byte-identical, but nothing
+    enforces that, and a name collision with a differently-shaped node would
+    otherwise leave a proof compiled against the OLD signature marked
+    "already solved" forever, never recompiled against the new one.
+    """
+    pruned = dict(proved_cache)
+    for name in list(pruned):
+        old_node = old_blueprint.node_by_name(name)
+        new_node = new_blueprint.node_by_name(name)
+        if old_node is None or new_node is None:
+            continue
+        if old_node.signature() != new_node.signature():
+            del pruned[name]
+    return pruned
+
+
 def _aux_lemma_decls(blueprint: Blueprint, proved_cache: dict[str, str], root_name: str) -> str:
     return "\n\n".join(
         f"{node.signature()} {proved_cache[node.name]}"
@@ -207,6 +231,7 @@ def prove_theorem(
         refinement_compiler = compiler or (compiler_factory() if compiler_factory else None)
         if refinement_compiler is None:
             break
+        old_blueprint = blueprint
         try:
             blueprint = refine_blueprint(
                 blueprint=blueprint,
@@ -223,10 +248,16 @@ def prove_theorem(
             print(f"  refinement failed: {e}", flush=True)
             break  # refinement failed, stop iterations
 
+        stale = set(proved_cache) - set(_invalidate_stale_proofs(old_blueprint, blueprint, proved_cache))
+        if stale:
+            print(f"  invalidated stale proof(s) (signature changed under the same name): {sorted(stale)}", flush=True)
+        proved_cache = _invalidate_stale_proofs(old_blueprint, blueprint, proved_cache)
+
         if checkpoint_path:
             state.set_blueprint(blueprint)
             state.refinement_history = list(refinement_history)
             state.iteration = iteration + 1
+            state.proved_cache = dict(proved_cache)
             state.node_results = {}  # stale against the new blueprint
             state.save(checkpoint_path)
 
@@ -370,6 +401,7 @@ def run_phase3(
         max_iterations=max_iterations,
     )
 
+    state.proved_cache = _invalidate_stale_proofs(blueprint, new_blueprint, state.proved_cache)
     state.set_blueprint(new_blueprint)
     state.refinement_history = refinement_history
     state.iteration += 1
