@@ -281,12 +281,19 @@ class GoedelProver:
         tool_results: list[dict] = []
         last_compile_ok = False
         all_lean_errors: list[str] = []
+        last_errors: list[str] = []
 
         while tool_calls_used < MAX_TOOL_CALLS:
             tool_results, text, proof, compile_ok, tools_called, compile_errors = self._process_response(
                 response, compiler, node_name, repo_retrieval, tool_calls_used, node_decl=node_stmt
             )
             all_lean_errors.extend(compile_errors)
+            # Classification must react to the MOST RECENT compile attempt only:
+            # an early draft's "type mismatch" (later abandoned for a completely
+            # different approach) must not keep tainting the verdict just
+            # because all_lean_errors accumulates across the whole tool loop.
+            if compile_errors:
+                last_errors = compile_errors
             if text:
                 last_text = text
             if proof:
@@ -331,6 +338,8 @@ class GoedelProver:
                 response, compiler, node_name, repo_retrieval, tool_calls_used
             )
             all_lean_errors.extend(drain_errors)
+            if drain_errors:
+                last_errors = drain_errors
             if drain_text:
                 last_text = drain_text
             if drain_proof:
@@ -349,6 +358,8 @@ class GoedelProver:
                 response, compiler, node_name, repo_retrieval, tool_calls_used
             )
             all_lean_errors.extend(final_errors)
+            if final_errors:
+                last_errors = final_errors
 
         # Probe negation if we couldn't prove it
         negation = self._probe_negation(compiler, node_name, response.id, MAX_TOKENS)
@@ -356,10 +367,10 @@ class GoedelProver:
             return negation
 
         if best_proof_body:
-            signal = _classify_failure(all_lean_errors, last_text)
+            signal = _classify_failure(last_errors, last_text)
             return ProverResult(signal=signal, proof_body=best_proof_body,
                                 analysis=last_text[:500], lean_errors=all_lean_errors)
-        return ProverResult(signal=_classify_failure(all_lean_errors, last_text),
+        return ProverResult(signal=_classify_failure(last_errors, last_text),
                             analysis=last_text[:500], lean_errors=all_lean_errors)
 
     # ------------------------------------------------------------------
