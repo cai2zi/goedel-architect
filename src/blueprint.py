@@ -5,6 +5,7 @@ and validates the resulting @[blueprint]-annotated Lean file via LeanArchitect.
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,6 +30,108 @@ BLUEPRINT_USER_TEMPLATE = load("blueprint_user")
 # regardless of model, and this is capped further to 64,000 to control cost.
 MAX_TOKENS = 64_000
 MAX_RETRIES = 8
+
+# `repo_context` is built from only the target file's own preceding content
+# (see eval/run_verisoftbench.py's _build_verif_context) - it never follows
+# `import` statements, so a theorem needing a type/def declared in a merely
+# imported sibling file gets no information about it and fabricates a
+# placeholder. repo_search (same tool Phase 2 already has) lets Phase 1/3
+# look up cross-file declarations on demand instead. Optional: passing
+# repo_retrieval=None (the default) reproduces the old no-tools behavior
+# exactly, so existing callers are unaffected.
+REPO_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "repo_search",
+        "description": (
+            "Semantic search over the target repository's .lean files, "
+            "including files merely imported by (not textually preceding) "
+            "the theorem's own file."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Natural language or identifier fragment."},
+                "k": {"type": "integer", "description": "Number of results (default 10).", "default": 10},
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+# Bounds the extra repo_search back-and-forth before a call must produce a
+# final text response, separate from MAX_RETRIES (whole-attempt retries after
+# a failed compile). Kept small - this is a targeted lookup for missing
+# cross-file context, not an open-ended exploration loop.
+MAX_SEARCH_TURNS = 4
+
+REPO_SEARCH_SUFFIX = """
+
+## repo_search tool
+
+You also have a `repo_search` tool: semantic search over the target
+repository's .lean files, including files merely `import`-ed by (not
+textually preceding) the theorem's own file. The repo context above only
+shows the target file's own preceding content - if the theorem's statement
+needs a type or definition not visible there (e.g. it lives in an imported
+sibling file), call repo_search for it before inventing a placeholder
+definition.
+"""
+
+
+def _call_with_repo_search(
+    client: OpenAI,
+    model: str,
+    messages: list[dict],
+    repo_retrieval,
+    reasoning_kwargs: dict,
+    max_tokens: int,
+):
+    """chat.completions.create, transparently handling repo_search tool calls.
+
+    `messages` is mutated in place (tool round-trips appended) so the
+    caller's own subsequent messages (e.g. compile-error feedback) continue
+    to append correctly after this exchange, matching the existing retry
+    loops in generate_blueprint/refine_blueprint. Returns the first response
+    that isn't a tool-calls-only response.
+    """
+    tools = [REPO_SEARCH_TOOL] if repo_retrieval is not None else None
+    for _ in range(MAX_SEARCH_TURNS):
+        # chat.completions rejects function tools + reasoning_effort together
+        # for gpt-5.x ("Function tools with reasoning_effort are not
+        # supported ... Please use /v1/responses instead") - drop
+        # reasoning_effort on tool-enabled turns; it still applies to the
+        # no-tools finalization call below (and to every call when
+        # repo_retrieval is None, unchanged from before this tool existed).
+        call_kwargs = {"tools": tools} if tools else dict(reasoning_kwargs)
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_completion_tokens=max_tokens,
+            **call_kwargs,
+        )
+        msg = response.choices[0].message
+        if not msg.tool_calls:
+            return response
+        messages.append({
+            "role": "assistant",
+            "content": msg.content,
+            "tool_calls": [tc.model_dump() for tc in msg.tool_calls],
+        })
+        for tc in msg.tool_calls:
+            if tc.function.name == "repo_search":
+                args = json.loads(tc.function.arguments)
+                hits = repo_retrieval.search(args.get("query", ""), args.get("k", 10))
+                result = "\n\n".join(h.format() for h in hits) or "No results in repo."
+            else:
+                result = f"Tool unavailable: {tc.function.name}"
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+    # Exhausted search turns without a final text response - one last call
+    # with tools withheld forces the model to commit to an answer.
+    return client.chat.completions.create(
+        model=model, messages=messages, max_completion_tokens=max_tokens, **reasoning_kwargs,
+    )
+
 
 # Shared text-surgery helpers for the `@[blueprint]` grammar. Previously
 # reimplemented independently (with subtly different regexes) in
@@ -125,28 +228,33 @@ def generate_blueprint(
     model: str = "gpt-5.5",
     compiler: AbstractLeanCompiler | None = None,
     repo_context: str | None = None,
+    repo_retrieval=None,
 ) -> Blueprint:
     """
     Generate a @[blueprint]-annotated Lean dependency graph for `theorem_stmt`.
 
     Uses the verbatim system prompt from Appendix C.1 of the paper.
     Validates via lean_compile after each LLM attempt (up to MAX_RETRIES).
+
+    repo_retrieval: optional RepoRetrieval, giving the model a repo_search
+        tool for cross-file lookups repo_context itself can't provide (see
+        REPO_SEARCH_TOOL). Omit for the old no-tools behavior.
     """
     client = OpenAI()
 
+    system_content = BLUEPRINT_SYSTEM_PROMPT
+    if repo_retrieval is not None:
+        system_content = system_content.strip() + "\n" + REPO_SEARCH_SUFFIX
     user_content = _build_user_prompt(theorem_stmt, nl_proof, repo_context)
     messages = [
-        {"role": "system", "content": BLUEPRINT_SYSTEM_PROMPT},
+        {"role": "system", "content": system_content},
         {"role": "user", "content": user_content},
     ]
 
     last_lean_code = None
     for attempt in range(MAX_RETRIES):
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_completion_tokens=MAX_TOKENS,
-            **_reasoning_kwargs(model),
+        response = _call_with_repo_search(
+            client, model, messages, repo_retrieval, _reasoning_kwargs(model), MAX_TOKENS,
         )
         lean_code = _extract_lean_code(response.choices[0].message.content)
         last_lean_code = lean_code

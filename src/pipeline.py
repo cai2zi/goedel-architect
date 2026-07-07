@@ -178,6 +178,7 @@ def prove_theorem(
             model=model,
             compiler=blueprint_compiler,
             repo_context=repo_context,
+            repo_retrieval=repo_retrieval,
         )
         proved_cache = {}
         proof_cache_keys = {}
@@ -269,6 +270,7 @@ def prove_theorem(
                 history=refinement_history,
                 iteration=iteration,
                 max_iterations=max_iterations,
+                repo_retrieval=repo_retrieval,
             )
             print(f"  new blueprint has {len(blueprint.nodes)} nodes: {[n.name for n in blueprint.nodes]}", flush=True)
         except RuntimeError as e:
@@ -333,6 +335,7 @@ def run_phase1(
     compiler: AbstractLeanCompiler | None = None,
     repo_context: str | None = None,
     checkpoint_path: Path | None = None,
+    repo_retrieval=None,
 ) -> Blueprint:
     """Run Phase 1 (blueprint generation) alone and checkpoint the result."""
     blueprint = generate_blueprint(
@@ -341,6 +344,7 @@ def run_phase1(
         model=model,
         compiler=compiler,
         repo_context=repo_context,
+        repo_retrieval=repo_retrieval,
     )
     if checkpoint_path:
         state = CheckpointState(theorem_stmt=theorem_stmt, model=model, repo_context=repo_context or "")
@@ -412,6 +416,7 @@ def run_phase3(
     model: str | None = None,
     repo_context: str | None = None,
     max_iterations: int = MAX_REFINEMENT_ITERATIONS,
+    repo_retrieval=None,
 ) -> Blueprint:
     """Run one Phase 3 (refinement) pass against a checkpointed blueprint.
 
@@ -451,6 +456,7 @@ def run_phase3(
         history=refinement_history,
         iteration=state.iteration,
         max_iterations=max_iterations,
+        repo_retrieval=repo_retrieval,
     )
 
     new_proved_cache = _invalidate_stale_proofs(new_blueprint, state.proved_cache, state.proof_cache_keys)

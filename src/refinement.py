@@ -9,7 +9,14 @@ import re
 
 from openai import OpenAI
 
-from blueprint import Blueprint, _extract_lean_code, _parse_blueprint, _reasoning_kwargs
+from blueprint import (
+    Blueprint,
+    REPO_SEARCH_SUFFIX,
+    _call_with_repo_search,
+    _extract_lean_code,
+    _parse_blueprint,
+    _reasoning_kwargs,
+)
 from lean_compiler import AbstractLeanCompiler
 from orchestrator import OrchestratorResult
 from goedel_prompts import load, render
@@ -34,6 +41,7 @@ def refine_blueprint(
     history: list[str] | None = None,
     iteration: int = 0,
     max_iterations: int = 0,
+    repo_retrieval=None,
 ) -> Blueprint:
     """
     Produce a revised blueprint by feeding failure diagnostics back to the LLM.
@@ -60,8 +68,11 @@ def refine_blueprint(
     else:
         prior_rounds = []
 
+    system_content = REFINEMENT_SYSTEM_PROMPT
+    if repo_retrieval is not None:
+        system_content = system_content.strip() + "\n" + REPO_SEARCH_SUFFIX
     messages = [
-        {"role": "system", "content": REFINEMENT_SYSTEM_PROMPT},
+        {"role": "system", "content": system_content},
         {"role": "user", "content": _build_refinement_user_prompt(
             annotated_lean, repo_context, prior_rounds=prior_rounds,
             iteration=iteration, max_iterations=max_iterations,
@@ -70,11 +81,8 @@ def refine_blueprint(
 
     last_error_feedback = ""
     for attempt in range(MAX_RETRIES):
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_completion_tokens=MAX_TOKENS,
-            **_reasoning_kwargs(model),
+        response = _call_with_repo_search(
+            client, model, messages, repo_retrieval, _reasoning_kwargs(model), MAX_TOKENS,
         )
         content = response.choices[0].message.content
         lean_code = _extract_lean_code(content)

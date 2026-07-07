@@ -305,6 +305,7 @@ def evaluate_theorem_phase(
             blueprint = run_phase1(
                 theorem_stmt=thm_stmt, model=model, compiler=make_compiler(),
                 repo_context=verif_ctx, checkpoint_path=checkpoint_path,
+                repo_retrieval=repo_retrieval,
             )
             result.update(
                 ok=True, validated=blueprint.fully_validated,
@@ -328,6 +329,7 @@ def evaluate_theorem_phase(
             blueprint = run_phase3(
                 checkpoint_path=checkpoint_path, compiler=make_compiler(),
                 model=model, repo_context=verif_ctx,
+                repo_retrieval=repo_retrieval,
             )
             result.update(
                 ok=True, validated=blueprint.fully_validated,
