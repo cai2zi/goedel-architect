@@ -1,0 +1,1 @@
+{"thm_name": "and_associative", "lean_root": "lean-formal-reasoning-program", "rel_path": "Frap/Propositional.lean", "phase": 3, "checkpoint": "results/single_test/checkpoints/and_associative.json", "ok": false, "error": "All nodes already proved in checkpoint results/single_test/checkpoints/and_associative.json \u2014 nothing to refine.", "wall_time_s": 0.0}
