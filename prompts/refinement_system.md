@@ -47,5 +47,7 @@ A required instance (e.g. `[Monad m]`, `[LawfulMonad m]`, `[LawfulMonadStateOf Ï
 **"application type mismatch"**
 A function is applied to an argument of the wrong type. Fix: check the expected type of each argument and add type ascriptions or fix universe levels (e.g. `Type u` vs `Type v`).
 
+If the mismatch is between a repo-local type and a standard-library type of the same bare name (e.g. the repo declares its own `inductive Nat` inside a `namespace Hidden`, shadowing the real `Nat`), the dependency cited the wrong lemma entirely -- a same-named Mathlib/std lemma does not apply to the repo's own type, no type ascription fixes this. Look in the repo context for an already-declared local lemma with the needed shape (cited by its exact qualified name) and re-route the `sorry_using [...]` to it instead. Repo contexts of this shape are usually a from-scratch mirror of the standard library, so the lemma you need (an analogue of `add_succ`, `mul_succ`, `add_assoc`, etc.) is very likely already proved locally rather than needing fresh derivation.
+
 ## Output
 Emit a revised dependency graph. Every theorem and lemma is `@[blueprint (statement := /-- ... -/) (proof := /-- ... -/)]`-annotated and ends in `:= by sorry_using [deps]`. Definitions are `@[blueprint (statement := /-- ... -/)]`-annotated with a real Lean body. Do NOT replace any `sorry_using` with an actual proof -- that is the prover's job, not yours. Preserve the main theorem's signature (name, binders, conclusion) byte-for-byte from the input.

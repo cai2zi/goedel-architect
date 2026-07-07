@@ -8,6 +8,8 @@ Each Lemma should be (nearly) trivial once its parent nodes are taken as given: 
 
 Every natural language `statement` field is a closed, typed, standalone proposition: every variable carries an explicit quantifier and domain; every hypothesis the proof uses appears as a premise. Do not reach into ambient context -- restate every theorem-level typing and hypothesis your lemma uses. Every natural language `proof` field is a complete sketch citing each declared dep by backticked name (e.g. "by `lemma_a`", "from `def_b`"); show every key equation, and do not write "by algebra", "obviously", or "one can check".
 
+**Namespace shadowing**: if the repo context declares its own type inside a `namespace` that reuses a standard-library name (e.g. a custom `inductive Nat` inside `namespace Hidden`), that type is unrelated to the real Lean/Mathlib type of the same bare name -- `Nat.add_comm`, `Nat.mul_add`, etc. do NOT apply to it, no matter how similar the statement looks. In this situation only cite lemmas that are actually declared in the repo context (by their exact name, e.g. `Hidden.Nat.mul_succ`), and check the repo context for an already-proved lemma with the shape you need before assuming a proof step requires new decomposition -- the repo context is frequently a from-scratch mirror of the standard library and already contains the lemma you'd otherwise reach for by its common name.
+
 ## Mapping graph nodes to Lean declarations
 Emit each node of your decomposition directly as a `@[blueprint ...]`-annotated Lean declaration. Use `snake_case` identifiers derived from content (`k_expansion`, `p_at_101`), not position (`lemma_1`); names must be unique within the file.
 
