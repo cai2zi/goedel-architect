@@ -64,12 +64,20 @@ def load_dataset(
     subset: int | None = None,
     seed: int = 0,
     exclude_repos: set[str] | None = None,
+    aristotle_only: bool = False,
 ) -> list[dict]:
     """
     subset: random sample of `subset` tasks spanning the whole (filtered)
         dataset, rather than `limit`'s first-N-in-file-order (which clusters
         entirely on one repo — the jsonl is grouped by lean_root, e.g. the
         first 60 rows are all ArkLib). Use subset for a repo-diverse pilot.
+
+    aristotle_only: restrict to the 100-task VeriSoftBench-Aristotle subset
+        (dataset field `subset_aristotle`) — the specific task population
+        Aristotle's reported 69% and Gemini-3-Pro's reported 65% (Table 3,
+        VeriSoftBench-Aristotle row) were measured against. Comparing to
+        those numbers on any other task selection isn't a like-for-like
+        comparison.
     """
     problems = []
     with open(VSB_DATA) as f:
@@ -81,6 +89,8 @@ def load_dataset(
                 if exclude_repos and entry.get("lean_root") in exclude_repos:
                     continue
                 if thm_filter and thm_filter not in entry.get("thm_name", ""):
+                    continue
+                if aristotle_only and not entry.get("subset_aristotle"):
                     continue
                 problems.append(entry)
                 if subset is None and limit and len(problems) >= limit:
@@ -108,6 +118,7 @@ def evaluate_theorem(
     tracer,
     verbose: bool,
     checkpoint_dir: Path | None = None,
+    aristotle_mode: bool = False,
 ) -> dict:
     thm_name  = theorem_entry["thm_name"]
     lean_root = theorem_entry["lean_root"]
@@ -135,7 +146,8 @@ def evaluate_theorem(
     try:
         # Build verification context
         verif_ctx = _build_verif_context(lean_repl, theorem_entry, lean_root,
-                                          rel_path, imports, local_ctx, thm_stmt, thm_name)
+                                          rel_path, imports, local_ctx, thm_stmt, thm_name,
+                                          aristotle_mode=aristotle_mode)
         theorem_entry["verif_local_ctxs"] = verif_ctx
 
         # VeriSoftBench prompts
@@ -240,20 +252,61 @@ def evaluate_theorem(
 
 
 def _build_verif_context(lean_repl, entry, lean_root, rel_path,
-                          imports, local_ctx, thm_stmt, thm_name) -> str:
+                          imports, local_ctx, thm_stmt, thm_name,
+                          aristotle_mode: bool = False) -> str:
+    """Build the repo_context string shown to Phase 1/3 (and used as the
+    compilation-time local context for candidate proofs).
+
+    Uses the dataset's own pre-curated `local_ctx` field (matching
+    VeriSoftBench's "base context": local-file content excluding lemma
+    proofs, per Section 3.2 of the paper), rather than reading the raw
+    source file from disk. The raw-file read previously left preceding
+    same-file lemma/theorem PROOF BODIES fully intact, handing the model
+    complete worked proofs of nearby lemmas verbatim - a real, uncontrolled
+    advantage no VeriSoftBench baseline condition gets (their curated_context
+    and full_context both explicitly elide proof bodies of everything they
+    provide). Tried eliding proofs from the raw-file read instead of
+    switching to local_ctx (via VSB's own `utils.elide_proofs`), but that
+    helper is only exercised elsewhere one declaration at a time - fed a
+    whole multi-declaration file blob, it mis-tracks bracket/proof
+    boundaries across declarations and silently swallows unrelated later
+    content (confirmed concretely on StateT.set_get: truncated 6113 chars
+    down to 1494 and dropped several lemmas entirely rather than eliding
+    just their proofs). local_ctx is what VSB's own PromptBuilder already
+    relies on for their reported results, so it's a safer source of truth.
+    Falls back to the raw-file read only if local_ctx is empty.
+
+    aristotle_mode additionally appends `used_local_lemmas` statements
+    (already proof-free) to approximate VeriSoftBench-Aristotle's guarantee
+    that every lemma statement the ground-truth proof used is visible to the
+    prover, rather than left to repo_search to find.
+    """
     if lean_root == "iris-lean":
         imports = [imp.replace("import src.", "import ") for imp in imports]
-    fallback = "\n".join(imports) + "\n" + local_ctx
-    try:
-        src_path = lean_repl.lean_src_dir / lean_root / rel_path
-        if src_path.exists():
-            full = src_path.read_text(encoding="utf-8")
-            ctx = utils.get_content_before_theorem(full, thm_stmt, thm_name=thm_name)
-            if ctx is not None:
-                return ctx
-    except Exception:
-        pass
-    return fallback
+    ctx = "\n".join(imports) + "\n" + local_ctx
+
+    if not local_ctx.strip():
+        try:
+            src_path = lean_repl.lean_src_dir / lean_root / rel_path
+            if src_path.exists():
+                full = src_path.read_text(encoding="utf-8")
+                raw_ctx = utils.get_content_before_theorem(full, thm_stmt, thm_name=thm_name)
+                if raw_ctx is not None:
+                    ctx = raw_ctx
+        except Exception:
+            pass
+
+    if aristotle_mode:
+        lemma_texts = [
+            item.get("content", "").strip()
+            for item in entry.get("used_local_lemmas", [])
+            if item.get("content", "").strip()
+        ]
+        if lemma_texts:
+            ctx += ("\n\n-- Lemma statements used by the ground-truth proof --\n"
+                    + "\n\n".join(lemma_texts))
+
+    return ctx
 
 
 def evaluate_theorem_phase(
@@ -265,6 +318,7 @@ def evaluate_theorem_phase(
     checkpoint_dir: Path,
     model: str,
     tracer,
+    aristotle_mode: bool = False,
 ) -> dict:
     """Run exactly one of Phase 1/2/3 against this theorem's checkpoint file.
 
@@ -298,7 +352,8 @@ def evaluate_theorem_phase(
     t0 = time.monotonic()
     try:
         verif_ctx = _build_verif_context(lean_repl, theorem_entry, lean_root,
-                                          rel_path, imports, local_ctx, thm_stmt, thm_name)
+                                          rel_path, imports, local_ctx, thm_stmt, thm_name,
+                                          aristotle_mode=aristotle_mode)
         theorem_entry["verif_local_ctxs"] = verif_ctx
 
         if phase == 1:
@@ -413,6 +468,7 @@ def _run_phase_only(
                 checkpoint_dir=checkpoint_dir,
                 model=args.model,
                 tracer=tracer,
+                aristotle_mode=args.aristotle_subset,
             )
             with results_lock:
                 all_results.append(res)
@@ -455,6 +511,14 @@ def main() -> None:
                              "(unlike --limit, which takes the first N in "
                              "file order and clusters on one repo)")
     parser.add_argument("--seed",    type=int, default=0, help="--subset sample seed")
+    parser.add_argument("--aristotle-subset", action="store_true",
+                        help="Restrict to the 100-task VeriSoftBench-Aristotle "
+                             "subset and use the matching context variant "
+                             "(same-file preceding proofs elided, plus "
+                             "ground-truth-used lemma statements guaranteed "
+                             "visible) — for comparing against Table 3's "
+                             "VeriSoftBench-Aristotle row (Aristotle 69%, "
+                             "Gemini-3-Pro 65%)")
     parser.add_argument("--repo",    default=None)
     parser.add_argument("--exclude-repo", default=None,
                         help="Comma-separated repo names to skip (e.g. known-broken builds)")
@@ -510,13 +574,15 @@ def main() -> None:
 
     print("Loading VeriSoftBench dataset ...")
     problems = load_dataset(limit=args.limit, repo_filter=args.repo, thm_filter=args.thm,
-                             subset=args.subset, seed=args.seed, exclude_repos=exclude_repos)
+                             subset=args.subset, seed=args.seed, exclude_repos=exclude_repos,
+                             aristotle_only=args.aristotle_subset)
     print(f"  {len(problems)} problems"
           + (f" (repo={args.repo})" if args.repo else "")
           + (f" (exclude_repo={sorted(exclude_repos)})" if exclude_repos else "")
           + (f" (thm={args.thm})" if args.thm else "")
           + (f" (limit={args.limit})" if args.limit else "")
-          + (f" (subset={args.subset}, seed={args.seed})" if args.subset else ""))
+          + (f" (subset={args.subset}, seed={args.seed})" if args.subset else "")
+          + (" (aristotle_subset=100)" if args.aristotle_subset else ""))
     if trace_path:
         print(f"  Tracing to: {trace_path}")
     if args.blueprint:
@@ -597,6 +663,7 @@ def main() -> None:
             tracer=tracer,
             verbose=args.verbose,
             checkpoint_dir=checkpoint_dir if args.blueprint else None,
+            aristotle_mode=args.aristotle_subset,
         )
 
     def run_repo_queue(repo_problems: list[dict]) -> None:
