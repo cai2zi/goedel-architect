@@ -1,0 +1,72 @@
+{
+  "theorem_stmt": "theorem WellTyped.not_eq_not_eq_ty {e1 e2 : Expr} {t1 t2 : Ty} :\n  WellTyped e1 t1 \u2192 WellTyped e2 t2 \u2192 t1 \u2260 t2 \u2192 \u2200 t, \u00ac (WellTyped (Expr.eq e1 e2) t) :=",
+  "model": "gpt-5.5",
+  "repo_context": "import Hoare.While.Syntax\nnamespace While\n\ninductive Ty\n| num : Ty\n| bool : Ty\nderiving Repr, DecidableEq\n\ninductive WellTyped : Expr \u2192 Ty \u2192 Prop\n| num : WellTyped (Expr.num _) Ty.num\n| bool : WellTyped (Expr.bool _) Ty.bool\n| add : \u2200 e1 e2, WellTyped e1 Ty.num \u2192 WellTyped e2 Ty.num \u2192\n    WellTyped (Expr.add e1 e2) Ty.num\n| sub : \u2200 e1 e2, WellTyped e1 Ty.num \u2192 WellTyped e2 Ty.num \u2192\n    WellTyped (Expr.sub e1 e2) Ty.num\n| mul : \u2200 e1 e2, WellTyped e1 Ty.num \u2192 WellTyped e2 Ty.num \u2192\n    WellTyped (Expr.mul e1 e2) Ty.num\n| eq : \u2200 e1 e2 t, WellTyped e1 t \u2192 WellTyped e2 t \u2192\n    WellTyped (Expr.eq e1 e2) Ty.bool\n| lt : \u2200 e1 e2, WellTyped e1 Ty.num \u2192 WellTyped e2 Ty.num \u2192\n    WellTyped (Expr.lt e1 e2) Ty.bool\n| gt : \u2200 e1 e2, WellTyped e1 Ty.num \u2192 WellTyped e2 Ty.num \u2192\n    WellTyped (Expr.gt e1 e2) Ty.bool\n| le : \u2200 e1 e2, WellTyped e1 Ty.num \u2192 WellTyped e2 Ty.num \u2192\n    WellTyped (Expr.le e1 e2) Ty.bool\n| ge : \u2200 e1 e2, WellTyped e1 Ty.num \u2192 WellTyped e2 Ty.num \u2192\n    WellTyped (Expr.ge e1 e2) Ty.bool\n| and : \u2200 e1 e2, WellTyped e1 Ty.bool \u2192 WellTyped e2 Ty.bool \u2192\n    WellTyped (Expr.and e1 e2) Ty.bool\n| or : \u2200 e1 e2, WellTyped e1 Ty.bool \u2192 WellTyped e2 Ty.bool \u2192\n    WellTyped (Expr.or e1 e2) Ty.bool\n\ntheorem WellTyped.unique : \u2200 {e t1 t2}, WellTyped e t1 \u2192 WellTyped e t2 \u2192 t1 = t2 := by\n  intro e t1 t2 h1 h2\n  cases h1 <;> cases h2 <;> rfl\n\ndef Expr.ty : Expr \u2192 Option Ty\n  | Expr.num _ => Ty.num\n  | Expr.bool _ => Ty.bool\n  | Expr.add e1 e2 => if e1.ty = some .num \u2227 e2.ty = some .num then some .num else none\n  | Expr.sub e1 e2 => if e1.ty = some .num \u2227 e2.ty = some .num then some .num else none\n  | Expr.mul e1 e2 => if e1.ty = some .num \u2227 e2.ty = some .num then some .num else none\n  | Expr.eq e1 e2 => if e1.ty = e2.ty \u2227 e1.ty.isSome then some .bool else none\n  | Expr.lt e1 e2 => if e1.ty = some .num \u2227 e2.ty = some .num then some .bool else none\n  | Expr.gt e1 e2 => if e1.ty = some .num \u2227 e2.ty = some .num then some .bool else none\n  | Expr.le e1 e2 => if e1.ty = some .num \u2227 e2.ty = some .num then some .bool else none\n  | Expr.ge e1 e2 => if e1.ty = some .num \u2227 e2.ty = some .num then some .bool else none\n  | Expr.and e1 e2 => if e1.ty = some .bool \u2227 e2.ty = some .bool then some .bool else none\n  | Expr.or e1 e2 => if e1.ty = some .bool \u2227 e2.ty = some .bool then some .bool else none\n  | Expr.var _ => none -- typing not supported for variables yet...\n\n",
+  "iteration": 0,
+  "blueprint_lean_file": "import Mathlib\nimport Architect\nimport Hoare.While.Types\n\nopen While\n\n@[blueprint\n    (statement := /-- For all expressions `e1` and `e2` and all result types `t`, if\n    `Expr.eq e1 e2` is well typed at `t`, then there exists a common operand type\n    `u : Ty` such that `e1` and `e2` are both well typed at `u`. -/)\n    (proof := /-- Perform inversion on the derivation of\n    `WellTyped (Expr.eq e1 e2) t`. The only constructor whose conclusion has head\n    expression `Expr.eq e1 e2` is `While.WellTyped.eq`, and its premises are exactly\n    `WellTyped e1 u` and `WellTyped e2 u` for some `u : Ty`; take this `u` as the\n    witness. -/)]\nlemma eq_typing_common_operand_type {e1 e2 : Expr} {t : Ty} :\n    WellTyped (Expr.eq e1 e2) t \u2192 \u2203 u : Ty, WellTyped e1 u \u2227 WellTyped e2 u := by sorry_using []\n\n@[blueprint\n    (statement := /-- For every expression `e : Expr` and all types `t` and `u`,\n    if `e` is well typed at `t` and also well typed at `u`, then `t = u`. -/)\n    (proof := /-- This is exactly the uniqueness of typing supplied by the\n    repository theorem `While.WellTyped.unique`, applied to the two derivations\n    `WellTyped e t` and `WellTyped e u`. -/)]\nlemma first_type_eq_second_type_of_two_typings {e : Expr} {t u : Ty} :\n    WellTyped e t \u2192 WellTyped e u \u2192 t = u := by sorry_using []\n\n@[blueprint\n    (statement := /-- For every expression `e : Expr` and all types `t` and `u`,\n    if `e` is well typed at `u` and also well typed at `t`, then `t = u`. -/)\n    (proof := /-- Apply `While.WellTyped.unique` to the derivation\n    `WellTyped e t` and the derivation `WellTyped e u`. This gives the desired\n    equality `t = u`. -/)]\nlemma second_type_eq_first_type_of_two_typings {e : Expr} {t u : Ty} :\n    WellTyped e u \u2192 WellTyped e t \u2192 t = u := by sorry_using []\n\n@[blueprint\n    (statement := /-- For all expressions `e1` and `e2` and all types `t1` and\n    `t2`, if `e1` is well typed at `t1`, `e2` is well typed at `t2`, and there is\n    a common type `u : Ty` at which both operands are well typed, then `t1 = t2`. -/)\n    (proof := /-- Let `u : Ty` be the common operand type. By\n    `first_type_eq_second_type_of_two_typings`, the derivations\n    `WellTyped e1 t1` and `WellTyped e1 u` imply `t1 = u`. By\n    `second_type_eq_first_type_of_two_typings`, the derivations\n    `WellTyped e2 u` and `WellTyped e2 t2` imply `t2 = u`. Rewriting both sides\n    through these equalities yields `t1 = t2`. -/)]\nlemma operand_types_eq_of_common_type {e1 e2 : Expr} {t1 t2 : Ty} :\n    WellTyped e1 t1 \u2192\n    WellTyped e2 t2 \u2192\n    (\u2203 u : Ty, WellTyped e1 u \u2227 WellTyped e2 u) \u2192\n    t1 = t2 := by sorry_using [\n      first_type_eq_second_type_of_two_typings,\n      second_type_eq_first_type_of_two_typings\n    ]\n\n@[blueprint\n    (statement := /-- For all expressions `e1` and `e2` and all types `t1`, `t2`,\n    and `t`, if `e1` is well typed at `t1`, `e2` is well typed at `t2`, and\n    `t1 \u2260 t2`, then `Expr.eq e1 e2` is not well typed at the result type `t`. -/)\n    (proof := /-- Assume a derivation `WellTyped (Expr.eq e1 e2) t`. By\n    `eq_typing_common_operand_type`, this derivation provides a common operand\n    type `u` for `e1` and `e2`. Then `operand_types_eq_of_common_type`, together\n    with the given typings of `e1` and `e2`, proves `t1 = t2`, contradicting the\n    premise `t1 \u2260 t2`. Therefore no such derivation can exist. -/)]\nlemma eq_expr_not_welltyped_at_type_of_operand_types_ne {e1 e2 : Expr} {t1 t2 t : Ty} :\n    WellTyped e1 t1 \u2192\n    WellTyped e2 t2 \u2192\n    t1 \u2260 t2 \u2192\n    \u00ac WellTyped (Expr.eq e1 e2) t := by sorry_using [\n      eq_typing_common_operand_type,\n      operand_types_eq_of_common_type\n    ]\n\n@[blueprint\n    (statement := /-- For all expressions `e1` and `e2` and all types `t1` and\n    `t2`, if `e1` is well typed at `t1`, `e2` is well typed at `t2`, and\n    `t1 \u2260 t2`, then for every type `t`, `Expr.eq e1 e2` is not well typed at\n    `t`. -/)\n    (proof := /-- Fix an arbitrary result type `t : Ty`. The lemma\n    `eq_expr_not_welltyped_at_type_of_operand_types_ne` applies directly to the\n    given typings of `e1` and `e2` and the inequality `t1 \u2260 t2`, yielding\n    `\u00ac WellTyped (Expr.eq e1 e2) t`. Since `t` was arbitrary, this proves the\n    universal conclusion. -/)]\ntheorem WellTyped.not_eq_not_eq_ty {e1 e2 : Expr} {t1 t2 : Ty} :\n  WellTyped e1 t1 \u2192 WellTyped e2 t2 \u2192 t1 \u2260 t2 \u2192 \u2200 t, \u00ac (WellTyped (Expr.eq e1 e2) t) := by sorry_using [\n    eq_expr_not_welltyped_at_type_of_operand_types_ne\n  ]",
+  "blueprint_target": "WellTyped",
+  "blueprint_fully_validated": true,
+  "proved_cache": {
+    "eq_typing_common_operand_type": ":= by\n  intro h\n  cases h <;> try contradiction\n  \u00b7 rename_i u h1 h2\n    exact \u27e8u, h1, h2\u27e9",
+    "first_type_eq_second_type_of_two_typings": ":= by\n  intro h1 h2\n  exact WellTyped.unique h1 h2",
+    "second_type_eq_first_type_of_two_typings": ":= by\n  intro h_u h_t\n  exact While.WellTyped.unique h_t h_u",
+    "operand_types_eq_of_common_type": ":= by\n  intro h1 h2 hcommon\n  rcases hcommon with \u27e8u, hu1, hu2\u27e9\n  have ht1u : t1 = u := first_type_eq_second_type_of_two_typings h1 hu1\n  have ht2u : t2 = u := second_type_eq_first_type_of_two_typings hu2 h2\n  exact ht1u.trans ht2u.symm",
+    "eq_expr_not_welltyped_at_type_of_operand_types_ne": ":= by\n  intro h1 h2 hne hEq\n  have hcommon := eq_typing_common_operand_type hEq\n  have heq : t1 = t2 := operand_types_eq_of_common_type h1 h2 hcommon\n  exact hne heq",
+    "WellTyped": ":= by\n  intro h1 h2 hne t\n  exact eq_expr_not_welltyped_at_type_of_operand_types_ne h1 h2 hne"
+  },
+  "proof_cache_keys": {
+    "eq_typing_common_operand_type": "theorem eq_typing_common_operand_type {e1 e2 : Expr} {t : Ty} :\n    WellTyped (Expr.eq e1 e2) t \u2192 \u2203 u : Ty, WellTyped e1 u \u2227 WellTyped e2 u\u0000deps:",
+    "first_type_eq_second_type_of_two_typings": "theorem first_type_eq_second_type_of_two_typings {e : Expr} {t u : Ty} :\n    WellTyped e t \u2192 WellTyped e u \u2192 t = u\u0000deps:",
+    "second_type_eq_first_type_of_two_typings": "theorem second_type_eq_first_type_of_two_typings {e : Expr} {t u : Ty} :\n    WellTyped e u \u2192 WellTyped e t \u2192 t = u\u0000deps:",
+    "operand_types_eq_of_common_type": "theorem operand_types_eq_of_common_type {e1 e2 : Expr} {t1 t2 : Ty} :\n    WellTyped e1 t1 \u2192\n    WellTyped e2 t2 \u2192\n    (\u2203 u : Ty, WellTyped e1 u \u2227 WellTyped e2 u) \u2192\n    t1 = t2\u0000deps:first_type_eq_second_type_of_two_typings,second_type_eq_first_type_of_two_typings",
+    "eq_expr_not_welltyped_at_type_of_operand_types_ne": "theorem eq_expr_not_welltyped_at_type_of_operand_types_ne {e1 e2 : Expr} {t1 t2 t : Ty} :\n    WellTyped e1 t1 \u2192\n    WellTyped e2 t2 \u2192\n    t1 \u2260 t2 \u2192\n    \u00ac WellTyped (Expr.eq e1 e2) t\u0000deps:eq_typing_common_operand_type,operand_types_eq_of_common_type",
+    "WellTyped": "theorem WellTyped.not_eq_not_eq_ty {e1 e2 : Expr} {t1 t2 : Ty} :\n  WellTyped e1 t1 \u2192 WellTyped e2 t2 \u2192 t1 \u2260 t2 \u2192 \u2200 t, \u00ac (WellTyped (Expr.eq e1 e2) t)\u0000deps:eq_expr_not_welltyped_at_type_of_operand_types_ne"
+  },
+  "node_results": {
+    "eq_typing_common_operand_type": {
+      "signal": "solved",
+      "proof_body": ":= by\n  intro h\n  cases h <;> try contradiction\n  \u00b7 rename_i u h1 h2\n    exact \u27e8u, h1, h2\u27e9",
+      "analysis": "",
+      "suggested_fix": "",
+      "lean_errors": []
+    },
+    "first_type_eq_second_type_of_two_typings": {
+      "signal": "solved",
+      "proof_body": ":= by\n  intro h1 h2\n  exact WellTyped.unique h1 h2",
+      "analysis": "",
+      "suggested_fix": "",
+      "lean_errors": []
+    },
+    "second_type_eq_first_type_of_two_typings": {
+      "signal": "solved",
+      "proof_body": ":= by\n  intro h_u h_t\n  exact While.WellTyped.unique h_t h_u",
+      "analysis": "",
+      "suggested_fix": "",
+      "lean_errors": []
+    },
+    "operand_types_eq_of_common_type": {
+      "signal": "solved",
+      "proof_body": ":= by\n  intro h1 h2 hcommon\n  rcases hcommon with \u27e8u, hu1, hu2\u27e9\n  have ht1u : t1 = u := first_type_eq_second_type_of_two_typings h1 hu1\n  have ht2u : t2 = u := second_type_eq_first_type_of_two_typings hu2 h2\n  exact ht1u.trans ht2u.symm",
+      "analysis": "",
+      "suggested_fix": "",
+      "lean_errors": []
+    },
+    "eq_expr_not_welltyped_at_type_of_operand_types_ne": {
+      "signal": "solved",
+      "proof_body": ":= by\n  intro h1 h2 hne hEq\n  have hcommon := eq_typing_common_operand_type hEq\n  have heq : t1 = t2 := operand_types_eq_of_common_type h1 h2 hcommon\n  exact hne heq",
+      "analysis": "",
+      "suggested_fix": "",
+      "lean_errors": []
+    },
+    "WellTyped": {
+      "signal": "solved",
+      "proof_body": ":= by\n  intro h1 h2 hne t\n  exact eq_expr_not_welltyped_at_type_of_operand_types_ne h1 h2 hne",
+      "analysis": "",
+      "suggested_fix": "",
+      "lean_errors": []
+    }
+  },
+  "refinement_history": [],
+  "done": true,
+  "success": true
+}

@@ -1,0 +1,63 @@
+{
+  "theorem_stmt": "@[simp]\nlemma map_pure_inv (f : PureEquiv m n) {\u03b1 : Type u} (x : \u03b1) :\n    f.invFun (pure x) = (pure x : m \u03b1) :=",
+  "model": "gpt-5.5",
+  "repo_context": "/-\nCopyright (c) 2025 Quang Dao. All rights reserved.\nReleased under Apache 2.0 license as described in the file LICENSE.\nAuthors: Quang Dao\n-/\n\nimport ToMathlib.Control.Monad.Hom\nimport Mathlib.Logic.Function.Defs\n\n/-!\n# Monad equivalences / isomorphisms\n\nThis file defines equivalences or isomorphisms between monads, which consists of a pair of monad\nmorphisms that are inverses of each other.\n\nTODO: extends the hierarchy with type classes such as `{Nat/Pure/Bind/Monad}EquivClass`\n-/\n\nuniverse u v w z\n\n/- A natural equivalence between two type-level functions (endofunctors).\n\nThis represents a natural isomorphism between two type constructors `m` and `n`. It consists\nof natural transformations in both directions that are inverses of each other. -/\nstructure NatEquiv (m : Type u \u2192 Type v) (n : Type u \u2192 Type w) where\n  toFun : {\u03b1 : Type u} \u2192 m \u03b1 \u2192 n \u03b1\n  invFun : {\u03b1 : Type u} \u2192 n \u03b1 \u2192 m \u03b1\n  left_inv : \u2200 {\u03b1}, Function.LeftInverse (@invFun \u03b1) (@toFun \u03b1) := by\n    intros; first | rfl | ext <;> rfl\n  right_inv : \u2200 {\u03b1}, Function.RightInverse (@invFun \u03b1) (@toFun \u03b1) := by\n    intros; first | rfl | ext <;> rfl\n\nnamespace NatEquiv\n\nvariable {m : Type u \u2192 Type v} {n : Type u \u2192 Type w} {p : Type u \u2192 Type z}\n\ndef toNatHom (e : NatEquiv m n) : NatHom m n where\n  toFun := e.toFun\n\ndef invNatHom (e : NatEquiv m n) : NatHom n m where\n  toFun := e.invFun\n\ninstance : Coe (NatEquiv m n) (NatHom m n) where\n  coe f := f.toNatHom\n\ninstance : Coe (NatEquiv m n) (NatHom n m) where\n  coe f := f.invNatHom\n\n/- The identity natural equivalence between `m : Type u \u2192 Type v` and itself. -/\ndef refl (m : Type u \u2192 Type v) : NatEquiv m m where\n  toFun := id\n  invFun := id\n  left_inv := by intros; simp [Function.LeftInverse, id]\n  right_inv := by intros; simp [Function.RightInverse, Function.LeftInverse, id]\n\n/- The inverse of a natural equivalence between `m` and `n`. -/\ndef symm (e : NatEquiv m n) : NatEquiv n m where\n  toFun := e.invFun\n  invFun := e.toFun\n  left_inv := e.right_inv\n  right_inv := e.left_inv\n\n/- The composition of natural equivalences between `m` and `n` and between `n` and `p`. -/\ndef trans (e\u2081 : NatEquiv m n) (e\u2082 : NatEquiv n p) : NatEquiv m p where\n  toFun := e\u2082.toFun \u2218 e\u2081.toFun\n  invFun := e\u2081.invFun \u2218 e\u2082.invFun\n  left_inv := by\n    intros \u03b1 a\n    have h\u2081 := @e\u2081.left_inv \u03b1\n    have h\u2082 := @e\u2082.left_inv \u03b1\n    dsimp [Function.LeftInverse] at h\u2081 h\u2082\n    simp [h\u2081, h\u2082]\n  right_inv := by\n    intros \u03b1 a\n    have h\u2081 := @e\u2081.right_inv \u03b1\n    have h\u2082 := @e\u2082.right_inv \u03b1\n    dsimp [Function.RightInverse, Function.LeftInverse] at h\u2081 h\u2082\n    simp [h\u2081, h\u2082]\n\nend NatEquiv\n\n/- A natural equivalence that preserves the `pure` operation.\n\nThis extends `NatEquiv` with the requirement that the forward transformation commutes with `pure`.\nThe inverse transformation automatically commutes with `pure` due to the inverse properties. -/\nstructure PureEquiv (m : Type u \u2192 Type v) [Pure m] (n : Type u \u2192 Type w) [Pure n]\n    extends NatEquiv m n where\n  map_pure' {\u03b1 : Type u} (x : \u03b1) : toFun (pure x) = (pure x : n \u03b1)\n\nnamespace PureEquiv\n\nvariable {m : Type u \u2192 Type v} [Pure m] {n : Type u \u2192 Type w} [Pure n]\n\ninstance : Coe (PureEquiv m n) (NatEquiv m n) where\n  coe f := f.toNatEquiv\n\ninstance : Coe (PureEquiv m n) (PureHom m n) where\n  coe f := \u27e8f.toNatEquiv, f.map_pure'\u27e9\n\n@[simp]\nlemma map_pure (f : PureEquiv m n) {\u03b1 : Type u} (x : \u03b1) :\n    f.toFun (pure x) = (pure x : n \u03b1) := f.map_pure' x\n\n",
+  "iteration": 0,
+  "blueprint_lean_file": "import Mathlib\nimport Architect\n\nvariable {m : Type u \u2192 Type v} [Pure m] {n : Type u \u2192 Type w} [Pure n]\n\n@[blueprint\n    (statement := /-- For every type constructors `m : Type u \u2192 Type v` and\n      `n : Type u \u2192 Type w` with `Pure` instances, every pure equivalence\n      `f : PureEquiv m n`, every type `\u03b1 : Type u`, and every `x : \u03b1`, the pure value\n      `(pure x : n \u03b1)` is equal to the forward image `f.toFun (pure x : m \u03b1)`. -/)\n    (proof := /-- The available lemma `PureEquiv.map_pure` gives\n      `f.toFun (pure x : m \u03b1) = (pure x : n \u03b1)`. Taking the symmetric equality gives\n      `(pure x : n \u03b1) = f.toFun (pure x : m \u03b1)`. -/)]\nlemma pure_eq_toFun_pure (f : PureEquiv m n) {\u03b1 : Type u} (x : \u03b1) :\n    (pure x : n \u03b1) = f.toFun (pure x : m \u03b1) := by\n  sorry_using []\n\n@[blueprint\n    (statement := /-- For every type constructors `m : Type u \u2192 Type v` and\n      `n : Type u \u2192 Type w` with `Pure` instances, every pure equivalence\n      `f : PureEquiv m n`, every type `\u03b1 : Type u`, and every `x : \u03b1`, applying\n      `f.invFun` after `f.toFun` to the pure value `(pure x : m \u03b1)` returns\n      `(pure x : m \u03b1)`. -/)\n    (proof := /-- The structure `PureEquiv` extends `NatEquiv`, so it has the inherited\n      left-inverse law `f.left_inv`. Applying this law to the element\n      `(pure x : m \u03b1)` gives exactly\n      `f.invFun (f.toFun (pure x : m \u03b1)) = (pure x : m \u03b1)`. -/)]\nlemma invFun_toFun_pure (f : PureEquiv m n) {\u03b1 : Type u} (x : \u03b1) :\n    f.invFun (f.toFun (pure x : m \u03b1)) = (pure x : m \u03b1) := by\n  sorry_using []\n\n@[blueprint\n    (statement := /-- For every type constructors `m : Type u \u2192 Type v` and\n      `n : Type u \u2192 Type w` with `Pure` instances, every pure equivalence\n      `f : PureEquiv m n`, every type `\u03b1 : Type u`, and every `x : \u03b1`, applying\n      `f.invFun` to `(pure x : n \u03b1)` is equal to applying `f.invFun` to\n      `f.toFun (pure x : m \u03b1)`. -/)\n    (proof := /-- By `pure_eq_toFun_pure`, we have\n      `(pure x : n \u03b1) = f.toFun (pure x : m \u03b1)`. Applying congruence of the function\n      `f.invFun` to this equality yields\n      `f.invFun (pure x : n \u03b1) = f.invFun (f.toFun (pure x : m \u03b1))`. -/)]\nlemma invFun_pure_eq_invFun_toFun_pure (f : PureEquiv m n) {\u03b1 : Type u} (x : \u03b1) :\n    f.invFun (pure x : n \u03b1) = f.invFun (f.toFun (pure x : m \u03b1)) := by\n  sorry_using [pure_eq_toFun_pure]\n\n@[blueprint\n    (statement := /-- For every type constructors `m : Type u \u2192 Type v` and\n      `n : Type u \u2192 Type w` with `Pure` instances, every pure equivalence\n      `f : PureEquiv m n`, every type `\u03b1 : Type u`, and every `x : \u03b1`, the inverse\n      map sends the pure value `(pure x : n \u03b1)` to `(pure x : m \u03b1)`. -/)\n    (proof := /-- First, `invFun_pure_eq_invFun_toFun_pure` rewrites\n      `f.invFun (pure x : n \u03b1)` as\n      `f.invFun (f.toFun (pure x : m \u03b1))`. Then `invFun_toFun_pure` rewrites this\n      latter term as `(pure x : m \u03b1)`. Combining the two equalities gives the desired\n      equation. -/)]\nlemma invFun_pure_of_forward (f : PureEquiv m n) {\u03b1 : Type u} (x : \u03b1) :\n    f.invFun (pure x : n \u03b1) = (pure x : m \u03b1) := by\n  sorry_using [invFun_pure_eq_invFun_toFun_pure, invFun_toFun_pure]\n\n@[simp]\n@[blueprint\n    (statement := /-- For every type constructors `m : Type u \u2192 Type v` and\n      `n : Type u \u2192 Type w` with `Pure` instances, every pure equivalence\n      `f : PureEquiv m n`, every type `\u03b1 : Type u`, and every `x : \u03b1`, the inverse\n      transformation of `f` preserves pure values:\n      `f.invFun (pure x) = (pure x : m \u03b1)`. -/)\n    (proof := /-- This is exactly `invFun_pure_of_forward`. That lemma combines the\n      forward pure-preservation equation with the inherited left-inverse law of the\n      underlying natural equivalence. -/)]\nlemma map_pure_inv (f : PureEquiv m n) {\u03b1 : Type u} (x : \u03b1) :\n    f.invFun (pure x) = (pure x : m \u03b1) := by\n  sorry_using [invFun_pure_of_forward]",
+  "blueprint_target": "main_theorem",
+  "blueprint_fully_validated": true,
+  "proved_cache": {
+    "pure_eq_toFun_pure": ":= by\n  exact (PureEquiv.map_pure f x).symm",
+    "invFun_toFun_pure": ":= by\n  exact f.left_inv (pure x : m \u03b1)",
+    "invFun_pure_eq_invFun_toFun_pure": ":= by\n  exact congrArg f.invFun (pure_eq_toFun_pure f x)",
+    "invFun_pure_of_forward": ":= by\n  calc\n    f.invFun (pure x : n \u03b1) = f.invFun (f.toFun (pure x : m \u03b1)) := invFun_pure_eq_invFun_toFun_pure f x\n    _ = (pure x : m \u03b1) := invFun_toFun_pure f x",
+    "map_pure_inv": ":= by\n  exact invFun_pure_of_forward f x"
+  },
+  "proof_cache_keys": {
+    "pure_eq_toFun_pure": "theorem pure_eq_toFun_pure (f : PureEquiv m n) {\u03b1 : Type u} (x : \u03b1) :\n    (pure x : n \u03b1) = f.toFun (pure x : m \u03b1)\u0000deps:",
+    "invFun_toFun_pure": "theorem invFun_toFun_pure (f : PureEquiv m n) {\u03b1 : Type u} (x : \u03b1) :\n    f.invFun (f.toFun (pure x : m \u03b1)) = (pure x : m \u03b1)\u0000deps:",
+    "invFun_pure_eq_invFun_toFun_pure": "theorem invFun_pure_eq_invFun_toFun_pure (f : PureEquiv m n) {\u03b1 : Type u} (x : \u03b1) :\n    f.invFun (pure x : n \u03b1) = f.invFun (f.toFun (pure x : m \u03b1))\u0000deps:pure_eq_toFun_pure",
+    "invFun_pure_of_forward": "theorem invFun_pure_of_forward (f : PureEquiv m n) {\u03b1 : Type u} (x : \u03b1) :\n    f.invFun (pure x : n \u03b1) = (pure x : m \u03b1)\u0000deps:invFun_pure_eq_invFun_toFun_pure,invFun_toFun_pure",
+    "map_pure_inv": "theorem map_pure_inv (f : PureEquiv m n) {\u03b1 : Type u} (x : \u03b1) :\n    f.invFun (pure x) = (pure x : m \u03b1)\u0000deps:invFun_pure_of_forward"
+  },
+  "node_results": {
+    "pure_eq_toFun_pure": {
+      "signal": "solved",
+      "proof_body": ":= by\n  exact (PureEquiv.map_pure f x).symm",
+      "analysis": "",
+      "suggested_fix": "",
+      "lean_errors": []
+    },
+    "invFun_toFun_pure": {
+      "signal": "solved",
+      "proof_body": ":= by\n  exact f.left_inv (pure x : m \u03b1)",
+      "analysis": "",
+      "suggested_fix": "",
+      "lean_errors": []
+    },
+    "invFun_pure_eq_invFun_toFun_pure": {
+      "signal": "solved",
+      "proof_body": ":= by\n  exact congrArg f.invFun (pure_eq_toFun_pure f x)",
+      "analysis": "",
+      "suggested_fix": "",
+      "lean_errors": []
+    },
+    "invFun_pure_of_forward": {
+      "signal": "solved",
+      "proof_body": ":= by\n  calc\n    f.invFun (pure x : n \u03b1) = f.invFun (f.toFun (pure x : m \u03b1)) := invFun_pure_eq_invFun_toFun_pure f x\n    _ = (pure x : m \u03b1) := invFun_toFun_pure f x",
+      "analysis": "",
+      "suggested_fix": "",
+      "lean_errors": []
+    },
+    "map_pure_inv": {
+      "signal": "solved",
+      "proof_body": ":= by\n  exact invFun_pure_of_forward f x",
+      "analysis": "",
+      "suggested_fix": "",
+      "lean_errors": []
+    }
+  },
+  "refinement_history": [],
+  "done": true,
+  "success": true
+}

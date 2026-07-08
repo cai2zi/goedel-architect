@@ -13,14 +13,14 @@ Sorted by `transitive_dep_count` (rough complexity proxy).
 | and_associative | 3 | DONE (proved) | 6 nodes, all solved first pass |
 | Hidden.Nat.add_comm | 5 | DONE (proved) | 4 nodes, all solved first pass |
 | Hidden.List.Palindrome.Palindrome_app_rev | 6 | DONE (proved) | 4 nodes, all solved first pass |
-| Hidden.Nat.mul_assoc | 6 | PARKED - genuinely stuck | 6/14 nodes solved, rest blocked on a distributivity cluster (`mul_assoc_mul_add_helper` etc.). Root cause: blueprint keeps citing real-Mathlib `Nat.mul_add`/`Nat.mul_zero`/`Nat.mul_succ` instead of this repo's own shadowed local lemmas (`Hidden.Nat.mul_succ`/`add_assoc`/`add_succ`, declared earlier in the same file - confirmed against VSB's own `used_local_lemmas` ground truth). Tried: (1) added namespace-shadowing guidance to blueprint/refinement prompts - no change; (2) cleared `refinement_history` for a clean-slate retry - still regenerated the same wrong dependency almost verbatim. Not a history-anchoring artifact; looks like a real prior the model won't override from soft prompt guidance alone. `mul_assoc_right_nested_zero` also hit a genuine 300s timeout 3x (correctly classified `infra_error`, confirms that fix works live). 4/8 refinement rounds used. |
+| Hidden.Nat.mul_assoc | 6 | DONE (proved) - was PARKED, fixed by giving Phase 1/3 a repo_search tool | Same root cause and fix as `Imp.optimize_0plus_com_sound` below. Old blueprint (built before Phase 1 had `repo_search`) kept citing real-Mathlib `Nat.mul_add`/`Nat.mul_zero`/`Nat.mul_succ` instead of this repo's own shadowed local lemmas. Re-ran fresh with the repo_search fix in place: Phase 1 produced a much simpler 6-node blueprint (vs. 14 before) that correctly cites `Hidden.Nat.add_zero`/`mul_zero`/`add_succ`/`mul_succ`/`add_assoc` throughout; Phase 2 then solved all 6 nodes in a single pass (31.2s total), zero refinement rounds needed. Confirms this was a Phase 1 blueprint-generation gap, not a per-node proving issue - the per-node prover's own `repo_search` calls had already found the right lemma names in the earlier attempt, but the wrong dependency was baked into the blueprint before Phase 2 ever ran. |
 | permutation_cons_app | 7 | DONE (proved) | 4 nodes; 2 initially failed (statement_wrong, proof_too_hard), fixed in 1 refinement round |
 | Hidden.List.reverse_append | 7 | DONE (proved) | Re-run fresh with the fixed pipeline. 4 nodes, all solved first pass, clean blueprint (no leaked-tag corruption this time - confirms the bug #10 fix holds) |
 | permutation_app_comm | 8 | DONE (proved) | 8 nodes; 1 initially statement_wrong, fixed in 1 refinement round |
 | Hidden.List.Palindrome.Palindrome_rev | 8 | DONE (proved) | 6 nodes; 1 initially proof_too_hard, fixed in 1 refinement round |
-| Tree.balance_BST | 11 | PARKED - exhausted 8/8 refinement rounds | 18/23 nodes solved, incl. the hard core rotation lemma (`balance_rotated_parts_BST`). 3 of 4 case-application wrappers (`balance_black_left_left_BST`/`left_right`/`right_right`) still `statement_wrong` at the iteration cap. Genuine proof difficulty (classic red-black tree rotation case-bash), not an obvious naming/dependency bug like mul_assoc - real incremental progress each round, just ran out of budget. Worth revisiting with either a higher MAX_REFINEMENT_ITERATIONS or by manually inspecting why the case-wrappers can't apply the now-proven rotation lemma. |
+| Tree.balance_BST | 11 | PARKED (re-tested 2026-07-07, much closer) - 60/64 nodes solved | Re-ran fresh post-repo_search-fix through all 8 refinement rounds again, then hand-fixed 5 more stuck leaf nodes myself (see below) once I confirmed they were proof-writing mistakes, not genuine difficulty. Down to exactly 4 unsolved: `balance_black_empty_left_BST`, `balance_black_red_left_BST`, `balance_black_BST`, and the root `balance_BST` (blocked only on `balance_black_BST`). All 4 rotation-case BST lemmas (`balance_left_left_BST`/`left_right`/`right_left`/`right_right`) and every order/bound helper ARE now proved. The remaining gap is a genuine Lean tactic-engineering puzzle in `balance_black_BST`'s own proof (`unfold balance; split` doesn't behave as naively expected against the real `balance` function's nested match + a literal `Color.black` scrutinee - see `vsb-balance-bst-progress` memory for the detailed diagnosis), not proof-difficulty in the traditional sense. Needs interactive Lean goal inspection to finish cleanly; parked here by user decision to move on to `Imp.Hoare.hoare_while` instead. |
 | Tree.bst_insert_of_bst | 11 | DONE (proved) | 12 nodes; fixed in 3 refinement rounds (proof_too_hard, then statement_wrong twice on a trichotomy/root-replacement lemma) |
-| Imp.Hoare.hoare_while | 15 | PARKED - exhausted 8/8 refinement rounds | 12/15 nodes solved. Repeatedly stuck on the core inductive lemma about while-loop evaluation preserving the invariant until exit (`while_eval_preserves_until_exit`/`_aux`/`_induction_post`, renamed each round), oscillating proof_too_hard/statement_wrong across all 8 rounds with no convergence. Looks like genuine difficulty with the recursive-evaluation induction, similar shape to balance_BST but without balance_BST's eventual payoff. |
+| Imp.Hoare.hoare_while | 15 | PARKED (re-tested 2026-07-07, cancelled early by user - still oscillating) | Re-ran fresh post-repo_search-fix; reproduced the exact same oscillation signature as the original run within just 4 rounds (round 1-2: split into `while_exit_guard_false`/`while_preserves_invariant`, both stuck; round 3: decomposed further into `ceval_while_exit_guard_false_aux`/`ceval_while_preserves_invariant_aux`, both `proof_too_hard`; round 4: merged back into one `ceval_while_invariant_and_exit_aux`, `statement_wrong`) - splitting apart then merging back with no net progress, unlike `Tree.balance_BST`'s monotonic convergence in the same session. Confirms this is genuine difficulty with the core while-loop-evaluation induction, not a naming/wiring bug fixable by the repo_search fix or by hand like balance_BST's stuck nodes were. Cancelled at round 4/8 by user judgment call rather than exhausting the full budget, since the pattern was already clearly non-convergent. |
 | TM.progress | 16 | DONE (proved) | 15 nodes; fixed in 2 refinement rounds |
 | step_normalizing | 17 | DONE (proved) | 8 nodes; 1 initially proof_too_hard, fixed in 1 refinement round |
 | Imp.fold_constants_bexp_sound | 21 | DONE (proved) | Large blueprint (~35 nodes by the end); took 7 refinement rounds, converging steadily each round (eq/le/neq comparison-folding cases resolved one at a time) rather than getting stuck |
@@ -31,7 +31,11 @@ Sorted by `transitive_dep_count` (rough complexity proxy).
 | Imp.optimize_0plus_com_sound | 35 | DONE (proved) - was PARKED, fixed by giving Phase 1/3 a repo_search tool | Root cause was `repo_context` construction (`_build_verif_context`) only reading the same file's preceding content, never following `import Frap.Trans` - Phase 1 had zero information about `AExp`/`BExp`/`Com`/`cequiv`/`ctrans_sound` and fabricated placeholder definitions. Fix: gave `generate_blueprint`/`refine_blueprint` a `repo_search` tool (see `_call_with_repo_search` in `src/blueprint.py`), same tool Phase 2 already had, so the model can look up cross-file declarations on demand. Re-ran fresh: Phase 1 produced a correct blueprint referencing the real repo types and matching the ground-truth target signature character-for-character (validated in 50s vs. the old 280-580s of failed retries); hit one unrelated infra snag (the repo's own `Frap.Exercises.Trans.olean` build artifact was simply missing from the shared checkout - fixed with a one-time `lake build Frap.Exercises.Trans`, not a pipeline bug); after that, Phase 2 solved all 5 nodes in a single pass with zero refinement rounds needed. |
 | Imp.fold_constants_com_sound | 40 | DONE (proved) | 10 nodes; 1 initially statement_wrong, fixed in 1 refinement round |
 
-## Parked: Hidden.Nat.mul_assoc (namespace-shadowing dependency bug)
+## RESOLVED: Hidden.Nat.mul_assoc (namespace-shadowing dependency bug)
+
+Fixed by the same Phase 1/3 `repo_search` tool built for `Imp.optimize_0plus_com_sound`
+(see that row above and `vsb-repo-context-missing-cross-file-imports` memory).
+The section below is kept as the original diagnosis record.
 
 **Symptom**: 6/14 blueprint nodes solved; the rest (`mul_assoc_mul_add_helper`,
 `mul_assoc_left_distrib_add`, `mul_assoc_product_mul_zero`,
@@ -91,6 +95,85 @@ Mathlib lemmas, which do not apply to `Hidden.Nat` values. Confirmed via:
   `/tmp/claude-1000/.../scratchpad/test_stuck_node.py` (session-specific
   scratchpad path, will need re-creating in a fresh session; the pattern is
   documented here for reference).
+
+## Parked: Tree.balance_BST (2026-07-07 re-test, 60/64 nodes)
+
+Re-ran fresh (deleted the old checkpoint) through all 8 refinement rounds
+post-repo_search-fix. Converged much further than the original run (which had
+capped at 18/23 nodes on a smaller blueprint) - this run's blueprint grew to
+64 nodes and reached 55/64 solved by round 8, then I manually diagnosed and
+hand-fixed 5 more:
+
+- `bst_left_of_left_node`, `bst_right_of_right_node` - the automated prover
+  used manual `cases`/`rename_i` pattern-matching or wrong named-argument
+  syntax instead of just composing an already-proved helper twice
+  (`bst_left_of_node (bst_left_of_node h)`). Not genuinely hard.
+- `balance_left_right_right_order` - the blueprint's own dependency list was
+  exactly right (3 sub-lemmas whose conclusions are precisely the 3 subgoals
+  `forallTree_node_from_parts` needs, in order); the automated prover's
+  `apply forallTree_node_from_parts` just failed to infer the lambda motive
+  `P`. Fixed by using a fully-explicit `exact forallTree_node_from_parts
+  (fun n _ => n > y) Color.black c z vz d (...) (...) (...)` instead of `apply`.
+- `balance_right_left_BST` - a purpose-built assembly lemma
+  (`balance_right_left_assemble_BST`, itself already solved) existed for
+  exactly this goal, but the automated proof ignored it and tried `constructor`
+  on the raw `BST.tree` structure instead, hitting argument-order mismatches.
+
+Each hand-written fix was verified independently by calling
+`VSBLeanCompiler.check_blueprint()` directly on the fully-substituted file
+before being injected into the checkpoint's `proved_cache` (with a matching
+`proof_cache_keys` entry via `BlueprintNode.cache_key()`) and re-running
+`--phase 2` to let the pipeline pick up newly-unblocked downstream nodes.
+
+**Found in passing**: `_substitute_proof` (`src/pipeline.py`) always inserts
+its own `":= "` before the spliced proof body, but `proved_cache` values
+already carry their own leading `:=` (confirmed in every `node_results`/
+`proved_cache` entry inspected) - every `_substitute_proof` call site
+(`extract_proof.py`, `_assemble_partial_file`, `_assemble_final_file`)
+produces a `:= := by ...` double-colon-equals. Harmless for `extract_proof.py`
+(human-reading only, never compiled) and apparently never hit by the real
+pipeline's own compile paths (`_aux_lemma_decls` builds `signature() +
+proved_cache[name]` instead, which is the correct single-`:=` concatenation),
+but it broke my own manual `check_blueprint()` validation until I added a
+`re.sub(r":=\s*:=", ":=", lean)` post-process step. Worth a real fix in
+`_substitute_proof` at some point since it's a footgun for any future
+direct-compile use of `_assemble_partial_file`/`_assemble_final_file`.
+
+**Where it's stuck now**: exactly 4 nodes - `balance_black_empty_left_BST`,
+`balance_black_red_left_BST`, `balance_black_BST`, and the root `balance_BST`
+(blocked only on `balance_black_BST`). All 4 rotation-case BST lemmas and
+every order/bound helper are proved; the real `balance` function
+(`Frap/RedBlack.lean:61`) is:
+```
+def balance (c : Color) (l : Tree α) (k : Nat) (vk : α) (r : Tree α) : Tree α :=
+  match c with
+  | red => tree red l k vk r
+  | black =>
+    match (l, k, vk, r) with
+    | (tree red (tree red a x vx b) y vy c, z, vz, d)
+    | (tree red a x vx (tree red b y vy c), z, vz, d)
+    | (a, x, vx, tree red (tree red b y vy c) z vz d)
+    | (a, x, vx, tree red b y vy (tree red c z vz d))
+        => tree red (tree black a x vx b) y vy (tree black c z vz d)
+    | _ => tree black l k vk r
+```
+Tried `unfold balance; repeat' (split <;> subst_vars); all_goals first | exact
+balance_left_left_BST .. | ... | exact bst_node_from_bounds ..` (using
+underscores for the 10 explicit leading args each rotation lemma takes) -
+`lake env lean`'s raw output (captured directly, not through the
+error-line-only filter) showed `split` produces a goal for the `Color.red`
+outer-match arm even though the target already fixes color to the literal
+`Color.black`, and the rotation-case goals show the hypotheses `hlt`/`hgt`/
+`hbstl`/`hbstr` NOT actually specialized by `subst_vars` to the split's new
+pattern variables. This needs interactive Lean goal inspection (not batch
+`lake env lean` + regex-filtered error output) to resolve efficiently - the
+repo's own `RedBlack.lean` notes exactly this class of match needs `repeat'`
+splitting (see `ins_not_empty`'s proof for a working example on a similarly-
+shaped double match), so the right tactic likely exists but wasn't found
+blind in the time spent. Paused here by user choice to move to
+`Imp.Hoare.hoare_while` instead; worth resuming with an interactive Lean
+session (VS Code / any LSP-backed environment) rather than more blind
+batch-and-guess iterations.
 
 ## How to extract a proof from a checkpoint
 
