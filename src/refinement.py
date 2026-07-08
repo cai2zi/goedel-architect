@@ -42,6 +42,8 @@ def refine_blueprint(
     iteration: int = 0,
     max_iterations: int = 0,
     repo_retrieval=None,
+    tracer=None,
+    thm_name: str = "",
 ) -> Blueprint:
     """
     Produce a revised blueprint by feeding failure diagnostics back to the LLM.
@@ -83,6 +85,7 @@ def refine_blueprint(
     for attempt in range(MAX_RETRIES):
         response = _call_with_repo_search(
             client, model, messages, repo_retrieval, _reasoning_kwargs(model), MAX_TOKENS,
+            tracer=tracer, thm_name=thm_name, phase="phase3",
         )
         content = response.choices[0].message.content
         lean_code = _extract_lean_code(content)

@@ -98,6 +98,7 @@ def prove_theorem(
     repo_context: str | None = None,
     node_timeout_s: float | None = 300.0,
     checkpoint_path: Path | None = None,
+    thm_name: str = "",
 ) -> ProofResult:
     """
     Full Goedel-Architect pipeline for a single theorem.
@@ -179,6 +180,8 @@ def prove_theorem(
             compiler=blueprint_compiler,
             repo_context=repo_context,
             repo_retrieval=repo_retrieval,
+            tracer=tracer,
+            thm_name=thm_name,
         )
         proved_cache = {}
         proof_cache_keys = {}
@@ -271,6 +274,8 @@ def prove_theorem(
                 iteration=iteration,
                 max_iterations=max_iterations,
                 repo_retrieval=repo_retrieval,
+                tracer=tracer,
+                thm_name=thm_name,
             )
             print(f"  new blueprint has {len(blueprint.nodes)} nodes: {[n.name for n in blueprint.nodes]}", flush=True)
         except RuntimeError as e:
@@ -336,6 +341,8 @@ def run_phase1(
     repo_context: str | None = None,
     checkpoint_path: Path | None = None,
     repo_retrieval=None,
+    tracer=None,
+    thm_name: str = "",
 ) -> Blueprint:
     """Run Phase 1 (blueprint generation) alone and checkpoint the result."""
     blueprint = generate_blueprint(
@@ -345,6 +352,8 @@ def run_phase1(
         compiler=compiler,
         repo_context=repo_context,
         repo_retrieval=repo_retrieval,
+        tracer=tracer,
+        thm_name=thm_name,
     )
     if checkpoint_path:
         state = CheckpointState(theorem_stmt=theorem_stmt, model=model, repo_context=repo_context or "")
@@ -417,6 +426,8 @@ def run_phase3(
     repo_context: str | None = None,
     max_iterations: int = MAX_REFINEMENT_ITERATIONS,
     repo_retrieval=None,
+    tracer=None,
+    thm_name: str = "",
 ) -> Blueprint:
     """Run one Phase 3 (refinement) pass against a checkpointed blueprint.
 
@@ -457,6 +468,8 @@ def run_phase3(
         iteration=state.iteration,
         max_iterations=max_iterations,
         repo_retrieval=repo_retrieval,
+        tracer=tracer,
+        thm_name=thm_name,
     )
 
     new_proved_cache = _invalidate_stale_proofs(new_blueprint, state.proved_cache, state.proof_cache_keys)

@@ -204,6 +204,27 @@ class GoedelProver:
         self.retrieval = retrieval or MathlibRetrieval()
         self.tracer = tracer or NullTracer()
 
+    def _emit_usage(self, node_name: str, response) -> None:
+        """Log token usage from a Responses API response. Field names differ
+        from chat.completions (input_tokens/output_tokens vs prompt/
+        completion), so this is a separate normalizer from blueprint.py's
+        _emit_usage rather than a shared one."""
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        prompt = getattr(usage, "input_tokens", 0)
+        completion = getattr(usage, "output_tokens", 0)
+        total = getattr(usage, "total_tokens", None) or (prompt + completion)
+        self.tracer.emit(TraceEvent(
+            kind="llm_usage",
+            thm_name=node_name,
+            args={
+                "phase": "phase2", "model": self.model_id,
+                "prompt_tokens": prompt, "completion_tokens": completion,
+                "total_tokens": total,
+            },
+        ))
+
     def prove_node(
         self,
         compiler: AbstractLeanCompiler,
@@ -279,6 +300,7 @@ class GoedelProver:
             max_output_tokens=MAX_TOKENS,
             **_responses_reasoning_kwargs(self.model_id),
         )
+        self._emit_usage(node_name, response)
 
         tool_calls_used = 0
         best_proof_body = ""
@@ -327,6 +349,7 @@ class GoedelProver:
                 max_output_tokens=MAX_TOKENS,
                 **_responses_reasoning_kwargs(self.model_id),
             )
+            self._emit_usage(node_name, response)
 
         # Drain any pending tool calls
         if tool_results:
@@ -339,6 +362,7 @@ class GoedelProver:
                 max_output_tokens=MAX_TOKENS,
                 **_responses_reasoning_kwargs(self.model_id),
             )
+            self._emit_usage(node_name, response)
             _, drain_text, drain_proof, _, _, drain_errors = self._process_response(
                 response, compiler, node_name, repo_retrieval, tool_calls_used
             )
@@ -359,6 +383,7 @@ class GoedelProver:
                 max_output_tokens=MAX_TOKENS,
                 **_responses_reasoning_kwargs(self.model_id),
             )
+            self._emit_usage(node_name, response)
             _, last_text, best_proof_body, _, _, final_errors = self._process_response(
                 response, compiler, node_name, repo_retrieval, tool_calls_used
             )
@@ -497,6 +522,7 @@ class GoedelProver:
             max_output_tokens=max_tokens,
             **_responses_reasoning_kwargs(self.model_id),
         )
+        self._emit_usage(node_name, response)
 
         for _ in range(NEGATION_PROBE_CALLS):
             results: list[dict] = []
@@ -530,6 +556,7 @@ class GoedelProver:
                 max_output_tokens=max_tokens,
                 **_responses_reasoning_kwargs(self.model_id),
             )
+            self._emit_usage(node_name, response)
 
         return None
 

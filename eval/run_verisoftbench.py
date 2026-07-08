@@ -142,6 +142,7 @@ def evaluate_theorem(
     }
 
     t0 = time.monotonic()
+    usage_names = {thm_name}
 
     try:
         # Build verification context
@@ -172,6 +173,7 @@ def evaluate_theorem(
                 tracer=tracer,
                 repo_context=verif_ctx,
                 checkpoint_path=checkpoint_path,
+                thm_name=thm_name,
             )
             # Use only the root-node proof body — final_lean_file is a full Lean
             # file with import statements, not a proof body VSBLeanCompiler can verify.
@@ -180,6 +182,10 @@ def evaluate_theorem(
             # references by name (a proved sibling node) only exists as prompt
             # text unless re-declared as a real lemma here.
             aux_lemmas = proof_result.aux_lemma_decls
+            # Phase 2's llm_usage events are tagged with each blueprint NODE's
+            # own name, not the overall theorem name - widen the usage lookup
+            # (Phase 1/3 events are already tagged with thm_name directly).
+            usage_names |= set(proof_result.proved_nodes) | set(proof_result.failed_nodes)
         else:
             # Phase 2 only (direct per-theorem proving, no blueprint)
             prover = GoedelProver(model_id=model, retrieval=retrieval, tracer=tracer)
@@ -248,6 +254,13 @@ def evaluate_theorem(
         },
     ))
 
+    usage = _sum_usage_from_trace(tracer, usage_names)
+    if usage:
+        result["token_usage"] = usage
+        print(f"  [{thm_name}] tokens used: {usage['total_tokens']:,} "
+              f"({usage['prompt_tokens']:,} prompt + {usage['completion_tokens']:,} "
+              f"completion, {usage['calls']} call(s))", flush=True)
+
     return result
 
 
@@ -297,11 +310,20 @@ def _build_verif_context(lean_repl, entry, lean_root, rel_path,
             pass
 
     if aristotle_mode:
-        lemma_texts = [
-            item.get("content", "").strip()
-            for item in entry.get("used_local_lemmas", [])
-            if item.get("content", "").strip()
-        ]
+        lemma_texts = []
+        for item in entry.get("used_local_lemmas", []):
+            text = item.get("content", "").strip()
+            if not text:
+                continue
+            # `used_local_lemmas` content is statement-only (no `:=`) - a bare
+            # `theorem name : type` with nothing after it is a Lean parse
+            # error, not just an incomplete proof, and breaks compilation of
+            # everything that follows it in the same file. Give it a stub
+            # proof so it's a syntactically valid (if unproven) declaration,
+            # same convention as the paper's own admit-elided lemmas.
+            if ":=" not in text:
+                text += " := by sorry"
+            lemma_texts.append(text)
         if lemma_texts:
             ctx += ("\n\n-- Lemma statements used by the ground-truth proof --\n"
                     + "\n\n".join(lemma_texts))
@@ -360,7 +382,7 @@ def evaluate_theorem_phase(
             blueprint = run_phase1(
                 theorem_stmt=thm_stmt, model=model, compiler=make_compiler(),
                 repo_context=verif_ctx, checkpoint_path=checkpoint_path,
-                repo_retrieval=repo_retrieval,
+                repo_retrieval=repo_retrieval, tracer=tracer, thm_name=thm_name,
             )
             result.update(
                 ok=True, validated=blueprint.fully_validated,
@@ -379,12 +401,17 @@ def evaluate_theorem_phase(
                 proved=sorted(orch_result.proved),
                 failed=sorted(orch_result.failed.keys()),
             )
+            # Phase 2's llm_usage events are tagged with each blueprint NODE's
+            # own name (matching theorem_start's existing convention, which
+            # graph_viz.py depends on), not the overall theorem name - widen
+            # the usage lookup to the node names this call actually attempted.
+            usage_names = set(orch_result.node_results.keys()) | {thm_name}
 
         elif phase == 3:
             blueprint = run_phase3(
                 checkpoint_path=checkpoint_path, compiler=make_compiler(),
                 model=model, repo_context=verif_ctx,
-                repo_retrieval=repo_retrieval,
+                repo_retrieval=repo_retrieval, tracer=tracer, thm_name=thm_name,
             )
             result.update(
                 ok=True, validated=blueprint.fully_validated,
@@ -398,7 +425,44 @@ def evaluate_theorem_phase(
         result["error"] = str(exc)
 
     result["wall_time_s"] = round(time.monotonic() - t0, 2)
+    usage = _sum_usage_from_trace(tracer, usage_names if phase == 2 else {thm_name})
+    if usage:
+        result["token_usage"] = usage
+        print(f"  [{thm_name}] tokens used this phase: "
+              f"{usage['total_tokens']:,} ({usage['prompt_tokens']:,} prompt + "
+              f"{usage['completion_tokens']:,} completion, {usage['calls']} call(s))",
+              flush=True)
     return result
+
+
+def _sum_usage_from_trace(tracer, names: set[str]) -> dict | None:
+    """Sum `llm_usage` trace events for a set of names. Phase 1/3 events are
+    tagged with the overall theorem name; Phase 2 events are tagged with
+    each blueprint NODE's own name (matching theorem_start's existing
+    convention, which graph_viz.py depends on) - callers must pass the right
+    set of names for whichever phase just ran. Only works when tracing is
+    enabled (NullTracer has no file to read back from, so this silently
+    returns None rather than requiring --trace everywhere)."""
+    path = getattr(tracer, "path", None)
+    if path is None or not path.exists():
+        return None
+    prompt = completion = total = calls = 0
+    with open(path) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            event = json.loads(line)
+            if event.get("kind") != "llm_usage" or event.get("thm_name") not in names:
+                continue
+            args = event.get("args") or {}
+            prompt += args.get("prompt_tokens", 0)
+            completion += args.get("completion_tokens", 0)
+            total += args.get("total_tokens", 0)
+            calls += 1
+    if calls == 0:
+        return None
+    return {"prompt_tokens": prompt, "completion_tokens": completion,
+            "total_tokens": total, "calls": calls}
 
 
 def summarise(results: list[dict]) -> dict:

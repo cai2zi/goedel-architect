@@ -14,6 +14,7 @@ from openai import OpenAI
 
 from lean_compiler import AbstractLeanCompiler, LeanCompiler, CompilerResult
 from goedel_prompts import load, render
+from tracer import TraceEvent
 
 
 def _reasoning_kwargs(model: str) -> dict:
@@ -79,6 +80,33 @@ definition.
 """
 
 
+def _emit_usage(tracer, thm_name: str, phase: str, model: str, response) -> None:
+    """Log token usage from a chat.completions/responses API response, if a
+    tracer was given. `response.usage` is present on both APIs but with
+    different field names, so normalize to prompt/completion/total."""
+    if tracer is None:
+        return
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    prompt = getattr(usage, "prompt_tokens", None)
+    completion = getattr(usage, "completion_tokens", None)
+    if prompt is None:
+        prompt = getattr(usage, "input_tokens", 0)
+    if completion is None:
+        completion = getattr(usage, "output_tokens", 0)
+    total = getattr(usage, "total_tokens", None) or (prompt + completion)
+    tracer.emit(TraceEvent(
+        kind="llm_usage",
+        thm_name=thm_name,
+        args={
+            "phase": phase, "model": model,
+            "prompt_tokens": prompt, "completion_tokens": completion,
+            "total_tokens": total,
+        },
+    ))
+
+
 def _call_with_repo_search(
     client: OpenAI,
     model: str,
@@ -86,6 +114,9 @@ def _call_with_repo_search(
     repo_retrieval,
     reasoning_kwargs: dict,
     max_tokens: int,
+    tracer=None,
+    thm_name: str = "",
+    phase: str = "",
 ):
     """chat.completions.create, transparently handling repo_search tool calls.
 
@@ -110,6 +141,7 @@ def _call_with_repo_search(
             max_completion_tokens=max_tokens,
             **call_kwargs,
         )
+        _emit_usage(tracer, thm_name, phase, model, response)
         msg = response.choices[0].message
         if not msg.tool_calls:
             return response
@@ -128,9 +160,11 @@ def _call_with_repo_search(
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
     # Exhausted search turns without a final text response - one last call
     # with tools withheld forces the model to commit to an answer.
-    return client.chat.completions.create(
+    response = client.chat.completions.create(
         model=model, messages=messages, max_completion_tokens=max_tokens, **reasoning_kwargs,
     )
+    _emit_usage(tracer, thm_name, phase, model, response)
+    return response
 
 
 # Shared text-surgery helpers for the `@[blueprint]` grammar. Previously
@@ -229,6 +263,8 @@ def generate_blueprint(
     compiler: AbstractLeanCompiler | None = None,
     repo_context: str | None = None,
     repo_retrieval=None,
+    tracer=None,
+    thm_name: str = "",
 ) -> Blueprint:
     """
     Generate a @[blueprint]-annotated Lean dependency graph for `theorem_stmt`.
@@ -255,6 +291,7 @@ def generate_blueprint(
     for attempt in range(MAX_RETRIES):
         response = _call_with_repo_search(
             client, model, messages, repo_retrieval, _reasoning_kwargs(model), MAX_TOKENS,
+            tracer=tracer, thm_name=thm_name, phase="phase1",
         )
         lean_code = _extract_lean_code(response.choices[0].message.content)
         last_lean_code = lean_code
