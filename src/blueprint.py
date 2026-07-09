@@ -13,6 +13,7 @@ from pathlib import Path
 from openai import OpenAI
 
 from lean_compiler import AbstractLeanCompiler, LeanCompiler, CompilerResult
+from llm_client import make_client
 from goedel_prompts import load, render
 from tracer import TraceEvent
 
@@ -276,7 +277,7 @@ def generate_blueprint(
         tool for cross-file lookups repo_context itself can't provide (see
         REPO_SEARCH_TOOL). Omit for the old no-tools behavior.
     """
-    client = OpenAI()
+    client = make_client(model)
 
     system_content = BLUEPRINT_SYSTEM_PROMPT
     if repo_retrieval is not None:
@@ -334,7 +335,29 @@ def generate_blueprint(
                 ),
             })
         else:
-            return _parse_blueprint(lean_code, _extract_target_name(lean_code, theorem_stmt))
+            target = _extract_target_name(lean_code, theorem_stmt)
+            parsed = _parse_blueprint(lean_code, target)
+            if parsed.nodes:
+                return parsed
+            # No compiler here to validate against (see comment above this
+            # branch), but a response with zero @[blueprint]-annotated
+            # declarations - a refusal, an apology, a plain sorry-free proof -
+            # is pure text-parsing to detect and needs no compiler at all.
+            # Silently accepting it as a "blueprint" would make all_proved()
+            # vacuously true downstream with no actual proof recorded, so
+            # this must be retried the same way the compiler branch already
+            # retries its own zero-node case above.
+            messages.append({"role": "assistant", "content": response.choices[0].message.content})
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"Your response contains no `@[blueprint ...]`-annotated "
+                    f"declarations (attempt {attempt + 1}/{MAX_RETRIES}). You must "
+                    "annotate the target theorem (and any helper lemmas) with "
+                    "`@[blueprint ...]` and give each a `sorry_using [...]` proof body. "
+                    "Re-emit the blueprint with proper annotations."
+                ),
+            })
 
     # All attempts failed compilation — use the last generated blueprint anyway
     # if it has real nodes (Phase 2/3 will encounter and surface type errors

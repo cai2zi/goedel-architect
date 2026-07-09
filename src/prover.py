@@ -18,9 +18,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from openai import OpenAI
-
 from lean_compiler import AbstractLeanCompiler, CompilerResult
+from llm_client import make_client
 from mathlib_retrieval import MathlibRetrieval
 from goedel_prompts import load, render
 from tracer import NullTracer, TraceEvent
@@ -195,14 +194,20 @@ class GoedelProver:
         retrieval: MathlibRetrieval | None = None,
         tracer=None,
         api_timeout_s: float = 120.0,
+        max_tool_calls: int | None = None,
     ):
         self.model_id = model_id
         # Bounds each individual Responses API call so a stuck request can't
         # hang a node indefinitely; the orchestrator's node_timeout_s bounds
         # the whole multi-turn tool loop on top of this.
-        self.client = OpenAI(timeout=api_timeout_s)
+        self.client = make_client(model_id, timeout=api_timeout_s)
         self.retrieval = retrieval or MathlibRetrieval()
         self.tracer = tracer or NullTracer()
+        # Per-instance override of the module-level MAX_TOOL_CALLS budget -
+        # used by orchestrator.py's cascade to give an escalated (expensive)
+        # attempt a much tighter budget (e.g. 1: a single lean_compile call,
+        # no fix-and-retry loop) than the cheap cascade attempt gets.
+        self.max_tool_calls = max_tool_calls if max_tool_calls is not None else MAX_TOOL_CALLS
 
     def _emit_usage(self, node_name: str, response) -> None:
         """Log token usage from a Responses API response. Field names differ
@@ -310,7 +315,7 @@ class GoedelProver:
         all_lean_errors: list[str] = []
         last_errors: list[str] = []
 
-        while tool_calls_used < MAX_TOOL_CALLS:
+        while tool_calls_used < self.max_tool_calls:
             tool_results, text, proof, compile_ok, tools_called, compile_errors = self._process_response(
                 response, compiler, node_name, repo_retrieval, tool_calls_used, node_decl=node_stmt
             )
@@ -335,7 +340,7 @@ class GoedelProver:
 
             if not tool_results:
                 break
-            if tool_calls_used >= MAX_TOOL_CALLS:
+            if tool_calls_used >= self.max_tool_calls:
                 break
 
             next_choice = {"type": "function", "name": "lean_compile"} if (had_search and not had_compile) else "required"
@@ -605,6 +610,7 @@ def prove_node(
     repo_retrieval=None,
     tracer=None,
     api_timeout_s: float = 120.0,
+    max_tool_calls: int | None = None,
 ) -> ProverResult:
     parent_block = "\n\n".join(
         f"```lean\n-- {n}\n{p}\n```" for n, p in parent_proofs.items()
@@ -616,7 +622,8 @@ def prove_node(
         nl_proof_sketch=node_proof_sketch_nl,
         parent_proofs=parent_block,
     )
-    prover = GoedelProver(model_id=model, retrieval=retrieval, tracer=tracer, api_timeout_s=api_timeout_s)
+    prover = GoedelProver(model_id=model, retrieval=retrieval, tracer=tracer,
+                           api_timeout_s=api_timeout_s, max_tool_calls=max_tool_calls)
     return prover.prove_node(
         compiler=compiler,
         node_name=node_name,

@@ -99,6 +99,9 @@ def prove_theorem(
     node_timeout_s: float | None = 300.0,
     checkpoint_path: Path | None = None,
     thm_name: str = "",
+    cascade_model: str | None = None,
+    cascade_timeout_s: float | None = None,
+    escalation_max_tool_calls: int | None = 1,
 ) -> ProofResult:
     """
     Full Goedel-Architect pipeline for a single theorem.
@@ -211,6 +214,9 @@ def prove_theorem(
                 nodes_to_retry=nodes_to_try,
                 tracer=tracer,
                 node_timeout_s=node_timeout_s,
+                cascade_model=cascade_model,
+                cascade_timeout_s=cascade_timeout_s,
+                escalation_max_tool_calls=escalation_max_tool_calls,
             )
         )
 
@@ -370,6 +376,9 @@ def run_phase2(
     repo_retrieval=None,
     tracer=None,
     node_timeout_s: float | None = 300.0,
+    cascade_model: str | None = None,
+    cascade_timeout_s: float | None = None,
+    escalation_max_tool_calls: int | None = 1,
 ) -> OrchestratorResult:
     """Run one Phase 2 (parallel proving) pass against a checkpointed blueprint.
 
@@ -400,6 +409,9 @@ def run_phase2(
             nodes_to_retry=nodes_to_try,
             tracer=tracer,
             node_timeout_s=node_timeout_s,
+            cascade_model=cascade_model,
+            cascade_timeout_s=cascade_timeout_s,
+            escalation_max_tool_calls=escalation_max_tool_calls,
         )
     )
 

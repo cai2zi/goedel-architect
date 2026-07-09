@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 
-from openai import OpenAI
+from llm_client import make_client
 
 from blueprint import (
     Blueprint,
@@ -30,6 +30,37 @@ REFINEMENT_USER_TEMPLATE = load("refinement_user")
 # regardless of model, and this is capped further to 64,000 to control cost.
 MAX_TOKENS = 64_000
 MAX_RETRIES = 8
+
+# Cap how many earlier rounds are replayed into the refinement prompt. Full
+# history is still kept in the checkpoint (round-count messaging stays
+# accurate), but only the most recent N rounds are rendered as ### Round
+# blocks - this bounds prompt growth on theorems needing many refinement
+# rounds instead of re-sending every prior round's full annotated Lean file
+# every time.
+MAX_HISTORY_ROUNDS = 3
+
+# Cap a single node's embedded diagnosis text (LLM-generated analysis +
+# suggested fix). Uncapped, a verbose per-node analysis gets replayed
+# round after round (within the MAX_HISTORY_ROUNDS window) for any node
+# that keeps failing, which is exactly the case that costs the most.
+MAX_DIAGNOSIS_CHARS = 800
+
+# Matches one @[blueprint ...] node's full text block (attribute + decl +
+# body), used to locate and edit individual node blocks by name rather than
+# scanning line by line - mirrors blueprint.py::_parse_blueprint's pattern.
+_NODE_BLOCK_RE = re.compile(
+    r'@\[blueprint\s*(.*?)\]\s*\n\s*(def|lemma|theorem|noncomputable def|abbrev)\s+(\w+)(.*?)(?=@\[blueprint|\Z)',
+    re.DOTALL,
+)
+_PROOF_SKETCH_ATTR_RE = re.compile(r'\(proof\s*:=\s*/--.*?-/\)\s*', re.DOTALL)
+
+# Recovers a compact (name, verdict) trail from an already-annotated round's
+# text, used to summarize rounds too old to replay in full (see
+# _summarize_dropped_rounds).
+_VERDICT_RE = re.compile(
+    r'(?:lemma|theorem)\s+(\w+).*?\n--\s*(PROVED|UNPROVED|FORMALLY_NEGATED|INFRA_ERROR)',
+    re.DOTALL,
+)
 
 
 def refine_blueprint(
@@ -61,23 +92,39 @@ def refine_blueprint(
         change strategy or accept a node as an unresolved gap, rather than
         cosmetically re-decomposing the same stuck problem every round.
     """
-    client = OpenAI()
+    client = make_client(model)
 
     annotated_lean = _annotate_with_verdicts(blueprint, orch_result)
     if history is not None:
         history.append(annotated_lean)
-        prior_rounds = history[:-1]
+        prior_all = history[:-1]
+        total_prior_rounds = len(prior_all)
+        prior_rounds = prior_all[-MAX_HISTORY_ROUNDS:]
+        dropped_rounds_summary = _summarize_dropped_rounds(
+            prior_all[:-MAX_HISTORY_ROUNDS] if total_prior_rounds > MAX_HISTORY_ROUNDS else []
+        )
     else:
+        total_prior_rounds = 0
         prior_rounds = []
+        dropped_rounds_summary = ""
 
     system_content = REFINEMENT_SYSTEM_PROMPT
     if repo_retrieval is not None:
         system_content = system_content.strip() + "\n" + REPO_SEARCH_SUFFIX
+    # repo_context is a static per-theorem block (doesn't change round to
+    # round), so re-sending it in full on every refinement round is a fixed
+    # cost multiplied by however many rounds run. Only the first round gets
+    # it verbatim to bootstrap understanding; later rounds fall back on the
+    # live repo_search tool (already wired in via repo_retrieval above) for
+    # anything they still need to look up.
+    effective_repo_context = repo_context if iteration == 0 else None
     messages = [
         {"role": "system", "content": system_content},
         {"role": "user", "content": _build_refinement_user_prompt(
-            annotated_lean, repo_context, prior_rounds=prior_rounds,
+            annotated_lean, effective_repo_context, prior_rounds=prior_rounds,
             iteration=iteration, max_iterations=max_iterations,
+            total_prior_rounds=total_prior_rounds,
+            dropped_rounds_summary=dropped_rounds_summary,
         )},
     ]
 
@@ -143,7 +190,8 @@ def _annotate_with_verdicts(blueprint: Blueprint, orch_result: OrchestratorResul
     the machine-checked counterexample proof so the refinement LLM can fix the
     statement accordingly.
     """
-    lines = blueprint.lean_file.splitlines()
+    lean_file = _strip_proof_sketch_for_solved(blueprint.lean_file, orch_result)
+    lines = lean_file.splitlines()
     output_lines: list[str] = []
     i = 0
     while i < len(lines):
@@ -160,7 +208,7 @@ def _annotate_with_verdicts(blueprint: Blueprint, orch_result: OrchestratorResul
                 elif nr.result.signal == ProofSignal.FORMALLY_NEGATED:
                     # Distinct red-node marker (Section 4.3 / Figure 1)
                     output_lines.append("-- FORMALLY_NEGATED")
-                    output_lines.append(nr.result.diagnosis_block(name))
+                    output_lines.append(_truncate_diagnosis(nr.result.diagnosis_block(name)))
                 elif nr.result.signal == ProofSignal.INFRA_ERROR:
                     # Infrastructure/tooling failure (timeout, exception), not
                     # a genuine proof-difficulty verdict - flagged distinctly
@@ -170,13 +218,57 @@ def _annotate_with_verdicts(blueprint: Blueprint, orch_result: OrchestratorResul
                         "-- INFRA_ERROR (infrastructure/tooling failure, not a "
                         "genuine proof-difficulty signal)"
                     )
-                    output_lines.append(nr.result.diagnosis_block(name))
+                    output_lines.append(_truncate_diagnosis(nr.result.diagnosis_block(name)))
                 else:
                     output_lines.append("-- UNPROVED")
-                    output_lines.append(nr.result.diagnosis_block(name))
+                    output_lines.append(_truncate_diagnosis(nr.result.diagnosis_block(name)))
         i += 1
 
     return "\n".join(output_lines)
+
+
+def _strip_proof_sketch_for_solved(lean_file: str, orch_result: OrchestratorResult) -> str:
+    """Drop the natural-language `(proof := /-- ... -/)` sketch attribute for
+    already-solved nodes before they're replayed into the refinement prompt.
+
+    A solved node only needs to be usable as a citable fact going forward
+    (its name + statement) - the NL plan that was used to derive its
+    now-verified proof is dead weight once the proof is done, and this text
+    gets re-sent every round a solved node still appears in the blueprint.
+    """
+    def replace(m: re.Match) -> str:
+        attrs_block, kind_kw, name, rest = m.group(1), m.group(2), m.group(3), m.group(4)
+        nr = orch_result.node_results.get(name)
+        if nr and nr.result.signal == ProofSignal.SOLVED:
+            new_attrs = _PROOF_SKETCH_ATTR_RE.sub("", attrs_block).strip()
+            return f"@[blueprint {new_attrs}]\n{kind_kw} {name}{rest}"
+        return m.group(0)
+
+    return _NODE_BLOCK_RE.sub(replace, lean_file)
+
+
+def _truncate_diagnosis(block: str, limit: int = MAX_DIAGNOSIS_CHARS) -> str:
+    if len(block) <= limit:
+        return block
+    truncated = block[:limit].rstrip()
+    omitted = len(block) - len(truncated)
+    return f"{truncated}\n... [diagnosis truncated, {omitted} more chars omitted]\n-/"
+
+
+def _summarize_dropped_rounds(dropped_rounds: list[str]) -> str:
+    """One compact line per round dropped from the replayed history window,
+    recovering just (node name -> verdict) pairs from that round's already-
+    annotated text - keeps a cheap "don't repeat this" memory trace for
+    rounds too old to afford replaying in full (see MAX_HISTORY_ROUNDS).
+    """
+    lines = []
+    for i, text in enumerate(dropped_rounds, start=1):
+        verdicts = _VERDICT_RE.findall(text)
+        if not verdicts:
+            continue
+        verdict_str = ", ".join(f"{name}={v}" for name, v in verdicts)
+        lines.append(f"Round {i}: {verdict_str}")
+    return "\n".join(lines)
 
 
 def _build_refinement_user_prompt(
@@ -185,22 +277,39 @@ def _build_refinement_user_prompt(
     prior_rounds: list[str] | None = None,
     iteration: int = 0,
     max_iterations: int = 0,
+    total_prior_rounds: int | None = None,
+    dropped_rounds_summary: str = "",
 ) -> str:
+    total_prior_rounds = total_prior_rounds if total_prior_rounds is not None else len(prior_rounds or [])
+
     prior_rounds_text = ""
     if prior_rounds:
+        # prior_rounds may be truncated to the most recent MAX_HISTORY_ROUNDS -
+        # number blocks by their true round number, not their index here, so
+        # the model isn't misled into thinking round 5 was actually round 1.
+        start_round = total_prior_rounds - len(prior_rounds) + 1
         blocks = [
-            f"### Round {i + 1}\n\n```lean\n{text}\n```"
+            f"### Round {start_round + i}\n\n```lean\n{text}\n```"
             for i, text in enumerate(prior_rounds)
         ]
         prior_rounds_text = "\n\n".join(blocks)
 
     round_info = ""
     if max_iterations:
+        omitted = total_prior_rounds - len(prior_rounds)
+        omitted_note = (
+            f" ({omitted} earliest round(s) omitted here for brevity)" if omitted > 0 else ""
+        )
         round_info = (
             f"This is refinement round {iteration + 1} of {max_iterations}. "
-            f"{len(prior_rounds)} earlier round(s) already attempted this theorem "
+            f"{total_prior_rounds} earlier round(s) already attempted this theorem{omitted_note} "
             "(see 'Earlier rounds' below, if present)."
         )
+        if dropped_rounds_summary:
+            round_info += (
+                "\n\nCompact per-node verdict trail for the earliest rounds not shown "
+                f"in full above:\n{dropped_rounds_summary}"
+            )
 
     return render(
         REFINEMENT_USER_TEMPLATE,

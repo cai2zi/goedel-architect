@@ -6,6 +6,7 @@ Proved lemma bodies are threaded as context into dependent nodes.
 from __future__ import annotations
 
 import asyncio
+import functools
 import time
 from dataclasses import dataclass, field
 from typing import Callable
@@ -91,6 +92,9 @@ async def prove_dag(
     repo_retrieval=None,
     tracer=None,
     node_timeout_s: float | None = 300.0,
+    cascade_model: str | None = None,
+    cascade_timeout_s: float | None = None,
+    escalation_max_tool_calls: int | None = 1,
 ) -> OrchestratorResult:
     """
     Prove all nodes in the blueprint DAG in parallel waves.
@@ -99,6 +103,24 @@ async def prove_dag(
     node_timeout_s: wall-clock bound per node (covers the whole multi-turn tool
         loop). A node that exceeds this comes back as INFRA_ERROR instead of
         blocking the rest of the wave indefinitely. None disables the bound.
+    cascade_model: if given, every node is first attempted with this (cheaper)
+        model; `model` is only used as an escalation when the cascade attempt
+        doesn't come back SOLVED. Many nodes are trivial one-liners a cheap
+        model can close on its own, so this skips the expensive model
+        entirely for those instead of paying its rate on every node
+        regardless of difficulty. None (default) disables cascading - every
+        node goes straight to `model`, unchanged from prior behavior.
+    escalation_max_tool_calls: caps the escalated (expensive) attempt's own
+        internal fix-and-retry budget (default 1: a single lean_compile call,
+        no follow-up correction round) - only applies when cascade_model is
+        set, since without cascading `model` IS the only attempt and keeps
+        its full default budget (see prover.MAX_TOOL_CALLS). The cheap
+        cascade attempt is unaffected and keeps the full budget too, so it
+        gets a real chance to fix its own syntax mistakes before escalating.
+    cascade_timeout_s: wall-clock bound for the cheap cascade attempt only,
+        independent of node_timeout_s, so a stuck cheap model can't burn the
+        budget meant for the escalation attempt. Defaults to node_timeout_s
+        if not given.
     """
     dag = _build_dag(blueprint)
     dag_node_names = set(dag.nodes)
@@ -172,6 +194,9 @@ async def prove_dag(
                 model=model,
                 tracer=tracer,
                 node_timeout_s=node_timeout_s,
+                cascade_model=cascade_model,
+                cascade_timeout_s=cascade_timeout_s,
+                escalation_max_tool_calls=escalation_max_tool_calls,
             )
             for name in wave
         ]
@@ -196,6 +221,9 @@ async def _prove_one(
     repo_retrieval=None,
     tracer=None,
     node_timeout_s: float | None = None,
+    cascade_model: str | None = None,
+    cascade_timeout_s: float | None = None,
+    escalation_max_tool_calls: int | None = None,
 ) -> NodeResult:
     node = blueprint.node_by_name(name)
     assert node is not None
@@ -221,55 +249,87 @@ async def _prove_one(
         if (dep_node := blueprint.node_by_name(dep)) is not None
     )
 
-    t0 = time.monotonic()
+    async def attempt(
+        use_model: str, timeout_s: float | None, max_tool_calls: int | None = None,
+    ) -> tuple[ProverResult, float]:
+        t0 = time.monotonic()
+        loop = asyncio.get_event_loop()
+        future = loop.run_in_executor(
+            None,
+            functools.partial(
+                prove_node,
+                node_name=name,
+                canonical_stmt=node.lean_declaration,
+                parent_proofs=parent_proofs,
+                parent_lemma_decls=parent_lemma_decls,
+                compiler=active_compiler,
+                retrieval=retrieval,
+                model=use_model,
+                node_statement_nl=node.statement,
+                node_proof_sketch_nl=node.proof_sketch,
+                repo_retrieval=repo_retrieval,
+                tracer=tracer,
+                max_tool_calls=max_tool_calls,
+            ),
+        )
+        try:
+            result = await asyncio.wait_for(future, timeout=timeout_s)
+        except asyncio.TimeoutError:
+            dt = time.monotonic() - t0
+            print(f"    [node {name}] TIMED OUT after {dt:.1f}s (bound={timeout_s}s, model={use_model}) "
+                  f"- the underlying call keeps running in its worker thread, "
+                  f"but this node is marked infra_error so the wave can proceed", flush=True)
+            # Note: run_in_executor uses a real OS thread, which asyncio.wait_for
+            # cannot forcibly kill - GoedelProver's own api_timeout_s (client-level
+            # request timeout) is what actually bounds the underlying OpenAI call.
+            # INFRA_ERROR (not PROOF_TOO_HARD): a timeout says nothing about
+            # whether the sub-goal is actually hard, so it must not be fed to
+            # Phase 3 refinement as if the model had genuinely tried and failed.
+            result = ProverResult(
+                signal=ProofSignal.INFRA_ERROR,
+                analysis=f"Node timed out after {timeout_s}s (orchestrator bound).",
+            )
+        except Exception as exc:
+            # An unhandled exception here (network blip, rate limit, etc.) would
+            # otherwise propagate through asyncio.gather and take down the whole
+            # wave - including sibling nodes that were succeeding - so it's
+            # caught per-node the same way a timeout is. INFRA_ERROR, not
+            # PROOF_TOO_HARD - see comment above.
+            dt = time.monotonic() - t0
+            print(f"    [node {name}] ERRORED after {dt:.1f}s (model={use_model}) -> {exc!r} "
+                  f"- marked infra_error so the wave can proceed", flush=True)
+            result = ProverResult(
+                signal=ProofSignal.INFRA_ERROR,
+                analysis=f"Node raised {type(exc).__name__}: {exc}",
+            )
+        return result, time.monotonic() - t0
+
     print(f"    [node {name}] started", flush=True)
 
-    loop = asyncio.get_event_loop()
-    future = loop.run_in_executor(
-        None,
-        prove_node,
-        name,
-        node.lean_declaration,
-        parent_proofs,
-        parent_lemma_decls,
-        active_compiler,
-        retrieval,
-        model,
-        node.statement,
-        node.proof_sketch,
-        repo_retrieval,
-        tracer,
+    escalating = False
+    if cascade_model:
+        print(f"    [node {name}] cascade attempt with {cascade_model} ...", flush=True)
+        # Cheap attempt keeps the full default tool-call budget (None here) -
+        # it needs a real chance to fix its own mistakes before we give up on
+        # it and pay for the expensive model.
+        result, dt = await attempt(
+            cascade_model,
+            cascade_timeout_s if cascade_timeout_s is not None else node_timeout_s,
+        )
+        if result.signal == ProofSignal.SOLVED:
+            print(f"    [node {name}] finished after {dt:.1f}s -> solved "
+                  f"(cascade model {cascade_model})", flush=True)
+            return NodeResult(node=node, result=result)
+        print(f"    [node {name}] cascade model {cascade_model} -> {result.signal.value} "
+              f"after {dt:.1f}s, escalating to {model} ...", flush=True)
+        escalating = True
+
+    # escalation_max_tool_calls only applies when this is a genuine escalation
+    # after a failed cascade attempt - a direct (non-cascaded) call to `model`
+    # keeps its full default budget, unchanged from prior behavior.
+    result, dt = await attempt(
+        model, node_timeout_s,
+        max_tool_calls=escalation_max_tool_calls if escalating else None,
     )
-    try:
-        result = await asyncio.wait_for(future, timeout=node_timeout_s)
-        dt = time.monotonic() - t0
-        print(f"    [node {name}] finished after {dt:.1f}s -> {result.signal.value}", flush=True)
-    except asyncio.TimeoutError:
-        dt = time.monotonic() - t0
-        print(f"    [node {name}] TIMED OUT after {dt:.1f}s (bound={node_timeout_s}s) "
-              f"- the underlying call keeps running in its worker thread, "
-              f"but this node is marked infra_error so the wave can proceed", flush=True)
-        # Note: run_in_executor uses a real OS thread, which asyncio.wait_for
-        # cannot forcibly kill - GoedelProver's own api_timeout_s (client-level
-        # request timeout) is what actually bounds the underlying OpenAI call.
-        # INFRA_ERROR (not PROOF_TOO_HARD): a timeout says nothing about
-        # whether the sub-goal is actually hard, so it must not be fed to
-        # Phase 3 refinement as if the model had genuinely tried and failed.
-        result = ProverResult(
-            signal=ProofSignal.INFRA_ERROR,
-            analysis=f"Node timed out after {node_timeout_s}s (orchestrator bound).",
-        )
-    except Exception as exc:
-        # An unhandled exception here (network blip, rate limit, etc.) would
-        # otherwise propagate through asyncio.gather and take down the whole
-        # wave - including sibling nodes that were succeeding - so it's
-        # caught per-node the same way a timeout is. INFRA_ERROR, not
-        # PROOF_TOO_HARD - see comment above.
-        dt = time.monotonic() - t0
-        print(f"    [node {name}] ERRORED after {dt:.1f}s -> {exc!r} "
-              f"- marked infra_error so the wave can proceed", flush=True)
-        result = ProverResult(
-            signal=ProofSignal.INFRA_ERROR,
-            analysis=f"Node raised {type(exc).__name__}: {exc}",
-        )
+    print(f"    [node {name}] finished after {dt:.1f}s -> {result.signal.value}", flush=True)
     return NodeResult(node=node, result=result)
