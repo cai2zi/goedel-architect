@@ -6,6 +6,7 @@ and validates the resulting @[blueprint]-annotated Lean file via LeanArchitect.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,9 +29,8 @@ BLUEPRINT_SYSTEM_PROMPT = load("blueprint_system")
 BLUEPRINT_USER_TEMPLATE = load("blueprint_user")
 
 # Appendix A specifies 262,144 (matches DeepSeek-V4-Flash's completion budget).
-# OpenAI's chat.completions API hard-caps max_completion_tokens at 128,000
-# regardless of model, and this is capped further to 64,000 to control cost.
-MAX_TOKENS = 64_000
+# Keep an environment override for cheaper local debugging.
+MAX_TOKENS = int(os.environ.get("GOEDEL_BLUEPRINT_MAX_TOKENS", "262144"))
 MAX_RETRIES = 8
 
 # `repo_context` is built from only the target file's own preceding content
