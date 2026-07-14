@@ -173,7 +173,7 @@ class LeanCompiler(AbstractLeanCompiler):
                 capture_output=True,
                 text=True,
                 cwd=self.project_root,
-                timeout=180,
+                timeout=300,
             )
             return self._parse_output(result.stdout + result.stderr, result.returncode)
         except subprocess.TimeoutExpired:
