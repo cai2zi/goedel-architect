@@ -46,7 +46,7 @@ class CompilerResult:
         )
 
 
-_DECL_RE = re.compile(r"\b(?:noncomputable\s+def|def|lemma|theorem|abbrev)\s+\w+.*", re.DOTALL)
+_DECL_START_RE = re.compile(r"\b(?:noncomputable\s+def|def|lemma|theorem|abbrev)\s+\w+", re.DOTALL)
 _SORRY_USING_RE = re.compile(r":=\s*by\s*sorry_using\s*\[[^\]]*\]", re.DOTALL)
 
 # Both prover_system.md and blueprint_system.md tell the model these are
@@ -62,14 +62,32 @@ def _assemble_node_attempt(node_decl: str, aux_lemmas: str, proof_body: str) -> 
     Strips the `@[blueprint ...]` attribute and swaps `:= by sorry_using [...]`
     for `:= ` + the prover's tactic proof.
     """
-    m = _DECL_RE.search(node_decl)
-    decl_text = m.group(0) if m else node_decl
+    decl_text = _extract_current_node_decl(node_decl)
     decl_text = _SORRY_USING_RE.sub(f":= {proof_body}", decl_text, count=1)
     parts = [MATHLIB_HEADER.rstrip("\n")]
     if aux_lemmas.strip():
         parts.append(aux_lemmas.strip())
     parts.append(decl_text)
     return "\n\n".join(parts) + "\n"
+
+
+def _extract_current_node_decl(node_decl: str) -> str:
+    """Extract only the declaration for the current blueprint node.
+
+    Blueprint parsing can leave trailing text from the root theorem or a doc
+    comment in `lean_declaration` when that trailing declaration is not itself
+    annotated with @[blueprint]. The prover only wants to compile the current
+    node, so stop at this node's `sorry_using [...]` proof body when present.
+    """
+    start = _DECL_START_RE.search(node_decl)
+    if not start:
+        return node_decl
+
+    tail = node_decl[start.start():]
+    sorry = _SORRY_USING_RE.search(tail)
+    if not sorry:
+        return tail
+    return tail[:sorry.end()]
 
 
 class AbstractLeanCompiler(ABC):
