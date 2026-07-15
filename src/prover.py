@@ -14,6 +14,7 @@ Returns one of four structured signals per the paper:
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -38,6 +39,21 @@ def _chat_reasoning_kwargs(model: str) -> dict:
     if model.startswith("gpt-5") or model.startswith("o1") or model.startswith("o3") or model.startswith("o4"):
         return {"reasoning_effort": "low"}
     return {}
+
+
+def _tool_choice_kwargs(choice: str | dict) -> dict:
+    """Return chat.completions tool_choice kwargs.
+
+    Some OpenAI-compatible endpoints reject object/required tool_choice while a
+    model is in thinking mode. Set GOEDEL_TOOL_CHOICE_MODE=auto to keep tools
+    enabled while letting the model choose when to call them.
+    """
+    mode = os.environ.get("GOEDEL_TOOL_CHOICE_MODE", "").strip().lower()
+    if mode == "auto" and choice != "none":
+        return {"tool_choice": "auto"}
+    if mode == "omit":
+        return {}
+    return {"tool_choice": choice}
 
 try:
     from repo_retrieval import RepoRetrieval
@@ -319,8 +335,8 @@ class GoedelProver:
             model=self.model_id,
             messages=messages,
             tools=TOOLS,
-            tool_choice={"type": "function", "function": {"name": "lean_compile"}},
             max_completion_tokens=MAX_TOKENS,
+            **_tool_choice_kwargs({"type": "function", "function": {"name": "lean_compile"}}),
         )
         self._emit_usage(node_name, response)
 
@@ -362,8 +378,8 @@ class GoedelProver:
                 model=self.model_id,
                 messages=messages,
                 tools=TOOLS,
-                tool_choice=next_choice,
                 max_completion_tokens=MAX_TOKENS,
+                **_tool_choice_kwargs(next_choice),
             )
             self._emit_usage(node_name, response)
 
@@ -548,8 +564,8 @@ class GoedelProver:
             model=self.model_id,
             messages=messages,
             tools=TOOLS,
-            tool_choice={"type": "function", "function": {"name": "lean_compile"}},
             max_completion_tokens=max_tokens,
+            **_tool_choice_kwargs({"type": "function", "function": {"name": "lean_compile"}}),
         )
         self._emit_usage(node_name, response)
 

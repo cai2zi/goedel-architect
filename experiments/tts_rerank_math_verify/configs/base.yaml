@@ -8,6 +8,6 @@ environment:
   OPENAI_BASE_URL: https://poloai.top/v1
   GOEDEL_OPENAI_BASE_URL: https://poloai.top/v1
   GOEDEL_BLUEPRINT_MAX_TOKENS: "262144"
+  GOEDEL_TOOL_CHOICE_MODE: auto
   http_proxy: http://127.0.0.1:7897
   https_proxy: http://127.0.0.1:7897
-

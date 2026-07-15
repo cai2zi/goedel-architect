@@ -10,6 +10,7 @@ Example:
 export OPENAI_BASE_URL=https://poloai.top/v1
 export GOEDEL_OPENAI_BASE_URL=https://poloai.top/v1
 export GOEDEL_BLUEPRINT_MAX_TOKENS=262144
+export GOEDEL_TOOL_CHOICE_MODE=auto
 export http_proxy=http://127.0.0.1:7897
 export https_proxy=http://127.0.0.1:7897
 
@@ -34,4 +35,3 @@ Main outputs:
 - `metrics.json`
 - `metrics.csv`
 - per-rollout checkpoints, traces, and generated blueprints
-
