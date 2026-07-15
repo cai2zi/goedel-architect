@@ -1,0 +1,11 @@
+model: deepseek-v4-flash
+split: test
+data_dir: data/minif2f
+output_root: ../../czx_work/goedel-architect/miniF2F_onepass/deepseek_v4_flash
+node_timeout_s: 300
+environment:
+  OPENAI_BASE_URL: https://poloai.top/v1
+  GOEDEL_OPENAI_BASE_URL: https://poloai.top/v1
+  GOEDEL_BLUEPRINT_MAX_TOKENS: "262144"
+  http_proxy: http://127.0.0.1:7897
+  https_proxy: http://127.0.0.1:7897
