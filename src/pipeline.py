@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from blueprint import Blueprint, generate_blueprint
+from blueprint import Blueprint, generate_blueprint, proof_body_to_decl_suffix
 from checkpoint import CheckpointState
 from lean_compiler import AbstractLeanCompiler, LeanCompiler
 from mathlib_retrieval import MathlibRetrieval
@@ -78,7 +78,7 @@ def _invalidate_stale_proofs(
 
 def _aux_lemma_decls(blueprint: Blueprint, proved_cache: dict[str, str], root_name: str) -> str:
     return "\n\n".join(
-        f"{node.signature()} {proved_cache[node.name]}"
+        f"{node.signature()} {proof_body_to_decl_suffix(proved_cache[node.name])}"
         for node in blueprint.dependency_order()
         if node.name != root_name and node.name in proved_cache
     )
@@ -549,7 +549,7 @@ def _substitute_proof(lean: str, name: str, proof_body: str) -> str:
     pattern = rf"(theorem|lemma)\s+{re.escape(name)}(.*?):=\s*by\s*sorry_using\s*\[.*?\]"
     return re.sub(
         pattern,
-        lambda m: f"{m.group(1)} {name}{m.group(2)}:= {proof_body}",
+        lambda m: f"{m.group(1)} {name}{m.group(2)}{proof_body_to_decl_suffix(proof_body)}",
         lean,
         flags=re.DOTALL,
     )

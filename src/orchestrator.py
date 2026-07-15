@@ -13,7 +13,7 @@ from typing import Callable
 
 import networkx as nx
 
-from blueprint import Blueprint, BlueprintNode
+from blueprint import Blueprint, BlueprintNode, proof_body_to_decl_suffix
 from lean_compiler import AbstractLeanCompiler
 from mathlib_retrieval import MathlibRetrieval
 from prover import ProofSignal, ProverResult, prove_node
@@ -244,7 +244,7 @@ async def _prove_one(
     # style references to already-solved siblings actually resolve instead of
     # hitting "unknown identifier".
     parent_lemma_decls = "\n\n".join(
-        f"{dep_node.signature()} {body}"
+        f"{dep_node.signature()} {proof_body_to_decl_suffix(body)}"
         for dep, body in parent_proofs.items()
         if (dep_node := blueprint.node_by_name(dep)) is not None
     )

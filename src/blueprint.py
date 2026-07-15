@@ -211,6 +211,20 @@ def lemma_to_theorem(text: str) -> str:
     return _LEMMA_KW_RE.sub(r"\1theorem", text)
 
 
+def proof_body_to_decl_suffix(body: str) -> str:
+    """Return a declaration suffix from a cached proof body.
+
+    Internally prover results are stored as proof bodies such as `by ...`, but
+    older checkpoints and some model outputs may include the declaration
+    assignment prefix `:=`. This helper makes both forms safe to append after
+    `BlueprintNode.signature()`.
+    """
+    stripped = body.strip()
+    if stripped.startswith(":="):
+        return stripped
+    return f":= {stripped}"
+
+
 @dataclass
 class BlueprintNode:
     name: str
