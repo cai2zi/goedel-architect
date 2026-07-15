@@ -495,7 +495,7 @@ class GoedelProver:
             ))
 
             if fn == "lean_compile":
-                proof_body = args.get("proof_body", "")
+                proof_body = _normalize_node_proof_body(args.get("proof_body", ""))
                 aux = args.get("aux_lemmas", "")
                 # Splice in already-proved sibling lemmas as real declarations
                 # (see BlueprintNode.signature) so the model can reference them
@@ -623,6 +623,21 @@ def _extract_proof_body(text: str) -> str:
     import re
     m = re.search(r"<lean4_proof>(.*?)</lean4_proof>", text, re.DOTALL)
     return m.group(1).strip() if m else ""
+
+
+def _normalize_node_proof_body(proof_body: str) -> str:
+    """Normalize tool proof_body for node_decl substitution.
+
+    LeanCompiler.check(..., node_decl=...) substitutes the proof into
+    `:= by sorry_using [...]` as `:= {proof_body}`, so the proof body must be
+    `by ...`, not `:= by ...`.
+    """
+    body = proof_body.strip()
+    if body.startswith(":= by"):
+        return "by" + body[len(":= by"):]
+    if body.startswith(":="):
+        return body[len(":="):].lstrip()
+    return body
 
 
 def _classify_failure(analysis: str) -> ProofSignal:
