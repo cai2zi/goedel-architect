@@ -13,7 +13,7 @@ PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
 def load(name: str) -> str:
     """Read a prompt file by stem name (e.g. 'blueprint_system')."""
-    return (PROMPTS_DIR / f"{name}.md").read_text()
+    return (PROMPTS_DIR / f"{name}.md").read_text(encoding="utf-8")
 
 
 def render(template: str, **kwargs) -> str:

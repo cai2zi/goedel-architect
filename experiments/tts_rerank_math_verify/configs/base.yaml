@@ -1,0 +1,13 @@
+model: deepseek-v4-flash
+bench_path: ../../czx_work/bench.json
+output_root: ../../czx_work/goedel-architect/tts_rerank_math_verify/deepseek_v4_flash
+phase0_max_attempts: 3
+node_timeout_s: 300
+exclude_empty_extracted_answer: true
+environment:
+  OPENAI_BASE_URL: https://poloai.top/v1
+  GOEDEL_OPENAI_BASE_URL: https://poloai.top/v1
+  GOEDEL_BLUEPRINT_MAX_TOKENS: "262144"
+  http_proxy: http://127.0.0.1:7897
+  https_proxy: http://127.0.0.1:7897
+
