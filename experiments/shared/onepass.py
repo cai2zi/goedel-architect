@@ -47,7 +47,8 @@ def _checkpoint_score(checkpoint_path: Path) -> dict[str, Any] | None:
     if not checkpoint_path.exists():
         return None
     state = CheckpointState.load(checkpoint_path)
-    if state.blueprint is None:
+    blueprint = state.get_blueprint()
+    if blueprint is None:
         return None
     proved = {
         name
@@ -62,7 +63,7 @@ def _checkpoint_score(checkpoint_path: Path) -> dict[str, Any] | None:
     result = Result()
     result.proved = proved
     result.failed = failed
-    return _blueprint_score(state.blueprint, result)
+    return _blueprint_score(blueprint, result)
 
 
 def run_onepass_record(
