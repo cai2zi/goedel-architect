@@ -198,17 +198,37 @@ def _call_with_repo_search(
 # eval/vsb_lean_compiler.py's `_node_signature()`/`_build_blueprint_file()` -
 # consolidated here as the single canonical version so a fix in one place
 # can't silently leave a copy elsewhere unfixed.
-_BLUEPRINT_ATTR_RE = re.compile(r"@\[blueprint\b[^\]]*\]", re.DOTALL)
+_BLUEPRINT_DECL_KW = r"(?:noncomputable\s+def|def|lemma|theorem|abbrev)"
+_BLUEPRINT_ATTR_RE = re.compile(
+    rf"@\[blueprint\s*.*?\]\s*(?={_BLUEPRINT_DECL_KW}\s+\w+)",
+    re.DOTALL,
+)
+_BLUEPRINT_PROOF_RE = re.compile(
+    r":=\s*by\s+sorry_using\s*\[[^\]]*\]",
+    re.DOTALL,
+)
 _LEMMA_KW_RE = re.compile(r"(?m)^(\s*)lemma\b")
 
 
-def strip_blueprint_attr(text: str) -> str:
+def strip_blueprint_attr(text: str) -> str:  # 删除所有 blueprint 属性
     return _BLUEPRINT_ATTR_RE.sub("", text)
 
 
 def lemma_to_theorem(text: str) -> str:
     """`lemma` needs Mathlib/Batteries; `theorem` works in every environment."""
     return _LEMMA_KW_RE.sub(r"\1theorem", text)
+
+
+def extract_blueprint_signature(text: str) -> str:
+    """Return a node's declaration without its blueprint attribute or proof."""
+    text = lemma_to_theorem(strip_blueprint_attr(text))
+    proof_match = _BLUEPRINT_PROOF_RE.search(text)
+    if proof_match:
+        return text[:proof_match.start()].strip()
+
+    # Compatibility for old checkpoints or non-standard declarations that do
+    # not use the blueprint `:= by sorry_using [...]` proof placeholder.
+    return text.split(":=", 1)[0].strip()
 
 
 def proof_body_to_decl_suffix(body: str) -> str:
@@ -234,7 +254,7 @@ class BlueprintNode:
     dependencies: list[str] = field(default_factory=list)
     lean_declaration: str = ""
 
-    def signature(self) -> str:
+    def signature(self) -> str:  # 针对单个 node，提取为类似 theorem l1 (n : ℕ) : n + 0 = n
         """Strip the @[blueprint ...] attribute and sorry_using proof body,
         returning just the declaration up to (not including) ':='.
 
@@ -244,8 +264,7 @@ class BlueprintNode:
         are otherwise only ever shown to the model as prompt text, never
         actually compiled into scope.
         """
-        text = lemma_to_theorem(strip_blueprint_attr(self.lean_declaration))
-        return text.split(":=", 1)[0].strip()
+        return extract_blueprint_signature(self.lean_declaration)
 
     def cache_key(self) -> str:
         """Signature plus dependency set: a cached proof is only valid for
@@ -454,12 +473,13 @@ def _parse_blueprint(lean_code: str, target_theorem: str) -> Blueprint:
     nodes: list[BlueprintNode] = []
     # Match @[blueprint ...] blocks followed by a declaration
     pattern = re.compile(
-        r'@\[blueprint\s*(.*?)\]\s*\n\s*(def|lemma|theorem|noncomputable def|abbrev)\s+(\w+)(.*?)(?=@\[blueprint|\Z)',
+        rf"@\[blueprint\s*(.*?)\]\s*\n\s*({_BLUEPRINT_DECL_KW})\s+"
+        rf"(\w+)(.*?)(?=@\[blueprint|\Z)",
         re.DOTALL,
     )
     for m in pattern.finditer(lean_code):
         attrs_block = m.group(1)
-        kind_kw = m.group(2).strip()
+        kind_kw = " ".join(m.group(2).split())
         name = m.group(3)
         rest = m.group(4)
 

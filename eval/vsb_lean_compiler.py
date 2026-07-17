@@ -19,7 +19,7 @@ sys.path.insert(0, str(VSB_ROOT))
 
 from core.lean_interface import LeanREPL
 from lean_compiler import AbstractLeanCompiler, CompilerResult
-from blueprint import strip_blueprint_attr, lemma_to_theorem
+from blueprint import extract_blueprint_signature, lemma_to_theorem, strip_blueprint_attr
 
 BLUEPRINT_COMPILE_TIMEOUT = 120  # seconds
 
@@ -43,8 +43,7 @@ def _node_signature(node_decl: str) -> str:
     unfixed: strip the `@[blueprint ...]` attribute, normalize `lemma` to
     `theorem` (not every repo has Mathlib/Batteries), and cut off at the
     `:=` that starts the `sorry_using [...]` body."""
-    text = lemma_to_theorem(strip_blueprint_attr(node_decl))
-    return text.split(":=", 1)[0].strip()
+    return extract_blueprint_signature(node_decl)
 
 
 class VSBLeanCompiler(AbstractLeanCompiler):
@@ -298,7 +297,8 @@ def _build_blueprint_file(lean_code: str, local_ctx: str, rel_path: str = "", ta
 # ---------------------------------------------------------------------------
 
 _NODE_RE = re.compile(
-    r"@\[blueprint[^\]]*\]\s*\n\s*(?:noncomputable\s+)?(?:def|lemma|theorem|abbrev)\s+(\w+)",
+    r"@\[blueprint\s*.*?\]\s*\n\s*"
+    r"(?:noncomputable\s+def|def|lemma|theorem|abbrev)\s+(\w+)",
     re.DOTALL,
 )
 _SORRY_USING_RE = re.compile(r"sorry_using\s*\[([^\]]*)\]")
