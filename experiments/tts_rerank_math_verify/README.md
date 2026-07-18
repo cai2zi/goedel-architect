@@ -46,6 +46,13 @@ runtime flags are:
 result row record the non-secret runtime settings. Resume refuses missing or
 mismatched runtime metadata.
 
+With `--resume`, solved rollout scores and terminal Phase 0 failures are
+skipped. An unfinished rollout reuses its successful Phase 0 row. If its
+checkpoint contains a non-empty, fully validated blueprint, Phase 1 is skipped
+and Phase 2 continues with nodes not already in `proved_cache`; otherwise the
+blueprint is generated again. Checkpoints for a different theorem statement
+are rejected.
+
 Outputs are written by default to:
 
 ```text

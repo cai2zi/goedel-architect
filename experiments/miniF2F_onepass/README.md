@@ -50,6 +50,13 @@ The output root contains `lean_runtime.json`, and every result row records the
 same non-secret runtime metadata. `--resume` refuses old output without this
 file or output produced with different Lean runtime settings.
 
+With `--resume`, a record whose root theorem is already proved is skipped. For
+an unfinished record, a non-empty checkpoint blueprint is reused only when its
+`blueprint_fully_validated` flag is true; Phase 1 is skipped and Phase 2 retries
+the nodes not present in `proved_cache`. Missing or unvalidated blueprints are
+generated again. A checkpoint whose theorem statement differs from the input
+is rejected instead of being mixed into the run.
+
 ## Linux acceptance
 
 The user starts and stops the service manually:

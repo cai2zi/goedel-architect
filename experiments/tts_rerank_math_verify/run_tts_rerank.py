@@ -120,6 +120,16 @@ def _rollout_record_id(parent_id: str, rollout_id: int) -> str:
     return f"{parent_id}__rollout_{rollout_id}"
 
 
+def _is_terminal_score(row: dict[str, Any] | None) -> bool:
+    if not row:
+        return False
+    if row.get("root_proved"):
+        return True
+    # Phase 0 failures have no blueprint to resume. Retrying formalization is
+    # a separate policy from Phase 1/2 checkpoint resume.
+    return not bool(row.get("phase0_success", True))
+
+
 def _phase0_score_row(phase0_row: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": phase0_row["id"],
@@ -319,8 +329,8 @@ def _run_experiment(args: argparse.Namespace, output_root: Path, runtime: LeanRu
             if args.rollout_id is not None and rollout_id != args.rollout_id:
                 continue
             record_id = _rollout_record_id(parent_id, rollout_id)
-            if args.resume and record_id in score_by_id:
-                print(f"[resume] skip completed score {record_id}")
+            if args.resume and _is_terminal_score(score_by_id.get(record_id)):
+                print(f"[resume] skip terminal score {record_id}")
                 continue
 
             phase0_row = phase0_by_id.get(record_id)

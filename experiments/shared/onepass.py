@@ -10,7 +10,7 @@ from checkpoint import CheckpointState
 from lean_compiler import AbstractLeanCompiler, LeanCompiler
 from mathlib_retrieval import MathlibRetrieval
 from pipeline import run_phase1, run_phase2
-from tracer import JsonlTracer
+from tracer import JsonlTracer, TraceEvent
 
 
 def _blueprint_score(blueprint: Blueprint | None, orch_result: Any | None) -> dict[str, Any]:
@@ -51,12 +51,9 @@ def _checkpoint_score(checkpoint_path: Path) -> dict[str, Any] | None:
     blueprint = state.get_blueprint()
     if blueprint is None:
         return None
-    proved = {
-        name
-        for name, result in state.node_results.items()
-        if getattr(result, "success", False)
-    }
-    failed = set(state.node_results) - proved
+    node_names = set(blueprint.nodes_by_name())
+    proved = set(state.proved_cache) & node_names
+    failed = node_names - proved
 
     class Result:
         pass
@@ -65,6 +62,29 @@ def _checkpoint_score(checkpoint_path: Path) -> dict[str, Any] | None:
     result.proved = proved
     result.failed = failed
     return _blueprint_score(blueprint, result)
+
+
+def _load_resumable_blueprint(
+    checkpoint_path: Path,
+    theorem_stmt: str,
+) -> tuple[CheckpointState | None, Blueprint | None]:
+    """Load a checkpoint blueprint only when it is safe to skip Phase 1."""
+    state = CheckpointState.load_or_none(checkpoint_path)
+    if state is None:
+        return None, None
+    if state.theorem_stmt.strip() != theorem_stmt.strip():
+        raise RuntimeError(
+            f"Cannot resume {checkpoint_path}: checkpoint theorem statement does not match the input."
+        )
+
+    blueprint = state.get_blueprint()
+    if (
+        blueprint is None
+        or not blueprint.nodes
+        or not state.blueprint_fully_validated
+    ):
+        return state, None
+    return state, blueprint
 
 
 def run_onepass_record(
@@ -90,12 +110,27 @@ def run_onepass_record(
             except FileNotFoundError:
                 pass
 
+    resume_state: CheckpointState | None = None
+    blueprint: Blueprint | None = None
+    blueprint_reused = False
     if resume:
-        cached_score = _checkpoint_score(checkpoint_path)
-        if cached_score is not None:
+        resume_state, blueprint = _load_resumable_blueprint(checkpoint_path, theorem_stmt)
+        blueprint_reused = blueprint is not None
+        cached_score = _checkpoint_score(checkpoint_path) if blueprint_reused else None
+        if (
+            resume_state is not None
+            and resume_state.done
+            and resume_state.success
+            and cached_score is not None
+            and cached_score["root_proved"]
+        ):
+            blueprint_path.parent.mkdir(parents=True, exist_ok=True)
+            blueprint_path.write_text(blueprint.lean_file, encoding="utf-8")
             return {
                 "id": record_id,
                 "blueprint_success": cached_score["total_nodes"] > 0,
+                "blueprint_reused": True,
+                "phase1_skipped": True,
                 "error": "",
                 "checkpoint_path": str(checkpoint_path),
                 "trace_path": str(trace_path),
@@ -109,17 +144,28 @@ def run_onepass_record(
 
     tracer = JsonlTracer(trace_path)
     active_compiler = compiler or LeanCompiler()
-    blueprint: Blueprint | None = None
     try:
-        blueprint = run_phase1(
-            theorem_stmt=theorem_stmt,
-            nl_proof=nl_proof or "",
-            model=model,
-            compiler=active_compiler,
-            checkpoint_path=checkpoint_path,
-            tracer=tracer,
-            thm_name=record_id,
-        )
+        if blueprint_reused:
+            assert blueprint is not None
+            tracer.emit(TraceEvent(
+                kind="resume",
+                thm_name=record_id,
+                args={
+                    "blueprint_reused": True,
+                    "proved_cache_count": len(resume_state.proved_cache) if resume_state else 0,
+                },
+                ok=True,
+            ))
+        else:
+            blueprint = run_phase1(
+                theorem_stmt=theorem_stmt,
+                nl_proof=nl_proof or "",
+                model=model,
+                compiler=active_compiler,
+                checkpoint_path=checkpoint_path,
+                tracer=tracer,
+                thm_name=record_id,
+            )
         blueprint_path.write_text(blueprint.lean_file, encoding="utf-8")
 
         if not blueprint.nodes:
@@ -127,6 +173,8 @@ def run_onepass_record(
             return {
                 "id": record_id,
                 "blueprint_success": False,
+                "blueprint_reused": blueprint_reused,
+                "phase1_skipped": blueprint_reused,
                 "error": "phase1 generated zero blueprint nodes",
                 "checkpoint_path": str(checkpoint_path),
                 "trace_path": str(trace_path),
@@ -147,6 +195,8 @@ def run_onepass_record(
         return {
             "id": record_id,
             "blueprint_success": True,
+            "blueprint_reused": blueprint_reused,
+            "phase1_skipped": blueprint_reused,
             "error": "",
             "checkpoint_path": str(checkpoint_path),
             "trace_path": str(trace_path),
@@ -154,10 +204,17 @@ def run_onepass_record(
             **score,
         }
     except Exception as exc:
-        score = _blueprint_score(blueprint, None)
+        cached_score = _checkpoint_score(checkpoint_path) if blueprint_reused else None
+        score = cached_score or _blueprint_score(blueprint, None)
         return {
             "id": record_id,
-            "blueprint_success": False,
+            "blueprint_success": bool(
+                blueprint is not None
+                and blueprint.nodes
+                and blueprint.fully_validated
+            ),
+            "blueprint_reused": blueprint_reused,
+            "phase1_skipped": blueprint_reused,
             "error": str(exc),
             "traceback": traceback.format_exc(),
             "checkpoint_path": str(checkpoint_path),

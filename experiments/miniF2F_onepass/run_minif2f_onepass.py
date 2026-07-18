@@ -72,6 +72,10 @@ def _select_rows(rows: list[dict[str, Any]], args: argparse.Namespace) -> list[t
     return selected
 
 
+def _is_completed_result(row: dict[str, Any] | None) -> bool:
+    return bool(row and row.get("root_proved"))
+
+
 def _run_experiment(args: argparse.Namespace, output_root: Path, runtime: LeanRuntime) -> None:
     data_path = args.data_dir / f"{args.split}.jsonl"
     rows = read_jsonl(data_path)
@@ -89,7 +93,7 @@ def _run_experiment(args: argparse.Namespace, output_root: Path, runtime: LeanRu
     for idx, row in selected:
         source_id = _problem_id(row, idx)
         record_id = safe_stem(source_id, prefix="miniF2F_")
-        if args.resume and record_id in done:
+        if args.resume and _is_completed_result(done.get(record_id)):
             print(f"[resume] skip completed {record_id}")
             continue
 

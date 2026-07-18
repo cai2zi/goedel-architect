@@ -16,7 +16,10 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "experiments"))
 
 from kimina_lean_compiler import KiminaLeanCompiler  # noqa: E402
+from blueprint import _parse_blueprint  # noqa: E402
+from checkpoint import CheckpointState  # noqa: E402
 from lean_compiler import CompilerResult, LeanCompiler  # noqa: E402
+from miniF2F_onepass.run_minif2f_onepass import _is_completed_result  # noqa: E402
 from shared.lean_runtime import (  # noqa: E402
     add_lean_runtime_args,
     make_lean_runtime,
@@ -24,13 +27,46 @@ from shared.lean_runtime import (  # noqa: E402
 )
 from shared.onepass import run_onepass_record  # noqa: E402
 from shared.phase0 import Phase0Result, _check_theorem  # noqa: E402
-from tts_rerank_math_verify.run_tts_rerank import _make_phase0_row  # noqa: E402
+from tts_rerank_math_verify.run_tts_rerank import (  # noqa: E402
+    _is_terminal_score,
+    _make_phase0_row,
+)
 
 
 def _parse_runtime_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     add_lean_runtime_args(parser)
     return parser.parse_args(argv)
+
+
+THEOREM_STMT = "theorem root : True := by"
+BLUEPRINT_LEAN = """import Mathlib
+import Architect
+
+@[blueprint
+  (statement := /-- The root theorem. -/)
+  (proof := /-- Trivial. -/)]
+theorem root : True := by
+  sorry_using []
+"""
+
+
+def _write_blueprint_checkpoint(
+    output_root: Path,
+    *,
+    validated: bool,
+    solved: bool = False,
+    theorem_stmt: str = THEOREM_STMT,
+) -> None:
+    blueprint = _parse_blueprint(BLUEPRINT_LEAN, "root")
+    blueprint.fully_validated = validated
+    state = CheckpointState(theorem_stmt=theorem_stmt, model="fake")
+    state.set_blueprint(blueprint)
+    if solved:
+        state.proved_cache = {"root": "by trivial"}
+        state.done = True
+        state.success = True
+    state.save(output_root / "checkpoints" / "test.json")
 
 
 class ExperimentLeanRuntimeTest(unittest.TestCase):
@@ -149,6 +185,104 @@ class ExperimentLeanRuntimeTest(unittest.TestCase):
         self.assertEqual(error, "")
         self.assertEqual(len(compiler.codes), 1)
         self.assertIn("theorem injected", compiler.codes[0])
+
+    def test_resume_reuses_validated_blueprint_and_continues_phase2(self) -> None:
+        orch_result = SimpleNamespace(proved={"root"}, failed=set())
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp)
+            _write_blueprint_checkpoint(output_root, validated=True)
+            with patch("shared.onepass.run_phase1") as phase1:
+                with patch("shared.onepass.run_phase2", return_value=orch_result) as phase2:
+                    result = run_onepass_record(
+                        record_id="test",
+                        theorem_stmt=THEOREM_STMT,
+                        nl_proof="trivial",
+                        model="fake",
+                        output_root=output_root,
+                        resume=True,
+                        compiler=LeanCompiler(),
+                        compiler_factory=None,
+                    )
+
+            self.assertTrue((output_root / "blueprints" / "test.lean").exists())
+            trace = (output_root / "traces" / "test.jsonl").read_text(encoding="utf-8")
+
+        phase1.assert_not_called()
+        phase2.assert_called_once()
+        self.assertTrue(result["blueprint_reused"])
+        self.assertTrue(result["phase1_skipped"])
+        self.assertTrue(result["root_proved"])
+        self.assertIn('"kind": "resume"', trace)
+
+    def test_resume_regenerates_unvalidated_blueprint(self) -> None:
+        blueprint = _parse_blueprint(BLUEPRINT_LEAN, "root")
+        blueprint.fully_validated = True
+        orch_result = SimpleNamespace(proved={"root"}, failed=set())
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp)
+            _write_blueprint_checkpoint(output_root, validated=False)
+            with patch("shared.onepass.run_phase1", return_value=blueprint) as phase1:
+                with patch("shared.onepass.run_phase2", return_value=orch_result) as phase2:
+                    result = run_onepass_record(
+                        record_id="test",
+                        theorem_stmt=THEOREM_STMT,
+                        nl_proof="trivial",
+                        model="fake",
+                        output_root=output_root,
+                        resume=True,
+                        compiler=LeanCompiler(),
+                        compiler_factory=None,
+                    )
+
+        phase1.assert_called_once()
+        phase2.assert_called_once()
+        self.assertFalse(result["blueprint_reused"])
+        self.assertFalse(result["phase1_skipped"])
+
+    def test_resume_skips_fully_solved_checkpoint_and_scores_proved_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp)
+            _write_blueprint_checkpoint(output_root, validated=True, solved=True)
+            with patch("shared.onepass.run_phase1") as phase1:
+                with patch("shared.onepass.run_phase2") as phase2:
+                    result = run_onepass_record(
+                        record_id="test",
+                        theorem_stmt=THEOREM_STMT,
+                        nl_proof="trivial",
+                        model="fake",
+                        output_root=output_root,
+                        resume=True,
+                    )
+
+        phase1.assert_not_called()
+        phase2.assert_not_called()
+        self.assertTrue(result["root_proved"])
+        self.assertEqual(result["proved_nodes"], ["root"])
+
+    def test_resume_rejects_checkpoint_for_different_theorem(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp)
+            _write_blueprint_checkpoint(
+                output_root,
+                validated=True,
+                theorem_stmt="theorem another : True := by",
+            )
+            with self.assertRaisesRegex(RuntimeError, "does not match"):
+                run_onepass_record(
+                    record_id="test",
+                    theorem_stmt=THEOREM_STMT,
+                    nl_proof="trivial",
+                    model="fake",
+                    output_root=output_root,
+                    resume=True,
+                )
+
+    def test_runner_resume_only_skips_terminal_rows(self) -> None:
+        self.assertTrue(_is_completed_result({"root_proved": True}))
+        self.assertFalse(_is_completed_result({"root_proved": False}))
+        self.assertFalse(_is_terminal_score({"phase0_success": True, "root_proved": False}))
+        self.assertTrue(_is_terminal_score({"phase0_success": True, "root_proved": True}))
+        self.assertTrue(_is_terminal_score({"phase0_success": False, "root_proved": False}))
 
 
 if __name__ == "__main__":
