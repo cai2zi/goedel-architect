@@ -14,6 +14,7 @@ from blueprint import (  # noqa: E402
     extract_blueprint_signature,
     strip_blueprint_attr,
 )
+from lean_compiler import _assemble_node_attempt, _extract_current_node_decl  # noqa: E402
 
 
 ZMOD_NODE = """@[blueprint
@@ -80,6 +81,22 @@ theorem root : helper = 1 := by
 def config : Nat × Nat := { fst := 1, snd := 2 }
 """
         self.assertEqual(extract_blueprint_signature(declaration), "def config : Nat × Nat")
+
+    def test_node_decl_ignores_declaration_words_inside_blueprint_comments(self) -> None:
+        declaration = """@[blueprint
+  (statement := /-- The target theorem. -/)
+  (proof := /-- The hypotheses are part of the original theorem statement. -/)]
+theorem mathd_algebra_478 : True := by
+  sorry_using []
+"""
+        expected = "theorem mathd_algebra_478 : True := by\n  sorry_using []"
+
+        self.assertEqual(_extract_current_node_decl(declaration), expected)
+
+        assembled = _assemble_node_attempt(declaration, "", "by trivial")
+        self.assertNotIn("@[blueprint", assembled)
+        self.assertNotIn("theorem statement", assembled)
+        self.assertIn("theorem mathd_algebra_478 : True := by trivial", assembled)
 
 
 if __name__ == "__main__":

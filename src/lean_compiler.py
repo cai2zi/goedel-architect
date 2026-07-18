@@ -10,6 +10,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from blueprint_text import BLUEPRINT_PROOF_RE, extract_current_node_decl
+
 # goedel_lean project root — where lakefile.toml lives (depends on the real
 # LeanArchitect package, see goedel_lean/lakefile.toml)
 LEAN_PROJECT_ROOT = Path(__file__).parent.parent / "goedel_lean"
@@ -46,8 +48,7 @@ class CompilerResult:
         )
 
 
-_DECL_START_RE = re.compile(r"\b(?:noncomputable\s+def|def|lemma|theorem|abbrev)\s+\w+", re.DOTALL)
-_SORRY_USING_RE = re.compile(r":=\s*by\s*sorry_using\s*\[[^\]]*\]", re.DOTALL)
+_SORRY_USING_RE = BLUEPRINT_PROOF_RE
 
 # Both prover_system.md and blueprint_system.md tell the model these are
 # forbidden — `axiom` lets it assert its own goal as true with zero proof,
@@ -79,15 +80,7 @@ def _extract_current_node_decl(node_decl: str) -> str:
     annotated with @[blueprint]. The prover only wants to compile the current
     node, so stop at this node's `sorry_using [...]` proof body when present.
     """
-    start = _DECL_START_RE.search(node_decl)
-    if not start:
-        return node_decl
-
-    tail = node_decl[start.start():]
-    sorry = _SORRY_USING_RE.search(tail)
-    if not sorry:
-        return tail
-    return tail[:sorry.end()]
+    return extract_current_node_decl(node_decl)
 
 
 class AbstractLeanCompiler(ABC):

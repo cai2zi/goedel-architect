@@ -88,12 +88,11 @@ def _lean_check_code(theorem_stmt: str) -> str:
     return "import Mathlib\nimport Aesop\n\n" + stmt + "\n  sorry\n"
 
 
-def _check_theorem(theorem_stmt: str) -> tuple[bool, str]:
-    compiler = LeanCompiler()
+def _check_theorem(theorem_stmt: str, compiler: LeanCompiler) -> tuple[bool, str]:
     result = compiler._run_lean(_lean_check_code(theorem_stmt))
-    if result.get("success"):
+    if result.success:
         return True, ""
-    return False, str(result.get("errors") or result.get("stderr") or result)
+    return False, str(result.errors or result.raw_output or result)
 
 
 def formalize_candidate(
@@ -104,11 +103,13 @@ def formalize_candidate(
     theorem_name: str,
     model: str,
     max_attempts: int = 3,
+    compiler: LeanCompiler | None = None,
 ) -> Phase0Result:
     if not candidate_answer:
         return Phase0Result("", False, "empty canonical_extracted_answer", 0)
 
     client = make_client()
+    active_compiler = compiler or LeanCompiler()
     max_tokens = int(os.environ.get("GOEDEL_PHASE0_MAX_TOKENS", "4096"))
     messages: list[dict[str, str]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -133,7 +134,7 @@ def formalize_candidate(
         content = response.choices[0].message.content or ""
         theorem_stmt = normalize_theorem_statement(content, theorem_name)
         last_stmt = theorem_stmt
-        ok, error = _check_theorem(theorem_stmt)
+        ok, error = _check_theorem(theorem_stmt, active_compiler)
         if ok:
             return Phase0Result(theorem_stmt, True, "", attempt)
         last_error = error

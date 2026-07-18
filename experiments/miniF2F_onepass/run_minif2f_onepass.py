@@ -19,6 +19,12 @@ from shared.io_utils import (  # noqa: E402
     unlink_if_exists,
     write_json,
 )
+from shared.lean_runtime import (  # noqa: E402
+    LeanRuntime,
+    add_lean_runtime_args,
+    make_lean_runtime,
+    prepare_lean_runtime_metadata,
+)
 from shared.onepass import run_onepass_record  # noqa: E402
 
 
@@ -35,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--problem-id", default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--node-timeout-s", type=int, default=300)
+    add_lean_runtime_args(parser)
     return parser.parse_args()
 
 
@@ -65,10 +72,7 @@ def _select_rows(rows: list[dict[str, Any]], args: argparse.Namespace) -> list[t
     return selected
 
 
-def main() -> None:
-    args = parse_args()
-    output_root = args.output_root or default_output_root(REPO_ROOT, "miniF2F_onepass", args.model) / args.split
-    output_root.mkdir(parents=True, exist_ok=True)
+def _run_experiment(args: argparse.Namespace, output_root: Path, runtime: LeanRuntime) -> None:
     data_path = args.data_dir / f"{args.split}.jsonl"
     rows = read_jsonl(data_path)
     selected = _select_rows(rows, args)
@@ -98,6 +102,8 @@ def main() -> None:
                 output_root=output_root,
                 node_timeout_s=args.node_timeout_s,
                 resume=args.resume,
+                compiler=runtime.compiler,
+                compiler_factory=runtime.compiler_factory,
             )
             result = {
                 **onepass,
@@ -105,6 +111,7 @@ def main() -> None:
                 "split": args.split,
                 "phase0_success": True,
                 "success": bool(onepass.get("root_proved")),
+                "lean_runtime": runtime.metadata,
             }
         except Exception as exc:
             result = {
@@ -120,6 +127,7 @@ def main() -> None:
                 "failed_nodes": [],
                 "success": False,
                 "error": str(exc),
+                "lean_runtime": runtime.metadata,
             }
         append_jsonl(results_path, result)
         done[record_id] = result
@@ -148,6 +156,21 @@ def main() -> None:
     print(f"[metrics] {metrics}")
 
 
+def main() -> None:
+    args = parse_args()
+    output_root = args.output_root or default_output_root(REPO_ROOT, "miniF2F_onepass", args.model) / args.split
+    output_root.mkdir(parents=True, exist_ok=True)
+    runtime = make_lean_runtime(args)
+    try:
+        prepare_lean_runtime_metadata(
+            output_root,
+            resume=args.resume,
+            metadata=runtime.metadata,
+        )
+        _run_experiment(args, output_root, runtime)
+    finally:
+        runtime.close()
+
+
 if __name__ == "__main__":
     main()
-

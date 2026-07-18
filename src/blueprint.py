@@ -13,6 +13,13 @@ from pathlib import Path
 
 from openai import OpenAI
 
+from blueprint_text import (
+    BLUEPRINT_DECL_KW as _BLUEPRINT_DECL_KW,
+    extract_blueprint_signature,
+    lemma_to_theorem,
+    proof_body_to_decl_suffix,
+    strip_blueprint_attr,
+)
 from lean_compiler import AbstractLeanCompiler, LeanCompiler, CompilerResult
 from llm_client import make_client
 from goedel_prompts import load, render
@@ -191,58 +198,6 @@ def _call_with_repo_search(
     )
     _emit_usage(tracer, thm_name, phase, model, response)
     return response
-
-
-# Shared text-surgery helpers for the `@[blueprint]` grammar. Previously
-# reimplemented independently (with subtly different regexes) in
-# eval/vsb_lean_compiler.py's `_node_signature()`/`_build_blueprint_file()` -
-# consolidated here as the single canonical version so a fix in one place
-# can't silently leave a copy elsewhere unfixed.
-_BLUEPRINT_DECL_KW = r"(?:noncomputable\s+def|def|lemma|theorem|abbrev)"
-_BLUEPRINT_ATTR_RE = re.compile(
-    rf"@\[blueprint\s*.*?\]\s*(?={_BLUEPRINT_DECL_KW}\s+\w+)",
-    re.DOTALL,
-)
-_BLUEPRINT_PROOF_RE = re.compile(
-    r":=\s*by\s+sorry_using\s*\[[^\]]*\]",
-    re.DOTALL,
-)
-_LEMMA_KW_RE = re.compile(r"(?m)^(\s*)lemma\b")
-
-
-def strip_blueprint_attr(text: str) -> str:  # 删除所有 blueprint 属性
-    return _BLUEPRINT_ATTR_RE.sub("", text)
-
-
-def lemma_to_theorem(text: str) -> str:
-    """`lemma` needs Mathlib/Batteries; `theorem` works in every environment."""
-    return _LEMMA_KW_RE.sub(r"\1theorem", text)
-
-
-def extract_blueprint_signature(text: str) -> str:
-    """Return a node's declaration without its blueprint attribute or proof."""
-    text = lemma_to_theorem(strip_blueprint_attr(text))
-    proof_match = _BLUEPRINT_PROOF_RE.search(text)
-    if proof_match:
-        return text[:proof_match.start()].strip()
-
-    # Compatibility for old checkpoints or non-standard declarations that do
-    # not use the blueprint `:= by sorry_using [...]` proof placeholder.
-    return text.split(":=", 1)[0].strip()
-
-
-def proof_body_to_decl_suffix(body: str) -> str:
-    """Return a declaration suffix from a cached proof body.
-
-    Internally prover results are stored as proof bodies such as `by ...`, but
-    older checkpoints and some model outputs may include the declaration
-    assignment prefix `:=`. This helper makes both forms safe to append after
-    `BlueprintNode.signature()`.
-    """
-    stripped = body.strip()
-    if stripped.startswith(":="):
-        return stripped
-    return f":= {stripped}"
 
 
 @dataclass

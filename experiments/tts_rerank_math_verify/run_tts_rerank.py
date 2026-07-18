@@ -22,9 +22,16 @@ from shared.io_utils import (  # noqa: E402
     write_json,
     write_jsonl,
 )
+from shared.lean_runtime import (  # noqa: E402
+    LeanRuntime,
+    add_lean_runtime_args,
+    make_lean_runtime,
+    prepare_lean_runtime_metadata,
+)
 from shared.onepass import run_onepass_record  # noqa: E402
 from shared.phase0 import formalize_candidate  # noqa: E402
 from shared.scoring import pick_best_rollout, vote_by_answer  # noqa: E402
+from lean_compiler import LeanCompiler  # noqa: E402
 
 
 DEFAULT_MODEL = "deepseek-v4-flash"
@@ -42,6 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include-empty-extracted", action="store_true")
     parser.add_argument("--phase0-max-attempts", type=int, default=3)
     parser.add_argument("--node-timeout-s", type=int, default=300)
+    add_lean_runtime_args(parser)
     return parser.parse_args()
 
 
@@ -132,6 +140,7 @@ def _phase0_score_row(phase0_row: dict[str, Any]) -> dict[str, Any]:
         "extracted_answer_consistent": phase0_row.get("extracted_answer_consistent", True),
         "warning": phase0_row.get("warning", ""),
         "error": phase0_row.get("phase0_error", ""),
+        "lean_runtime": phase0_row.get("lean_runtime"),
     }
 
 
@@ -167,6 +176,8 @@ def _make_phase0_row(
     rollout_index: int,
     model: str,
     max_attempts: int,
+    compiler: LeanCompiler,
+    lean_runtime: dict[str, Any],
 ) -> dict[str, Any]:
     parent_id = _problem_id(problem)
     rollout_id = _rollout_id(rollout, rollout_index)
@@ -183,6 +194,7 @@ def _make_phase0_row(
         theorem_name=theorem_name,
         model=model,
         max_attempts=max_attempts,
+        compiler=compiler,
     )
     if not phase0.success:
         print(f"[phase0-fail] {record_id}: {phase0.error[:500]}")
@@ -203,6 +215,7 @@ def _make_phase0_row(
         "math_verify_is_correct": to_bool(rollout.get("is_correct")),
         "extracted_answer_consistent": extracted_answer_consistent,
         "warning": warning,
+        "lean_runtime": lean_runtime,
     }
 
 
@@ -255,6 +268,7 @@ def _compute_metrics(
             "proved_ratio": best_row.get("proved_ratio"),
             "proved_node_count": best_row.get("proved_node_count"),
             "total_nodes": best_row.get("total_nodes"),
+            "lean_runtime": best_row.get("lean_runtime"),
         })
 
     denom = len(best_rows)
@@ -275,11 +289,7 @@ def _compute_metrics(
     return best_rows, metrics
 
 
-def main() -> None:
-    args = parse_args()
-    output_root = args.output_root or default_output_root(REPO_ROOT, "tts_rerank_math_verify", args.model)
-    output_root.mkdir(parents=True, exist_ok=True)
-
+def _run_experiment(args: argparse.Namespace, output_root: Path, runtime: LeanRuntime) -> None:
     phase0_path = output_root / "phase0_results.jsonl"
     scores_path = output_root / "rollout_scores.jsonl"
     best_path = output_root / "goedel_best.jsonl"
@@ -321,6 +331,8 @@ def main() -> None:
                     rollout_index=idx,
                     model=args.model,
                     max_attempts=args.phase0_max_attempts,
+                    compiler=runtime.compiler,
+                    lean_runtime=runtime.metadata,
                 )
                 append_jsonl(phase0_path, phase0_row)
                 phase0_by_id[record_id] = phase0_row
@@ -339,6 +351,8 @@ def main() -> None:
                 output_root=output_root,
                 node_timeout_s=args.node_timeout_s,
                 resume=args.resume,
+                compiler=runtime.compiler,
+                compiler_factory=runtime.compiler_factory,
             )
             score_row = {
                 **onepass,
@@ -349,6 +363,7 @@ def main() -> None:
                 "canonical_extracted_answer": phase0_row["candidate_answer"],
                 "extracted_answer_consistent": phase0_row.get("extracted_answer_consistent", True),
                 "warning": phase0_row.get("warning", ""),
+                "lean_runtime": runtime.metadata,
             }
             append_jsonl(scores_path, score_row)
             score_by_id[record_id] = score_row
@@ -371,6 +386,22 @@ def main() -> None:
     print(f"[done] scores={scores_path}")
     print(f"[done] best={best_path}")
     print(f"[metrics] {metrics}")
+
+
+def main() -> None:
+    args = parse_args()
+    output_root = args.output_root or default_output_root(REPO_ROOT, "tts_rerank_math_verify", args.model)
+    output_root.mkdir(parents=True, exist_ok=True)
+    runtime = make_lean_runtime(args)
+    try:
+        prepare_lean_runtime_metadata(
+            output_root,
+            resume=args.resume,
+            metadata=runtime.metadata,
+        )
+        _run_experiment(args, output_root, runtime)
+    finally:
+        runtime.close()
 
 
 if __name__ == "__main__":

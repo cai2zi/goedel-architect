@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import traceback
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from blueprint import Blueprint
 from checkpoint import CheckpointState
-from lean_compiler import LeanCompiler
+from lean_compiler import AbstractLeanCompiler, LeanCompiler
 from mathlib_retrieval import MathlibRetrieval
 from pipeline import run_phase1, run_phase2
 from tracer import JsonlTracer
@@ -75,6 +76,8 @@ def run_onepass_record(
     output_root: Path,
     node_timeout_s: int = 300,
     resume: bool = False,
+    compiler: AbstractLeanCompiler | None = None,
+    compiler_factory: Callable[[], AbstractLeanCompiler] | None = LeanCompiler,
 ) -> dict[str, Any]:
     checkpoint_path = output_root / "checkpoints" / f"{record_id}.json"
     trace_path = output_root / "traces" / f"{record_id}.jsonl"
@@ -105,14 +108,14 @@ def run_onepass_record(
     blueprint_path.parent.mkdir(parents=True, exist_ok=True)
 
     tracer = JsonlTracer(trace_path)
-    compiler = LeanCompiler()
+    active_compiler = compiler or LeanCompiler()
     blueprint: Blueprint | None = None
     try:
         blueprint = run_phase1(
             theorem_stmt=theorem_stmt,
             nl_proof=nl_proof or "",
             model=model,
-            compiler=compiler,
+            compiler=active_compiler,
             checkpoint_path=checkpoint_path,
             tracer=tracer,
             thm_name=record_id,
@@ -133,8 +136,8 @@ def run_onepass_record(
 
         orch_result = run_phase2(
             checkpoint_path=checkpoint_path,
-            compiler=compiler,
-            compiler_factory=LeanCompiler,
+            compiler=active_compiler,
+            compiler_factory=compiler_factory,
             retrieval=MathlibRetrieval(),
             tracer=tracer,
             node_timeout_s=node_timeout_s,
