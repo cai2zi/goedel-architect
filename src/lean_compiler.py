@@ -64,7 +64,14 @@ def _assemble_node_attempt(node_decl: str, aux_lemmas: str, proof_body: str) -> 
     for `:= ` + the prover's tactic proof.
     """
     decl_text = _extract_current_node_decl(node_decl)
-    decl_text = _SORRY_USING_RE.sub(f":= {proof_body}", decl_text, count=1)
+    decl_text, replacements = _SORRY_USING_RE.subn(
+        f":= {proof_body}", decl_text, count=1,
+    )
+    if replacements != 1:
+        raise ValueError(
+            "proof node declaration must contain exactly one "
+            "`:= by sorry_using [...]` placeholder"
+        )
     parts = [MATHLIB_HEADER.rstrip("\n")]
     if aux_lemmas.strip():
         parts.append(aux_lemmas.strip())
@@ -127,7 +134,16 @@ class LeanCompiler(AbstractLeanCompiler):
         `aux_lemmas` (if any) is compiled ahead of the assembled declaration.
         """
         if node_decl:
-            code = _assemble_node_attempt(node_decl, aux_lemmas, lean_code)
+            try:
+                code = _assemble_node_attempt(node_decl, aux_lemmas, lean_code)
+            except ValueError as exc:
+                message = f"Node assembly rejected: {exc}"
+                return CompilerResult(
+                    success=False,
+                    errors=[message],
+                    raw_output=message,
+                    validated=False,
+                )
         else:
             code = (MATHLIB_HEADER + lean_code) if prepend_header else lean_code
 

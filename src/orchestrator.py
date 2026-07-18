@@ -13,7 +13,7 @@ from typing import Callable
 
 import networkx as nx
 
-from blueprint import Blueprint, BlueprintNode, proof_body_to_decl_suffix
+from blueprint import Blueprint, BlueprintNode, render_solved_declaration
 from lean_compiler import AbstractLeanCompiler
 from mathlib_retrieval import MathlibRetrieval
 from prover import ProofSignal, ProverResult, prove_node
@@ -125,8 +125,26 @@ async def prove_dag(
     dag = _build_dag(blueprint)
     dag_node_names = set(dag.nodes)
     orch_result = OrchestratorResult()
-    proof_bodies: dict[str, str] = dict(proved_cache or {})
+    cached_bodies = dict(proved_cache or {})
+    definition_nodes = [node for node in blueprint.nodes if node.kind == "definition"]
+    definition_names = {node.name for node in definition_nodes}
+    # Definitions are already checked as part of the fully validated Phase 1
+    # blueprint.  Never interpret a legacy cached value as their proof body:
+    # old checkpoints may contain a complete declaration submitted by the LLM.
+    proof_bodies: dict[str, str] = {
+        name: body
+        for name, body in cached_bodies.items()
+        if (node := blueprint.node_by_name(name)) is not None
+        and node.kind != "definition"
+    }
+    available_names = definition_names | set(proof_bodies)
     tracer = tracer or NullTracer()
+
+    for node in definition_nodes:
+        orch_result.node_results[node.name] = NodeResult(
+            node=node,
+            result=ProverResult(signal=ProofSignal.SOLVED, proof_body=""),
+        )
 
     for name, body in proof_bodies.items():
         node = blueprint.node_by_name(name)
@@ -139,7 +157,7 @@ async def prove_dag(
     for generation in nx.topological_generations(dag):
         candidates = [
             name for name in generation
-            if name not in proof_bodies
+            if name not in available_names
             and (nodes_to_retry is None or name in nodes_to_retry)
         ]
         if not candidates:
@@ -157,7 +175,7 @@ async def prove_dag(
             node = blueprint.node_by_name(name)
             unresolved_deps = sorted(
                 dep for dep in node.dependencies
-                if dep in dag_node_names and dep not in proof_bodies
+                if dep in dag_node_names and dep not in available_names
             )
             if unresolved_deps:
                 print(f"    [node {name}] skipped - blocked on unresolved "
@@ -206,6 +224,7 @@ async def prove_dag(
             orch_result.node_results[nr.node.name] = nr
             if nr.result.signal == ProofSignal.SOLVED:
                 proof_bodies[nr.node.name] = nr.result.proof_body
+                available_names.add(nr.node.name)
 
     return orch_result
 
@@ -233,21 +252,34 @@ async def _prove_one(
     # a set (from _transitive_deps) has no defined iteration order.
     ordered_deps = [
         n.name for n in blueprint.dependency_order()
-        if n.name in ancestor_deps and n.name in proof_bodies
+        if n.kind != "definition"
+        and n.name in ancestor_deps
+        and n.name in proof_bodies
     ]
     parent_proofs = {dep: proof_bodies[dep] for dep in ordered_deps}
     active_compiler = compiler_factory() if compiler_factory else compiler
     assert active_compiler is not None
 
-    # Proven dependencies are otherwise only shown to the model as prompt
-    # text - re-declare them as real lemmas so `exact evalFuel_ret_sound h`
-    # style references to already-solved siblings actually resolve instead of
-    # hitting "unknown identifier".
-    parent_lemma_decls = "\n\n".join(
-        f"{dep_node.signature()} {proof_body_to_decl_suffix(body)}"
+    # Restore every definition appearing before the current node in the
+    # validated blueprint, in source order.  Their executable bodies are not
+    # encoded in sorry_using dependencies, but later statements/proofs can
+    # still refer to them.  Proven proof-node ancestors follow in topological
+    # order, so none of their references are forward declarations.
+    current_index = next(
+        index for index, blueprint_node in enumerate(blueprint.nodes)
+        if blueprint_node.name == name
+    )
+    declaration_context = [
+        definition.full_declaration()
+        for definition in blueprint.nodes[:current_index]
+        if definition.kind == "definition"
+    ]
+    declaration_context.extend(
+        render_solved_declaration(dep_node, body)
         for dep, body in parent_proofs.items()
         if (dep_node := blueprint.node_by_name(dep)) is not None
     )
+    parent_lemma_decls = "\n\n".join(declaration_context)
 
     async def attempt(
         use_model: str, timeout_s: float | None, max_tool_calls: int | None = None,

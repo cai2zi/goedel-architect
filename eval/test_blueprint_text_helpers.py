@@ -10,11 +10,18 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from blueprint import (  # noqa: E402
+    BlueprintNode,
     _parse_blueprint,
     extract_blueprint_signature,
+    render_solved_declaration,
     strip_blueprint_attr,
 )
-from lean_compiler import _assemble_node_attempt, _extract_current_node_decl  # noqa: E402
+from lean_compiler import (  # noqa: E402
+    CompilerResult,
+    LeanCompiler,
+    _assemble_node_attempt,
+    _extract_current_node_decl,
+)
 
 
 ZMOD_NODE = """@[blueprint
@@ -82,6 +89,74 @@ def config : Nat × Nat := { fst := 1, snd := 2 }
 """
         self.assertEqual(extract_blueprint_signature(declaration), "def config : Nat × Nat")
 
+    def test_full_declaration_preserves_definition_rhs_and_nested_assignment(self) -> None:
+        declarations = {
+            "regular": """@[blueprint
+  (statement := /-- A pair built through a local binding. -/)]
+def regular : Nat × Nat :=
+  let left := 1
+  (left, 2)
+""",
+            "choice": """@[blueprint (statement := /-- A chosen value. -/)]
+noncomputable def choice : Nat := Classical.choose (show Nonempty Nat from ⟨1⟩)
+""",
+            "short": """@[blueprint (statement := /-- A short alias. -/)]
+abbrev short : Nat := 3
+""",
+        }
+
+        for name, declaration in declarations.items():
+            with self.subTest(name=name):
+                node = BlueprintNode(
+                    name=name,
+                    kind="definition",
+                    statement="",
+                    proof_sketch="",
+                    lean_declaration=declaration,
+                )
+                full = node.full_declaration()
+                self.assertNotIn("@[blueprint", full)
+                self.assertIn(":=", full)
+
+        regular = BlueprintNode(
+            name="regular",
+            kind="definition",
+            statement="",
+            proof_sketch="",
+            lean_declaration=declarations["regular"],
+        )
+        self.assertIn("let left := 1", regular.full_declaration())
+        self.assertEqual(regular.full_declaration().count(":="), 2)
+
+    def test_definition_renderer_ignores_polluted_cached_body(self) -> None:
+        declaration = """@[blueprint (statement := /-- Base value. -/)]
+def base_val : ℝ := (30 : ℝ)
+"""
+        node = BlueprintNode(
+            name="base_val",
+            kind="definition",
+            statement="",
+            proof_sketch="",
+            lean_declaration=declaration,
+        )
+        polluted = "@[blueprint] def base_val : ℝ := (999 : ℝ)"
+        rendered = render_solved_declaration(node, polluted)
+
+        self.assertEqual(rendered, "def base_val : ℝ := (30 : ℝ)")
+        self.assertNotIn("999", rendered)
+
+    def test_definition_cache_key_includes_rhs(self) -> None:
+        def node(rhs: str) -> BlueprintNode:
+            return BlueprintNode(
+                name="value",
+                kind="definition",
+                statement="",
+                proof_sketch="",
+                lean_declaration=f"def value : Nat := {rhs}",
+            )
+
+        self.assertNotEqual(node("1").cache_key(), node("2").cache_key())
+
     def test_node_decl_ignores_declaration_words_inside_blueprint_comments(self) -> None:
         declaration = """@[blueprint
   (statement := /-- The target theorem. -/)
@@ -97,6 +172,44 @@ theorem mathd_algebra_478 : True := by
         self.assertNotIn("@[blueprint", assembled)
         self.assertNotIn("theorem statement", assembled)
         self.assertIn("theorem mathd_algebra_478 : True := by trivial", assembled)
+
+    def test_proof_node_without_placeholder_fails_before_backend(self) -> None:
+        class RecordingCompiler(LeanCompiler):
+            def __init__(self) -> None:
+                super().__init__()
+                self.codes: list[str] = []
+
+            def _run_lean(self, code: str) -> CompilerResult:
+                self.codes.append(code)
+                return CompilerResult(success=True)
+
+        compiler = RecordingCompiler()
+        result = compiler.check(
+            "by trivial",
+            node_decl="theorem already_complete : True := by trivial",
+        )
+
+        self.assertFalse(result.success)
+        self.assertFalse(result.validated)
+        self.assertIn("exactly one", result.errors[0])
+        self.assertEqual(compiler.codes, [])
+
+    def test_complete_definition_can_be_checked_directly(self) -> None:
+        class RecordingCompiler(LeanCompiler):
+            def __init__(self) -> None:
+                super().__init__()
+                self.codes: list[str] = []
+
+            def _run_lean(self, code: str) -> CompilerResult:
+                self.codes.append(code)
+                return CompilerResult(success=True)
+
+        compiler = RecordingCompiler()
+        declaration = "def value : Nat := 1"
+        result = compiler.check(declaration)
+
+        self.assertTrue(result.success)
+        self.assertEqual(compiler.codes, [declaration])
 
 
 if __name__ == "__main__":

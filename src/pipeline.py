@@ -15,7 +15,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from blueprint import Blueprint, generate_blueprint, proof_body_to_decl_suffix
+from blueprint import (
+    Blueprint,
+    generate_blueprint,
+    proof_body_to_decl_suffix,
+    render_solved_declaration,
+)
 from checkpoint import CheckpointState
 from lean_compiler import AbstractLeanCompiler, LeanCompiler
 from mathlib_retrieval import MathlibRetrieval
@@ -78,7 +83,7 @@ def _invalidate_stale_proofs(
 
 def _aux_lemma_decls(blueprint: Blueprint, proved_cache: dict[str, str], root_name: str) -> str:
     return "\n\n".join(
-        f"{node.signature()} {proof_body_to_decl_suffix(proved_cache[node.name])}"
+        render_solved_declaration(node, proved_cache[node.name])
         for node in blueprint.dependency_order()
         if node.name != root_name and node.name in proved_cache
     )

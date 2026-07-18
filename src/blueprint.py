@@ -15,6 +15,7 @@ from openai import OpenAI
 
 from blueprint_text import (
     BLUEPRINT_DECL_KW as _BLUEPRINT_DECL_KW,
+    extract_current_node_decl,
     extract_blueprint_signature,
     lemma_to_theorem,
     proof_body_to_decl_suffix,
@@ -221,16 +222,43 @@ class BlueprintNode:
         """
         return extract_blueprint_signature(self.lean_declaration)
 
+    def full_declaration(self) -> str:
+        """Return this node's complete declaration without ``@[blueprint]``.
+
+        Unlike :meth:`signature`, this deliberately preserves a definition's
+        outer ``:=`` and its entire right-hand side.  Attribute removal happens
+        before declaration detection, so declaration-like words in blueprint
+        comments cannot become part of the returned Lean code.
+        """
+        return extract_current_node_decl(self.lean_declaration)
+
     def cache_key(self) -> str:
-        """Signature plus dependency set: a cached proof is only valid for
-        the exact (signature, dependencies) shape it was compiled against.
-        `signature()` alone only covers the text before `:=`, so a node
+        """Declaration shape plus dependencies for cache staleness checks.
+
+        Proof nodes use their signature; definitions use the complete
+        declaration so an RHS change is visible. `signature()` alone only
+        covers the text before `:=`, so a node
         whose sorry_using [...] dependency list changes (text AFTER `:=`)
         while its exposed statement stays byte-identical would otherwise be
         invisible to staleness checks, even though its cached proof was
         spliced together with the OLD set of sibling declarations in scope.
         """
-        return self.signature() + "\x00deps:" + ",".join(sorted(self.dependencies))
+        declaration_shape = (
+            self.full_declaration() if self.kind == "definition" else self.signature()
+        )
+        return declaration_shape + "\x00deps:" + ",".join(sorted(self.dependencies))
+
+
+def render_solved_declaration(node: BlueprintNode, proof_body: str) -> str:
+    """Render a solved node as Lean code suitable for dependency context.
+
+    Definitions already carry their executable body in the validated
+    blueprint, so cached proof text is intentionally ignored.  Proof nodes
+    are reconstructed from their signature and the proof accepted by Lean.
+    """
+    if node.kind == "definition":
+        return node.full_declaration()
+    return f"{node.signature()} {proof_body_to_decl_suffix(proof_body)}"
 
 
 @dataclass
