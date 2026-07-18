@@ -13,17 +13,15 @@ Example:
 ```bash
 export OPENAI_BASE_URL=https://poloai.top/v1
 export GOEDEL_OPENAI_BASE_URL=https://poloai.top/v1
-export GOEDEL_BLUEPRINT_MAX_TOKENS=262144
+export GOEDEL_BLUEPRINT_MAX_TOKENS=128000
 export GOEDEL_TOOL_CHOICE_MODE=auto
 export KIMINA_API_URL=http://localhost:8000
-export KIMINA_API_KEY=
 export http_proxy=http://127.0.0.1:7897
 export https_proxy=http://127.0.0.1:7897
-
+export OPENAI_API_KEY=
 python experiments/miniF2F_onepass/run_minif2f_onepass.py \
-  --model deepseek-v4-flash \
-  --split test \
-  --limit 2
+  --model gpt-5-mini \
+  --split test 
 ```
 
 Use `--lean-backend local` to fall back to the existing `lake env lean`
