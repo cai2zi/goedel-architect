@@ -78,7 +78,7 @@ MAX_TOKENS = 64_000
 MAX_TOOL_CALLS = 8
 NEGATION_PROBE_CALLS = 4
 
-SYSTEM_SUFFIX = """
+SYSTEM_SUFFIX_WITH_REPO_SEARCH = """
 ## Tool-First Workflow
 
 You have three tools: lean_compile, repo_search, mathlib_search.
@@ -96,6 +96,27 @@ Workflow:
 4. When you need a lemma whose name you do NOT already know:
    - call repo_search for project-specific lemmas
    - call mathlib_search for general Mathlib lemmas
+5. Once lean_compile returns SUCCESSFUL, output:
+   <lean4_proof>:= by\n  ...\n</lean4_proof>
+
+Prefer lean_compile over search — faster to try a tactic and read the error.
+"""
+
+SYSTEM_SUFFIX_WITHOUT_REPO_SEARCH = """
+## Tool-First Workflow
+
+You have two tools: lean_compile and mathlib_search. No repository search
+tool is available in this experiment.
+
+Workflow:
+1. Draft a proof using the declarations and context already visible in the
+   prompt.
+2. Call lean_compile with your proof_body (starting with `:= by` — the harness
+   appends proof_body directly after the bare theorem signature, so the leading
+   `:=` is required or the submission fails to parse).
+3. Read errors, adjust, and call lean_compile again.
+4. When you need a general Mathlib lemma whose name you do not know, call
+   mathlib_search.
 5. Once lean_compile returns SUCCESSFUL, output:
    <lean4_proof>:= by\n  ...\n</lean4_proof>
 
@@ -165,6 +186,23 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
 ]
+
+
+def _tools_for_repo_retrieval(repo_retrieval) -> list[dict[str, Any]]:
+    """Expose repo_search only when a real repository index was supplied."""
+    if repo_retrieval is not None:
+        return list(TOOLS)
+    return [
+        tool for tool in TOOLS
+        if tool["function"]["name"] != "repo_search"
+    ]
+
+
+def _system_suffix_for_repo_retrieval(repo_retrieval) -> str:
+    """Keep the system prompt consistent with the tools sent to the model."""
+    if repo_retrieval is not None:
+        return SYSTEM_SUFFIX_WITH_REPO_SEARCH
+    return SYSTEM_SUFFIX_WITHOUT_REPO_SEARCH
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +343,9 @@ class GoedelProver:
         # _probe_negation call - one GoedelProver instance proves exactly one
         # node (see the module-level prove_node() factory), so this is safe.
         self._parent_lemma_decls = parent_lemma_decls
-        augmented_sys = (sys_prompt or PROVER_SYSTEM_PROMPT).strip() + "\n\n" + SYSTEM_SUFFIX.strip()
+        active_tools = _tools_for_repo_retrieval(repo_retrieval)
+        system_suffix = _system_suffix_for_repo_retrieval(repo_retrieval)
+        augmented_sys = (sys_prompt or PROVER_SYSTEM_PROMPT).strip() + "\n\n" + system_suffix.strip()
 
         if not user_prompt:
             user_prompt = render(
@@ -334,7 +374,7 @@ class GoedelProver:
         response = self.client.chat.completions.create(
             model=self.model_id,
             messages=messages,
-            tools=TOOLS,
+            tools=active_tools,
             max_completion_tokens=MAX_TOKENS,
             **_tool_choice_kwargs({"type": "function", "function": {"name": "lean_compile"}}),
         )
@@ -377,7 +417,7 @@ class GoedelProver:
             response = self.client.chat.completions.create(
                 model=self.model_id,
                 messages=messages,
-                tools=TOOLS,
+                tools=active_tools,
                 max_completion_tokens=MAX_TOKENS,
                 **_tool_choice_kwargs(next_choice),
             )
@@ -389,7 +429,7 @@ class GoedelProver:
             response = self.client.chat.completions.create(
                 model=self.model_id,
                 messages=messages,
-                tools=TOOLS,
+                tools=active_tools,
                 tool_choice="none",
                 max_completion_tokens=MAX_TOKENS,
             )
