@@ -119,6 +119,77 @@ def _emit_usage(tracer, thm_name: str, phase: str, model: str, response) -> None
     ))
 
 
+def _tool_calls_payload(message) -> list[dict]:
+    return [
+        {
+            "id": tc.id,
+            "type": getattr(tc, "type", "function"),
+            "function": {
+                "name": tc.function.name,
+                "arguments": tc.function.arguments,
+            },
+        }
+        for tc in message.tool_calls or []
+    ]
+
+
+def _emit_llm_response(
+    tracer,
+    *,
+    thm_name: str,
+    phase: str,
+    model: str,
+    response,
+    attempt: int,
+    turn: int,
+) -> None:
+    if tracer is None:
+        return
+    choice = response.choices[0]
+    msg = choice.message
+    tracer.emit(TraceEvent(
+        kind="llm_response",
+        thm_name=thm_name,
+        turn=turn,
+        result=msg.content or "",
+        args={
+            "phase": phase,
+            "model": model,
+            "attempt": attempt,
+            "finish_reason": getattr(choice, "finish_reason", None),
+            "tool_calls": _tool_calls_payload(msg),
+        },
+    ))
+
+
+def _emit_lean_check_result(
+    tracer,
+    *,
+    thm_name: str,
+    phase: str,
+    attempt: int,
+    target: str,
+    result: CompilerResult,
+) -> None:
+    if tracer is None:
+        return
+    tracer.emit(TraceEvent(
+        kind="lean_check_result",
+        thm_name=thm_name,
+        args={
+            "phase": phase,
+            "attempt": attempt,
+            "target": target,
+            "errors": result.errors,
+            "warnings": result.warnings,
+            "goals": result.goals,
+            "raw_output": result.raw_output,
+            "validated": result.validated,
+        },
+        ok=result.success,
+    ))
+
+
 def _append_assistant_turn(messages: list[dict], response) -> None:
     """Append an assistant message from `response` to `messages`, preserving
     tool_calls if present, followed by a synthetic tool reply for each one.
@@ -154,6 +225,7 @@ def _call_with_repo_search(
     tracer=None,
     thm_name: str = "",
     phase: str = "",
+    attempt: int = 0,
 ):
     """chat.completions.create, transparently handling repo_search tool calls.
 
@@ -164,7 +236,7 @@ def _call_with_repo_search(
     that isn't a tool-calls-only response.
     """
     tools = [REPO_SEARCH_TOOL] if repo_retrieval is not None else None
-    for _ in range(MAX_SEARCH_TURNS):
+    for turn in range(1, MAX_SEARCH_TURNS + 1):
         # chat.completions rejects function tools + reasoning_effort together
         # for gpt-5.x ("Function tools with reasoning_effort are not
         # supported ... Please use /v1/responses instead") - drop
@@ -179,6 +251,15 @@ def _call_with_repo_search(
             **call_kwargs,
         )
         _emit_usage(tracer, thm_name, phase, model, response)
+        _emit_llm_response(
+            tracer,
+            thm_name=thm_name,
+            phase=phase,
+            model=model,
+            response=response,
+            attempt=attempt,
+            turn=turn,
+        )
         msg = response.choices[0].message
         if not msg.tool_calls:
             return response
@@ -201,6 +282,15 @@ def _call_with_repo_search(
         model=model, messages=messages, max_completion_tokens=max_tokens, **reasoning_kwargs,
     )
     _emit_usage(tracer, thm_name, phase, model, response)
+    _emit_llm_response(
+        tracer,
+        thm_name=thm_name,
+        phase=phase,
+        model=model,
+        response=response,
+        attempt=attempt,
+        turn=MAX_SEARCH_TURNS + 1,
+    )
     return response
 
 
@@ -336,7 +426,7 @@ def generate_blueprint(
     for attempt in range(MAX_RETRIES):
         response = _call_with_repo_search(
             client, model, messages, repo_retrieval, _reasoning_kwargs(model), _max_tokens(),
-            tracer=tracer, thm_name=thm_name, phase="phase1",
+            tracer=tracer, thm_name=thm_name, phase="phase1", attempt=attempt + 1,
         )
         lean_code = _extract_lean_code(response.choices[0].message.content)
         last_lean_code = lean_code
@@ -344,6 +434,14 @@ def generate_blueprint(
         if compiler is not None:
             target = _extract_target_name(lean_code, theorem_stmt)
             result = compiler.check_blueprint(lean_code, target)
+            _emit_lean_check_result(
+                tracer,
+                thm_name=thm_name,
+                phase="phase1",
+                attempt=attempt + 1,
+                target=target,
+                result=result,
+            )
             if result.success:
                 parsed = _parse_blueprint(lean_code, target)
                 if parsed.nodes:

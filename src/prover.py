@@ -526,7 +526,7 @@ class GoedelProver:
             last_text = msg.content
             self.tracer.emit(TraceEvent(
                 kind="model_text", thm_name=node_name, turn=turn,
-                result=msg.content[:500],
+                result=msg.content,
             ))
 
         for tc in msg.tool_calls or []:
@@ -548,6 +548,14 @@ class GoedelProver:
                 parent_decls = getattr(self, "_parent_lemma_decls", "")
                 full_aux = f"{parent_decls}\n\n{aux}".strip() if parent_decls else aux
                 cr = compiler.check(proof_body, aux_lemmas=full_aux, node_decl=node_decl)
+                trace_args = {
+                    "success": cr.success,
+                    "errors": cr.errors,
+                    "warnings": cr.warnings,
+                    "goals": cr.goals,
+                    "raw_output": cr.raw_output,
+                    "validated": cr.validated,
+                }
                 if cr.success:
                     result = "Compilation SUCCESSFUL. Proof is correct."
                     any_compile_ok = True
@@ -561,18 +569,22 @@ class GoedelProver:
             elif fn == "repo_search" and repo_retrieval is not None:
                 hits = repo_retrieval.search(args["query"], args.get("k", 10))
                 result = "\n\n".join(h.format() for h in hits) or "No results in repo."
+                trace_args = None
 
             elif fn == "mathlib_search":
                 hits = self.retrieval.search(args["query"], args.get("k", 10))
                 result = "\n\n".join(h.format() for h in hits) or "No results found."
+                trace_args = None
 
             else:
                 result = f"Tool unavailable: {fn}"
+                trace_args = None
 
             self.tracer.emit(TraceEvent(
                 kind="tool_result", thm_name=node_name, turn=turn,
                 call_id=tc.id, tool_name=fn,
-                result=result[:500], ok=(fn == "lean_compile" and any_compile_ok),
+                args=trace_args,
+                result=result, ok=(fn == "lean_compile" and any_compile_ok),
             ))
 
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
