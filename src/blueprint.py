@@ -37,8 +37,11 @@ BLUEPRINT_SYSTEM_PROMPT = load("blueprint_system")
 BLUEPRINT_USER_TEMPLATE = load("blueprint_user")
 
 # Appendix A specifies 262,144 (matches DeepSeek-V4-Flash's completion budget).
-# Keep an environment override for cheaper local debugging.
-MAX_TOKENS = int(os.environ.get("GOEDEL_BLUEPRINT_MAX_TOKENS", "262144"))
+# Read at call time so experiment YAML environment settings apply after import.
+def _max_tokens() -> int:
+    return int(os.environ.get("GOEDEL_BLUEPRINT_MAX_TOKENS", "262144"))
+
+
 MAX_RETRIES = 8
 
 # `repo_context` is built from only the target file's own preceding content
@@ -332,7 +335,7 @@ def generate_blueprint(
     last_lean_code = None
     for attempt in range(MAX_RETRIES):
         response = _call_with_repo_search(
-            client, model, messages, repo_retrieval, _reasoning_kwargs(model), MAX_TOKENS,
+            client, model, messages, repo_retrieval, _reasoning_kwargs(model), _max_tokens(),
             tracer=tracer, thm_name=thm_name, phase="phase1",
         )
         lean_code = _extract_lean_code(response.choices[0].message.content)
