@@ -15,6 +15,7 @@ Example:
 export OPENAI_BASE_URL=https://poloai.top/v1
 export GOEDEL_OPENAI_BASE_URL=https://poloai.top/v1
 export GOEDEL_BLUEPRINT_MAX_TOKENS=262144
+export GOEDEL_PROVER_MAX_TOKENS=64000
 export GOEDEL_TOOL_CHOICE_MODE=auto
 export KIMINA_API_URL=http://localhost:8000
 export KIMINA_API_KEY=
@@ -58,6 +59,16 @@ Phase 2 blueprint proving, and Phase 2 node proving are controlled by:
 --phase1-concurrency N
 --phase2-blueprint-concurrency N
 --phase2-node-concurrency N
+```
+
+`GOEDEL_BLUEPRINT_MAX_TOKENS` controls the Phase 1 blueprint completion
+budget. `GOEDEL_PROVER_MAX_TOKENS` controls the Phase 2 per-node prover
+completion budget. For rate-limited OpenAI deployments, start conservatively:
+
+```bash
+GOEDEL_BLUEPRINT_MAX_TOKENS=32768 GOEDEL_PROVER_MAX_TOKENS=16384 \
+PHASE1_CONCURRENCY=1 PHASE2_BLUEPRINT_CONCURRENCY=1 PHASE2_NODE_CONCURRENCY=2 \
+bash experiments/tts_rerank_math_verify/run.sh --model gpt-5-mini
 ```
 
 `--node-timeout-s` limits a complete LLM node attempt; the separate

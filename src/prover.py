@@ -68,13 +68,17 @@ PROVER_USER_TEMPLATE = load("prover_user")
 # (discrete full-code resubmissions) differs from this loop (one continuous
 # multi-turn conversation), so this matches the stated budget number, not
 # the exact retry semantics — a true match would need a different loop shape.
-# Token budget capped to 32,000 (below the paper's 65,536) to control cost.
+# Token budget is configurable so high-throughput experiment runs can stay
+# under model/provider TPM limits.
 #
 # MAX_TOOL_CALLS raised 4 -> 8 (above the paper's own number) after observing
 # twice in VSB smoke tests that the model converged on a materially better
 # proof strategy right as the 4-call budget ran out, with the improved draft
 # never reaching lean_compile at all.
-MAX_TOKENS = 64_000
+def _max_tokens() -> int:
+    return int(os.environ.get("GOEDEL_PROVER_MAX_TOKENS", "64000"))
+
+
 MAX_TOOL_CALLS = 8
 NEGATION_PROBE_CALLS = 4
 
@@ -369,13 +373,14 @@ class GoedelProver:
             {"role": "system", "content": augmented_sys},
             {"role": "user", "content": user_prompt},
         ]
+        max_tokens = _max_tokens()
 
         # Force first call to lean_compile
         response = self.client.chat.completions.create(
             model=self.model_id,
             messages=messages,
             tools=active_tools,
-            max_completion_tokens=MAX_TOKENS,
+            max_completion_tokens=max_tokens,
             **_tool_choice_kwargs({"type": "function", "function": {"name": "lean_compile"}}),
         )
         self._emit_usage(node_name, response)
@@ -418,7 +423,7 @@ class GoedelProver:
                 model=self.model_id,
                 messages=messages,
                 tools=active_tools,
-                max_completion_tokens=MAX_TOKENS,
+                max_completion_tokens=max_tokens,
                 **_tool_choice_kwargs(next_choice),
             )
             self._emit_usage(node_name, response)
@@ -431,7 +436,7 @@ class GoedelProver:
                 messages=messages,
                 tools=active_tools,
                 tool_choice="none",
-                max_completion_tokens=MAX_TOKENS,
+                max_completion_tokens=max_tokens,
             )
             self._emit_usage(node_name, response)
             _, drain_text, drain_proof, _, _, drain_errors = self._process_response(
@@ -452,7 +457,7 @@ class GoedelProver:
             response = self.client.chat.completions.create(
                 model=self.model_id,
                 messages=messages,
-                max_completion_tokens=MAX_TOKENS,
+                max_completion_tokens=max_tokens,
                 **_chat_reasoning_kwargs(self.model_id),
             )
             self._emit_usage(node_name, response)
@@ -462,7 +467,7 @@ class GoedelProver:
             all_lean_errors.extend(final_errors)
 
         # Probe negation if we couldn't prove it
-        negation = self._probe_negation(compiler, node_name, messages, MAX_TOKENS)
+        negation = self._probe_negation(compiler, node_name, messages, max_tokens)
         if negation:
             return negation
 
