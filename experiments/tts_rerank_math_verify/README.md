@@ -28,6 +28,14 @@ python experiments/tts_rerank_math_verify/run_tts_rerank.py \
   --rollout-id 1
 ```
 
+Or use the experiment script, whose defaults can be overridden with
+environment variables and trailing CLI flags:
+
+```bash
+PHASE1_CONCURRENCY=4 PHASE2_BLUEPRINT_CONCURRENCY=4 PHASE2_NODE_CONCURRENCY=8 \
+bash experiments/tts_rerank_math_verify/run.sh --limit 1
+```
+
 Use `--lean-backend local` for the existing `lake env lean` fallback. The shared
 runtime flags are:
 
@@ -39,6 +47,17 @@ runtime flags are:
 --lean-server-reuse / --no-lean-server-reuse
 --lean-server-debug / --no-lean-server-debug
 --lean-check-concurrency N
+```
+
+The runner keeps Phase 0 unchanged and serial for now. It first completes or
+reuses Phase 0 for every selected rollout, then completes Phase 1 for every
+successful rollout, and only then starts Phase 2. Phase 1 blueprint creation,
+Phase 2 blueprint proving, and Phase 2 node proving are controlled by:
+
+```text
+--phase1-concurrency N
+--phase2-blueprint-concurrency N
+--phase2-node-concurrency N
 ```
 
 `--node-timeout-s` limits a complete LLM node attempt; the separate

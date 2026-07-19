@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -373,7 +374,7 @@ def run_phase1(
     return blueprint
 
 
-def run_phase2(
+async def run_phase2_async(
     checkpoint_path: Path,
     compiler: AbstractLeanCompiler | None = None,
     compiler_factory: Callable[[], AbstractLeanCompiler] | None = None,
@@ -385,6 +386,8 @@ def run_phase2(
     cascade_model: str | None = None,
     cascade_timeout_s: float | None = None,
     escalation_max_tool_calls: int | None = 1,
+    node_executor: Executor | None = None,
+    node_semaphore: asyncio.Semaphore | None = None,
 ) -> OrchestratorResult:
     """Run one Phase 2 (parallel proving) pass against a checkpointed blueprint.
 
@@ -403,22 +406,22 @@ def run_phase2(
     proof_cache_keys = dict(state.proof_cache_keys)
     nodes_to_try = set(blueprint.nodes_by_name()) - set(proved_cache)
 
-    orch_result = asyncio.run(
-        prove_dag(
-            blueprint=blueprint,
-            compiler=compiler,
-            compiler_factory=compiler_factory,
-            retrieval=retrieval,
-            repo_retrieval=repo_retrieval,
-            model=model or state.model,
-            proved_cache=proved_cache,
-            nodes_to_retry=nodes_to_try,
-            tracer=tracer,
-            node_timeout_s=node_timeout_s,
-            cascade_model=cascade_model,
-            cascade_timeout_s=cascade_timeout_s,
-            escalation_max_tool_calls=escalation_max_tool_calls,
-        )
+    orch_result = await prove_dag(
+        blueprint=blueprint,
+        compiler=compiler,
+        compiler_factory=compiler_factory,
+        retrieval=retrieval,
+        repo_retrieval=repo_retrieval,
+        model=model or state.model,
+        proved_cache=proved_cache,
+        nodes_to_retry=nodes_to_try,
+        tracer=tracer,
+        node_timeout_s=node_timeout_s,
+        cascade_model=cascade_model,
+        cascade_timeout_s=cascade_timeout_s,
+        escalation_max_tool_calls=escalation_max_tool_calls,
+        node_executor=node_executor,
+        node_semaphore=node_semaphore,
     )
 
     for name, nr in orch_result.node_results.items():
@@ -435,6 +438,40 @@ def run_phase2(
     state.success = state.done
     state.save(checkpoint_path)
     return orch_result
+
+
+def run_phase2(
+    checkpoint_path: Path,
+    compiler: AbstractLeanCompiler | None = None,
+    compiler_factory: Callable[[], AbstractLeanCompiler] | None = None,
+    retrieval: MathlibRetrieval | None = None,
+    repo_retrieval=None,
+    tracer=None,
+    node_timeout_s: float | None = 300.0,
+    model: str | None = None,
+    cascade_model: str | None = None,
+    cascade_timeout_s: float | None = None,
+    escalation_max_tool_calls: int | None = 1,
+    node_executor: Executor | None = None,
+    node_semaphore: asyncio.Semaphore | None = None,
+) -> OrchestratorResult:
+    return asyncio.run(
+        run_phase2_async(
+            checkpoint_path=checkpoint_path,
+            compiler=compiler,
+            compiler_factory=compiler_factory,
+            retrieval=retrieval,
+            repo_retrieval=repo_retrieval,
+            tracer=tracer,
+            node_timeout_s=node_timeout_s,
+            model=model,
+            cascade_model=cascade_model,
+            cascade_timeout_s=cascade_timeout_s,
+            escalation_max_tool_calls=escalation_max_tool_calls,
+            node_executor=node_executor,
+            node_semaphore=node_semaphore,
+        )
+    )
 
 
 def run_phase3(

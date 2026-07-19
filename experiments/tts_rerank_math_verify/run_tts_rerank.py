@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import sys
+import traceback
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -22,23 +26,37 @@ from shared.io_utils import (  # noqa: E402
     write_json,
     write_jsonl,
 )
+from shared.config_utils import (  # noqa: E402
+    add_config_arg,
+    apply_config_environment,
+    config_path_from_argv,
+    load_yaml_config,
+    set_defaults_from_config,
+)
 from shared.lean_runtime import (  # noqa: E402
     LeanRuntime,
     add_lean_runtime_args,
     make_lean_runtime,
     prepare_lean_runtime_metadata,
 )
-from shared.onepass import run_onepass_record  # noqa: E402
+from shared.onepass import run_onepass_phase1, run_onepass_phase2_async  # noqa: E402
 from shared.phase0 import formalize_candidate  # noqa: E402
 from shared.scoring import pick_best_rollout, vote_by_answer  # noqa: E402
 from lean_compiler import LeanCompiler  # noqa: E402
 
 
 DEFAULT_MODEL = "deepseek-v4-flash"
+DEFAULT_CONFIG = Path(__file__).resolve().parent / "configs" / "base.yaml"
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    argv = sys.argv[1:] if argv is None else argv
+    config_path = config_path_from_argv(argv, DEFAULT_CONFIG)
+    config = load_yaml_config(config_path)
+    apply_config_environment(config)
+
     parser = argparse.ArgumentParser(description="Run Goedel one-pass TTS reranking on bench.json.")
+    add_config_arg(parser, DEFAULT_CONFIG)
     parser.add_argument("--bench-path", type=Path, default=REPO_ROOT.parent / "czx_work" / "bench.json")
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--model", default=DEFAULT_MODEL)
@@ -49,8 +67,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include-empty-extracted", action="store_true")
     parser.add_argument("--phase0-max-attempts", type=int, default=3)
     parser.add_argument("--node-timeout-s", type=int, default=300)
+    parser.add_argument("--phase1-concurrency", type=int, default=4)
+    parser.add_argument("--phase2-blueprint-concurrency", type=int, default=4)
+    parser.add_argument("--phase2-node-concurrency", type=int, default=8)
     add_lean_runtime_args(parser)
-    return parser.parse_args()
+    if "exclude_empty_extracted_answer" in config:
+        parser.set_defaults(include_empty_extracted=not bool(config["exclude_empty_extracted_answer"]))
+    set_defaults_from_config(parser, config, ignore={"config", "include_empty_extracted"})
+    return parser.parse_args(argv)
 
 
 def _iter_problems(bench: dict[str, Any]) -> list[dict[str, Any]]:
@@ -299,6 +323,122 @@ def _compute_metrics(
     return best_rows, metrics
 
 
+def _validate_concurrency(args: argparse.Namespace) -> None:
+    for name in ("phase1_concurrency", "phase2_blueprint_concurrency", "phase2_node_concurrency"):
+        if getattr(args, name) <= 0:
+            raise ValueError(f"{name} must be positive")
+
+
+def _error_onepass_row(*, record_id: str, output_root: Path, error: str, include_traceback: bool = False) -> dict[str, Any]:
+    row = {
+        "id": record_id,
+        "blueprint_success": False,
+        "blueprint_reused": False,
+        "phase1_skipped": False,
+        "error": error,
+        "checkpoint_path": str(output_root / "checkpoints" / f"{record_id}.json"),
+        "trace_path": str(output_root / "traces" / f"{record_id}.jsonl"),
+        "blueprint_path": str(output_root / "blueprints" / f"{record_id}.lean"),
+        "root_theorem": "",
+        "root_proved": False,
+        "total_nodes": 0,
+        "proved_node_count": 0,
+        "proved_ratio": 0.0,
+        "failed_nodes": [],
+        "proved_nodes": [],
+        "all_proved": False,
+    }
+    if include_traceback:
+        row["traceback"] = traceback.format_exc()
+    return row
+
+
+def _score_from_onepass(onepass: dict[str, Any], phase0_row: dict[str, Any], runtime: LeanRuntime) -> dict[str, Any]:
+    return {
+        **onepass,
+        "parent_id": phase0_row["parent_id"],
+        "rollout_id": phase0_row["rollout_id"],
+        "phase0_success": True,
+        "math_verify_is_correct": phase0_row["math_verify_is_correct"],
+        "canonical_extracted_answer": phase0_row["candidate_answer"],
+        "extracted_answer_consistent": phase0_row.get("extracted_answer_consistent", True),
+        "warning": phase0_row.get("warning", ""),
+        "lean_runtime": runtime.metadata,
+    }
+
+
+async def _run_phase1_batch(
+    records: list[dict[str, Any]],
+    *,
+    args: argparse.Namespace,
+    output_root: Path,
+    runtime: LeanRuntime,
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    loop = asyncio.get_running_loop()
+    with ThreadPoolExecutor(max_workers=args.phase1_concurrency) as executor:
+        async def run_one(record: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+            phase0_row = record["phase0_row"]
+            try:
+                result = await loop.run_in_executor(
+                    executor,
+                    partial(
+                        run_onepass_phase1,
+                        record_id=record["record_id"],
+                        theorem_stmt=phase0_row["theorem_stmt"],
+                        nl_proof=phase0_row.get("nl_proof", ""),
+                        model=args.model,
+                        output_root=output_root,
+                        resume=args.resume,
+                        compiler=runtime.compiler,
+                    ),
+                )
+            except Exception as exc:
+                result = {
+                    "status": "failed",
+                    "row": _error_onepass_row(
+                        record_id=record["record_id"],
+                        output_root=output_root,
+                        error=str(exc),
+                        include_traceback=True,
+                    ),
+                }
+            print(f"[phase1-{result['status']}] {record['record_id']}", flush=True)
+            return record, result
+        return await asyncio.gather(*(run_one(record) for record in records))
+
+
+async def _run_phase2_batch(
+    records: list[tuple[dict[str, Any], dict[str, Any]]],
+    *,
+    args: argparse.Namespace,
+    output_root: Path,
+    runtime: LeanRuntime,
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    blueprint_sem = asyncio.Semaphore(args.phase2_blueprint_concurrency)
+    node_sem = asyncio.Semaphore(args.phase2_node_concurrency)
+    with ThreadPoolExecutor(max_workers=args.phase2_node_concurrency) as node_executor:
+        async def run_one(record: dict[str, Any], phase1: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+            phase0_row = record["phase0_row"]
+            async with blueprint_sem:
+                print(f"[phase2-start] {record['record_id']}", flush=True)
+                result = await run_onepass_phase2_async(
+                    record_id=record["record_id"],
+                    theorem_stmt=phase0_row["theorem_stmt"],
+                    model=args.model,
+                    output_root=output_root,
+                    node_timeout_s=args.node_timeout_s,
+                    compiler=runtime.compiler,
+                    compiler_factory=runtime.compiler_factory,
+                    blueprint_reused=bool(phase1.get("blueprint_reused")),
+                    phase1_skipped=bool(phase1.get("phase1_skipped")),
+                    node_executor=node_executor,
+                    node_semaphore=node_sem,
+                )
+                print(f"[phase2-done] {record['record_id']} root_proved={bool(result.get('root_proved'))}", flush=True)
+                return record, result
+        return await asyncio.gather(*(run_one(record, phase1) for record, phase1 in records))
+
+
 def _run_experiment(args: argparse.Namespace, output_root: Path, runtime: LeanRuntime) -> None:
     phase0_path = output_root / "phase0_results.jsonl"
     scores_path = output_root / "rollout_scores.jsonl"
@@ -319,6 +459,15 @@ def _run_experiment(args: argparse.Namespace, output_root: Path, runtime: LeanRu
     phase0_by_id = rows_by_id(phase0_path)
     score_by_id = rows_by_id(scores_path)
 
+    print(
+        "[concurrency] "
+        f"phase1={args.phase1_concurrency} "
+        f"phase2_blueprint={args.phase2_blueprint_concurrency} "
+        f"phase2_node={args.phase2_node_concurrency} "
+        f"lean_check={args.lean_check_concurrency}",
+        flush=True,
+    )
+    pending: list[dict[str, Any]] = []
     for problem in problems:
         parent_id = _problem_id(problem)
         if parent_id not in selected_set:
@@ -353,30 +502,26 @@ def _run_experiment(args: argparse.Namespace, output_root: Path, runtime: LeanRu
                 score_by_id[record_id] = score_row
                 continue
 
-            onepass = run_onepass_record(
-                record_id=record_id,
-                theorem_stmt=phase0_row["theorem_stmt"],
-                nl_proof=phase0_row.get("nl_proof", ""),
-                model=args.model,
-                output_root=output_root,
-                node_timeout_s=args.node_timeout_s,
-                resume=args.resume,
-                compiler=runtime.compiler,
-                compiler_factory=runtime.compiler_factory,
-            )
-            score_row = {
-                **onepass,
-                "parent_id": parent_id,
-                "rollout_id": rollout_id,
-                "phase0_success": True,
-                "math_verify_is_correct": phase0_row["math_verify_is_correct"],
-                "canonical_extracted_answer": phase0_row["candidate_answer"],
-                "extracted_answer_consistent": phase0_row.get("extracted_answer_consistent", True),
-                "warning": phase0_row.get("warning", ""),
-                "lean_runtime": runtime.metadata,
-            }
-            append_jsonl(scores_path, score_row)
-            score_by_id[record_id] = score_row
+            pending.append({
+                "record_id": record_id,
+                "phase0_row": phase0_row,
+            })
+
+    phase1_results = asyncio.run(_run_phase1_batch(pending, args=args, output_root=output_root, runtime=runtime))
+    phase2_ready: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for record, phase1 in phase1_results:
+        if phase1["status"] == "ready":
+            phase2_ready.append((record, phase1))
+            continue
+        score_row = _score_from_onepass(phase1["row"], record["phase0_row"], runtime)
+        append_jsonl(scores_path, score_row)
+        score_by_id[record["record_id"]] = score_row
+
+    phase2_results = asyncio.run(_run_phase2_batch(phase2_ready, args=args, output_root=output_root, runtime=runtime))
+    for record, onepass in phase2_results:
+        score_row = _score_from_onepass(onepass, record["phase0_row"], runtime)
+        append_jsonl(scores_path, score_row)
+        score_by_id[record["record_id"]] = score_row
 
     score_rows = list(score_by_id.values())
     best_rows, metrics = _compute_metrics(
@@ -400,6 +545,7 @@ def _run_experiment(args: argparse.Namespace, output_root: Path, runtime: LeanRu
 
 def main() -> None:
     args = parse_args()
+    _validate_concurrency(args)
     output_root = args.output_root or default_output_root(REPO_ROOT, "tts_rerank_math_verify", args.model)
     output_root.mkdir(parents=True, exist_ok=True)
     runtime = make_lean_runtime(args)

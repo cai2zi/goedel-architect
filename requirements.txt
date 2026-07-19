@@ -4,3 +4,4 @@ networkx>=3.3
 pydantic>=2.7
 tqdm>=4.66
 python-dotenv>=1.0
+PyYAML>=6.0

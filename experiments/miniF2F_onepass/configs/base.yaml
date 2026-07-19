@@ -1,12 +1,19 @@
 model: deepseek-v4-flash
 split: test
 data_dir: data/minif2f
-output_root: ../../czx_work/goedel-architect/miniF2F_onepass/deepseek_v4_flash
+output_root: ../czx_work/goedel-architect/miniF2F_onepass/deepseek_v4_flash/test
 node_timeout_s: 300
+phase1_concurrency: 4
+phase2_blueprint_concurrency: 4
+phase2_node_concurrency: 8
+lean_check_concurrency: 8
+cot:
+  path: null
+  id_field: name
+  text_field: nl_proof
+  allow_missing: false
 environment:
   OPENAI_BASE_URL: https://poloai.top/v1
   GOEDEL_OPENAI_BASE_URL: https://poloai.top/v1
   GOEDEL_BLUEPRINT_MAX_TOKENS: "262144"
   GOEDEL_TOOL_CHOICE_MODE: auto
-  http_proxy: http://127.0.0.1:7897
-  https_proxy: http://127.0.0.1:7897

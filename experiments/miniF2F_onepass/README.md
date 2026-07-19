@@ -24,6 +24,14 @@ python experiments/miniF2F_onepass/run_minif2f_onepass.py \
   --split test 
 ```
 
+Or use the experiment script, whose defaults can be overridden with
+environment variables and trailing CLI flags:
+
+```bash
+PHASE1_CONCURRENCY=4 PHASE2_BLUEPRINT_CONCURRENCY=4 PHASE2_NODE_CONCURRENCY=8 \
+bash experiments/miniF2F_onepass/run.sh --limit 2
+```
+
 Use `--lean-backend local` to fall back to the existing `lake env lean`
 implementation. Kimina runtime flags are:
 
@@ -36,6 +44,27 @@ implementation. Kimina runtime flags are:
 --lean-server-debug / --no-lean-server-debug
 --lean-check-concurrency N
 ```
+
+The runner first completes Phase 1 for the selected rows, then starts Phase 2.
+Phase 1 blueprint creation, Phase 2 blueprint proving, and Phase 2 node proving
+are controlled by:
+
+```text
+--phase1-concurrency N
+--phase2-blueprint-concurrency N
+--phase2-node-concurrency N
+```
+
+miniF2F can optionally load external chain-of-thought hints from a JSONL file
+aligned by problem id:
+
+```json
+{"name": "mathd_algebra_478", "nl_proof": "Natural-language proof sketch..."}
+```
+
+Use `--cot-path`, `--cot-id-field`, `--cot-text-field`, and
+`--cot-allow-missing / --no-cot-allow-missing`. The loaded text is passed as
+`nl_proof` to the blueprint prompt.
 
 `--node-timeout-s` limits a complete LLM node attempt. It is independent of
 `--lean-server-timeout`, which limits one Kimina Lean check.

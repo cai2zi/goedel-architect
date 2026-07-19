@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import time
+from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -95,6 +96,8 @@ async def prove_dag(
     cascade_model: str | None = None,
     cascade_timeout_s: float | None = None,
     escalation_max_tool_calls: int | None = 1,
+    node_executor: Executor | None = None,
+    node_semaphore: asyncio.Semaphore | None = None,
 ) -> OrchestratorResult:
     """
     Prove all nodes in the blueprint DAG in parallel waves.
@@ -121,6 +124,8 @@ async def prove_dag(
         independent of node_timeout_s, so a stuck cheap model can't burn the
         budget meant for the escalation attempt. Defaults to node_timeout_s
         if not given.
+    node_executor/node_semaphore: optional shared limits for node proof work
+        across multiple concurrently-proved blueprints.
     """
     dag = _build_dag(blueprint)
     dag_node_names = set(dag.nodes)
@@ -215,6 +220,8 @@ async def prove_dag(
                 cascade_model=cascade_model,
                 cascade_timeout_s=cascade_timeout_s,
                 escalation_max_tool_calls=escalation_max_tool_calls,
+                node_executor=node_executor,
+                node_semaphore=node_semaphore,
             )
             for name in wave
         ]
@@ -243,6 +250,8 @@ async def _prove_one(
     cascade_model: str | None = None,
     cascade_timeout_s: float | None = None,
     escalation_max_tool_calls: int | None = None,
+    node_executor: Executor | None = None,
+    node_semaphore: asyncio.Semaphore | None = None,
 ) -> NodeResult:
     node = blueprint.node_by_name(name)
     assert node is not None
@@ -286,8 +295,10 @@ async def _prove_one(
     ) -> tuple[ProverResult, float]:
         t0 = time.monotonic()
         loop = asyncio.get_event_loop()
+        if node_semaphore is not None:
+            await node_semaphore.acquire()
         future = loop.run_in_executor(
-            None,
+            node_executor,
             functools.partial(
                 prove_node,
                 node_name=name,
@@ -304,8 +315,10 @@ async def _prove_one(
                 max_tool_calls=max_tool_calls,
             ),
         )
+        if node_semaphore is not None:
+            future.add_done_callback(lambda _future: node_semaphore.release())
         try:
-            result = await asyncio.wait_for(future, timeout=timeout_s)
+            result = await asyncio.wait_for(asyncio.shield(future), timeout=timeout_s)
         except asyncio.TimeoutError:
             dt = time.monotonic() - t0
             print(f"    [node {name}] TIMED OUT after {dt:.1f}s (bound={timeout_s}s, model={use_model}) "
