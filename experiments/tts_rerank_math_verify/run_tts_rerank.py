@@ -4,12 +4,15 @@ import argparse
 import asyncio
 import csv
 import sys
+import time
 import traceback
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 from typing import Any
+
+from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -402,9 +405,15 @@ async def _run_phase1_batch(
                         include_traceback=True,
                     ),
                 }
-            print(f"[phase1-{result['status']}] {record['record_id']}", flush=True)
+            tqdm.write(f"[phase1-{result['status']}] {record['record_id']}")
             return record, result
-        return await asyncio.gather(*(run_one(record) for record in records))
+        tasks = [asyncio.create_task(run_one(record)) for record in records]
+        results: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        with tqdm(total=len(tasks), desc="phase1", unit="record") as progress:
+            for task in asyncio.as_completed(tasks):
+                results.append(await task)
+                progress.update(1)
+        return results
 
 
 async def _run_phase2_batch(
@@ -420,7 +429,7 @@ async def _run_phase2_batch(
         async def run_one(record: dict[str, Any], phase1: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
             phase0_row = record["phase0_row"]
             async with blueprint_sem:
-                print(f"[phase2-start] {record['record_id']}", flush=True)
+                tqdm.write(f"[phase2-start] {record['record_id']}")
                 result = await run_onepass_phase2_async(
                     record_id=record["record_id"],
                     theorem_stmt=phase0_row["theorem_stmt"],
@@ -434,9 +443,15 @@ async def _run_phase2_batch(
                     node_executor=node_executor,
                     node_semaphore=node_sem,
                 )
-                print(f"[phase2-done] {record['record_id']} root_proved={bool(result.get('root_proved'))}", flush=True)
+                tqdm.write(f"[phase2-done] {record['record_id']} root_proved={bool(result.get('root_proved'))}")
                 return record, result
-        return await asyncio.gather(*(run_one(record, phase1) for record, phase1 in records))
+        tasks = [asyncio.create_task(run_one(record, phase1)) for record, phase1 in records]
+        results: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        with tqdm(total=len(tasks), desc="phase2", unit="record") as progress:
+            for task in asyncio.as_completed(tasks):
+                results.append(await task)
+                progress.update(1)
+        return results
 
 
 def _run_experiment(args: argparse.Namespace, output_root: Path, runtime: LeanRuntime) -> None:
@@ -507,7 +522,10 @@ def _run_experiment(args: argparse.Namespace, output_root: Path, runtime: LeanRu
                 "phase0_row": phase0_row,
             })
 
+    phase1_start = time.perf_counter()
     phase1_results = asyncio.run(_run_phase1_batch(pending, args=args, output_root=output_root, runtime=runtime))
+    phase1_duration_s = round(time.perf_counter() - phase1_start, 3)
+    print(f"[runtime] phase1_duration_s={phase1_duration_s}", flush=True)
     phase2_ready: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for record, phase1 in phase1_results:
         if phase1["status"] == "ready":
@@ -517,7 +535,10 @@ def _run_experiment(args: argparse.Namespace, output_root: Path, runtime: LeanRu
         append_jsonl(scores_path, score_row)
         score_by_id[record["record_id"]] = score_row
 
+    phase2_start = time.perf_counter()
     phase2_results = asyncio.run(_run_phase2_batch(phase2_ready, args=args, output_root=output_root, runtime=runtime))
+    phase2_duration_s = round(time.perf_counter() - phase2_start, 3)
+    print(f"[runtime] phase2_duration_s={phase2_duration_s}", flush=True)
     for record, onepass in phase2_results:
         score_row = _score_from_onepass(onepass, record["phase0_row"], runtime)
         append_jsonl(scores_path, score_row)
@@ -530,6 +551,8 @@ def _run_experiment(args: argparse.Namespace, output_root: Path, runtime: LeanRu
         excluded_empty=excluded_empty,
         bench_metadata=bench.get("metadata", {}),
     )
+    metrics["phase1_duration_s"] = phase1_duration_s
+    metrics["phase2_duration_s"] = phase2_duration_s
     write_jsonl(best_path, best_rows)
     write_json(metrics_path, metrics)
     with metrics_csv_path.open("w", encoding="utf-8", newline="") as f:
