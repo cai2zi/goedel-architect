@@ -22,7 +22,7 @@ from enum import Enum
 from typing import Any
 
 from lean_compiler import AbstractLeanCompiler, CompilerResult
-from llm_client import make_client
+from llm_client import chat_completion_with_retry, make_client
 from mathlib_retrieval import MathlibRetrieval
 from goedel_prompts import load, render
 from tracer import NullTracer, TraceEvent
@@ -374,9 +374,17 @@ class GoedelProver:
             {"role": "user", "content": user_prompt},
         ]
         max_tokens = _max_tokens()
+        tool_calls_used = 0
 
         # Force first call to lean_compile
-        response = self.client.chat.completions.create(
+        response = chat_completion_with_retry(
+            self.client,
+            tracer=self.tracer,
+            thm_name=node_name,
+            phase="phase2",
+            model_id=self.model_id,
+            operation="prove_node_initial",
+            trace_args={"tool_calls_used": tool_calls_used},
             model=self.model_id,
             messages=messages,
             tools=active_tools,
@@ -385,7 +393,6 @@ class GoedelProver:
         )
         self._emit_usage(node_name, response)
 
-        tool_calls_used = 0
         best_proof_body = ""
         last_text = ""
         had_tool_calls = False
@@ -419,7 +426,14 @@ class GoedelProver:
                 if (had_search and not had_compile) else "required"
             )
 
-            response = self.client.chat.completions.create(
+            response = chat_completion_with_retry(
+                self.client,
+                tracer=self.tracer,
+                thm_name=node_name,
+                phase="phase2",
+                model_id=self.model_id,
+                operation="prove_node_next",
+                trace_args={"tool_calls_used": tool_calls_used},
                 model=self.model_id,
                 messages=messages,
                 tools=active_tools,
@@ -431,7 +445,14 @@ class GoedelProver:
         # Drain any pending tool calls (get the model's reaction to the last
         # round of tool results without letting it call more tools)
         if had_tool_calls:
-            response = self.client.chat.completions.create(
+            response = chat_completion_with_retry(
+                self.client,
+                tracer=self.tracer,
+                thm_name=node_name,
+                phase="phase2",
+                model_id=self.model_id,
+                operation="prove_node_drain",
+                trace_args={"tool_calls_used": tool_calls_used},
                 model=self.model_id,
                 messages=messages,
                 tools=active_tools,
@@ -454,7 +475,14 @@ class GoedelProver:
                 "role": "user",
                 "content": "Output your best proof: <lean4_proof>:= by\n  ...\n</lean4_proof>",
             })
-            response = self.client.chat.completions.create(
+            response = chat_completion_with_retry(
+                self.client,
+                tracer=self.tracer,
+                thm_name=node_name,
+                phase="phase2",
+                model_id=self.model_id,
+                operation="prove_node_final_answer",
+                trace_args={"tool_calls_used": tool_calls_used},
                 model=self.model_id,
                 messages=messages,
                 max_completion_tokens=max_tokens,
