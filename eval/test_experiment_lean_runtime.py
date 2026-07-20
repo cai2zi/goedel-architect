@@ -25,7 +25,7 @@ from shared.lean_runtime import (  # noqa: E402
     make_lean_runtime,
     prepare_lean_runtime_metadata,
 )
-from shared.onepass import run_onepass_record  # noqa: E402
+from shared.onepass import run_onepass_phase1, run_onepass_record  # noqa: E402
 from shared.phase0 import Phase0Result, _check_theorem  # noqa: E402
 from tts_rerank_math_verify.run_tts_rerank import (  # noqa: E402
     _is_terminal_score,
@@ -57,8 +57,9 @@ def _write_blueprint_checkpoint(
     validated: bool,
     solved: bool = False,
     theorem_stmt: str = THEOREM_STMT,
+    blueprint_lean: str = BLUEPRINT_LEAN,
 ) -> None:
-    blueprint = _parse_blueprint(BLUEPRINT_LEAN, "root")
+    blueprint = _parse_blueprint(blueprint_lean, "root")
     blueprint.fully_validated = validated
     state = CheckpointState(theorem_stmt=theorem_stmt, model="fake")
     state.set_blueprint(blueprint)
@@ -238,6 +239,45 @@ class ExperimentLeanRuntimeTest(unittest.TestCase):
         phase2.assert_called_once()
         self.assertFalse(result["blueprint_reused"])
         self.assertFalse(result["phase1_skipped"])
+
+    def test_resume_regenerates_blueprint_missing_phase2_placeholder(self) -> None:
+        invalid_blueprint = """import Mathlib
+import Architect
+
+@[blueprint
+  (statement := /-- The root theorem. -/)
+  (proof := /-- Trivial. -/)]
+theorem root : True := by
+  trivial
+"""
+        replacement = _parse_blueprint(BLUEPRINT_LEAN, "root")
+        replacement.fully_validated = True
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp)
+            _write_blueprint_checkpoint(
+                output_root,
+                validated=True,
+                blueprint_lean=invalid_blueprint,
+            )
+            with patch("shared.onepass.run_phase1", return_value=replacement) as phase1:
+                result = run_onepass_phase1(
+                    record_id="test",
+                    theorem_stmt=THEOREM_STMT,
+                    nl_proof="trivial",
+                    model="fake",
+                    output_root=output_root,
+                    resume=True,
+                    compiler=LeanCompiler(),
+                )
+
+        phase1.assert_called_once()
+        self.assertEqual(result["status"], "ready")
+        self.assertFalse(result["blueprint_reused"])
+        self.assertFalse(result["phase1_skipped"])
+        self.assertEqual(
+            result["resume_blueprint_invalid_categories"],
+            {"missing_sorry_using_placeholder": 1},
+        )
 
     def test_resume_skips_fully_solved_checkpoint_and_scores_proved_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

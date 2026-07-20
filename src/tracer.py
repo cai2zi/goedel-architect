@@ -38,19 +38,25 @@ class JsonlTracer:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
         self._lock = threading.Lock()
+        self._closed = False
         self._f = self.path.open("a", encoding="utf-8", buffering=1)
 
     def emit(self, event: TraceEvent) -> None:
         line = json.dumps(asdict(event)) + "\n"
         with self._lock:
+            if self._closed:
+                return
             self._f.write(line)
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
             self._f.close()
 
     def __del__(self) -> None:
         try:
-            self._f.close()
+            self.close()
         except Exception:
             pass

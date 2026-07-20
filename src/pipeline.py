@@ -18,7 +18,9 @@ from typing import Callable
 
 from blueprint import (
     Blueprint,
+    format_phase2_contract_errors,
     generate_blueprint,
+    phase2_contract_errors,
     proof_body_to_decl_suffix,
     render_solved_declaration,
 )
@@ -400,6 +402,12 @@ async def run_phase2_async(
     blueprint = state.get_blueprint()
     if blueprint is None:
         raise RuntimeError(f"No blueprint in checkpoint {checkpoint_path} — run Phase 1 first.")
+    contract_errors = phase2_contract_errors(blueprint)
+    if contract_errors:
+        raise RuntimeError(
+            f"Checkpoint blueprint is not phase2-ready; rerun Phase 1 for {checkpoint_path}.\n"
+            f"{format_phase2_contract_errors(contract_errors)}"
+        )
 
     retrieval = retrieval or MathlibRetrieval()
     proved_cache = dict(state.proved_cache)

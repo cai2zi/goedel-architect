@@ -6,6 +6,7 @@ import csv
 import sys
 import time
 import traceback
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
@@ -279,11 +280,13 @@ def _run_experiment(args: argparse.Namespace, output_root: Path, runtime: LeanRu
         flush=True,
     )
     pending: list[dict[str, Any]] = []
+    resume_completed_skips = 0
     for idx, row in selected:
         source_id = _problem_id(row, idx)
         record_id = safe_stem(source_id, prefix="miniF2F_")
         if args.resume and _is_completed_result(done.get(record_id)):
             print(f"[resume] skip completed {record_id}")
+            resume_completed_skips += 1
             continue
 
         try:
@@ -313,6 +316,27 @@ def _run_experiment(args: argparse.Namespace, output_root: Path, runtime: LeanRu
     phase1_results = asyncio.run(_run_phase1_batch(pending, args=args, output_root=output_root, runtime=runtime))
     phase1_duration_s = round(time.perf_counter() - phase1_start, 3)
     print(f"[runtime] phase1_duration_s={phase1_duration_s}", flush=True)
+    if args.resume:
+        resume_invalid_counts: Counter[str] = Counter()
+        successful_blueprint_resumes = 0
+        for _record, phase1 in phase1_results:
+            if phase1.get("blueprint_reused"):
+                successful_blueprint_resumes += 1
+            resume_invalid_counts.update(phase1.get("resume_blueprint_invalid_categories") or {})
+        print(
+            "[resume-summary] "
+            f"completed_result_skips={resume_completed_skips} "
+            f"successful_blueprint_resumes={successful_blueprint_resumes}",
+            flush=True,
+        )
+        if resume_invalid_counts:
+            categories = " ".join(
+                f"{category}={count}"
+                for category, count in sorted(resume_invalid_counts.items())
+            )
+            print(f"[resume-summary] invalid_blueprints {categories}", flush=True)
+        else:
+            print("[resume-summary] invalid_blueprints none", flush=True)
     phase2_ready: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for record, phase1 in phase1_results:
         if phase1["status"] == "ready":

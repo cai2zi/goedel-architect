@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from openai import OpenAI
 
 from blueprint_text import (
     BLUEPRINT_DECL_KW as _BLUEPRINT_DECL_KW,
+    BLUEPRINT_PROOF_RE,
     extract_current_node_decl,
     extract_blueprint_signature,
     lemma_to_theorem,
@@ -387,22 +389,70 @@ class Blueprint:
 
     def dependency_order(self) -> list[BlueprintNode]:
         """Topological order (definitions first, theorem last)."""
+        node_map = self.nodes_by_name()
         ordered: list[BlueprintNode] = []
         visited: set[str] = set()
+        visiting: set[str] = set()
+        stack: list[str] = []
 
         def visit(name: str) -> None:
             if name in visited:
                 return
-            visited.add(name)
-            node = self.node_by_name(name)
-            if node:
-                for dep in node.dependencies:
+            if name in visiting:
+                cycle_start = stack.index(name) if name in stack else 0
+                cycle = stack[cycle_start:] + [name]
+                raise ValueError(f"Blueprint dependency cycle: {' -> '.join(cycle)}")
+            node = node_map.get(name)
+            if node is None:
+                return
+            visiting.add(name)
+            stack.append(name)
+            for dep in node.dependencies:
+                if dep in node_map:
                     visit(dep)
-                ordered.append(node)
+            stack.pop()
+            visiting.remove(name)
+            visited.add(name)
+            ordered.append(node)
 
         for node in self.nodes:
             visit(node.name)
         return ordered
+
+
+def phase2_contract_errors(blueprint: Blueprint) -> list[str]:
+    """Return structural errors that would make Phase 2 node proving invalid."""
+    errors: list[str] = []
+    for node in blueprint.nodes:
+        if node.kind not in {"lemma", "theorem"}:
+            continue
+        current_decl = extract_current_node_decl(node.lean_declaration)
+        placeholder_count = len(BLUEPRINT_PROOF_RE.findall(current_decl))
+        if placeholder_count == 0:
+            errors.append(
+                f"missing_sorry_using_placeholder: proof node `{node.name}` must contain "
+                "`:= by sorry_using [...]`, not a completed proof or plain `sorry`."
+            )
+        elif placeholder_count > 1:
+            errors.append(
+                f"multiple_sorry_using_placeholders: proof node `{node.name}` contains "
+                f"{placeholder_count} `sorry_using` placeholders; expected exactly one."
+            )
+    try:
+        blueprint.dependency_order()
+    except ValueError as exc:
+        errors.append(f"dependency_cycle: {exc}")
+    return errors
+
+
+def phase2_contract_error_counts(errors: list[str]) -> dict[str, int]:
+    return dict(Counter(error.split(":", 1)[0] for error in errors))
+
+
+def format_phase2_contract_errors(errors: list[str], limit: int = 12) -> str:
+    shown = errors[:limit]
+    suffix = "" if len(errors) <= limit else f"\n... and {len(errors) - limit} more"
+    return "\n".join(f"- {error}" for error in shown) + suffix
 
 
 def generate_blueprint(
@@ -459,6 +509,24 @@ def generate_blueprint(
             if result.success:
                 parsed = _parse_blueprint(lean_code, target)
                 if parsed.nodes:
+                    contract_errors = phase2_contract_errors(parsed)
+                    if contract_errors:
+                        _append_assistant_turn(messages, response)
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                f"The file compiled, but the blueprint is not usable by Phase 2 "
+                                f"(attempt {attempt + 1}/{MAX_RETRIES}):\n\n"
+                                f"{format_phase2_contract_errors(contract_errors)}\n\n"
+                                "Fix the blueprint contract and re-emit the whole file. Every "
+                                "`lemma` and `theorem` blueprint node must end with exactly one "
+                                "`:= by sorry_using [...]` placeholder; do not provide completed "
+                                "proofs or plain `sorry` bodies in blueprint proof nodes. "
+                                "Definitions may keep executable bodies. The dependency graph "
+                                "must be acyclic."
+                            ),
+                        })
+                        continue
                     parsed.fully_validated = result.validated
                     return parsed
                 # Compiles, but has zero @[blueprint]-annotated declarations —
@@ -494,6 +562,22 @@ def generate_blueprint(
             target = _extract_target_name(lean_code, theorem_stmt)
             parsed = _parse_blueprint(lean_code, target)
             if parsed.nodes:
+                contract_errors = phase2_contract_errors(parsed)
+                if contract_errors:
+                    _append_assistant_turn(messages, response)
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"The blueprint is not usable by Phase 2 "
+                            f"(attempt {attempt + 1}/{MAX_RETRIES}):\n\n"
+                            f"{format_phase2_contract_errors(contract_errors)}\n\n"
+                            "Re-emit the whole blueprint. Every `lemma` and `theorem` "
+                            "blueprint node must end with exactly one "
+                            "`:= by sorry_using [...]` placeholder; definitions may keep "
+                            "executable bodies. The dependency graph must be acyclic."
+                        ),
+                    })
+                    continue
                 return parsed
             # No compiler here to validate against (see comment above this
             # branch), but a response with zero @[blueprint]-annotated
@@ -526,6 +610,13 @@ def generate_blueprint(
         target = _extract_target_name(last_lean_code, theorem_stmt)
         parsed = _parse_blueprint(last_lean_code, target)
         if parsed.nodes:
+            contract_errors = phase2_contract_errors(parsed)
+            if contract_errors:
+                raise RuntimeError(
+                    f"Blueprint generation failed after {MAX_RETRIES} attempts "
+                    f"(latest blueprint is not phase2-ready):\n"
+                    f"{format_phase2_contract_errors(contract_errors)}"
+                )
             return parsed
     raise RuntimeError(
         f"Blueprint generation failed after {MAX_RETRIES} attempts "

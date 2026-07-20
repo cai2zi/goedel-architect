@@ -13,6 +13,8 @@ from blueprint import (  # noqa: E402
     BlueprintNode,
     _parse_blueprint,
     extract_blueprint_signature,
+    phase2_contract_error_counts,
+    phase2_contract_errors,
     render_solved_declaration,
     strip_blueprint_attr,
 )
@@ -210,6 +212,117 @@ theorem mathd_algebra_478 : True := by
 
         self.assertTrue(result.success)
         self.assertEqual(compiler.codes, [declaration])
+
+    def test_phase2_contract_accepts_definitions_and_sorry_using_proof_nodes(self) -> None:
+        lean_code = """@[blueprint (statement := /-- Helper value. -/)]
+def helper : Nat := 1
+
+@[blueprint
+  (statement := /-- The target. -/)
+  (proof := /-- Use `helper`. -/)]
+theorem root : helper = 1 := by
+  sorry_using [helper]
+"""
+        blueprint = _parse_blueprint(lean_code, "root")
+
+        self.assertEqual(phase2_contract_errors(blueprint), [])
+
+    def test_phase2_contract_rejects_completed_proof_node(self) -> None:
+        lean_code = """@[blueprint
+  (statement := /-- Already proved, but not phase2-spliceable. -/)
+  (proof := /-- Trivial. -/)]
+theorem root : True := by
+  trivial
+"""
+        blueprint = _parse_blueprint(lean_code, "root")
+        errors = phase2_contract_errors(blueprint)
+
+        self.assertEqual(
+            phase2_contract_error_counts(errors),
+            {"missing_sorry_using_placeholder": 1},
+        )
+        self.assertIn("root", errors[0])
+
+    def test_phase2_contract_rejects_plain_sorry_proof_node(self) -> None:
+        lean_code = """@[blueprint
+  (statement := /-- Plain sorry is accepted by Lean but unusable by phase2. -/)
+  (proof := /-- Trivial. -/)]
+theorem root : True := by
+  sorry
+"""
+        blueprint = _parse_blueprint(lean_code, "root")
+        errors = phase2_contract_errors(blueprint)
+
+        self.assertEqual(
+            phase2_contract_error_counts(errors),
+            {"missing_sorry_using_placeholder": 1},
+        )
+
+    def test_dependency_order_rejects_cycles(self) -> None:
+        lean_code = """@[blueprint
+  (statement := /-- First. -/)
+  (proof := /-- Uses b. -/)]
+lemma a : True := by
+  sorry_using [b]
+
+@[blueprint
+  (statement := /-- Second. -/)
+  (proof := /-- Uses a. -/)]
+theorem b : True := by
+  sorry_using [a]
+"""
+        blueprint = _parse_blueprint(lean_code, "b")
+
+        with self.assertRaisesRegex(ValueError, "a -> b -> a"):
+            blueprint.dependency_order()
+
+        self.assertEqual(
+            phase2_contract_error_counts(phase2_contract_errors(blueprint)),
+            {"dependency_cycle": 1},
+        )
+
+    def test_mathd_numbertheory_227_style_blueprint_is_not_phase2_ready(self) -> None:
+        lean_code = """@[blueprint (statement := /-- Coffee contribution. -/)]
+noncomputable def coffee_share (x : ℕ+) : ℝ := (x : ℝ) / 4
+
+@[blueprint (statement := /-- Milk contribution. -/)]
+noncomputable def milk_share (y : ℕ+) : ℝ := (y : ℝ) / 6
+
+@[blueprint (statement := /-- Balance relation. -/)]
+noncomputable def family_balance (x y n : ℕ+) : Prop :=
+  coffee_share x + milk_share y = ((x + y : ℕ+) : ℝ) / n
+
+@[blueprint
+  (statement := /-- Rewrites the hypothesis. -/)
+  (proof := /-- Direct unfolding. -/)]
+lemma h0_is_family_balance (x y n : ℕ+)
+    (h₀ : ↑x / (4 : ℝ) + y / 6 = (x + y) / n) :
+    family_balance x y n := by
+  dsimp [family_balance, coffee_share, milk_share] at *
+  simpa using h₀
+
+@[blueprint
+  (statement := /-- Core arithmetic. -/)
+  (proof := /-- Deferred. -/)]
+lemma family_balance_implies_five (x y n : ℕ+)
+    (h : family_balance x y n) : n = 5 := by
+  sorry
+
+@[blueprint
+  (statement := /-- Root. -/)
+  (proof := /-- Apply helpers. -/)]
+theorem mathd_numbertheory_227 (x y n : ℕ+)
+    (h₀ : ↑x / (4 : ℝ) + y / 6 = (x + y) / n) : n = 5 := by
+  have h : family_balance x y n := h0_is_family_balance x y n h₀
+  exact family_balance_implies_five x y n h
+"""
+        blueprint = _parse_blueprint(lean_code, "mathd_numbertheory_227")
+        errors = phase2_contract_errors(blueprint)
+
+        self.assertEqual(
+            phase2_contract_error_counts(errors),
+            {"missing_sorry_using_placeholder": 3},
+        )
 
 
 if __name__ == "__main__":

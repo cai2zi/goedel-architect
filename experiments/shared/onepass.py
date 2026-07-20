@@ -7,7 +7,7 @@ from concurrent.futures import Executor
 from pathlib import Path
 from typing import Any
 
-from blueprint import Blueprint
+from blueprint import Blueprint, phase2_contract_error_counts, phase2_contract_errors
 from checkpoint import CheckpointState
 from lean_compiler import AbstractLeanCompiler, LeanCompiler
 from mathlib_retrieval import MathlibRetrieval
@@ -69,24 +69,27 @@ def _checkpoint_score(checkpoint_path: Path) -> dict[str, Any] | None:
 def _load_resumable_blueprint(
     checkpoint_path: Path,
     theorem_stmt: str,
-) -> tuple[CheckpointState | None, Blueprint | None]:
+) -> tuple[CheckpointState | None, Blueprint | None, list[str]]:
     """Load a checkpoint blueprint only when it is safe to skip Phase 1."""
     state = CheckpointState.load_or_none(checkpoint_path)
     if state is None:
-        return None, None
+        return None, None, []
     if state.theorem_stmt.strip() != theorem_stmt.strip():
         raise RuntimeError(
             f"Cannot resume {checkpoint_path}: checkpoint theorem statement does not match the input."
         )
 
     blueprint = state.get_blueprint()
-    if (
-        blueprint is None
-        or not blueprint.nodes
-        or not state.blueprint_fully_validated
-    ):
-        return state, None
-    return state, blueprint
+    if blueprint is None:
+        return state, None, ["missing_blueprint: checkpoint contains no blueprint"]
+    if not blueprint.nodes:
+        return state, None, ["empty_blueprint: checkpoint blueprint contains no nodes"]
+    if not state.blueprint_fully_validated:
+        return state, None, ["unvalidated_blueprint: checkpoint blueprint was not fully validated"]
+    contract_errors = phase2_contract_errors(blueprint)
+    if contract_errors:
+        return state, None, contract_errors
+    return state, blueprint, []
 
 
 def _paths(output_root: Path, record_id: str) -> tuple[Path, Path, Path]:
@@ -120,6 +123,15 @@ def _base_row(
     }
 
 
+def _resume_meta(invalid_errors: list[str]) -> dict[str, Any]:
+    error_counts = phase2_contract_error_counts(invalid_errors)
+    return {
+        "resume_blueprint_invalid_errors": list(invalid_errors),
+        "resume_blueprint_invalid_categories": {category: 1 for category in error_counts},
+        "resume_blueprint_invalid_error_counts": error_counts,
+    }
+
+
 def run_onepass_phase1(
     *,
     record_id: str,
@@ -142,8 +154,9 @@ def run_onepass_phase1(
     resume_state: CheckpointState | None = None
     blueprint: Blueprint | None = None
     blueprint_reused = False
+    resume_invalid_errors: list[str] = []
     if resume:
-        resume_state, blueprint = _load_resumable_blueprint(checkpoint_path, theorem_stmt)
+        resume_state, blueprint, resume_invalid_errors = _load_resumable_blueprint(checkpoint_path, theorem_stmt)
         blueprint_reused = blueprint is not None
         cached_score = _checkpoint_score(checkpoint_path) if blueprint_reused else None
         if (
@@ -175,6 +188,7 @@ def run_onepass_phase1(
                 "trace_path": str(trace_path),
                 "blueprint_path": str(blueprint_path),
                 "blueprint_success": cached_score["total_nodes"] > 0,
+                **_resume_meta(resume_invalid_errors),
                 **cached_score,
             }
 
@@ -231,6 +245,7 @@ def run_onepass_phase1(
                 "trace_path": str(trace_path),
                 "blueprint_path": str(blueprint_path),
                 "blueprint_success": False,
+                **_resume_meta(resume_invalid_errors),
                 **score,
             }
 
@@ -243,6 +258,7 @@ def run_onepass_phase1(
             "trace_path": str(trace_path),
             "blueprint_path": str(blueprint_path),
             "blueprint_success": True,
+            **_resume_meta(resume_invalid_errors),
         }
     except Exception as exc:
         cached_score = _checkpoint_score(checkpoint_path) if blueprint_reused else None
@@ -277,6 +293,7 @@ def run_onepass_phase1(
                 and blueprint.nodes
                 and getattr(blueprint, "fully_validated", True)
             ),
+            **_resume_meta(resume_invalid_errors),
             **score,
         }
     finally:
