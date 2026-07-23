@@ -37,6 +37,8 @@ def _reasoning_kwargs(model: str) -> dict:
 
 BLUEPRINT_SYSTEM_PROMPT = load("blueprint_system")
 BLUEPRINT_USER_TEMPLATE = load("blueprint_user")
+ROBUSTPA_BLUEPRINT_SYSTEM_PROMPT = load("robustpa_blueprint_system")
+ROBUSTPA_BLUEPRINT_USER_TEMPLATE = load("robustpa_blueprint_user")
 
 # Appendix A specifies 262,144 (matches DeepSeek-V4-Flash's completion budget).
 # Read at call time so experiment YAML environment settings apply after import.
@@ -205,7 +207,7 @@ def _append_assistant_turn(messages: list[dict], response) -> None:
     without a reply. A synthetic reply satisfies the latter.
     """
     msg = response.choices[0].message
-    assistant_msg: dict = {"role": "assistant", "content": msg.content}
+    assistant_msg: dict = {"role": "assistant", "content": msg.content or ""}
     if msg.tool_calls:
         assistant_msg["tool_calls"] = [tc.model_dump() for tc in msg.tool_calls]
     messages.append(assistant_msg)
@@ -274,7 +276,7 @@ def _call_with_repo_search(
             return response
         messages.append({
             "role": "assistant",
-            "content": msg.content,
+            "content": msg.content or "",
             "tool_calls": [tc.model_dump() for tc in msg.tool_calls],
         })
         for tc in msg.tool_calls:
@@ -624,6 +626,115 @@ def generate_blueprint(
     )
 
 
+def generate_blueprint_from_informal(
+    informal_statement: str,
+    informal_proof: str | None,
+    target_name: str,
+    model: str = "labs-leanstral-1-5",
+    compiler: AbstractLeanCompiler | None = None,
+    tracer=None,
+    thm_name: str = "",
+    max_retries: int = MAX_RETRIES,
+) -> Blueprint:
+    """Generate and strictly validate a blueprint from informal text only.
+
+    Unlike generate_blueprint(), this entry point has no formal Lean theorem
+    signature to preserve. The model must formalize the main theorem itself,
+    but the theorem identifier is fixed by target_name so downstream
+    checkpointing, validation, and scoring remain stable.
+    """
+    if compiler is None:
+        compiler = LeanCompiler()
+
+    client = make_client(model)
+    messages = [
+        {"role": "system", "content": ROBUSTPA_BLUEPRINT_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": render(
+                ROBUSTPA_BLUEPRINT_USER_TEMPLATE,
+                target_name=target_name,
+                informal_statement=informal_statement,
+                informal_proof=informal_proof or "",
+            ),
+        },
+    ]
+
+    last_error_feedback = ""
+    for attempt in range(max_retries):
+        response = _call_with_repo_search(
+            client,
+            model,
+            messages,
+            repo_retrieval=None,
+            reasoning_kwargs=_reasoning_kwargs(model),
+            max_tokens=_max_tokens(),
+            tracer=tracer,
+            thm_name=thm_name,
+            phase="phase1",
+            attempt=attempt + 1,
+        )
+        lean_code = _extract_lean_code(response.choices[0].message.content)
+        emitted_target = _extract_target_name(lean_code, "")
+        if emitted_target != target_name:
+            last_error_feedback = (
+                f"The main theorem must be named `{target_name}`, but the "
+                f"latest output's final theorem is `{emitted_target or '<missing>'}`."
+            )
+            _append_assistant_turn(messages, response)
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"{last_error_feedback}\n\n"
+                    "Re-emit the whole Lean file with exactly one main theorem "
+                    f"named `{target_name}`."
+                ),
+            })
+            continue
+
+        result = compiler.check_blueprint(lean_code, target_name)
+        _emit_lean_check_result(
+            tracer,
+            thm_name=thm_name,
+            phase="phase1",
+            attempt=attempt + 1,
+            target=target_name,
+            result=result,
+        )
+        if result.success:
+            parsed = _parse_blueprint(lean_code, target_name)
+            if not parsed.nodes:
+                last_error_feedback = (
+                    "The file compiled, but contains no `@[blueprint ...]`-annotated declarations."
+                )
+            else:
+                contract_errors = phase2_contract_errors(parsed)
+                if not contract_errors:
+                    parsed.fully_validated = result.validated
+                    return parsed
+                last_error_feedback = (
+                    "The file compiled, but the blueprint is not usable by Phase 2:\n\n"
+                    f"{format_phase2_contract_errors(contract_errors)}"
+                )
+        else:
+            last_error_feedback = "\n".join(result.errors) or result.raw_output[-2000:]
+
+        _append_assistant_turn(messages, response)
+        messages.append({
+            "role": "user",
+            "content": (
+                f"lean_compile reported errors (attempt {attempt + 1}/{max_retries}):\n\n"
+                f"{last_error_feedback}\n\n"
+                "Fix the issues and call lean_compile again."
+            ),
+        })
+
+    raise RuntimeError(
+        f"Informal blueprint generation failed after {max_retries} attempts. "
+        f"Last error:\n{last_error_feedback[-2000:]}"
+    )
+
+
 def _build_user_prompt(theorem_stmt: str, nl_proof: str | None, repo_context: str | None = None) -> str:
     return render(BLUEPRINT_USER_TEMPLATE, theorem_stmt=theorem_stmt, nl_proof=nl_proof or "", repo_context=repo_context or "")
 
@@ -638,11 +749,25 @@ _LEAN_START_RE = re.compile(
 )
 
 
-def _extract_lean_code(content: str) -> str:
+def _extract_lean_code(content: str | None) -> str:
     """Extract the Lean code block from the LLM response."""
-    match = re.search(r"```(?:lean)?\n(.*?)```", content, re.DOTALL)
-    if match:
-        return match.group(1).strip()
+    content = content or ""
+    fenced_blocks = [
+        block.strip()
+        for block in re.findall(r"```(?:lean|lean4)?\s*\n(.*?)```", content, re.DOTALL)
+        if block.strip()
+    ]
+    if fenced_blocks:
+        blueprint_blocks = [
+            block for block in fenced_blocks
+            if "@[blueprint" in block and re.search(r"\btheorem\b", block)
+        ]
+        if blueprint_blocks:
+            return blueprint_blocks[-1]
+        leanish_blocks = [block for block in fenced_blocks if _LEAN_START_RE.search(block)]
+        if leanish_blocks:
+            return leanish_blocks[-1]
+        return fenced_blocks[-1]
     # No fence - the model may still have prefixed its response with
     # non-Lean text (a leaked tag, an apology, etc.). Start at the first
     # line that looks like real Lean rather than treating the raw response

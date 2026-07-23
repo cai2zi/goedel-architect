@@ -41,6 +41,10 @@ from shared.lean_runtime import (  # noqa: E402
     prepare_lean_runtime_metadata,
 )
 from shared.onepass import run_onepass_phase1, run_onepass_phase2_async  # noqa: E402
+try:
+    from .summarize_run import summarize_run  # type: ignore  # noqa: E402
+except ImportError:
+    from summarize_run import summarize_run  # type: ignore  # noqa: E402
 
 
 DEFAULT_MODEL = "deepseek-v4-flash"
@@ -69,6 +73,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--phase1-concurrency", type=int, default=4)
     parser.add_argument("--phase2-blueprint-concurrency", type=int, default=4)
     parser.add_argument("--phase2-node-concurrency", type=int, default=8)
+    parser.add_argument("--summary", action=argparse.BooleanOptionalAction, default=True)
     cot_path_default = cot_config.get("path")
     parser.add_argument("--cot-path", type=Path, default=Path(cot_path_default) if cot_path_default else None)
     parser.add_argument("--cot-id-field", default=cot_config.get("id_field", "name"))
@@ -379,6 +384,11 @@ def _run_experiment(args: argparse.Namespace, output_root: Path, runtime: LeanRu
 
     print(f"[done] results={results_path}")
     print(f"[metrics] {metrics}")
+    if args.summary:
+        summary = summarize_run(output_root)
+        print(f"[summary] events={summary['events_path']} rows={summary['event_count']}")
+        print(f"[summary] samples={summary['samples_path']} rows={summary['sample_count']}")
+        print(f"[summary] failure_category_counts={summary['failure_category_counts']}")
 
 
 def main() -> None:

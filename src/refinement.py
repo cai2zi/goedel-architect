@@ -75,6 +75,7 @@ def refine_blueprint(
     repo_retrieval=None,
     tracer=None,
     thm_name: str = "",
+    max_retries: int = MAX_RETRIES,
 ) -> Blueprint:
     """
     Produce a revised blueprint by feeding failure diagnostics back to the LLM.
@@ -129,7 +130,7 @@ def refine_blueprint(
     ]
 
     last_error_feedback = ""
-    for attempt in range(MAX_RETRIES):
+    for attempt in range(max_retries):
         response = _call_with_repo_search(
             client, model, messages, repo_retrieval, _reasoning_kwargs(model), MAX_TOKENS,
             tracer=tracer, thm_name=thm_name, phase="phase3",
@@ -142,19 +143,19 @@ def refine_blueprint(
             parsed = _parse_blueprint(lean_code, blueprint.target_theorem)
             if parsed.nodes:
                 parsed.fully_validated = result.validated
-                print(f"  [refine] attempt {attempt + 1}/{MAX_RETRIES}: check_blueprint OK", flush=True)
+                print(f"  [refine] attempt {attempt + 1}/{max_retries}: check_blueprint OK", flush=True)
                 return parsed
             # Compiles, but has zero @[blueprint]-annotated declarations - an
             # empty node set would make all_proved() vacuously true downstream
             # with no actual proof recorded, so this must be retried rather
             # than accepted (mirrors generate_blueprint's same guard).
-            print(f"  [refine] attempt {attempt + 1}/{MAX_RETRIES}: check_blueprint OK but zero nodes, retrying", flush=True)
+            print(f"  [refine] attempt {attempt + 1}/{max_retries}: check_blueprint OK but zero nodes, retrying", flush=True)
             messages.append({"role": "assistant", "content": content})
             messages.append({
                 "role": "user",
                 "content": (
                     f"The file compiled, but contains no `@[blueprint ...]`-annotated "
-                    f"declarations (attempt {attempt + 1}/{MAX_RETRIES}). Re-emit the "
+                    f"declarations (attempt {attempt + 1}/{max_retries}). Re-emit the "
                     "blueprint with proper annotations."
                 ),
             })
@@ -163,20 +164,20 @@ def refine_blueprint(
         # Feed compile errors back for next attempt
         error_feedback = "\n".join(result.errors) or result.raw_output[-2000:]
         last_error_feedback = error_feedback
-        print(f"  [refine] attempt {attempt + 1}/{MAX_RETRIES}: check_blueprint FAILED - "
+        print(f"  [refine] attempt {attempt + 1}/{max_retries}: check_blueprint FAILED - "
               f"{error_feedback[:300]!r}", flush=True)
         messages.append({"role": "assistant", "content": content})
         messages.append({
             "role": "user",
             "content": (
-                f"lean_compile reported errors (attempt {attempt + 1}/{MAX_RETRIES}):\n\n"
+                f"lean_compile reported errors (attempt {attempt + 1}/{max_retries}):\n\n"
                 f"{error_feedback}\n\n"
                 "Fix the issues and call lean_compile again."
             ),
         })
 
     raise RuntimeError(
-        f"Refinement failed after {MAX_RETRIES} attempts. "
+        f"Refinement failed after {max_retries} attempts. "
         f"Last check_blueprint error:\n{last_error_feedback[-2000:]}"
     )
 

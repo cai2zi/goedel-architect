@@ -105,11 +105,14 @@ def prove_theorem(
     project_root: Path | None = None,
     repo_context: str | None = None,
     node_timeout_s: float | None = 300.0,
+    llm_api_timeout_s: float = 120.0,
     checkpoint_path: Path | None = None,
     thm_name: str = "",
     cascade_model: str | None = None,
     cascade_timeout_s: float | None = None,
+    node_max_tool_calls: int | None = None,
     escalation_max_tool_calls: int | None = 1,
+    refine_max_retries: int | None = None,
 ) -> ProofResult:
     """
     Full Goedel-Architect pipeline for a single theorem.
@@ -128,6 +131,9 @@ def prove_theorem(
         tracer: Optional tracer for emitting events.
         node_timeout_s: Per-node wall-clock bound in Phase 2 (see
             orchestrator.prove_dag). None disables the bound.
+        llm_api_timeout_s: Per-request timeout for Phase 2 LLM HTTP calls.
+            Increase this when a local OpenAI-compatible server queues
+            requests for longer than the default 120s.
         checkpoint_path: If given, state is saved after every phase and, if
             the file already exists, resumed from wherever it left off
             (skipping Phase 1 and any already-proved nodes). See checkpoint.py
@@ -222,8 +228,10 @@ def prove_theorem(
                 nodes_to_retry=nodes_to_try,
                 tracer=tracer,
                 node_timeout_s=node_timeout_s,
+                llm_api_timeout_s=llm_api_timeout_s,
                 cascade_model=cascade_model,
                 cascade_timeout_s=cascade_timeout_s,
+                node_max_tool_calls=node_max_tool_calls,
                 escalation_max_tool_calls=escalation_max_tool_calls,
             )
         )
@@ -290,6 +298,7 @@ def prove_theorem(
                 repo_retrieval=repo_retrieval,
                 tracer=tracer,
                 thm_name=thm_name,
+                max_retries=refine_max_retries or 8,
             )
             print(f"  new blueprint has {len(blueprint.nodes)} nodes: {[n.name for n in blueprint.nodes]}", flush=True)
         except RuntimeError as e:
@@ -384,9 +393,11 @@ async def run_phase2_async(
     repo_retrieval=None,
     tracer=None,
     node_timeout_s: float | None = 300.0,
+    llm_api_timeout_s: float = 120.0,
     model: str | None = None,
     cascade_model: str | None = None,
     cascade_timeout_s: float | None = None,
+    node_max_tool_calls: int | None = None,
     escalation_max_tool_calls: int | None = 1,
     node_executor: Executor | None = None,
     node_semaphore: asyncio.Semaphore | None = None,
@@ -425,8 +436,10 @@ async def run_phase2_async(
         nodes_to_retry=nodes_to_try,
         tracer=tracer,
         node_timeout_s=node_timeout_s,
+        llm_api_timeout_s=llm_api_timeout_s,
         cascade_model=cascade_model,
         cascade_timeout_s=cascade_timeout_s,
+        node_max_tool_calls=node_max_tool_calls,
         escalation_max_tool_calls=escalation_max_tool_calls,
         node_executor=node_executor,
         node_semaphore=node_semaphore,
@@ -456,9 +469,11 @@ def run_phase2(
     repo_retrieval=None,
     tracer=None,
     node_timeout_s: float | None = 300.0,
+    llm_api_timeout_s: float = 120.0,
     model: str | None = None,
     cascade_model: str | None = None,
     cascade_timeout_s: float | None = None,
+    node_max_tool_calls: int | None = None,
     escalation_max_tool_calls: int | None = 1,
     node_executor: Executor | None = None,
     node_semaphore: asyncio.Semaphore | None = None,
@@ -472,9 +487,11 @@ def run_phase2(
             repo_retrieval=repo_retrieval,
             tracer=tracer,
             node_timeout_s=node_timeout_s,
+            llm_api_timeout_s=llm_api_timeout_s,
             model=model,
             cascade_model=cascade_model,
             cascade_timeout_s=cascade_timeout_s,
+            node_max_tool_calls=node_max_tool_calls,
             escalation_max_tool_calls=escalation_max_tool_calls,
             node_executor=node_executor,
             node_semaphore=node_semaphore,
@@ -491,6 +508,7 @@ def run_phase3(
     repo_retrieval=None,
     tracer=None,
     thm_name: str = "",
+    refine_max_retries: int | None = None,
 ) -> Blueprint:
     """Run one Phase 3 (refinement) pass against a checkpointed blueprint.
 
@@ -533,6 +551,7 @@ def run_phase3(
         repo_retrieval=repo_retrieval,
         tracer=tracer,
         thm_name=thm_name,
+        max_retries=refine_max_retries or 8,
     )
 
     new_proved_cache = _invalidate_stale_proofs(new_blueprint, state.proved_cache, state.proof_cache_keys)

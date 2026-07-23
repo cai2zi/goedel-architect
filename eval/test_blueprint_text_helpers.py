@@ -11,6 +11,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from blueprint import (  # noqa: E402
     BlueprintNode,
+    _extract_lean_code,
     _parse_blueprint,
     extract_blueprint_signature,
     phase2_contract_error_counts,
@@ -36,6 +37,9 @@ lemma mod7_2003_eq_1 :
 
 
 class BlueprintTextHelpersTest(unittest.TestCase):
+    def test_extract_lean_code_treats_none_content_as_empty(self) -> None:
+        self.assertEqual(_extract_lean_code(None), "")
+
     def test_signature_ignores_bracket_inside_blueprint_doc_comment(self) -> None:
         expected = (
             "theorem mod7_2003_eq_1 :\n"

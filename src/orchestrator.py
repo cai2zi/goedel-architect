@@ -95,6 +95,8 @@ async def prove_dag(
     node_timeout_s: float | None = 300.0,
     cascade_model: str | None = None,
     cascade_timeout_s: float | None = None,
+    llm_api_timeout_s: float = 120.0,
+    node_max_tool_calls: int | None = None,
     escalation_max_tool_calls: int | None = 1,
     node_executor: Executor | None = None,
     node_semaphore: asyncio.Semaphore | None = None,
@@ -113,6 +115,11 @@ async def prove_dag(
         entirely for those instead of paying its rate on every node
         regardless of difficulty. None (default) disables cascading - every
         node goes straight to `model`, unchanged from prior behavior.
+    node_max_tool_calls: optional cap for each normal per-node prover loop.
+        None keeps prover.py's default MAX_TOOL_CALLS.
+    llm_api_timeout_s: per-request timeout passed to the OpenAI-compatible
+        chat client used by prover.py. This bounds a single queued/generating
+        LLM HTTP request; node_timeout_s bounds the whole node proof loop.
     escalation_max_tool_calls: caps the escalated (expensive) attempt's own
         internal fix-and-retry budget (default 1: a single lean_compile call,
         no follow-up correction round) - only applies when cascade_model is
@@ -219,6 +226,8 @@ async def prove_dag(
                 node_timeout_s=node_timeout_s,
                 cascade_model=cascade_model,
                 cascade_timeout_s=cascade_timeout_s,
+                llm_api_timeout_s=llm_api_timeout_s,
+                node_max_tool_calls=node_max_tool_calls,
                 escalation_max_tool_calls=escalation_max_tool_calls,
                 node_executor=node_executor,
                 node_semaphore=node_semaphore,
@@ -249,6 +258,8 @@ async def _prove_one(
     node_timeout_s: float | None = None,
     cascade_model: str | None = None,
     cascade_timeout_s: float | None = None,
+    llm_api_timeout_s: float = 120.0,
+    node_max_tool_calls: int | None = None,
     escalation_max_tool_calls: int | None = None,
     node_executor: Executor | None = None,
     node_semaphore: asyncio.Semaphore | None = None,
@@ -312,6 +323,7 @@ async def _prove_one(
                 node_proof_sketch_nl=node.proof_sketch,
                 repo_retrieval=repo_retrieval,
                 tracer=tracer,
+                api_timeout_s=llm_api_timeout_s,
                 max_tool_calls=max_tool_calls,
             ),
         )
@@ -360,6 +372,7 @@ async def _prove_one(
         result, dt = await attempt(
             cascade_model,
             cascade_timeout_s if cascade_timeout_s is not None else node_timeout_s,
+            max_tool_calls=node_max_tool_calls,
         )
         if result.signal == ProofSignal.SOLVED:
             print(f"    [node {name}] finished after {dt:.1f}s -> solved "
@@ -374,7 +387,7 @@ async def _prove_one(
     # keeps its full default budget, unchanged from prior behavior.
     result, dt = await attempt(
         model, node_timeout_s,
-        max_tool_calls=escalation_max_tool_calls if escalating else None,
+        max_tool_calls=escalation_max_tool_calls if escalating else node_max_tool_calls,
     )
     print(f"    [node {name}] finished after {dt:.1f}s -> {result.signal.value}", flush=True)
     return NodeResult(node=node, result=result)
