@@ -26,7 +26,6 @@ python experiments/robustpa_refine/run_robustpa_refine.py \
   --exp-name vllm_qwen_run1 \
   --model <vllm-model-name> \
   --openai-base-url http://localhost:8000/v1 \
-  --llm-api-timeout-s 600 \
   --resume
 ```
 
@@ -40,12 +39,31 @@ python experiments/robustpa_refine/run_robustpa_refine.py \
   --limit 1 \
   --model <vllm-model-name> \
   --openai-base-url http://localhost:8000/v1 \
-  --llm-api-timeout-s 600
+  --llm-api-timeout-s none
 ```
 
 `--llm-api-timeout-s` controls the timeout for one OpenAI-compatible LLM HTTP
 request. `--node-timeout-s` controls the whole Phase2 proof loop for one node,
-which may contain multiple LLM calls and Lean tool calls.
+which may contain multiple LLM calls and Lean tool calls. RobustPA defaults
+both to `null` for local vLLM runs. Passing `0`, `none`, or `null` on the
+command line has the same effect.
+
+Subset filtering:
+
+`--subset` may be passed more than once. If omitted, the runner uses every
+subset under the data root that contains parquet files. Current available
+subsets in `/ssd/czx/czx_work/RobustPABench` are:
+
+- `global_gemini_rephrase`
+- `global_gemini_step`
+- `global_original`
+- `global_qwen3_rephrase`
+- `global_qwen3_step`
+- `local_number_edit_proof`
+- `local_number_edit_statement`
+- `local_step_delete`
+- `local_symbol_edit_proof`
+- `local_symbol_edit_statement`
 
 Outputs are written to `/ssd/czx/czx_work/robustpa_refine/<exp_name>` by
 default:

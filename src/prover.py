@@ -265,7 +265,7 @@ class GoedelProver:
         model_id: str = "labs-leanstral-1-5",
         retrieval: MathlibRetrieval | None = None,
         tracer=None,
-        api_timeout_s: float = 120.0,
+        api_timeout_s: float | None = 120.0,
         max_tool_calls: int | None = None,
     ):
         self.model_id = model_id
@@ -757,7 +757,7 @@ def prove_node(
     node_proof_sketch_nl: str = "",
     repo_retrieval=None,
     tracer=None,
-    api_timeout_s: float = 120.0,
+    api_timeout_s: float | None = 120.0,
     max_tool_calls: int | None = None,
 ) -> ProverResult:
     parent_block = "\n\n".join(

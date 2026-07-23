@@ -4,14 +4,14 @@ output_base: /ssd/czx/czx_work/robustpa_refine
 model: Qwen3.5-397B-A17B-FP8
 max_refinement_iterations: 8
 blueprint_max_retries: 8
-refine_max_retries: 8
+refine_max_retries: 4
 node_max_tool_calls: 8
-node_timeout_s: 1200
-llm_api_timeout_s: 300
-phase1_concurrency: 256
-phase2_blueprint_concurrency: 128
-phase2_node_concurrency: 512
-refine_concurrency: 128
+node_timeout_s: null
+llm_api_timeout_s: null
+phase1_concurrency: 1024
+phase2_blueprint_concurrency: 512
+phase2_node_concurrency: 1024
+refine_concurrency: 1024
 lean_check_concurrency: 8
 lean_backend: local
 environment:

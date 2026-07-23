@@ -95,7 +95,7 @@ async def prove_dag(
     node_timeout_s: float | None = 300.0,
     cascade_model: str | None = None,
     cascade_timeout_s: float | None = None,
-    llm_api_timeout_s: float = 120.0,
+    llm_api_timeout_s: float | None = 120.0,
     node_max_tool_calls: int | None = None,
     escalation_max_tool_calls: int | None = 1,
     node_executor: Executor | None = None,
@@ -119,7 +119,8 @@ async def prove_dag(
         None keeps prover.py's default MAX_TOOL_CALLS.
     llm_api_timeout_s: per-request timeout passed to the OpenAI-compatible
         chat client used by prover.py. This bounds a single queued/generating
-        LLM HTTP request; node_timeout_s bounds the whole node proof loop.
+        LLM HTTP request; None disables the client-side timeout.
+        node_timeout_s bounds the whole node proof loop.
     escalation_max_tool_calls: caps the escalated (expensive) attempt's own
         internal fix-and-retry budget (default 1: a single lean_compile call,
         no follow-up correction round) - only applies when cascade_model is
@@ -258,7 +259,7 @@ async def _prove_one(
     node_timeout_s: float | None = None,
     cascade_model: str | None = None,
     cascade_timeout_s: float | None = None,
-    llm_api_timeout_s: float = 120.0,
+    llm_api_timeout_s: float | None = 120.0,
     node_max_tool_calls: int | None = None,
     escalation_max_tool_calls: int | None = None,
     node_executor: Executor | None = None,

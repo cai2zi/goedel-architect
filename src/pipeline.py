@@ -105,7 +105,7 @@ def prove_theorem(
     project_root: Path | None = None,
     repo_context: str | None = None,
     node_timeout_s: float | None = 300.0,
-    llm_api_timeout_s: float = 120.0,
+    llm_api_timeout_s: float | None = 120.0,
     checkpoint_path: Path | None = None,
     thm_name: str = "",
     cascade_model: str | None = None,
@@ -133,7 +133,8 @@ def prove_theorem(
             orchestrator.prove_dag). None disables the bound.
         llm_api_timeout_s: Per-request timeout for Phase 2 LLM HTTP calls.
             Increase this when a local OpenAI-compatible server queues
-            requests for longer than the default 120s.
+            requests for longer than the default 120s. None disables the
+            client-side timeout.
         checkpoint_path: If given, state is saved after every phase and, if
             the file already exists, resumed from wherever it left off
             (skipping Phase 1 and any already-proved nodes). See checkpoint.py
@@ -393,7 +394,7 @@ async def run_phase2_async(
     repo_retrieval=None,
     tracer=None,
     node_timeout_s: float | None = 300.0,
-    llm_api_timeout_s: float = 120.0,
+    llm_api_timeout_s: float | None = 120.0,
     model: str | None = None,
     cascade_model: str | None = None,
     cascade_timeout_s: float | None = None,
@@ -469,7 +470,7 @@ def run_phase2(
     repo_retrieval=None,
     tracer=None,
     node_timeout_s: float | None = 300.0,
-    llm_api_timeout_s: float = 120.0,
+    llm_api_timeout_s: float | None = 120.0,
     model: str | None = None,
     cascade_model: str | None = None,
     cascade_timeout_s: float | None = None,

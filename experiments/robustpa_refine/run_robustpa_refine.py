@@ -49,6 +49,21 @@ DEFAULT_OUTPUT_BASE = REPO_ROOT.parent / "czx_work" / "robustpa_refine"
 DEFAULT_MODEL = "deepseek-v4-flash"
 
 
+def _optional_timeout(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        timeout = float(value)
+    else:
+        text = str(value).strip().lower()
+        if text in {"", "none", "null", "no", "false"}:
+            return None
+        timeout = float(text)
+    if timeout == 0:
+        return None
+    return timeout
+
+
 @dataclass(frozen=True)
 class Record:
     unique_id: str
@@ -85,8 +100,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--blueprint-max-retries", type=int, default=8)
     parser.add_argument("--refine-max-retries", type=int, default=8)
     parser.add_argument("--node-max-tool-calls", type=int, default=8)
-    parser.add_argument("--node-timeout-s", type=int, default=300)
-    parser.add_argument("--llm-api-timeout-s", type=float, default=120.0)
+    parser.add_argument("--node-timeout-s", type=_optional_timeout, default=300.0)
+    parser.add_argument("--llm-api-timeout-s", type=_optional_timeout, default=120.0)
     parser.add_argument("--phase1-concurrency", type=int, default=4)
     parser.add_argument("--phase2-blueprint-concurrency", type=int, default=4)
     parser.add_argument("--phase2-node-concurrency", type=int, default=8)
@@ -100,6 +115,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.openai_base_url:
         os.environ["GOEDEL_OPENAI_BASE_URL"] = args.openai_base_url.rstrip("/")
         os.environ.setdefault("GOEDEL_OPENAI_API_KEY", "dummy")
+    args.node_timeout_s = _optional_timeout(args.node_timeout_s)
+    args.llm_api_timeout_s = _optional_timeout(args.llm_api_timeout_s)
     _validate_args(args)
     return args
 
@@ -119,9 +136,9 @@ def _validate_args(args: argparse.Namespace) -> None:
     if args.max_refinement_iterations < 0:
         raise ValueError("max_refinement_iterations must be non-negative")
     if args.node_timeout_s is not None and args.node_timeout_s <= 0:
-        raise ValueError("node_timeout_s must be positive")
-    if args.llm_api_timeout_s <= 0:
-        raise ValueError("llm_api_timeout_s must be positive")
+        raise ValueError("node_timeout_s must be positive or none/null/0")
+    if args.llm_api_timeout_s is not None and args.llm_api_timeout_s <= 0:
+        raise ValueError("llm_api_timeout_s must be positive or none/null/0")
 
 
 def _read_parquet_rows(path: Path) -> list[dict[str, Any]]:
@@ -683,6 +700,7 @@ async def _run_experiment(args: argparse.Namespace, output_root: Path, runtime: 
         f"phase2_node={args.phase2_node_concurrency} "
         f"refine={args.refine_concurrency} "
         f"lean_check={args.lean_check_concurrency} "
+        f"node_timeout_s={args.node_timeout_s} "
         f"llm_api_timeout_s={args.llm_api_timeout_s}",
         flush=True,
     )
