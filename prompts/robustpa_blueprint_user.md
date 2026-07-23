@@ -15,7 +15,9 @@ The main theorem in your Lean output MUST be named exactly `{{target_name}}`.
 {{#if informal_proof}}
 ## Informal proof
 
-Use this as a structural hint when formalizing and decomposing the proof. You do not need to follow it exactly; reformulate or split steps as needed to make each lemma nearly trivial given its parents.
+Translate this proof faithfully. Follow its reasoning steps, intermediate claims, equations, constants, symbols, and proof order as the primary structure of the blueprint. You may split a step into smaller lemmas to make the graph type-correct and tractable, but each split lemma must still correspond to the proof as written.
+
+Important: this proof may contain deliberate perturbations, missing reasoning, or mathematical errors. Do not silently correct them, revert them to an original version, or replace them with a different proof. If a step is wrong or unjustified, encode the claimed step as its own `@[blueprint]` lemma/gap with `:= by sorry_using [...]` and describe the same claimed reasoning in the natural-language `proof` field.
 
 {{informal_proof}}
 {{/if}}

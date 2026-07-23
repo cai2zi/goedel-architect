@@ -659,7 +659,7 @@ def generate_blueprint_from_informal(
             ),
         },
     ]
-    import pdb;pdb.set_trace()
+    
     last_error_feedback = ""
     for attempt in range(max_retries):
         response = _call_with_repo_search(
