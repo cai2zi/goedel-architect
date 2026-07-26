@@ -49,6 +49,22 @@ DEFAULT_OUTPUT_BASE = REPO_ROOT.parent / "czx_work" / "robustpa_refine"
 DEFAULT_MODEL = "deepseek-v4-flash"
 
 
+def _exp_name_component(values: str | list[str] | None, fallback: str) -> str:
+    if values is None:
+        return fallback
+    if isinstance(values, str):
+        return safe_stem(values)
+    parts = [safe_stem(str(value)) for value in values if str(value).strip()]
+    return "_".join(parts) if parts else fallback
+
+
+def default_exp_name(model: str, splits: list[str] | None, subsets: list[str] | None) -> str:
+    model_part = safe_stem(model)
+    split_part = _exp_name_component(splits, "all")
+    subset_part = _exp_name_component(subsets, "all")
+    return f"{model_part}_{split_part}_{subset_part}"
+
+
 def _optional_timeout(value: Any) -> float | None:
     if value is None:
         return None
@@ -111,7 +127,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     set_defaults_from_config(parser, config, ignore={"config"})
     args = parser.parse_args(argv)
     if not args.exp_name:
-        raise ValueError("--exp-name is required, or set exp_name in the config file.")
+        args.exp_name = default_exp_name(args.model, args.split, args.subset)
     if args.openai_base_url:
         os.environ["GOEDEL_OPENAI_BASE_URL"] = args.openai_base_url.rstrip("/")
         os.environ.setdefault("GOEDEL_OPENAI_API_KEY", "dummy")

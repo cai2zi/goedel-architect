@@ -74,3 +74,26 @@ default:
   accuracy summaries.
 - `checkpoints/`, `traces/`, `blueprints/`: resumable state and per-round Lean
   blueprint snapshots.
+
+Build a compact one-file bundle for web-chat analysis:
+
+```bash
+python experiments/robustpa_refine/summarize_for_chat.py \
+  /ssd/czx/czx_work/robustpa_refine/<exp_name> \
+  --output /ssd/czx/czx_work/robustpa_refine/<exp_name>/chat_bundle.md
+```
+
+The bundle summarizes `metrics.json`, `results.jsonl`, `rounds.jsonl`, and
+`traces/**/*.jsonl` without pasting raw trace logs. Use `--problem-rows all` if
+you want compact rows for every selected problem rather than failures only.
+
+Browse per-problem trace conversations in a local web UI:
+
+```bash
+python experiments/robustpa_refine/trace_viewer.py \
+  /ssd/czx/czx_work/robustpa_refine/<exp_name> \
+  --port 8765
+```
+
+Open the printed URL, enter a `source_id`, `record_id`, or full unique id, and
+optionally filter by node name.

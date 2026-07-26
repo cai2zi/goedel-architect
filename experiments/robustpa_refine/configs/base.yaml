@@ -4,7 +4,7 @@ output_base: /ssd/czx/czx_work/robustpa_refine
 model: Qwen3.5-397B-A17B-FP8
 max_refinement_iterations: 8
 blueprint_max_retries: 8
-refine_max_retries: 4
+refine_max_retries: 8
 node_max_tool_calls: 8
 node_timeout_s: null
 llm_api_timeout_s: null
@@ -15,8 +15,8 @@ refine_concurrency: 1024
 lean_check_concurrency: 8
 lean_backend: local
 environment:
-  GOEDEL_BLUEPRINT_MAX_TOKENS: "16384"
-  GOEDEL_PROVER_MAX_TOKENS: "8192"
+  GOEDEL_BLUEPRINT_MAX_TOKENS: "32768"
+  GOEDEL_PROVER_MAX_TOKENS: "16384"
   GOEDEL_LLM_MAX_RETRIES: "6"
   GOEDEL_LLM_RETRY_BASE_DELAY_S: "2"
   GOEDEL_LLM_RETRY_MAX_DELAY_S: "60"
