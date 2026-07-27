@@ -80,6 +80,28 @@ def _optional_timeout(value: Any) -> float | None:
     return timeout
 
 
+def _optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+    text = str(value).strip().lower()
+    if text in {"", "none", "null", "default", "omit"}:
+        return None
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(
+        "expected one of: true/false/null, 1/0, yes/no, on/off"
+    )
+
+
 @dataclass(frozen=True)
 class Record:
     unique_id: str
@@ -116,6 +138,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--blueprint-max-retries", type=int, default=8)
     parser.add_argument("--refine-max-retries", type=int, default=8)
     parser.add_argument("--node-max-tool-calls", type=int, default=8)
+    parser.add_argument(
+        "--parallel-tool-calls",
+        type=_optional_bool,
+        default=None,
+        metavar="{true,false,null}",
+        help=(
+            "Whether to pass parallel_tool_calls to chat.completions. "
+            "true/1 allows multiple tool calls in one assistant response; "
+            "false/0 asks for at most one; null/none omits the field."
+        ),
+    )
     parser.add_argument("--node-timeout-s", type=_optional_timeout, default=300.0)
     parser.add_argument("--llm-api-timeout-s", type=_optional_timeout, default=120.0)
     parser.add_argument("--phase1-concurrency", type=int, default=4)
@@ -133,6 +166,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         os.environ.setdefault("GOEDEL_OPENAI_API_KEY", "dummy")
     args.node_timeout_s = _optional_timeout(args.node_timeout_s)
     args.llm_api_timeout_s = _optional_timeout(args.llm_api_timeout_s)
+    args.parallel_tool_calls = _optional_bool(args.parallel_tool_calls)
     _validate_args(args)
     return args
 
@@ -446,6 +480,7 @@ async def _run_record(
 
         if blueprint is None:
             phase = "phase1"
+            phase1_tracer = tracer.with_context(phase="phase1", iteration=0)
             async with phase1_sem:
                 tqdm.write(f"[phase1-start] {record.unique_id}")
                 blueprint = await loop.run_in_executor(
@@ -457,7 +492,7 @@ async def _run_record(
                         target_name=record.theorem_name,
                         model=args.model,
                         compiler=runtime.compiler,
-                        tracer=tracer,
+                        tracer=phase1_tracer,
                         thm_name=record.unique_id,
                         max_retries=args.blueprint_max_retries,
                     ),
@@ -483,6 +518,8 @@ async def _run_record(
             tracer.emit(TraceEvent(
                 kind="resume",
                 thm_name=record.unique_id,
+                phase="resume",
+                iteration=state.iteration,
                 args={"iteration": state.iteration, "proved_cache_count": len(state.proved_cache)},
                 ok=True,
             ))
@@ -507,16 +544,18 @@ async def _run_record(
             phase = "phase2"
             async with phase2_sem:
                 tqdm.write(f"[phase2-start] {record.unique_id} iteration={state.iteration}")
+                phase2_tracer = tracer.with_context(phase="phase2", iteration=state.iteration)
                 orch_result = await run_phase2_async(
                     checkpoint_path=checkpoint_path,
                     compiler=runtime.compiler,
                     compiler_factory=runtime.compiler_factory,
                     retrieval=MathlibRetrieval(),
-                    tracer=tracer,
+                    tracer=phase2_tracer,
                     node_timeout_s=args.node_timeout_s,
                     llm_api_timeout_s=args.llm_api_timeout_s,
                     model=args.model,
                     node_max_tool_calls=args.node_max_tool_calls,
+                    parallel_tool_calls=args.parallel_tool_calls,
                     node_executor=node_executor,
                     node_semaphore=node_sem,
                 )
@@ -568,6 +607,7 @@ async def _run_record(
             phase = "phase3"
             async with refine_sem:
                 tqdm.write(f"[phase3-start] {record.unique_id} iteration={state.iteration}")
+                phase3_tracer = tracer.with_context(phase="phase3", iteration=state.iteration)
                 await loop.run_in_executor(
                     phase_executor,
                     partial(
@@ -576,7 +616,7 @@ async def _run_record(
                         compiler=runtime.compiler,
                         model=args.model,
                         max_iterations=args.max_refinement_iterations,
-                        tracer=tracer,
+                        tracer=phase3_tracer,
                         thm_name=record.unique_id,
                         refine_max_retries=args.refine_max_retries,
                     ),
@@ -717,7 +757,8 @@ async def _run_experiment(args: argparse.Namespace, output_root: Path, runtime: 
         f"refine={args.refine_concurrency} "
         f"lean_check={args.lean_check_concurrency} "
         f"node_timeout_s={args.node_timeout_s} "
-        f"llm_api_timeout_s={args.llm_api_timeout_s}",
+        f"llm_api_timeout_s={args.llm_api_timeout_s} "
+        f"parallel_tool_calls={args.parallel_tool_calls}",
         flush=True,
     )
 

@@ -3,6 +3,14 @@
 Runs Goedel-Architect on RobustPABench using only `informal_statement` and
 `informal_proof`. The experiment ignores `formal_statement` and `formal_proof`.
 
+Lean checks use a manually managed Kimina server by default:
+
+```bash
+cd /ssd/czx/kimina-lean-server
+/ssd/miniconda3/envs/lean4-czx/bin/python -m server
+```
+
+The default config points RobustPA refine at `http://localhost:8000`.
 
 ```bash
 conda activate lean4-czx
@@ -47,6 +55,12 @@ request. `--node-timeout-s` controls the whole Phase2 proof loop for one node,
 which may contain multiple LLM calls and Lean tool calls. RobustPA defaults
 both to `null` for local vLLM runs. Passing `0`, `none`, or `null` on the
 command line has the same effect.
+
+`--parallel-tool-calls true|false|null` controls the OpenAI-compatible
+`parallel_tool_calls` request field for Phase2 prover turns. `true` allows a
+single assistant response to contain multiple tool calls, `false` asks the
+server to return at most one, and `null` omits the field. The default config
+sets `parallel_tool_calls: false`.
 
 Subset filtering:
 

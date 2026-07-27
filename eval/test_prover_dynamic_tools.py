@@ -13,7 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from lean_compiler import CompilerResult  # noqa: E402
-from prover import GoedelProver, ProofSignal  # noqa: E402
+from prover import GoedelProver, ProofSignal, _build_negation_node_decl  # noqa: E402
 
 
 def _tool_response(name: str, arguments: dict, call_id: str) -> SimpleNamespace:
@@ -57,6 +57,15 @@ class _FakeClient:
 
 class _FakeCompiler:
     def check(self, _proof_body: str, **_kwargs) -> CompilerResult:
+        return CompilerResult(success=True)
+
+
+class _RecordingCompiler:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    def check(self, proof_body: str, **kwargs) -> CompilerResult:
+        self.calls.append((proof_body, kwargs))
         return CompilerResult(success=True)
 
 
@@ -112,6 +121,57 @@ class ProverDynamicToolsTest(unittest.TestCase):
             "You have two tools, `lean_compile` and `mathlib_search`",
             system_prompt,
         )
+
+    def test_build_negation_node_decl_preserves_binders(self) -> None:
+        node_decl = (
+            "lemma f_rec (x y : ℕ) (hx : 0 < x) (hy : 0 < y) : "
+            "((x + y) : ℚ) * f x y = (y : ℚ) * f x (x + y) := by sorry_using []"
+        )
+
+        neg_decl = _build_negation_node_decl(node_decl, "f_rec")
+
+        self.assertEqual(
+            neg_decl,
+            "theorem neg_f_rec (x y : ℕ) (hx : 0 < x) (hy : 0 < y) : "
+            "¬ (((x + y) : ℚ) * f x y = (y : ℚ) * f x (x + y)) := by sorry_using []",
+        )
+
+    def test_negation_probe_compiles_generated_declaration(self) -> None:
+        client = _FakeClient()
+        client.completions.responses = [
+            _tool_response(
+                "lean_compile",
+                {"proof_body": ":= by\n  intro h\n  exact h"},
+                "neg-compile-call",
+            )
+        ]
+        compiler = _RecordingCompiler()
+
+        with patch("prover.make_client", return_value=client):
+            prover = GoedelProver(
+                model_id="test-model",
+                retrieval=_FakeMathlibRetrieval(),
+            )
+            result = prover._probe_negation(
+                compiler=compiler,
+                node_name="test_node",
+                messages=[],
+                max_tokens=256,
+                node_decl="lemma test_node (x : Nat) : False := by sorry_using []",
+            )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.signal, ProofSignal.FORMALLY_NEGATED)
+        self.assertEqual(compiler.calls, [
+            (
+                "by\n  intro h\n  exact h",
+                {
+                    "aux_lemmas": "",
+                    "node_decl": "theorem neg_test_node (x : Nat) : ¬ (False) := by sorry_using []",
+                },
+            )
+        ])
 
 
 if __name__ == "__main__":

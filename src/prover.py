@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from blueprint_text import BLUEPRINT_PROOF_RE, extract_current_node_decl, lemma_to_theorem
 from lean_compiler import AbstractLeanCompiler, CompilerResult
 from llm_client import chat_completion_with_retry, make_client
 from mathlib_retrieval import MathlibRetrieval
@@ -54,6 +55,49 @@ def _tool_choice_kwargs(choice: str | dict) -> dict:
     if mode == "omit":
         return {}
     return {"tool_choice": choice}
+
+
+def _parallel_tool_calls_kwargs(parallel_tool_calls: bool | None) -> dict:
+    if parallel_tool_calls is None:
+        return {}
+    return {"parallel_tool_calls": parallel_tool_calls}
+
+
+def _parse_tool_arguments(raw_arguments: str) -> Any:
+    if not raw_arguments:
+        return {}
+    try:
+        return json.loads(raw_arguments)
+    except json.JSONDecodeError:
+        return raw_arguments
+
+
+def _tool_calls_payload(tool_calls) -> list[dict[str, Any]]:
+    payload: list[dict[str, Any]] = []
+    for index, tc in enumerate(tool_calls or []):
+        raw_arguments = tc.function.arguments or ""
+        payload.append({
+            "index": index,
+            "id": tc.id,
+            "type": getattr(tc, "type", "function"),
+            "name": tc.function.name,
+            "arguments": _parse_tool_arguments(raw_arguments),
+            "arguments_raw": raw_arguments,
+        })
+    return payload
+
+
+def _reconstruct_tool_calls_text(tool_calls) -> str:
+    blocks: list[str] = []
+    for tc in tool_calls or []:
+        raw_arguments = tc.function.arguments or ""
+        blocks.append(
+            "<tool_call>:\n"
+            f"name={tc.function.name}\n"
+            f"arguments={raw_arguments}\n"
+            "</tool_call>"
+        )
+    return "\n\n".join(blocks)
 
 try:
     from repo_retrieval import RepoRetrieval
@@ -267,6 +311,7 @@ class GoedelProver:
         tracer=None,
         api_timeout_s: float | None = 120.0,
         max_tool_calls: int | None = None,
+        parallel_tool_calls: bool | None = None,
     ):
         self.model_id = model_id
         # Bounds each individual chat.completions call so a stuck request
@@ -275,6 +320,7 @@ class GoedelProver:
         self.client = make_client(model_id, timeout=api_timeout_s)
         self.retrieval = retrieval or MathlibRetrieval()
         self.tracer = tracer or NullTracer()
+        self.parallel_tool_calls = parallel_tool_calls
         # Per-instance override of the module-level MAX_TOOL_CALLS budget -
         # used by orchestrator.py's cascade to give an escalated (expensive)
         # attempt a much tighter budget (e.g. 1: a single lean_compile call,
@@ -296,6 +342,38 @@ class GoedelProver:
                 "phase": "phase2", "model": self.model_id,
                 "prompt_tokens": prompt, "completion_tokens": completion,
                 "total_tokens": total,
+            },
+        ))
+
+    def _emit_llm_response(
+        self,
+        node_name: str,
+        response,
+        *,
+        turn: int,
+        tool_calls_used_before: int = 0,
+        operation: str = "",
+    ) -> None:
+        choice = response.choices[0]
+        msg = choice.message
+        tool_call_payload = _tool_calls_payload(msg.tool_calls)
+        self.tracer.emit(TraceEvent(
+            kind="llm_response",
+            thm_name=node_name,
+            turn=turn,
+            result=msg.content or "",
+            args={
+                "phase": "phase2",
+                "model": getattr(response, "model", self.model_id),
+                "response_id": getattr(response, "id", None),
+                "finish_reason": getattr(choice, "finish_reason", None),
+                "operation": operation,
+                "tool_calls_used_before": tool_calls_used_before,
+                "tool_call_count": len(tool_call_payload),
+                "content": msg.content,
+                "content_len": len(msg.content or ""),
+                "tool_calls": tool_call_payload,
+                "reconstructed_tool_calls_text": _reconstruct_tool_calls_text(msg.tool_calls),
             },
         ))
 
@@ -377,6 +455,7 @@ class GoedelProver:
         tool_calls_used = 0
 
         # Force first call to lean_compile
+        response_operation = "prove_node_initial"
         response = chat_completion_with_retry(
             self.client,
             tracer=self.tracer,
@@ -389,6 +468,7 @@ class GoedelProver:
             messages=messages,
             tools=active_tools,
             max_completion_tokens=max_tokens,
+            **_parallel_tool_calls_kwargs(self.parallel_tool_calls),
             **_tool_choice_kwargs({"type": "function", "function": {"name": "lean_compile"}}),
         )
         self._emit_usage(node_name, response)
@@ -401,7 +481,14 @@ class GoedelProver:
 
         while tool_calls_used < self.max_tool_calls:
             had_tool_calls, text, proof, compile_ok, tools_called, compile_errors = self._process_response(
-                response, messages, compiler, node_name, repo_retrieval, tool_calls_used, node_decl=node_stmt
+                response,
+                messages,
+                compiler,
+                node_name,
+                repo_retrieval,
+                tool_calls_used,
+                node_decl=node_stmt,
+                operation=response_operation,
             )
             all_lean_errors.extend(compile_errors)
             if text:
@@ -426,6 +513,7 @@ class GoedelProver:
                 if (had_search and not had_compile) else "required"
             )
 
+            response_operation = "prove_node_next"
             response = chat_completion_with_retry(
                 self.client,
                 tracer=self.tracer,
@@ -438,6 +526,7 @@ class GoedelProver:
                 messages=messages,
                 tools=active_tools,
                 max_completion_tokens=max_tokens,
+                **_parallel_tool_calls_kwargs(self.parallel_tool_calls),
                 **_tool_choice_kwargs(next_choice),
             )
             self._emit_usage(node_name, response)
@@ -458,10 +547,18 @@ class GoedelProver:
                 tools=active_tools,
                 tool_choice="none",
                 max_completion_tokens=max_tokens,
+                **_parallel_tool_calls_kwargs(self.parallel_tool_calls),
             )
             self._emit_usage(node_name, response)
             _, drain_text, drain_proof, _, _, drain_errors = self._process_response(
-                response, messages, compiler, node_name, repo_retrieval, tool_calls_used, node_decl=node_stmt
+                response,
+                messages,
+                compiler,
+                node_name,
+                repo_retrieval,
+                tool_calls_used,
+                node_decl=node_stmt,
+                operation="prove_node_drain",
             )
             all_lean_errors.extend(drain_errors)
             if drain_text:
@@ -490,12 +587,25 @@ class GoedelProver:
             )
             self._emit_usage(node_name, response)
             _, last_text, best_proof_body, _, _, final_errors = self._process_response(
-                response, messages, compiler, node_name, repo_retrieval, tool_calls_used, node_decl=node_stmt
+                response,
+                messages,
+                compiler,
+                node_name,
+                repo_retrieval,
+                tool_calls_used,
+                node_decl=node_stmt,
+                operation="prove_node_final_answer",
             )
             all_lean_errors.extend(final_errors)
 
         # Probe negation if we couldn't prove it
-        negation = self._probe_negation(compiler, node_name, messages, max_tokens)
+        negation = self._probe_negation(
+            compiler,
+            node_name,
+            messages,
+            max_tokens,
+            node_decl=node_stmt,
+        )
         if negation:
             return negation
 
@@ -519,6 +629,7 @@ class GoedelProver:
         repo_retrieval,
         tool_calls_so_far: int,
         node_decl: str = "",
+        operation: str = "",
     ) -> tuple[bool, str, str, bool, list[str], list[str]]:
         """Append this turn's assistant + tool-result messages to `messages`
         in place (chat.completions is stateless - the caller re-sends the
@@ -529,7 +640,8 @@ class GoedelProver:
         Responses-API tool_results list as the "was anything called this
         turn" signal.
         """
-        msg = response.choices[0].message
+        choice = response.choices[0]
+        msg = choice.message
         last_text = ""
         best_proof = ""
         compiled_proof = ""   # proof body that actually compiled — never overwritten by message text
@@ -537,6 +649,13 @@ class GoedelProver:
         tools_called: list[str] = []
         compile_errors: list[str] = []
         turn = tool_calls_so_far + 1
+        self._emit_llm_response(
+            node_name,
+            response,
+            turn=turn,
+            tool_calls_used_before=tool_calls_so_far,
+            operation=operation,
+        )
 
         assistant_msg: dict = {"role": "assistant", "content": msg.content}
         if msg.tool_calls:
@@ -637,11 +756,27 @@ class GoedelProver:
         node_name: str,
         messages: list[dict],
         max_tokens: int,
+        node_decl: str,
     ) -> ProverResult | None:
+        try:
+            negation_node_decl = _build_negation_node_decl(node_decl, node_name)
+        except ValueError as exc:
+            self.tracer.emit(TraceEvent(
+                kind="negation_probe_skipped",
+                thm_name=node_name,
+                args={"reason": str(exc)},
+            ))
+            return None
+
         prompt = (
             f"You could not prove the statement. Try to show it is FALSE.\n"
-            f"Prove `neg_{node_name}` showing `¬ (conclusion)` with the same hypotheses. "
-            "Tactics: `omega`, `decide`, `norm_num`, `push_neg; linarith`, `simp`, `native_decide`.\n"
+            "Prove the following generated Lean declaration, which keeps the same "
+            "parameters and hypotheses but negates the conclusion:\n"
+            "```lean\n"
+            f"{negation_node_decl}\n"
+            "```\n"
+            "Call lean_compile with only the proof_body for this declaration. "
+            "Tactics: `omega`, `decide`, `norm_num`, `push_neg; linarith`, `simp`.\n"
             "Call lean_compile. If it succeeds, the original statement is formally refuted."
         )
         messages.append({"role": "user", "content": prompt})
@@ -650,11 +785,19 @@ class GoedelProver:
             messages=messages,
             tools=TOOLS,
             max_completion_tokens=max_tokens,
+            **_parallel_tool_calls_kwargs(self.parallel_tool_calls),
             **_tool_choice_kwargs({"type": "function", "function": {"name": "lean_compile"}}),
         )
         self._emit_usage(node_name, response)
 
-        for _ in range(NEGATION_PROBE_CALLS):
+        for probe_turn in range(NEGATION_PROBE_CALLS):
+            self._emit_llm_response(
+                node_name,
+                response,
+                turn=probe_turn + 1,
+                tool_calls_used_before=probe_turn,
+                operation="negation_probe",
+            )
             msg = response.choices[0].message
             assistant_msg: dict = {"role": "assistant", "content": msg.content}
             if msg.tool_calls:
@@ -672,20 +815,72 @@ class GoedelProver:
                 break
 
             for tc in msg.tool_calls:
+                args = json.loads(tc.function.arguments)
+                self.tracer.emit(TraceEvent(
+                    kind="tool_call",
+                    thm_name=node_name,
+                    turn=probe_turn + 1,
+                    call_id=tc.id,
+                    tool_name=tc.function.name,
+                    args=args,
+                ))
+
                 if tc.function.name == "lean_compile":
-                    args = json.loads(tc.function.arguments)
                     parent_decls = getattr(self, "_parent_lemma_decls", "")
-                    cr = compiler.check(args.get("proof_body", ""), aux_lemmas=parent_decls)
+                    proof_body = _normalize_node_proof_body(args.get("proof_body", ""))
+                    cr = compiler.check(
+                        proof_body,
+                        aux_lemmas=parent_decls,
+                        node_decl=negation_node_decl,
+                    )
                     if cr.success:
+                        self.tracer.emit(TraceEvent(
+                            kind="tool_result",
+                            thm_name=node_name,
+                            turn=probe_turn + 1,
+                            call_id=tc.id,
+                            tool_name=tc.function.name,
+                            args={
+                                "success": cr.success,
+                                "errors": cr.errors,
+                                "warnings": cr.warnings,
+                                "goals": cr.goals,
+                                "raw_output": cr.raw_output,
+                                "validated": cr.validated,
+                                "negation_node_decl": negation_node_decl,
+                            },
+                            result="Compilation SUCCESSFUL. Negation proof is correct.",
+                            ok=True,
+                        ))
                         return ProverResult(
                             signal=ProofSignal.FORMALLY_NEGATED,
-                            proof_body=args.get("proof_body", ""),
+                            proof_body=proof_body,
                             analysis=f"{node_name} is formally refuted — a proof of ¬(statement) was found.",
                             suggested_fix="The statement is mathematically FALSE. Revise it.",
                         )
                     output = f"Compilation FAILED.\n" + "\n".join(cr.errors)
+                    trace_args = {
+                        "success": cr.success,
+                        "errors": cr.errors,
+                        "warnings": cr.warnings,
+                        "goals": cr.goals,
+                        "raw_output": cr.raw_output,
+                        "validated": cr.validated,
+                        "negation_node_decl": negation_node_decl,
+                    }
                 else:
                     output = "Tool unavailable in negation probe."
+                    trace_args = None
+                self.tracer.emit(TraceEvent(
+                    kind="tool_result",
+                    thm_name=node_name,
+                    turn=probe_turn + 1,
+                    call_id=tc.id,
+                    tool_name=tc.function.name,
+                    args=trace_args,
+                    result=output,
+                    ok=False,
+                ))
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
 
             response = self.client.chat.completions.create(
@@ -694,6 +889,7 @@ class GoedelProver:
                 tools=TOOLS,
                 tool_choice="auto",
                 max_completion_tokens=max_tokens,
+                **_parallel_tool_calls_kwargs(self.parallel_tool_calls),
             )
             self._emit_usage(node_name, response)
 
@@ -708,6 +904,111 @@ def _extract_proof_body(text: str) -> str:
     import re
     m = re.search(r"<lean4_proof>(.*?)</lean4_proof>", text, re.DOTALL)
     return m.group(1).strip() if m else ""
+
+
+def _build_negation_node_decl(node_decl: str, node_name: str) -> str:
+    """Return a theorem declaration proving the negated conclusion of a node.
+
+    The prover's lean_compile tool checks proof bodies by splicing them into a
+    declaration containing `:= by sorry_using [...]`.  Negation probing must use
+    the same contract; otherwise backends receive a bare `:= by ...` at top
+    level, which Lean rejects before checking the proof.
+    """
+    decl = lemma_to_theorem(extract_current_node_decl(node_decl)).strip()
+    proof_match = BLUEPRINT_PROOF_RE.search(decl)
+    if proof_match:
+        signature = decl[:proof_match.start()].strip()
+    else:
+        signature = decl.split(":=", 1)[0].strip()
+
+    if not signature:
+        raise ValueError("empty node declaration")
+
+    head = re.match(r"^\s*(?:theorem|lemma)\s+\S+", signature)
+    if not head:
+        raise ValueError("node declaration is not a theorem/lemma")
+
+    neg_name = _lean_safe_negation_name(node_name)
+    signature = f"theorem {neg_name}" + signature[head.end():]
+    colon = _find_top_level_colon(signature)
+    if colon is None:
+        raise ValueError("could not find theorem conclusion separator")
+
+    prefix = signature[:colon].rstrip()
+    conclusion = signature[colon + 1:].strip()
+    if not conclusion:
+        raise ValueError("empty theorem conclusion")
+    return f"{prefix} : ¬ ({conclusion}) := by sorry_using []"
+
+
+def _lean_safe_negation_name(node_name: str) -> str:
+    ident = re.sub(r"[^A-Za-z0-9_']", "_", f"neg_{node_name}")
+    if not re.match(r"[A-Za-z_]", ident):
+        ident = f"neg_{ident}"
+    return ident
+
+
+def _find_top_level_colon(text: str) -> int | None:
+    depth = 0
+    i = 0
+    in_string = False
+    line_comment = False
+    block_comment_depth = 0
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    closers = set(pairs.values())
+
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+
+        if line_comment:
+            if ch == "\n":
+                line_comment = False
+            i += 1
+            continue
+
+        if block_comment_depth:
+            if ch == "/" and nxt == "-":
+                block_comment_depth += 1
+                i += 2
+                continue
+            if ch == "-" and nxt == "/":
+                block_comment_depth -= 1
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if in_string:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+
+        if ch == "-" and nxt == "-":
+            line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "-":
+            block_comment_depth = 1
+            i += 2
+            continue
+        if ch == '"':
+            in_string = True
+            i += 1
+            continue
+        if ch in pairs:
+            depth += 1
+        elif ch in closers and depth > 0:
+            depth -= 1
+        elif ch == ":" and depth == 0:
+            return i
+        i += 1
+
+    return None
 
 
 def _normalize_node_proof_body(proof_body: str) -> str:
@@ -759,6 +1060,7 @@ def prove_node(
     tracer=None,
     api_timeout_s: float | None = 120.0,
     max_tool_calls: int | None = None,
+    parallel_tool_calls: bool | None = None,
 ) -> ProverResult:
     parent_block = "\n\n".join(
         f"```lean\n-- {n}\n{p}\n```" for n, p in parent_proofs.items()
@@ -771,7 +1073,8 @@ def prove_node(
         parent_proofs=parent_block,
     )
     prover = GoedelProver(model_id=model, retrieval=retrieval, tracer=tracer,
-                           api_timeout_s=api_timeout_s, max_tool_calls=max_tool_calls)
+                           api_timeout_s=api_timeout_s, max_tool_calls=max_tool_calls,
+                           parallel_tool_calls=parallel_tool_calls)
     return prover.prove_node(
         compiler=compiler,
         node_name=node_name,

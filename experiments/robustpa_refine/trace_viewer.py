@@ -167,6 +167,8 @@ def _event_summary(event: dict[str, Any], max_text: int) -> dict[str, Any]:
         "turn": event.get("turn"),
         "thm_name": event.get("thm_name"),
         "tool_name": tool,
+        "phase": event.get("phase"),
+        "iteration": event.get("iteration"),
         "ok": event.get("ok"),
         "ts": event.get("ts"),
         "args": _trim_payload(args, max_text),
@@ -175,8 +177,17 @@ def _event_summary(event: dict[str, Any], max_text: int) -> dict[str, Any]:
     }
     if kind == "theorem_start":
         out["short"] = _norm((args or {}).get("thm_stmt"), max_text)
-    elif kind in {"model_text", "llm_response"}:
+    elif kind == "model_text":
         out["short"] = _norm(result, max_text)
+    elif kind == "llm_response":
+        llm_args = args or {}
+        prefix = (
+            f"{llm_args.get('operation') or 'llm_response'} "
+            f"finish={llm_args.get('finish_reason')} "
+            f"tool_calls={llm_args.get('tool_call_count')}"
+        )
+        body = llm_args.get("reconstructed_tool_calls_text") or result
+        out["short"] = f"{prefix}; {_norm(body, max_text)}"
     elif kind == "tool_call":
         out["short"] = f"{tool} {_norm(args, max_text)}"
     elif kind == "tool_result":
@@ -241,7 +252,7 @@ def build_trace_payload(
         kind = event.get("kind")
         thm_name = str(event.get("thm_name") or "")
         turn = int(event.get("turn") or 0)
-        if kind in {"theorem_start", "tool_call", "tool_result", "model_text", "final_verify", "llm_usage", "llm_error"} and thm_name != unique_id:
+        if kind in {"theorem_start", "llm_response", "tool_call", "tool_result", "model_text", "final_verify", "llm_usage", "llm_error"} and thm_name != unique_id:
             grouped[(thm_name, turn)].append(event)
         else:
             phase_events.append(event)
@@ -641,8 +652,9 @@ HTML_PAGE = r"""<!doctype html>
     function renderEvent(event) {
       const ok = event.ok === true ? tag('ok', 'good') : event.ok === false ? tag('fail', 'bad') : '';
       const tool = event.tool_name ? tag(event.tool_name) : '';
+      const phase = event.phase ? tag(event.phase + ':' + (event.iteration ?? '')) : '';
       return `<div class="event">
-        <div class="event-head">${tag(event.kind)} ${tool} ${ok} ${tag('turn ' + (event.turn ?? 0))}</div>
+        <div class="event-head">${tag(event.kind)} ${phase} ${tool} ${ok} ${tag('turn ' + (event.turn ?? 0))}</div>
         <div class="event-content">
           ${event.short ? `<pre>${esc(event.short)}</pre>` : ''}
           <details>

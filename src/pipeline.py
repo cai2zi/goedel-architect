@@ -112,6 +112,7 @@ def prove_theorem(
     cascade_timeout_s: float | None = None,
     node_max_tool_calls: int | None = None,
     escalation_max_tool_calls: int | None = 1,
+    parallel_tool_calls: bool | None = None,
     refine_max_retries: int | None = None,
 ) -> ProofResult:
     """
@@ -234,6 +235,7 @@ def prove_theorem(
                 cascade_timeout_s=cascade_timeout_s,
                 node_max_tool_calls=node_max_tool_calls,
                 escalation_max_tool_calls=escalation_max_tool_calls,
+                parallel_tool_calls=parallel_tool_calls,
             )
         )
 
@@ -400,6 +402,7 @@ async def run_phase2_async(
     cascade_timeout_s: float | None = None,
     node_max_tool_calls: int | None = None,
     escalation_max_tool_calls: int | None = 1,
+    parallel_tool_calls: bool | None = None,
     node_executor: Executor | None = None,
     node_semaphore: asyncio.Semaphore | None = None,
 ) -> OrchestratorResult:
@@ -442,6 +445,7 @@ async def run_phase2_async(
         cascade_timeout_s=cascade_timeout_s,
         node_max_tool_calls=node_max_tool_calls,
         escalation_max_tool_calls=escalation_max_tool_calls,
+        parallel_tool_calls=parallel_tool_calls,
         node_executor=node_executor,
         node_semaphore=node_semaphore,
     )
@@ -476,6 +480,7 @@ def run_phase2(
     cascade_timeout_s: float | None = None,
     node_max_tool_calls: int | None = None,
     escalation_max_tool_calls: int | None = 1,
+    parallel_tool_calls: bool | None = None,
     node_executor: Executor | None = None,
     node_semaphore: asyncio.Semaphore | None = None,
 ) -> OrchestratorResult:
@@ -494,6 +499,7 @@ def run_phase2(
             cascade_timeout_s=cascade_timeout_s,
             node_max_tool_calls=node_max_tool_calls,
             escalation_max_tool_calls=escalation_max_tool_calls,
+            parallel_tool_calls=parallel_tool_calls,
             node_executor=node_executor,
             node_semaphore=node_semaphore,
         )
