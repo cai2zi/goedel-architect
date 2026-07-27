@@ -278,6 +278,18 @@ def failure_text(latest_round_by_id: dict[str, dict[str, Any]], row: dict[str, A
     return "\n".join(parts)
 
 
+def is_blocked_by_dependency_node(node: dict[str, Any]) -> bool:
+    return (
+        node.get("signal") == "blocked_by_dependency"
+        or (
+            node.get("signal") == "proof_too_hard"
+            and str(node.get("analysis") or "").startswith(
+                "Skipped without attempting a proof: dependency"
+            )
+        )
+    )
+
+
 def proof_failure_category(
     row: dict[str, Any],
     latest_round_by_id: dict[str, dict[str, Any]],
@@ -292,6 +304,9 @@ def proof_failure_category(
         return "P3_refinement_contract_violation"
     if (trace_summary and trace_summary.context_overflow_errors) or int(row.get("infra_error_node_count") or 0):
         return "P4_infra_context_or_timeout"
+    nodes = failed_nodes(latest_round_by_id, row)
+    if nodes and all(is_blocked_by_dependency_node(node) for node in nodes):
+        return "P11_blocked_by_dependency"
 
     text = failure_text(latest_round_by_id, row)
     low = text.lower()
@@ -347,6 +362,8 @@ def proof_failure_category(
         return "P8_tactic_algebra_search_stuck"
     if any(node.get("signal") in {"statement_wrong", "formally_negated"} for node in failed_nodes(latest_round_by_id, row)):
         return "P9_bad_or_false_sublemma"
+    if any(is_blocked_by_dependency_node(node) for node in nodes):
+        return "P12_mixed_blocked_by_dependency"
     return "P10_other_proof_too_hard"
 
 
@@ -371,7 +388,7 @@ def proof_symptoms(latest_round_by_id: dict[str, dict[str, Any]], rows: list[dic
             "omega could not prove", "ring_nf", "nlinarith", "No goals to be solved", "unsolved goals",
         ],
         "incomplete_or_sorry": ["Proof contains `sorry`", "unexpected end of input"],
-        "dependency_cascade": ["Skipped without attempting a proof: dependency"],
+        "dependency_cascade": ["blocked_by_dependency", "Skipped without attempting a proof: dependency"],
         "bad_or_false_sublemma_signal": ["statement_wrong", "formally_negated", "formally refuted", "counterexample"],
         "forbidden_construct": ["forbidden construct `native_decide`"],
     }

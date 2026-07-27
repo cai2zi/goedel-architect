@@ -200,7 +200,7 @@ async def prove_dag(
                 orch_result.node_results[name] = NodeResult(
                     node=node,
                     result=ProverResult(
-                        signal=ProofSignal.PROOF_TOO_HARD,
+                        signal=ProofSignal.BLOCKED_BY_DEPENDENCY,
                         analysis=(
                             f"Skipped without attempting a proof: dependency "
                             f"{'/'.join(unresolved_deps)} is not yet proved, so "

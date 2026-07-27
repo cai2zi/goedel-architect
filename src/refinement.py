@@ -220,6 +220,12 @@ def _annotate_with_verdicts(blueprint: Blueprint, orch_result: OrchestratorResul
                         "genuine proof-difficulty signal)"
                     )
                     output_lines.append(_truncate_diagnosis(nr.result.diagnosis_block(name)))
+                elif nr.result.signal == ProofSignal.BLOCKED_BY_DEPENDENCY:
+                    # The prover intentionally did not attempt this node because
+                    # an upstream dependency failed. Keep this separate from a
+                    # genuine proof attempt that exhausted its tool budget.
+                    output_lines.append("-- BLOCKED_BY_DEPENDENCY")
+                    output_lines.append(_truncate_diagnosis(nr.result.diagnosis_block(name)))
                 else:
                     output_lines.append("-- UNPROVED")
                     output_lines.append(_truncate_diagnosis(nr.result.diagnosis_block(name)))

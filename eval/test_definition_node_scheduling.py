@@ -155,6 +155,40 @@ theorem mathd_algebra_478 : base_val * height_val = 195 := by
             root_call["parent_lemma_decls"],
         )
 
+    def test_unproved_dependency_marks_dependent_node_blocked(self) -> None:
+        calls: list[str] = []
+
+        def fake_prove_node(**kwargs) -> ProverResult:
+            calls.append(kwargs["node_name"])
+            return ProverResult(
+                signal=ProofSignal.PROOF_TOO_HARD,
+                analysis="upstream proof attempt failed",
+            )
+
+        with patch("orchestrator.prove_node", side_effect=fake_prove_node):
+            result = asyncio.run(
+                prove_dag(
+                    blueprint=self.blueprint,
+                    compiler=object(),
+                    retrieval=object(),
+                    node_timeout_s=None,
+                )
+            )
+
+        self.assertEqual(calls, ["mult_30_13_over_2"])
+        self.assertEqual(
+            result.node_results["mult_30_13_over_2"].result.signal,
+            ProofSignal.PROOF_TOO_HARD,
+        )
+        self.assertEqual(
+            result.node_results["mathd_algebra_478"].result.signal,
+            ProofSignal.BLOCKED_BY_DEPENDENCY,
+        )
+        self.assertIn(
+            "Skipped without attempting a proof: dependency mult_30_13_over_2",
+            result.node_results["mathd_algebra_478"].result.analysis,
+        )
+
     def test_aux_and_final_output_keep_definition_rhs_once(self) -> None:
         proved_cache = {
             "base_val": "",

@@ -261,6 +261,7 @@ class ProofSignal(str, Enum):
     SOLVED = "solved"
     STATEMENT_WRONG = "statement_wrong"
     PROOF_TOO_HARD = "proof_too_hard"
+    BLOCKED_BY_DEPENDENCY = "blocked_by_dependency"
     FORMALLY_NEGATED = "formally_negated"
     # Not one of the paper's four signals: an infra/tooling failure (timeout,
     # unhandled exception) rather than a genuine "the model tried and
