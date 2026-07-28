@@ -111,3 +111,35 @@ python experiments/robustpa_refine/trace_viewer.py \
 
 Open the printed URL, enter a `source_id`, `record_id`, or full unique id, and
 optionally filter by node name.
+
+## RobustPABench-Aligned StmtSC
+
+The runner intentionally keeps inference output in Goedel's native checkpoint
+format. To evaluate statement semantic consistency with the same StmtSC prompt
+and parser as `/ssd/czx/robust-proof-autoformalization`, export the final
+checkpoints first, then run the StmtSC judge.
+
+Artifacts are written under `/ssd/czx/czx_work/robustpa_eval/<exp_name>`:
+
+- `stmt_sc_inputs.jsonl` — RobustPABench-style rows with `LLM_Output#1`.
+- `stmt_sc_scored.jsonl` — rows enriched with `LLM_StmtSC?#1` and details.
+- `stmt_sc_summary.json` — overall and grouped StmtSC accuracy.
+- `lean_outputs/<subset>/<split>/<record_id>.lean` — assembled final/partial
+  Lean files reconstructed from checkpoints.
+
+Example:
+
+```bash
+python experiments/robustpa_refine/export_stmt_sc_inputs.py \
+  --exp-dir /ssd/czx/czx_work/robustpa_refine/qwen3_5_397b_MiniF2F_orig_reExp
+
+python experiments/robustpa_refine/evaluate_stmt_sc.py \
+  --exp-name qwen3_5_397b_MiniF2F_orig_reExp \
+  --gemini-model gemini-2.5-flash
+```
+
+The exporter evaluates only the final checkpoint for each problem. It includes
+all final `results.jsonl` rows in the denominator: solved, exhausted, and error
+rows. If a checkpoint cannot be assembled or no theorem can be extracted, the
+StmtSC scorer records `LLM_StmtSC?#1 = "no"` and reports the reason in the
+summary counts.

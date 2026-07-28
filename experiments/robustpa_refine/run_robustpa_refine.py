@@ -16,6 +16,9 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+import hydra
+from hydra.utils import get_original_cwd
+from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -24,17 +27,9 @@ sys.path.insert(0, str(REPO_ROOT / "experiments"))
 
 from blueprint import Blueprint, generate_blueprint_from_informal  # noqa: E402
 from checkpoint import CheckpointState  # noqa: E402
-from shared.config_utils import (  # noqa: E402
-    add_config_arg,
-    apply_config_environment,
-    config_path_from_argv,
-    load_yaml_config,
-    set_defaults_from_config,
-)
 from shared.io_utils import append_jsonl, safe_stem, unlink_if_exists, write_json  # noqa: E402
 from shared.lean_runtime import (  # noqa: E402
     LeanRuntime,
-    add_lean_runtime_args,
     make_lean_runtime,
     prepare_lean_runtime_metadata,
 )
@@ -43,7 +38,6 @@ from pipeline import run_phase2_async, run_phase3  # noqa: E402
 from tracer import JsonlTracer, TraceEvent  # noqa: E402
 
 
-DEFAULT_CONFIG = Path(__file__).resolve().parent / "configs" / "base.yaml"
 DEFAULT_DATA_ROOT = REPO_ROOT.parent / "czx_work" / "RobustPABench"
 DEFAULT_OUTPUT_BASE = REPO_ROOT.parent / "czx_work" / "robustpa_refine"
 DEFAULT_MODEL = "deepseek-v4-flash"
@@ -116,54 +110,51 @@ class Record:
     informal_proof: str
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    argv = sys.argv[1:] if argv is None else argv
-    config = load_yaml_config(config_path_from_argv(argv, DEFAULT_CONFIG))
-    apply_config_environment(config)
+def _apply_environment(config: dict[str, Any]) -> None:
+    env = config.get("environment") or {}
+    if not isinstance(env, dict):
+        raise ValueError("Config key 'environment' must be an object.")
+    for key, value in env.items():
+        if value is not None:
+            os.environ.setdefault(str(key), str(value))
 
-    parser = argparse.ArgumentParser(description="Run RobustPABench informal-only blueprint/refine experiment.")
-    add_config_arg(parser, DEFAULT_CONFIG)
-    parser.add_argument("--exp-name", default=None)
-    parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
-    parser.add_argument("--output-base", type=Path, default=DEFAULT_OUTPUT_BASE)
-    parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--openai-base-url", default=None)
-    parser.add_argument("--subset", action="append", default=None)
-    parser.add_argument("--split", action="append", default=None)
-    parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--problem-id", default=None)
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--rerun-failed", action="store_true")
-    parser.add_argument("--max-refinement-iterations", type=int, default=8)
-    parser.add_argument("--blueprint-max-retries", type=int, default=8)
-    parser.add_argument("--refine-max-retries", type=int, default=8)
-    parser.add_argument("--node-max-tool-calls", type=int, default=8)
-    parser.add_argument(
-        "--parallel-tool-calls",
-        type=_optional_bool,
-        default=None,
-        metavar="{true,false,null}",
-        help=(
-            "Whether to pass parallel_tool_calls to chat.completions. "
-            "true/1 allows multiple tool calls in one assistant response; "
-            "false/0 asks for at most one; null/none omits the field."
-        ),
-    )
-    parser.add_argument("--node-timeout-s", type=_optional_timeout, default=300.0)
-    parser.add_argument("--llm-api-timeout-s", type=_optional_timeout, default=120.0)
-    parser.add_argument("--phase1-concurrency", type=int, default=4)
-    parser.add_argument("--phase2-blueprint-concurrency", type=int, default=4)
-    parser.add_argument("--phase2-node-concurrency", type=int, default=8)
-    parser.add_argument("--refine-concurrency", type=int, default=2)
-    add_lean_runtime_args(parser)
-    parser.set_defaults(lean_backend="local")
-    set_defaults_from_config(parser, config, ignore={"config"})
-    args = parser.parse_args(argv)
+
+def _as_list(value: Any) -> list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [value] if value else None
+    return [str(item) for item in value]
+
+
+def _resolve_path(value: Any, original_cwd: Path) -> Path:
+    path = Path(str(value)).expanduser()
+    return path if path.is_absolute() else original_cwd / path
+
+
+def parse_args(cfg: DictConfig) -> argparse.Namespace:
+    config = OmegaConf.to_container(cfg, resolve=True)
+    if not isinstance(config, dict):
+        raise ValueError("Hydra config must be a mapping.")
+    _apply_environment(config)
+
+    original_cwd = Path(get_original_cwd())
+    config.pop("environment", None)
+    args = argparse.Namespace(**config)
+    args.data_root = _resolve_path(getattr(args, "data_root", DEFAULT_DATA_ROOT), original_cwd)
+    args.output_base = _resolve_path(getattr(args, "output_base", DEFAULT_OUTPUT_BASE), original_cwd)
+    args.subset = _as_list(getattr(args, "subset", None))
+    args.split = _as_list(getattr(args, "split", None))
+    args.limit = getattr(args, "limit", None)
+    args.problem_id = getattr(args, "problem_id", None)
+    args.resume = bool(getattr(args, "resume", False))
+    args.rerun_failed = bool(getattr(args, "rerun_failed", False))
     if not args.exp_name:
         args.exp_name = default_exp_name(args.model, args.split, args.subset)
     if args.openai_base_url:
         os.environ["GOEDEL_OPENAI_BASE_URL"] = args.openai_base_url.rstrip("/")
-        os.environ.setdefault("GOEDEL_OPENAI_API_KEY", "dummy")
+        if not (os.environ.get("GOEDEL_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")):
+            os.environ["GOEDEL_OPENAI_API_KEY"] = "dummy"
     args.node_timeout_s = _optional_timeout(args.node_timeout_s)
     args.llm_api_timeout_s = _optional_timeout(args.llm_api_timeout_s)
     args.parallel_tool_calls = _optional_bool(args.parallel_tool_calls)
@@ -807,8 +798,9 @@ async def _run_experiment(args: argparse.Namespace, output_root: Path, runtime: 
     print(f"[metrics] primary root_proved_acc={metrics['groups'][0]['root_proved_acc']}", flush=True)
 
 
-def main() -> None:
-    args = parse_args()
+@hydra.main(version_base=None, config_path="configs", config_name="base")
+def main(cfg: DictConfig) -> None:
+    args = parse_args(cfg)
     output_root = args.output_base / args.exp_name
     output_root.mkdir(parents=True, exist_ok=True)
     runtime = make_lean_runtime(args)

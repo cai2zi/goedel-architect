@@ -14,6 +14,7 @@ from blueprint import (
     REPO_SEARCH_SUFFIX,
     _call_with_repo_search,
     _extract_lean_code,
+    _max_tokens as _blueprint_max_tokens,
     _parse_blueprint,
     _reasoning_kwargs,
 )
@@ -25,10 +26,6 @@ from prover import ProofSignal
 REFINEMENT_SYSTEM_PROMPT = load("refinement_system")
 REFINEMENT_USER_TEMPLATE = load("refinement_user")
 
-# Appendix A specifies 262,144 (matches DeepSeek-V4-Flash's completion budget).
-# OpenAI's chat.completions API hard-caps max_completion_tokens at 128,000
-# regardless of model, and this is capped further to 64,000 to control cost.
-MAX_TOKENS = 64_000
 MAX_RETRIES = 8
 
 # Cap how many earlier rounds are replayed into the refinement prompt. Full
@@ -132,7 +129,12 @@ def refine_blueprint(
     last_error_feedback = ""
     for attempt in range(max_retries):
         response = _call_with_repo_search(
-            client, model, messages, repo_retrieval, _reasoning_kwargs(model), MAX_TOKENS,
+            client,
+            model,
+            messages,
+            repo_retrieval,
+            _reasoning_kwargs(model),
+            _blueprint_max_tokens(),
             tracer=tracer, thm_name=thm_name, phase="phase3",
         )
         content = response.choices[0].message.content

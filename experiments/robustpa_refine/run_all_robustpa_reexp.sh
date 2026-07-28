@@ -1,42 +1,110 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-# global_original
-python experiments/robustpa_refine/run_robustpa_refine.py --exp-name qwen3_5_397b_MiniF2F_orig_reExp44 --model Qwen3.5-397B-A17B-FP8 --openai-base-url http://127.0.0.1:8001/v1 --split miniF2F --subset global_original
-python experiments/robustpa_refine/run_robustpa_refine.py --exp-name qwen3_5_397b_math500_orig_reExp44 --model Qwen3.5-397B-A17B-FP8 --openai-base-url http://127.0.0.1:8001/v1 --split MATH500 --subset global_original
+# Run from the goedel-architect repo root:
+#   bash experiments/robustpa_refine/run_all_robustpa_reexp.sh
 
-# global_gemini_rephrase
-python experiments/robustpa_refine/run_robustpa_refine.py --exp-name qwen3_5_397b_MiniF2F_global_gemini_rephrase_reExp44 --model Qwen3.5-397B-A17B-FP8 --openai-base-url http://127.0.0.1:8001/v1 --split miniF2F --subset global_gemini_rephrase
-python experiments/robustpa_refine/run_robustpa_refine.py --exp-name qwen3_5_397b_math500_global_gemini_rephrase_reExp44 --model Qwen3.5-397B-A17B-FP8 --openai-base-url http://127.0.0.1:8001/v1 --split MATH500 --subset global_gemini_rephrase
+DEFAULT_PYTHON_BIN="/ssd/miniconda3/envs/lean4-czx/bin/python"
+if [[ -x "${DEFAULT_PYTHON_BIN}" ]]; then
+  PYTHON_BIN="${PYTHON_BIN:-${DEFAULT_PYTHON_BIN}}"
+else
+  PYTHON_BIN="${PYTHON_BIN:-python}"
+fi
+MODEL="${MODEL:-Qwen3.5-397B-A17B-FP8}"
+VLLM_BASE_URL="${VLLM_BASE_URL:-http://127.0.0.1:8001/v1}"
+DATA_ROOT="${DATA_ROOT:-/ssd/czx/czx_work/RobustPABench}"
+OUTPUT_BASE="${OUTPUT_BASE:-/ssd/czx/czx_work/robustpa_refine}"
+RESUME="${RESUME:-false}"
+RERUN_FAILED="${RERUN_FAILED:-false}"
+LIMIT="${LIMIT:-null}"
 
-# global_gemini_step
-python experiments/robustpa_refine/run_robustpa_refine.py --exp-name qwen3_5_397b_MiniF2F_global_gemini_step_reExp44 --model Qwen3.5-397B-A17B-FP8 --openai-base-url http://127.0.0.1:8001/v1 --split miniF2F --subset global_gemini_step
-python experiments/robustpa_refine/run_robustpa_refine.py --exp-name qwen3_5_397b_math500_global_gemini_step_reExp44 --model Qwen3.5-397B-A17B-FP8 --openai-base-url http://127.0.0.1:8001/v1 --split MATH500 --subset global_gemini_step
+MAX_REFINEMENT_ITERATIONS="${MAX_REFINEMENT_ITERATIONS:-1}"
+BLUEPRINT_MAX_RETRIES="${BLUEPRINT_MAX_RETRIES:-4}"
+REFINE_MAX_RETRIES="${REFINE_MAX_RETRIES:-1}"
+NODE_MAX_TOOL_CALLS="${NODE_MAX_TOOL_CALLS:-4}"
+PARALLEL_TOOL_CALLS="${PARALLEL_TOOL_CALLS:-false}"
+NODE_TIMEOUT_S="${NODE_TIMEOUT_S:-null}"
+LLM_API_TIMEOUT_S="${LLM_API_TIMEOUT_S:-null}"
 
-# global_qwen3_rephrase
-python experiments/robustpa_refine/run_robustpa_refine.py --exp-name qwen3_5_397b_MiniF2F_global_qwen3_rephrase_reExp44 --model Qwen3.5-397B-A17B-FP8 --openai-base-url http://127.0.0.1:8001/v1 --split miniF2F --subset global_qwen3_rephrase
-python experiments/robustpa_refine/run_robustpa_refine.py --exp-name qwen3_5_397b_math500_global_qwen3_rephrase_reExp44 --model Qwen3.5-397B-A17B-FP8 --openai-base-url http://127.0.0.1:8001/v1 --split MATH500 --subset global_qwen3_rephrase
+PHASE1_CONCURRENCY="${PHASE1_CONCURRENCY:-1024}"
+PHASE2_BLUEPRINT_CONCURRENCY="${PHASE2_BLUEPRINT_CONCURRENCY:-512}"
+PHASE2_NODE_CONCURRENCY="${PHASE2_NODE_CONCURRENCY:-4096}"
+REFINE_CONCURRENCY="${REFINE_CONCURRENCY:-1024}"
 
-# global_qwen3_step
-python experiments/robustpa_refine/run_robustpa_refine.py --exp-name qwen3_5_397b_MiniF2F_global_qwen3_step_reExp44 --model Qwen3.5-397B-A17B-FP8 --openai-base-url http://127.0.0.1:8001/v1 --split miniF2F --subset global_qwen3_step
-python experiments/robustpa_refine/run_robustpa_refine.py --exp-name qwen3_5_397b_math500_global_qwen3_step_reExp44 --model Qwen3.5-397B-A17B-FP8 --openai-base-url http://127.0.0.1:8001/v1 --split MATH500 --subset global_qwen3_step
+LEAN_BACKEND="${LEAN_BACKEND:-kimina_server}"
+LEAN_API_URL="${LEAN_API_URL:-http://localhost:8000}"
+LEAN_SERVER_TIMEOUT="${LEAN_SERVER_TIMEOUT:-600}"
+LEAN_SERVER_REUSE="${LEAN_SERVER_REUSE:-true}"
+LEAN_SERVER_DEBUG="${LEAN_SERVER_DEBUG:-false}"
+LEAN_CHECK_CONCURRENCY="${LEAN_CHECK_CONCURRENCY:-64}"
 
-# local_number_edit_proof
-python experiments/robustpa_refine/run_robustpa_refine.py --exp-name qwen3_5_397b_MiniF2F_local_number_edit_proof_reExp44 --model Qwen3.5-397B-A17B-FP8 --openai-base-url http://127.0.0.1:8001/v1 --split miniF2F --subset local_number_edit_proof
-python experiments/robustpa_refine/run_robustpa_refine.py --exp-name qwen3_5_397b_math500_local_number_edit_proof_reExp44 --model Qwen3.5-397B-A17B-FP8 --openai-base-url http://127.0.0.1:8001/v1 --split MATH500 --subset local_number_edit_proof
+# Local vLLM usually ignores the key, but the OpenAI SDK requires one.
+export GOEDEL_OPENAI_API_KEY="${GOEDEL_OPENAI_API_KEY:-dummy}"
 
-# local_number_edit_statement
-python experiments/robustpa_refine/run_robustpa_refine.py --exp-name qwen3_5_397b_MiniF2F_local_number_edit_statement_reExp44 --model Qwen3.5-397B-A17B-FP8 --openai-base-url http://127.0.0.1:8001/v1 --split miniF2F --subset local_number_edit_statement
-python experiments/robustpa_refine/run_robustpa_refine.py --exp-name qwen3_5_397b_math500_local_number_edit_statement_reExp44 --model Qwen3.5-397B-A17B-FP8 --openai-base-url http://127.0.0.1:8001/v1 --split MATH500 --subset local_number_edit_statement
+COMMON_OVERRIDES=(
+  "model=${MODEL}"
+  "openai_base_url=${VLLM_BASE_URL}"
+  "data_root=${DATA_ROOT}"
+  "output_base=${OUTPUT_BASE}"
+  "resume=${RESUME}"
+  "rerun_failed=${RERUN_FAILED}"
+  "limit=${LIMIT}"
+  "max_refinement_iterations=${MAX_REFINEMENT_ITERATIONS}"
+  "blueprint_max_retries=${BLUEPRINT_MAX_RETRIES}"
+  "refine_max_retries=${REFINE_MAX_RETRIES}"
+  "node_max_tool_calls=${NODE_MAX_TOOL_CALLS}"
+  "parallel_tool_calls=${PARALLEL_TOOL_CALLS}"
+  "node_timeout_s=${NODE_TIMEOUT_S}"
+  "llm_api_timeout_s=${LLM_API_TIMEOUT_S}"
+  "phase1_concurrency=${PHASE1_CONCURRENCY}"
+  "phase2_blueprint_concurrency=${PHASE2_BLUEPRINT_CONCURRENCY}"
+  "phase2_node_concurrency=${PHASE2_NODE_CONCURRENCY}"
+  "refine_concurrency=${REFINE_CONCURRENCY}"
+  "lean_backend=${LEAN_BACKEND}"
+  "lean_api_url=${LEAN_API_URL}"
+  "lean_server_timeout=${LEAN_SERVER_TIMEOUT}"
+  "lean_server_reuse=${LEAN_SERVER_REUSE}"
+  "lean_server_debug=${LEAN_SERVER_DEBUG}"
+  "lean_check_concurrency=${LEAN_CHECK_CONCURRENCY}"
+)
 
-# local_step_delete
-python experiments/robustpa_refine/run_robustpa_refine.py --exp-name qwen3_5_397b_MiniF2F_local_step_delete_reExp44 --model Qwen3.5-397B-A17B-FP8 --openai-base-url http://127.0.0.1:8001/v1 --split miniF2F --subset local_step_delete
-python experiments/robustpa_refine/run_robustpa_refine.py --exp-name qwen3_5_397b_math500_local_step_delete_reExp44 --model Qwen3.5-397B-A17B-FP8 --openai-base-url http://127.0.0.1:8001/v1 --split MATH500 --subset local_step_delete
+run_exp() {
+  local exp_name="$1"
+  local split="$2"
+  local subset="$3"
+  "${PYTHON_BIN}" experiments/robustpa_refine/run_robustpa_refine.py \
+    "${COMMON_OVERRIDES[@]}" \
+    "exp_name=${exp_name}" \
+    "split=${split}" \
+    "subset=${subset}"
+}
 
-# local_symbol_edit_proof
-python experiments/robustpa_refine/run_robustpa_refine.py --exp-name qwen3_5_397b_MiniF2F_local_symbol_edit_proof_reExp44 --model Qwen3.5-397B-A17B-FP8 --openai-base-url http://127.0.0.1:8001/v1 --split miniF2F --subset local_symbol_edit_proof
-python experiments/robustpa_refine/run_robustpa_refine.py --exp-name qwen3_5_397b_math500_local_symbol_edit_proof_reExp44 --model Qwen3.5-397B-A17B-FP8 --openai-base-url http://127.0.0.1:8001/v1 --split MATH500 --subset local_symbol_edit_proof
+run_exp qwen3_5_397b_MiniF2F_orig_reExp41 miniF2F global_original
+run_exp qwen3_5_397b_math500_orig_reExp41 MATH500 global_original
 
-# local_symbol_edit_statement
-python experiments/robustpa_refine/run_robustpa_refine.py --exp-name qwen3_5_397b_MiniF2F_local_symbol_edit_statement_reExp44 --model Qwen3.5-397B-A17B-FP8 --openai-base-url http://127.0.0.1:8001/v1 --split miniF2F --subset local_symbol_edit_statement
-python experiments/robustpa_refine/run_robustpa_refine.py --exp-name qwen3_5_397b_math500_local_symbol_edit_statement_reExp44 --model Qwen3.5-397B-A17B-FP8 --openai-base-url http://127.0.0.1:8001/v1 --split MATH500 --subset local_symbol_edit_statement
+run_exp qwen3_5_397b_MiniF2F_global_gemini_rephrase_reExp41 miniF2F global_gemini_rephrase
+run_exp qwen3_5_397b_math500_global_gemini_rephrase_reExp41 MATH500 global_gemini_rephrase
+
+run_exp qwen3_5_397b_MiniF2F_global_gemini_step_reExp41 miniF2F global_gemini_step
+run_exp qwen3_5_397b_math500_global_gemini_step_reExp41 MATH500 global_gemini_step
+
+run_exp qwen3_5_397b_MiniF2F_global_qwen3_rephrase_reExp41 miniF2F global_qwen3_rephrase
+run_exp qwen3_5_397b_math500_global_qwen3_rephrase_reExp41 MATH500 global_qwen3_rephrase
+
+run_exp qwen3_5_397b_MiniF2F_global_qwen3_step_reExp41 miniF2F global_qwen3_step
+run_exp qwen3_5_397b_math500_global_qwen3_step_reExp41 MATH500 global_qwen3_step
+
+run_exp qwen3_5_397b_MiniF2F_local_number_edit_proof_reExp41 miniF2F local_number_edit_proof
+run_exp qwen3_5_397b_math500_local_number_edit_proof_reExp41 MATH500 local_number_edit_proof
+
+run_exp qwen3_5_397b_MiniF2F_local_number_edit_statement_reExp41 miniF2F local_number_edit_statement
+run_exp qwen3_5_397b_math500_local_number_edit_statement_reExp41 MATH500 local_number_edit_statement
+
+run_exp qwen3_5_397b_MiniF2F_local_step_delete_reExp41 miniF2F local_step_delete
+run_exp qwen3_5_397b_math500_local_step_delete_reExp41 MATH500 local_step_delete
+
+run_exp qwen3_5_397b_MiniF2F_local_symbol_edit_proof_reExp41 miniF2F local_symbol_edit_proof
+run_exp qwen3_5_397b_math500_local_symbol_edit_proof_reExp41 MATH500 local_symbol_edit_proof
+
+run_exp qwen3_5_397b_MiniF2F_local_symbol_edit_statement_reExp41 miniF2F local_symbol_edit_statement
+run_exp qwen3_5_397b_math500_local_symbol_edit_statement_reExp41 MATH500 local_symbol_edit_statement

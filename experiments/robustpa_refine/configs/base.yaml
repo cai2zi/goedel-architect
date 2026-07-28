@@ -2,6 +2,13 @@ exp_name: null
 data_root: /ssd/czx/czx_work/RobustPABench
 output_base: /ssd/czx/czx_work/robustpa_refine
 model: Qwen3.5-397B-A17B-FP8
+openai_base_url: null
+subset: null
+split: null
+limit: null
+problem_id: null
+resume: false
+rerun_failed: false
 max_refinement_iterations: 4
 blueprint_max_retries: 8
 refine_max_retries: 8
@@ -16,6 +23,7 @@ refine_concurrency: 1024
 lean_check_concurrency: 64
 lean_backend: kimina_server
 lean_api_url: http://localhost:8000
+lean_api_key_env: KIMINA_API_KEY
 lean_server_timeout: 600
 lean_server_reuse: true
 lean_server_debug: false
@@ -26,3 +34,9 @@ environment:
   GOEDEL_LLM_RETRY_BASE_DELAY_S: "2"
   GOEDEL_LLM_RETRY_MAX_DELAY_S: "60"
   GOEDEL_LLM_RETRY_JITTER_S: "1"
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${output_base}/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S}
