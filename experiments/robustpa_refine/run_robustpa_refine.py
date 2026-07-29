@@ -74,26 +74,21 @@ def _optional_timeout(value: Any) -> float | None:
     return timeout
 
 
-def _optional_bool(value: Any) -> bool | None:
+def _optional_positive_int(value: Any) -> int | None:
     if value is None:
         return None
     if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        if value == 1:
-            return True
-        if value == 0:
-            return False
+        raise argparse.ArgumentTypeError("expected a positive integer or null")
     text = str(value).strip().lower()
     if text in {"", "none", "null", "default", "omit"}:
         return None
-    if text in {"1", "true", "yes", "y", "on"}:
-        return True
-    if text in {"0", "false", "no", "n", "off"}:
-        return False
-    raise argparse.ArgumentTypeError(
-        "expected one of: true/false/null, 1/0, yes/no, on/off"
-    )
+    try:
+        parsed = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a positive integer or null") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("expected a positive integer or null")
+    return parsed
 
 
 @dataclass(frozen=True)
@@ -157,7 +152,7 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
             os.environ["GOEDEL_OPENAI_API_KEY"] = "dummy"
     args.node_timeout_s = _optional_timeout(args.node_timeout_s)
     args.llm_api_timeout_s = _optional_timeout(args.llm_api_timeout_s)
-    args.parallel_tool_calls = _optional_bool(args.parallel_tool_calls)
+    args.parallel_tool_calls = _optional_positive_int(args.parallel_tool_calls)
     _validate_args(args)
     return args
 
@@ -169,7 +164,6 @@ def _validate_args(args: argparse.Namespace) -> None:
         "phase2_node_concurrency",
         "refine_concurrency",
         "blueprint_max_retries",
-        "refine_max_retries",
         "node_max_tool_calls",
     ):
         if getattr(args, name) <= 0:
@@ -180,6 +174,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("node_timeout_s must be positive or none/null/0")
     if args.llm_api_timeout_s is not None and args.llm_api_timeout_s <= 0:
         raise ValueError("llm_api_timeout_s must be positive or none/null/0")
+    if args.parallel_tool_calls is not None and args.parallel_tool_calls <= 0:
+        raise ValueError("parallel_tool_calls must be a positive integer or null")
 
 
 def _read_parquet_rows(path: Path) -> list[dict[str, Any]]:
@@ -609,7 +605,7 @@ async def _run_record(
                         max_iterations=args.max_refinement_iterations,
                         tracer=phase3_tracer,
                         thm_name=record.unique_id,
-                        refine_max_retries=args.refine_max_retries,
+                        blueprint_max_retries=args.blueprint_max_retries,
                     ),
                 )
                 state = CheckpointState.load(checkpoint_path)

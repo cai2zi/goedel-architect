@@ -98,7 +98,7 @@ async def prove_dag(
     llm_api_timeout_s: float | None = 120.0,
     node_max_tool_calls: int | None = None,
     escalation_max_tool_calls: int | None = 1,
-    parallel_tool_calls: bool | None = None,
+    parallel_tool_calls: int | None = None,
     node_executor: Executor | None = None,
     node_semaphore: asyncio.Semaphore | None = None,
 ) -> OrchestratorResult:
@@ -118,9 +118,10 @@ async def prove_dag(
         node goes straight to `model`, unchanged from prior behavior.
     node_max_tool_calls: optional cap for each normal per-node prover loop.
         None keeps prover.py's default MAX_TOOL_CALLS.
-    parallel_tool_calls: passed to chat.completions on tool-enabled prover
-        turns. False asks the provider to return at most one tool call per
-        assistant message; None omits the provider-specific request field.
+    parallel_tool_calls: maximum number of tool calls to execute from one
+        assistant message in Phase2. A value of 1 asks the provider for serial
+        tool calls; values greater than 1 enable provider-side parallel tool
+        calls, but only the first N returned tool calls are executed.
     llm_api_timeout_s: per-request timeout passed to the OpenAI-compatible
         chat client used by prover.py. This bounds a single queued/generating
         LLM HTTP request; None disables the client-side timeout.
@@ -267,7 +268,7 @@ async def _prove_one(
     llm_api_timeout_s: float | None = 120.0,
     node_max_tool_calls: int | None = None,
     escalation_max_tool_calls: int | None = None,
-    parallel_tool_calls: bool | None = None,
+    parallel_tool_calls: int | None = None,
     node_executor: Executor | None = None,
     node_semaphore: asyncio.Semaphore | None = None,
 ) -> NodeResult:

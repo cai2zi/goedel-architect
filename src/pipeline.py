@@ -112,8 +112,8 @@ def prove_theorem(
     cascade_timeout_s: float | None = None,
     node_max_tool_calls: int | None = None,
     escalation_max_tool_calls: int | None = 1,
-    parallel_tool_calls: bool | None = None,
-    refine_max_retries: int | None = None,
+    parallel_tool_calls: int | None = None,
+    blueprint_max_retries: int | None = None,
 ) -> ProofResult:
     """
     Full Goedel-Architect pipeline for a single theorem.
@@ -201,6 +201,7 @@ def prove_theorem(
             repo_retrieval=repo_retrieval,
             tracer=tracer,
             thm_name=thm_name,
+            max_retries=blueprint_max_retries or 8,
         )
         proved_cache = {}
         proof_cache_keys = {}
@@ -301,7 +302,7 @@ def prove_theorem(
                 repo_retrieval=repo_retrieval,
                 tracer=tracer,
                 thm_name=thm_name,
-                max_retries=refine_max_retries or 8,
+                max_retries=blueprint_max_retries or 8,
             )
             print(f"  new blueprint has {len(blueprint.nodes)} nodes: {[n.name for n in blueprint.nodes]}", flush=True)
         except RuntimeError as e:
@@ -402,7 +403,7 @@ async def run_phase2_async(
     cascade_timeout_s: float | None = None,
     node_max_tool_calls: int | None = None,
     escalation_max_tool_calls: int | None = 1,
-    parallel_tool_calls: bool | None = None,
+    parallel_tool_calls: int | None = None,
     node_executor: Executor | None = None,
     node_semaphore: asyncio.Semaphore | None = None,
 ) -> OrchestratorResult:
@@ -480,7 +481,7 @@ def run_phase2(
     cascade_timeout_s: float | None = None,
     node_max_tool_calls: int | None = None,
     escalation_max_tool_calls: int | None = 1,
-    parallel_tool_calls: bool | None = None,
+    parallel_tool_calls: int | None = None,
     node_executor: Executor | None = None,
     node_semaphore: asyncio.Semaphore | None = None,
 ) -> OrchestratorResult:
@@ -515,7 +516,7 @@ def run_phase3(
     repo_retrieval=None,
     tracer=None,
     thm_name: str = "",
-    refine_max_retries: int | None = None,
+    blueprint_max_retries: int | None = None,
 ) -> Blueprint:
     """Run one Phase 3 (refinement) pass against a checkpointed blueprint.
 
@@ -558,7 +559,7 @@ def run_phase3(
         repo_retrieval=repo_retrieval,
         tracer=tracer,
         thm_name=thm_name,
-        max_retries=refine_max_retries or 8,
+        max_retries=blueprint_max_retries or 8,
     )
 
     new_proved_cache = _invalidate_stale_proofs(new_blueprint, state.proved_cache, state.proof_cache_keys)

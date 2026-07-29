@@ -56,11 +56,11 @@ which may contain multiple LLM calls and Lean tool calls. RobustPA defaults
 both to `null` for local vLLM runs. Passing `0`, `none`, or `null` on the
 command line has the same effect.
 
-`--parallel-tool-calls true|false|null` controls the OpenAI-compatible
-`parallel_tool_calls` request field for Phase2 prover turns. `true` allows a
-single assistant response to contain multiple tool calls, `false` asks the
-server to return at most one, and `null` omits the field. The default config
-sets `parallel_tool_calls: false`.
+`parallel_tool_calls=N` controls the per-turn Phase2 tool-call budget. `1`
+asks the provider for at most one tool call per assistant message and processes
+only one; values greater than `1` allow provider-side parallel tool calls, but
+the runner executes only the first `N` tool calls from a turn and ignores the
+rest. The default config sets `parallel_tool_calls: 1`.
 
 Subset filtering:
 

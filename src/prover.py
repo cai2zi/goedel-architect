@@ -57,10 +57,20 @@ def _tool_choice_kwargs(choice: str | dict) -> dict:
     return {"tool_choice": choice}
 
 
-def _parallel_tool_calls_kwargs(parallel_tool_calls: bool | None) -> dict:
+def _parallel_tool_calls_kwargs(parallel_tool_calls: int | None) -> dict:
     if parallel_tool_calls is None:
         return {}
-    return {"parallel_tool_calls": parallel_tool_calls}
+    return {"parallel_tool_calls": parallel_tool_calls > 1}
+
+
+def _tool_call_limit_notice(parallel_tool_calls: int | None) -> str:
+    if parallel_tool_calls is None:
+        return ""
+    return (
+        "Per-turn tool budget: call at most "
+        f"{parallel_tool_calls} tool(s) in each assistant turn. "
+        "Extra tool calls in the same turn will be ignored."
+    )
 
 
 def _parse_tool_arguments(raw_arguments: str) -> Any:
@@ -312,7 +322,7 @@ class GoedelProver:
         tracer=None,
         api_timeout_s: float | None = 120.0,
         max_tool_calls: int | None = None,
-        parallel_tool_calls: bool | None = None,
+        parallel_tool_calls: int | None = None,
     ):
         self.model_id = model_id
         # Bounds each individual chat.completions call so a stuck request
@@ -327,6 +337,14 @@ class GoedelProver:
         # attempt a much tighter budget (e.g. 1: a single lean_compile call,
         # no fix-and-retry loop) than the cheap cascade attempt gets.
         self.max_tool_calls = max_tool_calls if max_tool_calls is not None else MAX_TOOL_CALLS
+
+    def _tool_call_limit_for_turn(self, tool_calls_so_far: int) -> int | None:
+        remaining = self.max_tool_calls - tool_calls_so_far
+        if remaining <= 0:
+            return 0
+        if self.parallel_tool_calls is None:
+            return remaining
+        return min(self.parallel_tool_calls, remaining)
 
     def _emit_usage(self, node_name: str, response) -> None:
         """Log token usage from a chat.completions response."""
@@ -428,7 +446,10 @@ class GoedelProver:
         self._parent_lemma_decls = parent_lemma_decls
         active_tools = _tools_for_repo_retrieval(repo_retrieval)
         system_suffix = _system_suffix_for_repo_retrieval(repo_retrieval)
+        tool_limit_notice = _tool_call_limit_notice(self.parallel_tool_calls)
         augmented_sys = (sys_prompt or PROVER_SYSTEM_PROMPT).strip() + "\n\n" + system_suffix.strip()
+        if tool_limit_notice:
+            augmented_sys += "\n\n" + tool_limit_notice
 
         if not user_prompt:
             user_prompt = render(
@@ -677,7 +698,12 @@ class GoedelProver:
                 result=msg.content,
             ))
 
-        for tc in msg.tool_calls or []:
+        tool_calls = list(msg.tool_calls or [])
+        limit = self._tool_call_limit_for_turn(tool_calls_so_far)
+        calls_to_process = tool_calls if limit is None else tool_calls[:limit]
+        calls_to_drop = [] if limit is None else tool_calls[limit:]
+
+        for tc in calls_to_process:
             fn = tc.function.name
             args = json.loads(tc.function.arguments)
             tools_called.append(fn)
@@ -737,6 +763,28 @@ class GoedelProver:
 
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
+        for tc in calls_to_drop:
+            result = (
+                "Tool call ignored: per-turn tool-call limit is "
+                f"{self.parallel_tool_calls}. Continue with at most "
+                f"{self.parallel_tool_calls} tool call(s) per assistant turn."
+            )
+            self.tracer.emit(TraceEvent(
+                kind="tool_call_dropped",
+                thm_name=node_name,
+                turn=turn,
+                call_id=tc.id,
+                tool_name=tc.function.name,
+                args={
+                    "parallel_tool_calls": self.parallel_tool_calls,
+                    "tool_calls_returned": len(tool_calls),
+                    "tool_calls_processed": len(calls_to_process),
+                },
+                result=result,
+                ok=False,
+            ))
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+
         # Only use message-extracted proof if no compile succeeded yet;
         # compiled_proof is authoritative and must not be overwritten.
         if last_text and not any_compile_ok:
@@ -780,6 +828,9 @@ class GoedelProver:
             "Tactics: `omega`, `decide`, `norm_num`, `push_neg; linarith`, `simp`.\n"
             "Call lean_compile. If it succeeds, the original statement is formally refuted."
         )
+        tool_limit_notice = _tool_call_limit_notice(self.parallel_tool_calls)
+        if tool_limit_notice:
+            prompt += "\n\n" + tool_limit_notice
         messages.append({"role": "user", "content": prompt})
         response = self.client.chat.completions.create(
             model=self.model_id,
@@ -815,7 +866,12 @@ class GoedelProver:
             if not msg.tool_calls:
                 break
 
-            for tc in msg.tool_calls:
+            tool_calls = list(msg.tool_calls or [])
+            limit = self.parallel_tool_calls
+            calls_to_process = tool_calls if limit is None else tool_calls[:limit]
+            calls_to_drop = [] if limit is None else tool_calls[limit:]
+
+            for tc in calls_to_process:
                 args = json.loads(tc.function.arguments)
                 self.tracer.emit(TraceEvent(
                     kind="tool_call",
@@ -879,6 +935,28 @@ class GoedelProver:
                     call_id=tc.id,
                     tool_name=tc.function.name,
                     args=trace_args,
+                    result=output,
+                    ok=False,
+                ))
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
+
+            for tc in calls_to_drop:
+                output = (
+                    "Tool call ignored: per-turn tool-call limit is "
+                    f"{self.parallel_tool_calls}. Continue with at most "
+                    f"{self.parallel_tool_calls} tool call(s) per assistant turn."
+                )
+                self.tracer.emit(TraceEvent(
+                    kind="tool_call_dropped",
+                    thm_name=node_name,
+                    turn=probe_turn + 1,
+                    call_id=tc.id,
+                    tool_name=tc.function.name,
+                    args={
+                        "parallel_tool_calls": self.parallel_tool_calls,
+                        "tool_calls_returned": len(tool_calls),
+                        "tool_calls_processed": len(calls_to_process),
+                    },
                     result=output,
                     ok=False,
                 ))
@@ -1061,7 +1139,7 @@ def prove_node(
     tracer=None,
     api_timeout_s: float | None = 120.0,
     max_tool_calls: int | None = None,
-    parallel_tool_calls: bool | None = None,
+    parallel_tool_calls: int | None = None,
 ) -> ProverResult:
     parent_block = "\n\n".join(
         f"```lean\n-- {n}\n{p}\n```" for n, p in parent_proofs.items()
