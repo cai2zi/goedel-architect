@@ -118,23 +118,12 @@ except ImportError:
 PROVER_SYSTEM_PROMPT = load("prover_system")
 PROVER_USER_TEMPLATE = load("prover_user")
 
-# From Appendix A: "each node retries up to 4 times." The paper's mechanism
-# (discrete full-code resubmissions) differs from this loop (one continuous
-# multi-turn conversation), so this matches the stated budget number, not
-# the exact retry semantics — a true match would need a different loop shape.
-# Token budget is configurable so high-throughput experiment runs can stay
-# under model/provider TPM limits.
-#
-# MAX_TOOL_CALLS raised 4 -> 8 (above the paper's own number) after observing
-# twice in VSB smoke tests that the model converged on a materially better
-# proof strategy right as the 4-call budget ran out, with the improved draft
-# never reaching lean_compile at all.
 def _max_tokens() -> int:
     return int(os.environ.get("GOEDEL_PROVER_MAX_TOKENS", "64000"))
 
 
-MAX_TOOL_CALLS = 8
-NEGATION_PROBE_CALLS = 4
+DEFAULT_NODE_MAX_PROVE_TURNS = 8
+DEFAULT_NODE_MAX_NEGATION_PROBE_TURNS = 4
 
 SYSTEM_SUFFIX_WITH_REPO_SEARCH = """
 ## Tool-First Workflow
@@ -154,8 +143,7 @@ Workflow:
 4. When you need a lemma whose name you do NOT already know:
    - call repo_search for project-specific lemmas
    - call mathlib_search for general Mathlib lemmas
-5. Once lean_compile returns SUCCESSFUL, output:
-   <lean4_proof>:= by\n  ...\n</lean4_proof>
+5. A successful lean_compile call is the only accepted proof source.
 
 Prefer lean_compile over search — faster to try a tactic and read the error.
 """
@@ -175,8 +163,7 @@ Workflow:
 3. Read errors, adjust, and call lean_compile again.
 4. When you need a general Mathlib lemma whose name you do not know, call
    mathlib_search.
-5. Once lean_compile returns SUCCESSFUL, output:
-   <lean4_proof>:= by\n  ...\n</lean4_proof>
+5. A successful lean_compile call is the only accepted proof source.
 
 Prefer lean_compile over search — faster to try a tactic and read the error.
 """
@@ -321,7 +308,8 @@ class GoedelProver:
         retrieval: MathlibRetrieval | None = None,
         tracer=None,
         api_timeout_s: float | None = 120.0,
-        max_tool_calls: int | None = None,
+        max_prove_turns: int | None = None,
+        max_negation_probe_turns: int | None = None,
         parallel_tool_calls: int | None = None,
     ):
         self.model_id = model_id
@@ -332,19 +320,16 @@ class GoedelProver:
         self.retrieval = retrieval or MathlibRetrieval()
         self.tracer = tracer or NullTracer()
         self.parallel_tool_calls = parallel_tool_calls
-        # Per-instance override of the module-level MAX_TOOL_CALLS budget -
-        # used by orchestrator.py's cascade to give an escalated (expensive)
-        # attempt a much tighter budget (e.g. 1: a single lean_compile call,
-        # no fix-and-retry loop) than the cheap cascade attempt gets.
-        self.max_tool_calls = max_tool_calls if max_tool_calls is not None else MAX_TOOL_CALLS
-
-    def _tool_call_limit_for_turn(self, tool_calls_so_far: int) -> int | None:
-        remaining = self.max_tool_calls - tool_calls_so_far
-        if remaining <= 0:
-            return 0
-        if self.parallel_tool_calls is None:
-            return remaining
-        return min(self.parallel_tool_calls, remaining)
+        self.max_prove_turns = (
+            max_prove_turns
+            if max_prove_turns is not None
+            else DEFAULT_NODE_MAX_PROVE_TURNS
+        )
+        self.max_negation_probe_turns = (
+            max_negation_probe_turns
+            if max_negation_probe_turns is not None
+            else DEFAULT_NODE_MAX_NEGATION_PROBE_TURNS
+        )
 
     def _emit_usage(self, node_name: str, response) -> None:
         """Log token usage from a chat.completions response."""
@@ -370,8 +355,11 @@ class GoedelProver:
         response,
         *,
         turn: int,
-        tool_calls_used_before: int = 0,
+        stage: str,
+        max_turns: int,
         operation: str = "",
+        tool_calls_processed: int = 0,
+        tool_calls_dropped: int = 0,
     ) -> None:
         choice = response.choices[0]
         msg = choice.message
@@ -386,9 +374,12 @@ class GoedelProver:
                 "model": getattr(response, "model", self.model_id),
                 "response_id": getattr(response, "id", None),
                 "finish_reason": getattr(choice, "finish_reason", None),
+                "stage": stage,
                 "operation": operation,
-                "tool_calls_used_before": tool_calls_used_before,
+                "max_turns": max_turns,
                 "tool_call_count": len(tool_call_payload),
+                "tool_calls_processed": tool_calls_processed,
+                "tool_calls_dropped": tool_calls_dropped,
                 "content": msg.content,
                 "content_len": len(msg.content or ""),
                 "tool_calls": tool_call_payload,
@@ -474,7 +465,6 @@ class GoedelProver:
             {"role": "user", "content": user_prompt},
         ]
         max_tokens = _max_tokens()
-        tool_calls_used = 0
 
         # Force first call to lean_compile
         response_operation = "prove_node_initial"
@@ -485,7 +475,11 @@ class GoedelProver:
             phase="phase2",
             model_id=self.model_id,
             operation="prove_node_initial",
-            trace_args={"tool_calls_used": tool_calls_used},
+            trace_args={
+                "stage": "prove",
+                "turn": 1,
+                "max_turns": self.max_prove_turns,
+            },
             model=self.model_id,
             messages=messages,
             tools=active_tools,
@@ -495,39 +489,34 @@ class GoedelProver:
         )
         self._emit_usage(node_name, response)
 
-        best_proof_body = ""
         last_text = ""
-        had_tool_calls = False
-        last_compile_ok = False
         all_lean_errors: list[str] = []
 
-        while tool_calls_used < self.max_tool_calls:
+        for turn in range(1, self.max_prove_turns + 1):
             had_tool_calls, text, proof, compile_ok, tools_called, compile_errors = self._process_response(
                 response,
                 messages,
                 compiler,
                 node_name,
                 repo_retrieval,
-                tool_calls_used,
+                turn=turn,
+                stage="prove",
+                max_turns=self.max_prove_turns,
                 node_decl=node_stmt,
                 operation=response_operation,
             )
             all_lean_errors.extend(compile_errors)
             if text:
                 last_text = text
-            if proof:
-                best_proof_body = proof
             if compile_ok:
-                last_compile_ok = True
                 return ProverResult(signal=ProofSignal.SOLVED, proof_body=proof)
 
             had_search = any(t in ("repo_search", "mathlib_search") for t in tools_called)
             had_compile = "lean_compile" in tools_called
-            tool_calls_used += len(tools_called)
 
             if not had_tool_calls:
                 break
-            if tool_calls_used >= self.max_tool_calls:
+            if turn >= self.max_prove_turns:
                 break
 
             next_choice = (
@@ -543,7 +532,11 @@ class GoedelProver:
                 phase="phase2",
                 model_id=self.model_id,
                 operation="prove_node_next",
-                trace_args={"tool_calls_used": tool_calls_used},
+                trace_args={
+                    "stage": "prove",
+                    "turn": turn + 1,
+                    "max_turns": self.max_prove_turns,
+                },
                 model=self.model_id,
                 messages=messages,
                 tools=active_tools,
@@ -552,73 +545,6 @@ class GoedelProver:
                 **_tool_choice_kwargs(next_choice),
             )
             self._emit_usage(node_name, response)
-
-        # Drain any pending tool calls (get the model's reaction to the last
-        # round of tool results without letting it call more tools)
-        if had_tool_calls:
-            response = chat_completion_with_retry(
-                self.client,
-                tracer=self.tracer,
-                thm_name=node_name,
-                phase="phase2",
-                model_id=self.model_id,
-                operation="prove_node_drain",
-                trace_args={"tool_calls_used": tool_calls_used},
-                model=self.model_id,
-                messages=messages,
-                tools=active_tools,
-                tool_choice="none",
-                max_completion_tokens=max_tokens,
-                **_parallel_tool_calls_kwargs(self.parallel_tool_calls),
-            )
-            self._emit_usage(node_name, response)
-            _, drain_text, drain_proof, _, _, drain_errors = self._process_response(
-                response,
-                messages,
-                compiler,
-                node_name,
-                repo_retrieval,
-                tool_calls_used,
-                node_decl=node_stmt,
-                operation="prove_node_drain",
-            )
-            all_lean_errors.extend(drain_errors)
-            if drain_text:
-                last_text = drain_text
-            if drain_proof:
-                best_proof_body = drain_proof
-
-        # Ask for final answer if no proof tag found
-        if not best_proof_body:
-            messages.append({
-                "role": "user",
-                "content": "Output your best proof: <lean4_proof>:= by\n  ...\n</lean4_proof>",
-            })
-            response = chat_completion_with_retry(
-                self.client,
-                tracer=self.tracer,
-                thm_name=node_name,
-                phase="phase2",
-                model_id=self.model_id,
-                operation="prove_node_final_answer",
-                trace_args={"tool_calls_used": tool_calls_used},
-                model=self.model_id,
-                messages=messages,
-                max_completion_tokens=max_tokens,
-                **_chat_reasoning_kwargs(self.model_id),
-            )
-            self._emit_usage(node_name, response)
-            _, last_text, best_proof_body, _, _, final_errors = self._process_response(
-                response,
-                messages,
-                compiler,
-                node_name,
-                repo_retrieval,
-                tool_calls_used,
-                node_decl=node_stmt,
-                operation="prove_node_final_answer",
-            )
-            all_lean_errors.extend(final_errors)
 
         # Probe negation if we couldn't prove it
         negation = self._probe_negation(
@@ -631,10 +557,6 @@ class GoedelProver:
         if negation:
             return negation
 
-        if best_proof_body:
-            signal = _classify_failure(last_text)
-            return ProverResult(signal=signal, proof_body=best_proof_body,
-                                analysis=last_text[:500], lean_errors=all_lean_errors)
         return ProverResult(signal=_classify_failure(last_text),
                             analysis=last_text[:500], lean_errors=all_lean_errors)
 
@@ -649,7 +571,10 @@ class GoedelProver:
         compiler: AbstractLeanCompiler,
         node_name: str,
         repo_retrieval,
-        tool_calls_so_far: int,
+        *,
+        turn: int,
+        stage: str,
+        max_turns: int,
         node_decl: str = "",
         operation: str = "",
     ) -> tuple[bool, str, str, bool, list[str], list[str]]:
@@ -665,18 +590,23 @@ class GoedelProver:
         choice = response.choices[0]
         msg = choice.message
         last_text = ""
-        best_proof = ""
         compiled_proof = ""   # proof body that actually compiled — never overwritten by message text
         any_compile_ok = False
         tools_called: list[str] = []
         compile_errors: list[str] = []
-        turn = tool_calls_so_far + 1
+        tool_calls = list(msg.tool_calls or [])
+        limit = self.parallel_tool_calls
+        calls_to_process = tool_calls if limit is None else tool_calls[:limit]
+        calls_to_drop = [] if limit is None else tool_calls[limit:]
         self._emit_llm_response(
             node_name,
             response,
             turn=turn,
-            tool_calls_used_before=tool_calls_so_far,
+            stage=stage,
+            max_turns=max_turns,
             operation=operation,
+            tool_calls_processed=len(calls_to_process),
+            tool_calls_dropped=len(calls_to_drop),
         )
 
         assistant_msg: dict = {"role": "assistant", "content": msg.content}
@@ -698,19 +628,16 @@ class GoedelProver:
                 result=msg.content,
             ))
 
-        tool_calls = list(msg.tool_calls or [])
-        limit = self._tool_call_limit_for_turn(tool_calls_so_far)
-        calls_to_process = tool_calls if limit is None else tool_calls[:limit]
-        calls_to_drop = [] if limit is None else tool_calls[limit:]
-
         for tc in calls_to_process:
             fn = tc.function.name
             args = json.loads(tc.function.arguments)
             tools_called.append(fn)
+            tool_ok = False
 
             self.tracer.emit(TraceEvent(
                 kind="tool_call", thm_name=node_name, turn=turn,
-                call_id=tc.id, tool_name=fn, args=args,
+                call_id=tc.id, tool_name=fn,
+                args={"stage": stage, "arguments": args},
             ))
 
             if fn == "lean_compile":
@@ -733,8 +660,8 @@ class GoedelProver:
                 if cr.success:
                     result = "Compilation SUCCESSFUL. Proof is correct."
                     any_compile_ok = True
+                    tool_ok = True
                     compiled_proof = proof_body
-                    best_proof = proof_body
                 else:
                     errs = "\n".join(cr.errors)
                     result = f"Compilation FAILED.\n{errs}\n\nFix errors and call lean_compile again."
@@ -758,7 +685,7 @@ class GoedelProver:
                 kind="tool_result", thm_name=node_name, turn=turn,
                 call_id=tc.id, tool_name=fn,
                 args=trace_args,
-                result=result, ok=(fn == "lean_compile" and any_compile_ok),
+                result=result, ok=tool_ok,
             ))
 
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
@@ -776,6 +703,7 @@ class GoedelProver:
                 call_id=tc.id,
                 tool_name=tc.function.name,
                 args={
+                    "stage": stage,
                     "parallel_tool_calls": self.parallel_tool_calls,
                     "tool_calls_returned": len(tool_calls),
                     "tool_calls_processed": len(calls_to_process),
@@ -785,15 +713,7 @@ class GoedelProver:
             ))
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
-        # Only use message-extracted proof if no compile succeeded yet;
-        # compiled_proof is authoritative and must not be overwritten.
-        if last_text and not any_compile_ok:
-            extracted = _extract_proof_body(last_text)
-            if extracted:
-                best_proof = extracted
-
-        # Prefer the proof that actually compiled over anything extracted from text
-        return bool(msg.tool_calls), last_text, compiled_proof or best_proof, any_compile_ok, tools_called, compile_errors
+        return bool(msg.tool_calls), last_text, compiled_proof, any_compile_ok, tools_called, compile_errors
 
     # ------------------------------------------------------------------
     # Negation probe (Section 4.3 / Figure 1)
@@ -807,6 +727,14 @@ class GoedelProver:
         max_tokens: int,
         node_decl: str,
     ) -> ProverResult | None:
+        if self.max_negation_probe_turns <= 0:
+            self.tracer.emit(TraceEvent(
+                kind="negation_probe_skipped",
+                thm_name=node_name,
+                args={"reason": "node_max_negation_probe_turns=0"},
+            ))
+            return None
+
         try:
             negation_node_decl = _build_negation_node_decl(node_decl, node_name)
         except ValueError as exc:
@@ -842,15 +770,22 @@ class GoedelProver:
         )
         self._emit_usage(node_name, response)
 
-        for probe_turn in range(NEGATION_PROBE_CALLS):
+        for turn in range(1, self.max_negation_probe_turns + 1):
+            msg = response.choices[0].message
+            tool_calls = list(msg.tool_calls or [])
+            limit = self.parallel_tool_calls
+            calls_to_process = tool_calls if limit is None else tool_calls[:limit]
+            calls_to_drop = [] if limit is None else tool_calls[limit:]
             self._emit_llm_response(
                 node_name,
                 response,
-                turn=probe_turn + 1,
-                tool_calls_used_before=probe_turn,
+                turn=turn,
+                stage="negation_probe",
+                max_turns=self.max_negation_probe_turns,
                 operation="negation_probe",
+                tool_calls_processed=len(calls_to_process),
+                tool_calls_dropped=len(calls_to_drop),
             )
-            msg = response.choices[0].message
             assistant_msg: dict = {"role": "assistant", "content": msg.content}
             if msg.tool_calls:
                 assistant_msg["tool_calls"] = [
@@ -866,20 +801,15 @@ class GoedelProver:
             if not msg.tool_calls:
                 break
 
-            tool_calls = list(msg.tool_calls or [])
-            limit = self.parallel_tool_calls
-            calls_to_process = tool_calls if limit is None else tool_calls[:limit]
-            calls_to_drop = [] if limit is None else tool_calls[limit:]
-
             for tc in calls_to_process:
                 args = json.loads(tc.function.arguments)
                 self.tracer.emit(TraceEvent(
                     kind="tool_call",
                     thm_name=node_name,
-                    turn=probe_turn + 1,
+                    turn=turn,
                     call_id=tc.id,
                     tool_name=tc.function.name,
-                    args=args,
+                    args={"stage": "negation_probe", "arguments": args},
                 ))
 
                 if tc.function.name == "lean_compile":
@@ -894,7 +824,7 @@ class GoedelProver:
                         self.tracer.emit(TraceEvent(
                             kind="tool_result",
                             thm_name=node_name,
-                            turn=probe_turn + 1,
+                            turn=turn,
                             call_id=tc.id,
                             tool_name=tc.function.name,
                             args={
@@ -931,7 +861,7 @@ class GoedelProver:
                 self.tracer.emit(TraceEvent(
                     kind="tool_result",
                     thm_name=node_name,
-                    turn=probe_turn + 1,
+                    turn=turn,
                     call_id=tc.id,
                     tool_name=tc.function.name,
                     args=trace_args,
@@ -949,10 +879,11 @@ class GoedelProver:
                 self.tracer.emit(TraceEvent(
                     kind="tool_call_dropped",
                     thm_name=node_name,
-                    turn=probe_turn + 1,
+                    turn=turn,
                     call_id=tc.id,
                     tool_name=tc.function.name,
                     args={
+                        "stage": "negation_probe",
                         "parallel_tool_calls": self.parallel_tool_calls,
                         "tool_calls_returned": len(tool_calls),
                         "tool_calls_processed": len(calls_to_process),
@@ -961,6 +892,9 @@ class GoedelProver:
                     ok=False,
                 ))
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
+
+            if turn >= self.max_negation_probe_turns:
+                break
 
             response = self.client.chat.completions.create(
                 model=self.model_id,
@@ -973,16 +907,6 @@ class GoedelProver:
             self._emit_usage(node_name, response)
 
         return None
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _extract_proof_body(text: str) -> str:
-    import re
-    m = re.search(r"<lean4_proof>(.*?)</lean4_proof>", text, re.DOTALL)
-    return m.group(1).strip() if m else ""
 
 
 def _build_negation_node_decl(node_decl: str, node_name: str) -> str:
@@ -1138,7 +1062,8 @@ def prove_node(
     repo_retrieval=None,
     tracer=None,
     api_timeout_s: float | None = 120.0,
-    max_tool_calls: int | None = None,
+    max_prove_turns: int | None = None,
+    max_negation_probe_turns: int | None = None,
     parallel_tool_calls: int | None = None,
 ) -> ProverResult:
     parent_block = "\n\n".join(
@@ -1152,7 +1077,9 @@ def prove_node(
         parent_proofs=parent_block,
     )
     prover = GoedelProver(model_id=model, retrieval=retrieval, tracer=tracer,
-                           api_timeout_s=api_timeout_s, max_tool_calls=max_tool_calls,
+                           api_timeout_s=api_timeout_s,
+                           max_prove_turns=max_prove_turns,
+                           max_negation_probe_turns=max_negation_probe_turns,
                            parallel_tool_calls=parallel_tool_calls)
     return prover.prove_node(
         compiler=compiler,

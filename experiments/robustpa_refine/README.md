@@ -60,7 +60,12 @@ command line has the same effect.
 asks the provider for at most one tool call per assistant message and processes
 only one; values greater than `1` allow provider-side parallel tool calls, but
 the runner executes only the first `N` tool calls from a turn and ignores the
-rest. The default config sets `parallel_tool_calls: 1`.
+rest. `node_max_prove_turns` controls how many assistant responses are allowed
+in the normal proving loop, and `node_max_negation_probe_turns` controls the
+same budget for the negation probe after proving fails. Setting
+`node_max_negation_probe_turns: 0` disables the negation probe. The default
+config sets `parallel_tool_calls: 4`, `node_max_prove_turns: 8`, and
+`node_max_negation_probe_turns: 4`.
 
 Subset filtering:
 

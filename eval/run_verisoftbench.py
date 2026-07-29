@@ -119,9 +119,9 @@ def evaluate_theorem(
     verbose: bool,
     checkpoint_dir: Path | None = None,
     aristotle_mode: bool = False,
-    cascade_model: str | None = None,
-    cascade_timeout_s: float | None = None,
-    escalation_max_tool_calls: int | None = 1,
+    node_max_prove_turns: int | None = None,
+    node_max_negation_probe_turns: int | None = None,
+    parallel_tool_calls: int | None = None,
 ) -> dict:
     thm_name  = theorem_entry["thm_name"]
     lean_root = theorem_entry["lean_root"]
@@ -177,9 +177,9 @@ def evaluate_theorem(
                 repo_context=verif_ctx,
                 checkpoint_path=checkpoint_path,
                 thm_name=thm_name,
-                cascade_model=cascade_model,
-                cascade_timeout_s=cascade_timeout_s,
-                escalation_max_tool_calls=escalation_max_tool_calls,
+                node_max_prove_turns=node_max_prove_turns,
+                node_max_negation_probe_turns=node_max_negation_probe_turns,
+                parallel_tool_calls=parallel_tool_calls,
             )
             # Use only the root-node proof body — final_lean_file is a full Lean
             # file with import statements, not a proof body VSBLeanCompiler can verify.
@@ -347,9 +347,9 @@ def evaluate_theorem_phase(
     model: str,
     tracer,
     aristotle_mode: bool = False,
-    cascade_model: str | None = None,
-    cascade_timeout_s: float | None = None,
-    escalation_max_tool_calls: int | None = 1,
+    node_max_prove_turns: int | None = None,
+    node_max_negation_probe_turns: int | None = None,
+    parallel_tool_calls: int | None = None,
 ) -> dict:
     """Run exactly one of Phase 1/2/3 against this theorem's checkpoint file.
 
@@ -403,8 +403,9 @@ def evaluate_theorem_phase(
                 checkpoint_path=checkpoint_path, compiler_factory=make_compiler,
                 retrieval=retrieval, repo_retrieval=repo_retrieval, tracer=tracer,
                 model=model,
-                cascade_model=cascade_model, cascade_timeout_s=cascade_timeout_s,
-                escalation_max_tool_calls=escalation_max_tool_calls,
+                node_max_prove_turns=node_max_prove_turns,
+                node_max_negation_probe_turns=node_max_negation_probe_turns,
+                parallel_tool_calls=parallel_tool_calls,
             )
             result.update(
                 ok=True,
@@ -545,9 +546,9 @@ def _run_phase_only(
                 model=args.model,
                 tracer=tracer,
                 aristotle_mode=args.aristotle_subset,
-                cascade_model=args.cascade_model,
-                cascade_timeout_s=args.cascade_timeout,
-                escalation_max_tool_calls=args.escalation_max_tool_calls,
+                node_max_prove_turns=args.node_max_prove_turns,
+                node_max_negation_probe_turns=args.node_max_negation_probe_turns,
+                parallel_tool_calls=args.parallel_tool_calls,
             )
             with results_lock:
                 all_results.append(res)
@@ -584,28 +585,12 @@ def _run_phase_only(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Goedel-Architect on VeriSoftBench")
     parser.add_argument("--model",    default="labs-leanstral-1-5")
-    parser.add_argument("--cascade-model", default=None,
-                        help="If set, Phase 2 first attempts every node with this "
-                             "(cheaper) model; --model is only used to escalate a "
-                             "node that doesn't come back solved. Skips --model's "
-                             "rate entirely for nodes the cheap model can already "
-                             "close (many blueprint nodes are trivial one-liners). "
-                             "Default (unset): every node goes straight to --model, "
-                             "unchanged from prior behavior.")
-    parser.add_argument("--cascade-timeout", type=float, default=90.0,
-                        help="Wall-clock bound (seconds) for the cheap cascade "
-                             "attempt only, independent of the escalation attempt's "
-                             "own timeout — bounds how long a stuck cheap model can "
-                             "delay falling back to --model. Only used when "
-                             "--cascade-model is set.")
-    parser.add_argument("--escalation-max-tool-calls", type=int, default=1,
-                        help="Caps the escalated (--model) attempt's own internal "
-                             "fix-and-retry budget after a failed cascade attempt "
-                             "(default 1: a single lean_compile call, no follow-up "
-                             "correction round). The cheap cascade attempt keeps its "
-                             "full default budget regardless. Only applies when "
-                             "--cascade-model is set; a direct (non-cascaded) call "
-                             "to --model is unaffected.")
+    parser.add_argument("--node-max-prove-turns", type=int, default=8,
+                        help="Maximum Phase2 assistant responses per normal node proving loop.")
+    parser.add_argument("--node-max-negation-probe-turns", type=int, default=4,
+                        help="Maximum Phase2 assistant responses in the negation probe; 0 disables it.")
+    parser.add_argument("--parallel-tool-calls", type=int, default=1,
+                        help="Maximum tool calls executed from one assistant response.")
     parser.add_argument("--limit",   type=int, default=None)
     parser.add_argument("--subset",  type=int, default=None,
                         help="Random sample of N tasks spanning all repos "
@@ -765,9 +750,9 @@ def main() -> None:
             verbose=args.verbose,
             checkpoint_dir=checkpoint_dir if args.blueprint else None,
             aristotle_mode=args.aristotle_subset,
-            cascade_model=args.cascade_model,
-            cascade_timeout_s=args.cascade_timeout,
-            escalation_max_tool_calls=args.escalation_max_tool_calls,
+            node_max_prove_turns=args.node_max_prove_turns,
+            node_max_negation_probe_turns=args.node_max_negation_probe_turns,
+            parallel_tool_calls=args.parallel_tool_calls,
         )
 
     def run_repo_queue(repo_problems: list[dict]) -> None:

@@ -91,6 +91,23 @@ def _optional_positive_int(value: Any) -> int | None:
     return parsed
 
 
+def _optional_nonnegative_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise argparse.ArgumentTypeError("expected a non-negative integer or null")
+    text = str(value).strip().lower()
+    if text in {"", "none", "null", "default", "omit"}:
+        return None
+    try:
+        parsed = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a non-negative integer or null") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("expected a non-negative integer or null")
+    return parsed
+
+
 @dataclass(frozen=True)
 class Record:
     unique_id: str
@@ -152,6 +169,10 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
             os.environ["GOEDEL_OPENAI_API_KEY"] = "dummy"
     args.node_timeout_s = _optional_timeout(args.node_timeout_s)
     args.llm_api_timeout_s = _optional_timeout(args.llm_api_timeout_s)
+    args.node_max_prove_turns = _optional_positive_int(args.node_max_prove_turns)
+    args.node_max_negation_probe_turns = _optional_nonnegative_int(
+        args.node_max_negation_probe_turns
+    )
     args.parallel_tool_calls = _optional_positive_int(args.parallel_tool_calls)
     _validate_args(args)
     return args
@@ -164,10 +185,12 @@ def _validate_args(args: argparse.Namespace) -> None:
         "phase2_node_concurrency",
         "refine_concurrency",
         "blueprint_max_retries",
-        "node_max_tool_calls",
+        "node_max_prove_turns",
     ):
         if getattr(args, name) <= 0:
             raise ValueError(f"{name} must be positive")
+    if args.node_max_negation_probe_turns is not None and args.node_max_negation_probe_turns < 0:
+        raise ValueError("node_max_negation_probe_turns must be non-negative or null")
     if args.max_refinement_iterations < 0:
         raise ValueError("max_refinement_iterations must be non-negative")
     if args.node_timeout_s is not None and args.node_timeout_s <= 0:
@@ -382,6 +405,7 @@ def _result_row(
     blueprint: Blueprint | None,
     state: CheckpointState | None,
     runtime: LeanRuntime,
+    args: argparse.Namespace,
     error: str = "",
     traceback_text: str = "",
 ) -> dict[str, Any]:
@@ -407,6 +431,9 @@ def _result_row(
         "blueprint_dir": str(blueprint_dir),
         "error": error,
         "lean_runtime": runtime.metadata,
+        "node_max_prove_turns": args.node_max_prove_turns,
+        "node_max_negation_probe_turns": args.node_max_negation_probe_turns,
+        "parallel_tool_calls": args.parallel_tool_calls,
         **score,
     }
     if traceback_text:
@@ -526,6 +553,7 @@ async def _run_record(
                     blueprint=blueprint,
                     state=state,
                     runtime=runtime,
+                    args=args,
                 )
 
             phase = "phase2"
@@ -541,7 +569,8 @@ async def _run_record(
                     node_timeout_s=args.node_timeout_s,
                     llm_api_timeout_s=args.llm_api_timeout_s,
                     model=args.model,
-                    node_max_tool_calls=args.node_max_tool_calls,
+                    node_max_prove_turns=args.node_max_prove_turns,
+                    node_max_negation_probe_turns=args.node_max_negation_probe_turns,
                     parallel_tool_calls=args.parallel_tool_calls,
                     node_executor=node_executor,
                     node_semaphore=node_sem,
@@ -575,6 +604,7 @@ async def _run_record(
                     blueprint=blueprint,
                     state=state,
                     runtime=runtime,
+                    args=args,
                 )
 
             if state.iteration >= args.max_refinement_iterations:
@@ -589,6 +619,7 @@ async def _run_record(
                     blueprint=blueprint,
                     state=state,
                     runtime=runtime,
+                    args=args,
                 )
 
             phase = "phase3"
@@ -638,6 +669,7 @@ async def _run_record(
             blueprint=blueprint,
             state=state,
             runtime=runtime,
+            args=args,
             error=str(exc),
             traceback_text=traceback.format_exc(),
         )
@@ -745,6 +777,8 @@ async def _run_experiment(args: argparse.Namespace, output_root: Path, runtime: 
         f"lean_check={args.lean_check_concurrency} "
         f"node_timeout_s={args.node_timeout_s} "
         f"llm_api_timeout_s={args.llm_api_timeout_s} "
+        f"node_max_prove_turns={args.node_max_prove_turns} "
+        f"node_max_negation_probe_turns={args.node_max_negation_probe_turns} "
         f"parallel_tool_calls={args.parallel_tool_calls}",
         flush=True,
     )

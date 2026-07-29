@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Run from the goedel-architect repo root:
-#   bash experiments/robustpa_refine/run_all_robustpa_reexp.sh
+#   bash experiments/robustpa_refine/run_all_robustpa_rePipe.sh
 
 DEFAULT_PYTHON_BIN="/ssd/miniconda3/envs/lean4-czx/bin/python"
 if [[ -x "${DEFAULT_PYTHON_BIN}" ]]; then
@@ -18,10 +18,11 @@ RESUME="${RESUME:-false}"
 RERUN_FAILED="${RERUN_FAILED:-false}"
 LIMIT="${LIMIT:-null}"
 
-MAX_REFINEMENT_ITERATIONS="${MAX_REFINEMENT_ITERATIONS:-0}"
-BLUEPRINT_MAX_RETRIES="${BLUEPRINT_MAX_RETRIES:-4}"
-NODE_MAX_TOOL_CALLS="${NODE_MAX_TOOL_CALLS:-8}"
-PARALLEL_TOOL_CALLS="${PARALLEL_TOOL_CALLS:-4}"
+MAX_REFINEMENT_ITERATIONS="${MAX_REFINEMENT_ITERATIONS:-2}" # refine的次数
+BLUEPRINT_MAX_RETRIES="${BLUEPRINT_MAX_RETRIES:-4}" # 生成blueprint的次数
+NODE_MAX_PROVE_TURNS="${NODE_MAX_PROVE_TURNS:-4}" # node的prove的轮数
+NODE_MAX_NEGATION_PROBE_TURNS="${NODE_MAX_NEGATION_PROBE_TURNS:-2}" # 失败node 证明否命题的次数
+PARALLEL_TOOL_CALLS="${PARALLEL_TOOL_CALLS:-4}" # 每轮tool call的次数
 NODE_TIMEOUT_S="${NODE_TIMEOUT_S:-null}"
 LLM_API_TIMEOUT_S="${LLM_API_TIMEOUT_S:-null}"
 
@@ -50,7 +51,8 @@ COMMON_OVERRIDES=(
   "limit=${LIMIT}"
   "max_refinement_iterations=${MAX_REFINEMENT_ITERATIONS}"
   "blueprint_max_retries=${BLUEPRINT_MAX_RETRIES}"
-  "node_max_tool_calls=${NODE_MAX_TOOL_CALLS}"
+  "node_max_prove_turns=${NODE_MAX_PROVE_TURNS}"
+  "node_max_negation_probe_turns=${NODE_MAX_NEGATION_PROBE_TURNS}"
   "parallel_tool_calls=${PARALLEL_TOOL_CALLS}"
   "node_timeout_s=${NODE_TIMEOUT_S}"
   "llm_api_timeout_s=${LLM_API_TIMEOUT_S}"
@@ -77,32 +79,32 @@ run_exp() {
     "subset=${subset}"
 }
 
-run_exp qwen3_5_397b_MiniF2F_orig_reExp40 miniF2F global_original
-run_exp qwen3_5_397b_math500_orig_reExp40 MATH500 global_original
+run_exp qwen3_5_397b_MiniF2F_orig_rePipe42 miniF2F global_original
+run_exp qwen3_5_397b_math500_orig_rePipe42 MATH500 global_original
 
-run_exp qwen3_5_397b_MiniF2F_global_gemini_rephrase_reExp40 miniF2F global_gemini_rephrase
-run_exp qwen3_5_397b_math500_global_gemini_rephrase_reExp40 MATH500 global_gemini_rephrase
+run_exp qwen3_5_397b_MiniF2F_global_gemini_rephrase_rePipe42 miniF2F global_gemini_rephrase
+run_exp qwen3_5_397b_math500_global_gemini_rephrase_rePipe42 MATH500 global_gemini_rephrase
 
-run_exp qwen3_5_397b_MiniF2F_global_gemini_step_reExp40 miniF2F global_gemini_step
-run_exp qwen3_5_397b_math500_global_gemini_step_reExp40 MATH500 global_gemini_step
+run_exp qwen3_5_397b_MiniF2F_global_gemini_step_rePipe42 miniF2F global_gemini_step
+run_exp qwen3_5_397b_math500_global_gemini_step_rePipe42 MATH500 global_gemini_step
 
-run_exp qwen3_5_397b_MiniF2F_global_qwen3_rephrase_reExp40 miniF2F global_qwen3_rephrase
-run_exp qwen3_5_397b_math500_global_qwen3_rephrase_reExp40 MATH500 global_qwen3_rephrase
+run_exp qwen3_5_397b_MiniF2F_global_qwen3_rephrase_rePipe42 miniF2F global_qwen3_rephrase
+run_exp qwen3_5_397b_math500_global_qwen3_rephrase_rePipe42 MATH500 global_qwen3_rephrase
 
-run_exp qwen3_5_397b_MiniF2F_global_qwen3_step_reExp40 miniF2F global_qwen3_step
-run_exp qwen3_5_397b_math500_global_qwen3_step_reExp40 MATH500 global_qwen3_step
+run_exp qwen3_5_397b_MiniF2F_global_qwen3_step_rePipe42 miniF2F global_qwen3_step
+run_exp qwen3_5_397b_math500_global_qwen3_step_rePipe42 MATH500 global_qwen3_step
 
-run_exp qwen3_5_397b_MiniF2F_local_number_edit_proof_reExp40 miniF2F local_number_edit_proof
-run_exp qwen3_5_397b_math500_local_number_edit_proof_reExp40 MATH500 local_number_edit_proof
+run_exp qwen3_5_397b_MiniF2F_local_number_edit_proof_rePipe42 miniF2F local_number_edit_proof
+run_exp qwen3_5_397b_math500_local_number_edit_proof_rePipe42 MATH500 local_number_edit_proof
 
-run_exp qwen3_5_397b_MiniF2F_local_number_edit_statement_reExp40 miniF2F local_number_edit_statement
-run_exp qwen3_5_397b_math500_local_number_edit_statement_reExp40 MATH500 local_number_edit_statement
+run_exp qwen3_5_397b_MiniF2F_local_number_edit_statement_rePipe42 miniF2F local_number_edit_statement
+run_exp qwen3_5_397b_math500_local_number_edit_statement_rePipe42 MATH500 local_number_edit_statement
 
-run_exp qwen3_5_397b_MiniF2F_local_step_delete_reExp40 miniF2F local_step_delete
-run_exp qwen3_5_397b_math500_local_step_delete_reExp40 MATH500 local_step_delete
+run_exp qwen3_5_397b_MiniF2F_local_step_delete_rePipe42 miniF2F local_step_delete
+run_exp qwen3_5_397b_math500_local_step_delete_rePipe42 MATH500 local_step_delete
 
-run_exp qwen3_5_397b_MiniF2F_local_symbol_edit_proof_reExp40 miniF2F local_symbol_edit_proof
-run_exp qwen3_5_397b_math500_local_symbol_edit_proof_reExp40 MATH500 local_symbol_edit_proof
+run_exp qwen3_5_397b_MiniF2F_local_symbol_edit_proof_rePipe42 miniF2F local_symbol_edit_proof
+run_exp qwen3_5_397b_math500_local_symbol_edit_proof_rePipe42 MATH500 local_symbol_edit_proof
 
-run_exp qwen3_5_397b_MiniF2F_local_symbol_edit_statement_reExp40 miniF2F local_symbol_edit_statement
-run_exp qwen3_5_397b_math500_local_symbol_edit_statement_reExp40 MATH500 local_symbol_edit_statement
+run_exp qwen3_5_397b_MiniF2F_local_symbol_edit_statement_rePipe42 miniF2F local_symbol_edit_statement
+run_exp qwen3_5_397b_math500_local_symbol_edit_statement_rePipe42 MATH500 local_symbol_edit_statement

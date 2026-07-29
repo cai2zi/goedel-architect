@@ -93,11 +93,9 @@ async def prove_dag(
     repo_retrieval=None,
     tracer=None,
     node_timeout_s: float | None = 300.0,
-    cascade_model: str | None = None,
-    cascade_timeout_s: float | None = None,
     llm_api_timeout_s: float | None = 120.0,
-    node_max_tool_calls: int | None = None,
-    escalation_max_tool_calls: int | None = 1,
+    node_max_prove_turns: int | None = None,
+    node_max_negation_probe_turns: int | None = None,
     parallel_tool_calls: int | None = None,
     node_executor: Executor | None = None,
     node_semaphore: asyncio.Semaphore | None = None,
@@ -109,15 +107,10 @@ async def prove_dag(
     node_timeout_s: wall-clock bound per node (covers the whole multi-turn tool
         loop). A node that exceeds this comes back as INFRA_ERROR instead of
         blocking the rest of the wave indefinitely. None disables the bound.
-    cascade_model: if given, every node is first attempted with this (cheaper)
-        model; `model` is only used as an escalation when the cascade attempt
-        doesn't come back SOLVED. Many nodes are trivial one-liners a cheap
-        model can close on its own, so this skips the expensive model
-        entirely for those instead of paying its rate on every node
-        regardless of difficulty. None (default) disables cascading - every
-        node goes straight to `model`, unchanged from prior behavior.
-    node_max_tool_calls: optional cap for each normal per-node prover loop.
-        None keeps prover.py's default MAX_TOOL_CALLS.
+    node_max_prove_turns: optional cap on assistant responses in the normal
+        per-node proving loop. None keeps prover.py's default.
+    node_max_negation_probe_turns: optional cap on assistant responses in the
+        negation-probe loop after proving fails. 0 disables negation probing.
     parallel_tool_calls: maximum number of tool calls to execute from one
         assistant message in Phase2. A value of 1 asks the provider for serial
         tool calls; values greater than 1 enable provider-side parallel tool
@@ -126,17 +119,6 @@ async def prove_dag(
         chat client used by prover.py. This bounds a single queued/generating
         LLM HTTP request; None disables the client-side timeout.
         node_timeout_s bounds the whole node proof loop.
-    escalation_max_tool_calls: caps the escalated (expensive) attempt's own
-        internal fix-and-retry budget (default 1: a single lean_compile call,
-        no follow-up correction round) - only applies when cascade_model is
-        set, since without cascading `model` IS the only attempt and keeps
-        its full default budget (see prover.MAX_TOOL_CALLS). The cheap
-        cascade attempt is unaffected and keeps the full budget too, so it
-        gets a real chance to fix its own syntax mistakes before escalating.
-    cascade_timeout_s: wall-clock bound for the cheap cascade attempt only,
-        independent of node_timeout_s, so a stuck cheap model can't burn the
-        budget meant for the escalation attempt. Defaults to node_timeout_s
-        if not given.
     node_executor/node_semaphore: optional shared limits for node proof work
         across multiple concurrently-proved blueprints.
     """
@@ -230,11 +212,9 @@ async def prove_dag(
                 model=model,
                 tracer=tracer,
                 node_timeout_s=node_timeout_s,
-                cascade_model=cascade_model,
-                cascade_timeout_s=cascade_timeout_s,
                 llm_api_timeout_s=llm_api_timeout_s,
-                node_max_tool_calls=node_max_tool_calls,
-                escalation_max_tool_calls=escalation_max_tool_calls,
+                node_max_prove_turns=node_max_prove_turns,
+                node_max_negation_probe_turns=node_max_negation_probe_turns,
                 parallel_tool_calls=parallel_tool_calls,
                 node_executor=node_executor,
                 node_semaphore=node_semaphore,
@@ -263,11 +243,9 @@ async def _prove_one(
     repo_retrieval=None,
     tracer=None,
     node_timeout_s: float | None = None,
-    cascade_model: str | None = None,
-    cascade_timeout_s: float | None = None,
     llm_api_timeout_s: float | None = 120.0,
-    node_max_tool_calls: int | None = None,
-    escalation_max_tool_calls: int | None = None,
+    node_max_prove_turns: int | None = None,
+    node_max_negation_probe_turns: int | None = None,
     parallel_tool_calls: int | None = None,
     node_executor: Executor | None = None,
     node_semaphore: asyncio.Semaphore | None = None,
@@ -309,9 +287,7 @@ async def _prove_one(
     )
     parent_lemma_decls = "\n\n".join(declaration_context)
 
-    async def attempt(
-        use_model: str, timeout_s: float | None, max_tool_calls: int | None = None,
-    ) -> tuple[ProverResult, float]:
+    async def attempt(timeout_s: float | None) -> tuple[ProverResult, float]:
         t0 = time.monotonic()
         loop = asyncio.get_event_loop()
         if node_semaphore is not None:
@@ -326,13 +302,14 @@ async def _prove_one(
                 parent_lemma_decls=parent_lemma_decls,
                 compiler=active_compiler,
                 retrieval=retrieval,
-                model=use_model,
+                model=model,
                 node_statement_nl=node.statement,
                 node_proof_sketch_nl=node.proof_sketch,
                 repo_retrieval=repo_retrieval,
                 tracer=tracer,
                 api_timeout_s=llm_api_timeout_s,
-                max_tool_calls=max_tool_calls,
+                max_prove_turns=node_max_prove_turns,
+                max_negation_probe_turns=node_max_negation_probe_turns,
                 parallel_tool_calls=parallel_tool_calls,
             ),
         )
@@ -342,7 +319,7 @@ async def _prove_one(
             result = await asyncio.wait_for(asyncio.shield(future), timeout=timeout_s)
         except asyncio.TimeoutError:
             dt = time.monotonic() - t0
-            print(f"    [node {name}] TIMED OUT after {dt:.1f}s (bound={timeout_s}s, model={use_model}) "
+            print(f"    [node {name}] TIMED OUT after {dt:.1f}s (bound={timeout_s}s, model={model}) "
                   f"- the underlying call keeps running in its worker thread, "
                   f"but this node is marked infra_error so the wave can proceed", flush=True)
             # Note: run_in_executor uses a real OS thread, which asyncio.wait_for
@@ -362,7 +339,7 @@ async def _prove_one(
             # caught per-node the same way a timeout is. INFRA_ERROR, not
             # PROOF_TOO_HARD - see comment above.
             dt = time.monotonic() - t0
-            print(f"    [node {name}] ERRORED after {dt:.1f}s (model={use_model}) -> {exc!r} "
+            print(f"    [node {name}] ERRORED after {dt:.1f}s (model={model}) -> {exc!r} "
                   f"- marked infra_error so the wave can proceed", flush=True)
             result = ProverResult(
                 signal=ProofSignal.INFRA_ERROR,
@@ -372,31 +349,6 @@ async def _prove_one(
 
     print(f"    [node {name}] started", flush=True)
 
-    escalating = False
-    if cascade_model:
-        print(f"    [node {name}] cascade attempt with {cascade_model} ...", flush=True)
-        # Cheap attempt keeps the full default tool-call budget (None here) -
-        # it needs a real chance to fix its own mistakes before we give up on
-        # it and pay for the expensive model.
-        result, dt = await attempt(
-            cascade_model,
-            cascade_timeout_s if cascade_timeout_s is not None else node_timeout_s,
-            max_tool_calls=node_max_tool_calls,
-        )
-        if result.signal == ProofSignal.SOLVED:
-            print(f"    [node {name}] finished after {dt:.1f}s -> solved "
-                  f"(cascade model {cascade_model})", flush=True)
-            return NodeResult(node=node, result=result)
-        print(f"    [node {name}] cascade model {cascade_model} -> {result.signal.value} "
-              f"after {dt:.1f}s, escalating to {model} ...", flush=True)
-        escalating = True
-
-    # escalation_max_tool_calls only applies when this is a genuine escalation
-    # after a failed cascade attempt - a direct (non-cascaded) call to `model`
-    # keeps its full default budget, unchanged from prior behavior.
-    result, dt = await attempt(
-        model, node_timeout_s,
-        max_tool_calls=escalation_max_tool_calls if escalating else node_max_tool_calls,
-    )
+    result, dt = await attempt(node_timeout_s)
     print(f"    [node {name}] finished after {dt:.1f}s -> {result.signal.value}", flush=True)
     return NodeResult(node=node, result=result)
