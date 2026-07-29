@@ -18,6 +18,13 @@ from shared.io_utils import safe_stem, write_jsonl  # noqa: E402
 
 
 DEFAULT_OUTPUT_BASE = REPO_ROOT.parent / "czx_work" / "robustpa_eval"
+DEFAULT_EXPERIMENT_BASE = REPO_ROOT.parent / "czx_work" / "robustpa_refine"
+LEAN_SERVER_API_URL = "http://localhost:8000"
+LEAN_SERVER_API_KEY_ENV = "KIMINA_API_KEY"
+LEAN_SERVER_TIMEOUT_S = 600
+LEAN_SERVER_REUSE = True
+LEAN_SERVER_DEBUG = False
+LEAN_CHECK_CONCURRENCY = 64
 _GOEDEL_HELPERS: tuple[Any, Any, Any, Any] | None = None
 
 
@@ -48,13 +55,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--exp-dir",
         type=Path,
-        required=True,
-        help="Finished robustpa_refine experiment directory containing results.jsonl.",
+        default=None,
+        help=(
+            "Finished robustpa_refine experiment directory containing results.jsonl. "
+            "Defaults to <experiment-base>/<exp-name>."
+        ),
     )
     parser.add_argument(
         "--exp-name",
         default="",
-        help="Name under --output-base. Defaults to basename of --exp-dir.",
+        help="Experiment name under --experiment-base and --output-base.",
+    )
+    parser.add_argument(
+        "--experiment-base",
+        type=Path,
+        default=DEFAULT_EXPERIMENT_BASE,
+        help="Base directory containing robustpa_refine experiment outputs.",
     )
     parser.add_argument(
         "--output-base",
@@ -181,6 +197,33 @@ def _write_lean_file(
     return str(path), digest, len(lean_text)
 
 
+def _make_lean_compiler():
+    from kimina_lean_compiler import KiminaLeanCompiler
+
+    return KiminaLeanCompiler(
+        api_url=LEAN_SERVER_API_URL,
+        api_key_env=LEAN_SERVER_API_KEY_ENV,
+        timeout_s=LEAN_SERVER_TIMEOUT_S,
+        reuse=LEAN_SERVER_REUSE,
+        debug=LEAN_SERVER_DEBUG,
+        check_concurrency=LEAN_CHECK_CONCURRENCY,
+    )
+
+
+def _validate_export_lean(compiler, lean_text: str, assembly_kind: str) -> tuple[bool, list[str]]:
+    if assembly_kind == "error" or not lean_text or lean_text.startswith("ERROR"):
+        return False, []
+    try:
+        result = compiler.check(lean_text)
+    except BaseException as exc:
+        return False, [_result_text(exc)]
+    validated = bool(result.validated and result.success)
+    errors = list(result.errors or [])
+    if not errors and not validated and result.raw_output:
+        errors = [str(result.raw_output)[:4000]]
+    return validated, errors
+
+
 def _make_export_row(
     result_row: dict[str, Any],
     source_row: dict[str, Any],
@@ -190,6 +233,8 @@ def _make_export_row(
     lean_path: str,
     lean_hash: str,
     lean_chars: int,
+    lean_validated: bool,
+    lean_errors: list[str],
 ) -> dict[str, Any]:
     source_id = str(result_row.get("source_id") or source_row.get("name") or source_row.get("id") or "")
     return {
@@ -222,15 +267,23 @@ def _make_export_row(
         "GOEDEL_lean_output_chars": lean_chars,
         "GOEDEL_lean_assembly": assembly_kind,
         "GOEDEL_lean_assembly_details": assembly_diag,
+        "GOEDEL_export_lean_validated": lean_validated,
+        "GOEDEL_export_lean_errors": lean_errors,
     }
 
 
 def export(args: argparse.Namespace) -> Path:
     _, _, _, read_parquet_rows = _load_goedel_helpers()
-    exp_dir = args.exp_dir.resolve()
+    if args.exp_dir is None:
+        if not args.exp_name:
+            raise SystemExit("Pass --exp-name or --exp-dir")
+        exp_dir = (args.experiment_base / args.exp_name).resolve()
+    else:
+        exp_dir = args.exp_dir.resolve()
     exp_name = args.exp_name or exp_dir.name
     eval_dir = args.output_base / exp_name
     output_path = args.output or (eval_dir / "stmt_sc_inputs.jsonl")
+    mismatch_output_path = output_path.parent / "export_lean_validation_mismatches.jsonl"
     lean_output_dir = args.lean_output_dir or (eval_dir / "lean_outputs")
 
     results_path = exp_dir / "results.jsonl"
@@ -242,35 +295,39 @@ def export(args: argparse.Namespace) -> Path:
         result_rows = result_rows[: args.limit]
 
     parquet_cache = ParquetRowCache(read_parquet_rows)
+    compiler = _make_lean_compiler()
     exported_rows: list[dict[str, Any]] = []
     counts: Counter[str] = Counter()
+    validation_mismatches: list[str] = []
+    validation_mismatch_rows: list[dict[str, Any]] = []
 
-    for result_row in tqdm(result_rows, desc="export-stmt-sc", unit="row"):
-        try:
-            source_row = parquet_cache.get_row(
-                Path(str(result_row.get("parquet_path") or "")),
-                int(result_row.get("row_index") or 0),
+    try:
+        for result_row in tqdm(result_rows, desc="export-stmt-sc", unit="row"):
+            try:
+                source_row = parquet_cache.get_row(
+                    Path(str(result_row.get("parquet_path") or "")),
+                    int(result_row.get("row_index") or 0),
+                )
+            except BaseException as exc:
+                source_row = {}
+                counts["source_row_error"] += 1
+                source_error = _result_text(exc)
+            else:
+                source_error = ""
+
+            lean_text, assembly_kind, assembly_diag = _assemble_lean_from_checkpoint(
+                Path(str(result_row.get("checkpoint_path") or ""))
             )
-        except BaseException as exc:
-            source_row = {}
-            counts["source_row_error"] += 1
-            source_error = _result_text(exc)
-        else:
-            source_error = ""
+            if source_error:
+                assembly_diag = dict(assembly_diag)
+                assembly_diag["source_row_error"] = source_error
 
-        lean_text, assembly_kind, assembly_diag = _assemble_lean_from_checkpoint(
-            Path(str(result_row.get("checkpoint_path") or ""))
-        )
-        if source_error:
-            assembly_diag = dict(assembly_diag)
-            assembly_diag["source_row_error"] = source_error
-
-        lean_path, lean_hash, lean_chars = _write_lean_file(
-            lean_output_dir, result_row, lean_text, assembly_kind
-        )
-        counts[assembly_kind] += 1
-        exported_rows.append(
-            _make_export_row(
+            lean_path, lean_hash, lean_chars = _write_lean_file(
+                lean_output_dir, result_row, lean_text, assembly_kind
+            )
+            lean_validated, lean_errors = _validate_export_lean(compiler, lean_text, assembly_kind)
+            counts[assembly_kind] += 1
+            export_row = _make_export_row(
                 result_row,
                 source_row,
                 lean_text,
@@ -279,13 +336,28 @@ def export(args: argparse.Namespace) -> Path:
                 lean_path,
                 lean_hash,
                 lean_chars,
+                lean_validated,
+                lean_errors,
             )
-        )
+            if lean_validated != bool(result_row.get("root_proved")):
+                validation_mismatches.append(str(result_row.get("id") or result_row.get("record_id") or ""))
+                validation_mismatch_rows.append(export_row)
+            exported_rows.append(export_row)
+    finally:
+        compiler.close()
 
     write_jsonl(output_path, exported_rows)
+    write_jsonl(mismatch_output_path, validation_mismatch_rows)
     print(f"[export] rows={len(exported_rows)} output={output_path}")
+    print(f"[export] validation_mismatches={mismatch_output_path}")
     print(f"[export] lean_outputs={lean_output_dir}")
     print(f"[export] assembly_counts={dict(counts)}")
+    print(
+        "[export] GOEDEL_export_lean_validated/root_proved mismatches="
+        f"{len(validation_mismatches)}"
+    )
+    for row_id in validation_mismatches:
+        print(f"[export-mismatch] {row_id}")
     return output_path
 
 

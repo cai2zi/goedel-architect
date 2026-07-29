@@ -614,29 +614,96 @@ def _proof_result_from_checkpoint(state: CheckpointState) -> ProofResult:
     )
 
 
-def _substitute_proof(lean: str, name: str, proof_body: str) -> str:
-    """Replace `name`'s `:= by sorry_using [...]` tail with a real proof body.
+@dataclass(frozen=True)
+class _LeanDeclSpan:
+    kind: str
+    name: str
+    start: int
+    end: int
 
-    Tolerant of whitespace/newlines between `by` and `sorry_using` (the model
-    doesn't always keep them on one line), and uses a replacement function
-    (not a template string) so backslashes in `proof_body` aren't
-    misinterpreted as regex group references.
+
+_LEAN_DECL_START_RE = re.compile(
+    r"(?m)^[ \t]*(?:(?:private|protected|noncomputable)\s+)*"
+    r"(?P<kind>theorem|lemma|def|abbrev)\s+"
+    r"(?P<name>[^\s:({]+)\b"
+)
+_SORRY_USING_PLACEHOLDER_RE = re.compile(
+    r":=\s*by\s*sorry_using\s*\[.*?\]",
+    flags=re.DOTALL,
+)
+
+
+def _lean_decl_spans(lean: str) -> list[_LeanDeclSpan]:
+    matches = list(_LEAN_DECL_START_RE.finditer(lean))
+    return [
+        _LeanDeclSpan(
+            kind=match.group("kind"),
+            name=match.group("name"),
+            start=match.start(),
+            end=matches[idx + 1].start() if idx + 1 < len(matches) else len(lean),
+        )
+        for idx, match in enumerate(matches)
+    ]
+
+
+def _substitute_proofs(
+    lean: str,
+    proof_bodies: dict[str, str],
+    decl_spans: list[_LeanDeclSpan] | None = None,
+) -> str:
+    """Replace theorem/lemma placeholders by exact declaration-name matching.
+
+    The declaration spans must belong to the same `lean` string. This helper
+    performs all substitutions in one pass so replacement text cannot invalidate
+    offsets for later declarations.
     """
-    pattern = rf"(theorem|lemma)\s+{re.escape(name)}(.*?):=\s*by\s*sorry_using\s*\[.*?\]"
-    return re.sub(
-        pattern,
-        lambda m: f"{m.group(1)} {name}{m.group(2)}{proof_body_to_decl_suffix(proof_body)}",
-        lean,
-        flags=re.DOTALL,
-    )
+    if not proof_bodies:
+        return lean
+
+    spans = decl_spans if decl_spans is not None else _lean_decl_spans(lean)
+    if not spans:
+        return lean
+
+    out: list[str] = []
+    last = 0
+    for span in spans:
+        out.append(lean[last:span.start])
+        block = lean[span.start:span.end]
+        proof_body = proof_bodies.get(span.name)
+        if span.kind in {"theorem", "lemma"} and proof_body:
+            suffix = proof_body_to_decl_suffix(proof_body)
+            block, count = _SORRY_USING_PLACEHOLDER_RE.subn(
+                lambda _m: suffix, block, count=1
+            )
+            if count != 1:
+                block = lean[span.start:span.end]
+        out.append(block)
+        last = span.end
+    out.append(lean[last:])
+    return "".join(out)
+
+
+def _substitute_proof(
+    lean: str,
+    name: str,
+    proof_body: str,
+    decl_spans: list[_LeanDeclSpan] | None = None,
+) -> str:
+    """Replace one proof node by exact declaration-name matching."""
+    return _substitute_proofs(lean, {name: proof_body}, decl_spans=decl_spans)
 
 
 def _assemble_final_file(blueprint: Blueprint, orch_result: OrchestratorResult) -> str:
-    lean = blueprint.lean_file
-    for name, nr in orch_result.node_results.items():
-        if nr.result.proof_body:
-            lean = _substitute_proof(lean, name, nr.result.proof_body)
-    return lean
+    proof_bodies: dict[str, str] = {}
+    for node in blueprint.dependency_order():
+        if node.kind not in {"lemma", "theorem"}:
+            continue
+        nr = orch_result.node_results.get(node.name)
+        if nr is not None and nr.result.proof_body:
+            proof_bodies[node.name] = nr.result.proof_body
+    return _substitute_proofs(
+        blueprint.lean_file, proof_bodies, _lean_decl_spans(blueprint.lean_file)
+    )
 
 
 def _assemble_partial_file(
@@ -646,7 +713,13 @@ def _assemble_partial_file(
 ) -> str:
     if orch_result is None:
         return blueprint.lean_file
-    lean = blueprint.lean_file
-    for name, body in proved_cache.items():
-        lean = _substitute_proof(lean, name, body)
-    return lean
+    proof_bodies: dict[str, str] = {}
+    for node in blueprint.dependency_order():
+        if node.kind not in {"lemma", "theorem"}:
+            continue
+        body = proved_cache.get(node.name)
+        if body:
+            proof_bodies[node.name] = body
+    return _substitute_proofs(
+        blueprint.lean_file, proof_bodies, _lean_decl_spans(blueprint.lean_file)
+    )
