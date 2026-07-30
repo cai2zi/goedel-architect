@@ -706,7 +706,26 @@ def _metric_row(scope: str, rows: list[dict[str, Any]], subset: str = "", split:
     }
 
 
-def _write_metrics(output_root: Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
+def _format_elapsed_time(seconds: float) -> str:
+    total_seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    parts: list[str] = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes or hours:
+        parts.append(f"{minutes}min")
+    if not parts:
+        parts.append(f"{secs}s")
+    return "".join(parts)
+
+
+def _write_metrics(
+    output_root: Path,
+    rows: list[dict[str, Any]],
+    *,
+    elapsed_s: float | None = None,
+) -> dict[str, Any]:
     metric_rows: list[dict[str, Any]] = [_metric_row("global", rows)]
 
     by_subset: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -730,6 +749,8 @@ def _write_metrics(output_root: Path, rows: list[dict[str, Any]]) -> dict[str, A
         "primary_metric": "root_proved_acc",
         "groups": metric_rows,
     }
+    if elapsed_s is not None:
+        metrics["elapsed_time"] = _format_elapsed_time(elapsed_s)
     write_json(output_root / "metrics.json", metrics)
     with (output_root / "metrics.csv").open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(metric_rows[0]))
@@ -748,7 +769,13 @@ def _should_skip_existing(row: dict[str, Any] | None, args: argparse.Namespace) 
     return False
 
 
-async def _run_experiment(args: argparse.Namespace, output_root: Path, runtime: LeanRuntime) -> None:
+async def _run_experiment(
+    args: argparse.Namespace,
+    output_root: Path,
+    runtime: LeanRuntime,
+    *,
+    started_at: float | None = None,
+) -> None:
     records = _select_records(args)
     results_path = output_root / "results.jsonl"
     rounds_path = output_root / "rounds.jsonl"
@@ -826,7 +853,8 @@ async def _run_experiment(args: argparse.Namespace, output_root: Path, runtime: 
 
     selected_ids = {record.unique_id for record in records}
     final_rows = [row for row_id, row in existing.items() if row_id in selected_ids]
-    metrics = _write_metrics(output_root, final_rows)
+    elapsed_s = time.perf_counter() - started_at if started_at is not None else None
+    metrics = _write_metrics(output_root, final_rows, elapsed_s=elapsed_s)
     print(f"[done] results={results_path}", flush=True)
     print(f"[rounds] {rounds_path}", flush=True)
     print(f"[metrics] primary root_proved_acc={metrics['groups'][0]['root_proved_acc']}", flush=True)
@@ -841,7 +869,7 @@ def main(cfg: DictConfig) -> None:
     try:
         prepare_lean_runtime_metadata(output_root, resume=args.resume, metadata=runtime.metadata)
         start = time.perf_counter()
-        asyncio.run(_run_experiment(args, output_root, runtime))
+        asyncio.run(_run_experiment(args, output_root, runtime, started_at=start))
         print(f"[runtime] duration_s={time.perf_counter() - start:.3f}", flush=True)
     finally:
         runtime.close()

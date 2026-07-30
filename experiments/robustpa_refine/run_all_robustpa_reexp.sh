@@ -21,8 +21,8 @@ LIMIT="${LIMIT:-null}"
 MAX_REFINEMENT_ITERATIONS="${MAX_REFINEMENT_ITERATIONS:-4}" # refine的次数
 BLUEPRINT_MAX_RETRIES="${BLUEPRINT_MAX_RETRIES:-4}" # 生成blueprint的次数
 NODE_MAX_PROVE_TURNS="${NODE_MAX_PROVE_TURNS:-4}" # node的prove的轮数
-NODE_MAX_NEGATION_PROBE_TURNS="${NODE_MAX_NEGATION_PROBE_TURNS:-2}" # 失败node 证明否命题的次数
-PARALLEL_TOOL_CALLS="${PARALLEL_TOOL_CALLS:-4}" # 每轮tool call的次数
+NODE_MAX_NEGATION_PROBE_TURNS="${NODE_MAX_NEGATION_PROBE_TURNS:-1}" # 失败node 证明否命题的次数
+PARALLEL_TOOL_CALLS="${PARALLEL_TOOL_CALLS:-3}" # 每轮tool call的次数
 NODE_TIMEOUT_S="${NODE_TIMEOUT_S:-null}"
 LLM_API_TIMEOUT_S="${LLM_API_TIMEOUT_S:-null}"
 
@@ -30,7 +30,7 @@ PHASE1_CONCURRENCY="${PHASE1_CONCURRENCY:-1024}"
 PHASE2_BLUEPRINT_CONCURRENCY="${PHASE2_BLUEPRINT_CONCURRENCY:-512}"
 PHASE2_NODE_CONCURRENCY="${PHASE2_NODE_CONCURRENCY:-4096}"
 REFINE_CONCURRENCY="${REFINE_CONCURRENCY:-1024}"
-PHASE2_CONTRACT_CHECK_CONCURRENCY="${PHASE2_CONTRACT_CHECK_CONCURRENCY:-4}"
+PHASE2_CONTRACT_CHECK_CONCURRENCY="${PHASE2_CONTRACT_CHECK_CONCURRENCY:-8}"
 
 LEAN_BACKEND="${LEAN_BACKEND:-kimina_server}"
 LEAN_API_URL="${LEAN_API_URL:-http://localhost:8000}"
@@ -70,15 +70,34 @@ COMMON_OVERRIDES=(
   "lean_check_concurrency=${LEAN_CHECK_CONCURRENCY}"
 )
 
+format_elapsed() {
+  local total_seconds="$1"
+  local hours=$((total_seconds / 3600))
+  local minutes=$(((total_seconds % 3600) / 60))
+  local seconds=$((total_seconds % 60))
+  if (( hours > 0 )); then
+    printf "%dh%dmin" "${hours}" "${minutes}"
+  elif (( minutes > 0 )); then
+    printf "%dmin" "${minutes}"
+  else
+    printf "%ds" "${seconds}"
+  fi
+}
+
 run_exp() {
   local exp_name="$1"
   local split="$2"
   local subset="$3"
+  local start
+  local elapsed
+  start="$(date +%s)"
   "${PYTHON_BIN}" experiments/robustpa_refine/run_robustpa_refine.py \
     "${COMMON_OVERRIDES[@]}" \
     "exp_name=${exp_name}" \
     "split=${split}" \
     "subset=${subset}"
+  elapsed=$(($(date +%s) - start))
+  printf '[runtime] exp_name=%s elapsed_time=%s\n' "${exp_name}" "$(format_elapsed "${elapsed}")"
 }
 
 run_exp qwen3_5_397b_MiniF2F_orig_rePipe_debug44 miniF2F global_original
