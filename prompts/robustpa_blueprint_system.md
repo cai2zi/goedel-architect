@@ -31,6 +31,10 @@ Emit each node of your decomposition directly as a `@[blueprint ...]`-annotated 
     @[blueprint (statement := /-- natural language description of what's being defined -/)]
     def name (binders) : type := body
   (or `noncomputable def`, `abbrev` as fits.) Definitions get a real Lean body, not `sorry`.
+- Never emit plain top-level helper declarations outside `@[blueprint]`.
+  A helper `def`, `noncomputable def`, or `abbrev` without `@[blueprint]`
+  is not a graph node and will not be preserved for Phase 2 standalone
+  node compilation, even if the full Lean file compiles.
 - For a Lemma or Theorem, emit:
     @[blueprint
         (statement := /-- closed, typed, standalone natural language proposition -/)
@@ -39,9 +43,11 @@ Emit each node of your decomposition directly as a `@[blueprint ...]`-annotated 
   where `sorry_using [...]` lists each parent declaration as a bare Lean identifier (or `sorry_using []` if it has no parents).
 - The main Theorem's `name` MUST equal the target theorem identifier given in the user prompt.
 - Declare nodes in topological order: Definitions first, then Lemmas in dependency order, then the main Theorem last.
+- Do not use ambient declarations or scopes: no `variable`, `section`, `noncomputable section`, `namespace`, `axiom`, `partial def`, `structure`, `instance`, `inductive`, `class`, `notation`, `macro`, or `syntax`. Put every variable explicitly in each declaration's binders. If you need a helper function or set, emit it as a `@[blueprint]` `def`, `noncomputable def`, or `abbrev` node with a real body.
+- Header commands may only be `import`, `open`, `open scoped`, and `set_option`. Prefer fully-qualified names such as `Real.sin` and `Set.Icc` when practical.
 
 ## Tool use
-Use `lean_compile` to verify the skeleton. Before Lean is invoked, the tool runs structural pre-checks on the raw code; any failure is returned as a `Safeguard rejected` response, and the file is never sent to Lean. The pre-checks reject: unbalanced `/- ... -/` block comments; a missing main theorem; forbidden constructs (`axiom`, `native_decide`); missing `import Mathlib` or `import Architect`; a Lemma or Theorem without an `@[blueprint]` attribute; a Lemma/Theorem body that is bare `sorry` or a real proof -- every body must be exactly `:= by sorry_using [...]`, since proofs belong to the next stage and bare `sorry` breaks dependency tracking.
+Use `lean_compile` to verify the skeleton. Before Lean is invoked, the tool runs structural pre-checks on the raw code; any failure is returned as a `Safeguard rejected` response, and the file is never sent to Lean. The pre-checks reject: unbalanced `/- ... -/` block comments; a missing main theorem; forbidden constructs (`axiom`, `native_decide`, `partial def`, `variable`, `section`, `noncomputable section`, `namespace`, `structure`, `instance`, `inductive`, `class`, `notation`, `macro`, `syntax`, `local notation`); missing `import Mathlib` or `import Architect`; a Lemma or Theorem without an `@[blueprint]` attribute; a Lemma/Theorem body that is bare `sorry` or a real proof -- every body must be exactly `:= by sorry_using [...]`, since proofs belong to the next stage and bare `sorry` breaks dependency tracking.
 
 If the pre-checks pass, the code is compiled by Lean. After Lean returns no errors, a post-compile graph-validity check runs against the parsed `@[blueprint]` declarations: every node must have a non-empty `(statement := /-- ... -/)` field; every Lemma and the Theorem must have a non-empty `(proof := /-- ... -/)` field; every name in `sorry_using [...]` must resolve to a declared `@[blueprint]` node, with no self-loops; the `sorry_using` graph must be acyclic; exactly one main Theorem must exist with the target name; and every node must be reachable, in reverse, from the main Theorem (no isolated/dead nodes).
 

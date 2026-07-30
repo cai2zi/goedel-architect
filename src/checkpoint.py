@@ -35,6 +35,7 @@ class CheckpointState:
     iteration: int = 0
     blueprint_lean_file: str = ""
     blueprint_target: str = ""
+    blueprint_phase2_header: str = ""
     blueprint_fully_validated: bool = False
     proved_cache: dict[str, str] = field(default_factory=dict)
     # name -> BlueprintNode.cache_key() recorded at the moment the proof was
@@ -55,12 +56,15 @@ class CheckpointState:
     def set_blueprint(self, blueprint: Blueprint) -> None:
         self.blueprint_lean_file = blueprint.lean_file
         self.blueprint_target = blueprint.target_theorem
+        self.blueprint_phase2_header = blueprint.phase2_header
         self.blueprint_fully_validated = blueprint.fully_validated
 
     def get_blueprint(self) -> Blueprint | None:
         if not self.blueprint_lean_file:
             return None
         bp = _parse_blueprint(self.blueprint_lean_file, self.blueprint_target)
+        if self.blueprint_phase2_header:
+            bp.phase2_header = self.blueprint_phase2_header
         bp.fully_validated = self.blueprint_fully_validated
         return bp
 

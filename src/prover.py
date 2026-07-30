@@ -398,6 +398,7 @@ class GoedelProver:
         nl_proof_sketch: str = "",
         repo_retrieval=None,
         parent_lemma_decls: str = "",
+        header: str = "",
     ) -> ProverResult:
         """Attempt to prove a single node, timing it and emitting a final_verify trace event."""
         t0 = time.time()
@@ -405,6 +406,7 @@ class GoedelProver:
             compiler, node_name, node_stmt, sys_prompt, user_prompt,
             nl_statement, nl_proof_sketch, repo_retrieval,
             parent_lemma_decls=parent_lemma_decls,
+            header=header,
         )
         self.tracer.emit(TraceEvent(
             kind="final_verify",
@@ -429,12 +431,14 @@ class GoedelProver:
         nl_proof_sketch: str = "",
         repo_retrieval=None,
         parent_lemma_decls: str = "",
+        header: str = "",
     ) -> ProverResult:
         """Attempt to prove a single node using the chat.completions tool loop."""
         # Stashed on self rather than threaded through every _process_response /
         # _probe_negation call - one GoedelProver instance proves exactly one
         # node (see the module-level prove_node() factory), so this is safe.
         self._parent_lemma_decls = parent_lemma_decls
+        self._phase2_header = header
         active_tools = _tools_for_repo_retrieval(repo_retrieval)
         system_suffix = _system_suffix_for_repo_retrieval(repo_retrieval)
         tool_limit_notice = _tool_call_limit_notice(self.parallel_tool_calls)
@@ -648,7 +652,12 @@ class GoedelProver:
                 # by name instead of hitting "unknown identifier".
                 parent_decls = getattr(self, "_parent_lemma_decls", "")
                 full_aux = f"{parent_decls}\n\n{aux}".strip() if parent_decls else aux
-                cr = compiler.check(proof_body, aux_lemmas=full_aux, node_decl=node_decl)
+                cr = compiler.check(
+                    proof_body,
+                    aux_lemmas=full_aux,
+                    node_decl=node_decl,
+                    header=getattr(self, "_phase2_header", ""),
+                )
                 trace_args = {
                     "success": cr.success,
                     "errors": cr.errors,
@@ -819,6 +828,7 @@ class GoedelProver:
                         proof_body,
                         aux_lemmas=parent_decls,
                         node_decl=negation_node_decl,
+                        header=getattr(self, "_phase2_header", ""),
                     )
                     if cr.success:
                         self.tracer.emit(TraceEvent(
@@ -1054,6 +1064,7 @@ def prove_node(
     canonical_stmt: str,
     parent_proofs: dict[str, str],
     parent_lemma_decls: str,
+    header: str,
     compiler: AbstractLeanCompiler,
     retrieval: MathlibRetrieval,
     model: str = "labs-leanstral-1-5",
@@ -1088,4 +1099,5 @@ def prove_node(
         user_prompt=user_prompt,
         repo_retrieval=repo_retrieval,
         parent_lemma_decls=parent_lemma_decls,
+        header=header,
     )

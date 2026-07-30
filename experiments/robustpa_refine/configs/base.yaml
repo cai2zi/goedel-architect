@@ -20,6 +20,7 @@ phase1_concurrency: 1024
 phase2_blueprint_concurrency: 512
 phase2_node_concurrency: 4096
 refine_concurrency: 1024
+phase2_contract_check_concurrency: 4
 lean_check_concurrency: 64
 lean_backend: kimina_server
 lean_api_url: http://localhost:8000

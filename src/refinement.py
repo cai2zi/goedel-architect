@@ -17,6 +17,9 @@ from blueprint import (
     _max_tokens as _blueprint_max_tokens,
     _parse_blueprint,
     _reasoning_kwargs,
+    format_phase2_contract_errors,
+    phase2_contract_errors,
+    phase2_standalone_contract_errors,
 )
 from lean_compiler import AbstractLeanCompiler
 from orchestrator import OrchestratorResult
@@ -73,6 +76,7 @@ def refine_blueprint(
     tracer=None,
     thm_name: str = "",
     max_retries: int = MAX_RETRIES,
+    phase2_contract_check_concurrency: int = 1,
 ) -> Blueprint:
     """
     Produce a revised blueprint by feeding failure diagnostics back to the LLM.
@@ -144,6 +148,36 @@ def refine_blueprint(
         if result.success:
             parsed = _parse_blueprint(lean_code, blueprint.target_theorem)
             if parsed.nodes:
+                contract_errors = phase2_contract_errors(parsed)
+                if not contract_errors:
+                    contract_errors = phase2_standalone_contract_errors(
+                        parsed,
+                        compiler,
+                        concurrency=phase2_contract_check_concurrency,
+                    )
+                if contract_errors:
+                    last_error_feedback = (
+                        "The file compiled, but the blueprint is not usable by Phase 2:\n\n"
+                        f"{format_phase2_contract_errors(contract_errors)}"
+                    )
+                    print(
+                        f"  [refine] attempt {attempt + 1}/{max_retries}: "
+                        "check_blueprint OK but phase2 contract FAILED",
+                        flush=True,
+                    )
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"{last_error_feedback}\n\n"
+                            "Fix the Phase 2 standalone contract and re-emit the whole "
+                            "blueprint. Avoid ambient declarations such as `variable`, "
+                            "`section`, `namespace`, `axiom`, and `partial def`; make "
+                            "parameters explicit and emit helper definitions as "
+                            "`@[blueprint]` definition nodes."
+                        ),
+                    })
+                    continue
                 parsed.fully_validated = result.validated
                 print(f"  [refine] attempt {attempt + 1}/{max_retries}: check_blueprint OK", flush=True)
                 return parsed

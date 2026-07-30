@@ -184,6 +184,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         "phase2_blueprint_concurrency",
         "phase2_node_concurrency",
         "refine_concurrency",
+        "phase2_contract_check_concurrency",
         "blueprint_max_retries",
         "node_max_prove_turns",
     ):
@@ -509,6 +510,7 @@ async def _run_record(
                         tracer=phase1_tracer,
                         thm_name=record.unique_id,
                         max_retries=args.blueprint_max_retries,
+                        phase2_contract_check_concurrency=args.phase2_contract_check_concurrency,
                     ),
                 )
                 state = CheckpointState(theorem_stmt=record.informal_statement, model=args.model)
@@ -637,6 +639,7 @@ async def _run_record(
                         tracer=phase3_tracer,
                         thm_name=record.unique_id,
                         blueprint_max_retries=args.blueprint_max_retries,
+                        phase2_contract_check_concurrency=args.phase2_contract_check_concurrency,
                     ),
                 )
                 state = CheckpointState.load(checkpoint_path)
@@ -774,6 +777,7 @@ async def _run_experiment(args: argparse.Namespace, output_root: Path, runtime: 
         f"phase2_blueprint={args.phase2_blueprint_concurrency} "
         f"phase2_node={args.phase2_node_concurrency} "
         f"refine={args.refine_concurrency} "
+        f"phase2_contract_check={args.phase2_contract_check_concurrency} "
         f"lean_check={args.lean_check_concurrency} "
         f"node_timeout_s={args.node_timeout_s} "
         f"llm_api_timeout_s={args.llm_api_timeout_s} "

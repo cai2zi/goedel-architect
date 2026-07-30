@@ -112,6 +112,7 @@ def prove_theorem(
     node_max_negation_probe_turns: int | None = None,
     parallel_tool_calls: int | None = None,
     blueprint_max_retries: int | None = None,
+    phase2_contract_check_concurrency: int = 1,
 ) -> ProofResult:
     """
     Full Goedel-Architect pipeline for a single theorem.
@@ -200,6 +201,7 @@ def prove_theorem(
             tracer=tracer,
             thm_name=thm_name,
             max_retries=blueprint_max_retries or 8,
+            phase2_contract_check_concurrency=phase2_contract_check_concurrency,
         )
         proved_cache = {}
         proof_cache_keys = {}
@@ -299,6 +301,7 @@ def prove_theorem(
                 tracer=tracer,
                 thm_name=thm_name,
                 max_retries=blueprint_max_retries or 8,
+                phase2_contract_check_concurrency=phase2_contract_check_concurrency,
             )
             print(f"  new blueprint has {len(blueprint.nodes)} nodes: {[n.name for n in blueprint.nodes]}", flush=True)
         except RuntimeError as e:
@@ -366,6 +369,7 @@ def run_phase1(
     repo_retrieval=None,
     tracer=None,
     thm_name: str = "",
+    phase2_contract_check_concurrency: int = 1,
 ) -> Blueprint:
     """Run Phase 1 (blueprint generation) alone and checkpoint the result."""
     blueprint = generate_blueprint(
@@ -377,6 +381,7 @@ def run_phase1(
         repo_retrieval=repo_retrieval,
         tracer=tracer,
         thm_name=thm_name,
+        phase2_contract_check_concurrency=phase2_contract_check_concurrency,
     )
     if checkpoint_path:
         state = CheckpointState(theorem_stmt=theorem_stmt, model=model, repo_context=repo_context or "")
@@ -505,6 +510,7 @@ def run_phase3(
     tracer=None,
     thm_name: str = "",
     blueprint_max_retries: int | None = None,
+    phase2_contract_check_concurrency: int = 1,
 ) -> Blueprint:
     """Run one Phase 3 (refinement) pass against a checkpointed blueprint.
 
@@ -548,6 +554,7 @@ def run_phase3(
         tracer=tracer,
         thm_name=thm_name,
         max_retries=blueprint_max_retries or 8,
+        phase2_contract_check_concurrency=phase2_contract_check_concurrency,
     )
 
     new_proved_cache = _invalidate_stale_proofs(new_blueprint, state.proved_cache, state.proof_cache_keys)

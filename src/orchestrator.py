@@ -266,18 +266,12 @@ async def _prove_one(
     active_compiler = compiler_factory() if compiler_factory else compiler
     assert active_compiler is not None
 
-    # Restore every definition appearing before the current node in the
-    # validated blueprint, in source order.  Their executable bodies are not
-    # encoded in sorry_using dependencies, but later statements/proofs can
-    # still refer to them.  Proven proof-node ancestors follow in topological
-    # order, so none of their references are forward declarations.
-    current_index = next(
-        index for index, blueprint_node in enumerate(blueprint.nodes)
-        if blueprint_node.name == name
-    )
+    # Restore every blueprint definition as global context. Their executable
+    # bodies are not encoded in sorry_using dependencies, but statements and
+    # proofs can still refer to them across the DAG.
     declaration_context = [
         definition.full_declaration()
-        for definition in blueprint.nodes[:current_index]
+        for definition in blueprint.nodes
         if definition.kind == "definition"
     ]
     declaration_context.extend(
@@ -300,6 +294,7 @@ async def _prove_one(
                 canonical_stmt=node.lean_declaration,
                 parent_proofs=parent_proofs,
                 parent_lemma_decls=parent_lemma_decls,
+                header=blueprint.phase2_header,
                 compiler=active_compiler,
                 retrieval=retrieval,
                 model=model,

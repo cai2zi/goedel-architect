@@ -5,11 +5,12 @@ and validates the resulting @[blueprint]-annotated Lean file via LeanArchitect.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter
+from dataclasses import dataclass, field
 import json
 import os
 import re
-from collections import Counter
-from dataclasses import dataclass, field
 from pathlib import Path
 
 from openai import OpenAI
@@ -23,7 +24,7 @@ from blueprint_text import (
     proof_body_to_decl_suffix,
     strip_blueprint_attr,
 )
-from lean_compiler import AbstractLeanCompiler, LeanCompiler, CompilerResult
+from lean_compiler import AbstractLeanCompiler, LeanCompiler, CompilerResult, MATHLIB_HEADER
 from llm_client import chat_completion_with_retry, make_client
 from goedel_prompts import load, render
 from tracer import TraceEvent
@@ -377,6 +378,7 @@ class Blueprint:
     nodes: list[BlueprintNode]
     lean_file: str  # full compilable @[blueprint]-annotated Lean file
     target_theorem: str
+    phase2_header: str = MATHLIB_HEADER
     # True only when this exact lean_file was confirmed to compile by a real
     # Lean invocation (not a structural-only fallback, and not a give-up
     # after MAX_RETRIES). Defaults to False so any code path that forgets to
@@ -420,6 +422,125 @@ class Blueprint:
         for node in self.nodes:
             visit(node.name)
         return ordered
+
+
+def _safe_phase2_header(lean_code: str) -> str:
+    """Extract the leading commands Phase 2 may safely preserve."""
+    imports: list[str] = []
+    other: list[str] = []
+    in_block_comment = False
+    for raw_line in lean_code.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        if in_block_comment:
+            if "-/" in stripped:
+                in_block_comment = False
+            continue
+        if stripped.startswith("/-"):
+            if "-/" not in stripped[2:]:
+                in_block_comment = True
+            continue
+        if stripped.startswith("--"):
+            continue
+        if stripped.startswith("import "):
+            imports.append(stripped)
+            continue
+        if stripped.startswith("open ") or stripped.startswith("open scoped "):
+            other.append(stripped)
+            continue
+        if stripped.startswith("set_option "):
+            other.append(stripped)
+            continue
+        break
+
+    if not any(line == "import Mathlib" for line in imports):
+        imports.insert(0, "import Mathlib")
+    if not any(line == "import Architect" for line in imports):
+        insert_at = 1 if imports and imports[0] == "import Mathlib" else len(imports)
+        imports.insert(insert_at, "import Architect")
+    if not any(line.startswith("set_option autoImplicit ") for line in other):
+        other.insert(0, "set_option autoImplicit false")
+    return "\n".join(imports + other).rstrip() + "\n\n"
+
+
+def _transitive_node_deps(node: BlueprintNode, blueprint: Blueprint) -> set[str]:
+    seen: set[str] = set()
+    stack = list(node.dependencies)
+    while stack:
+        dep = stack.pop()
+        if dep in seen:
+            continue
+        seen.add(dep)
+        dep_node = blueprint.node_by_name(dep)
+        if dep_node:
+            stack.extend(dep_node.dependencies)
+    return seen
+
+
+def _phase2_preflight_file(blueprint: Blueprint, node: BlueprintNode) -> str:
+    parts = [blueprint.phase2_header.rstrip()]
+    parts.extend(
+        definition.full_declaration()
+        for definition in blueprint.nodes
+        if definition.kind == "definition" and definition.name != node.name
+    )
+    ancestor_deps = _transitive_node_deps(node, blueprint)
+    parts.extend(
+        dep_node.full_declaration()
+        for dep_node in blueprint.dependency_order()
+        if dep_node.kind != "definition"
+        and dep_node.name in ancestor_deps
+    )
+    parts.append(node.full_declaration())
+    return "\n\n".join(part.strip() for part in parts if part.strip()) + "\n"
+
+
+def phase2_standalone_contract_errors(
+    blueprint: Blueprint,
+    compiler: AbstractLeanCompiler,
+    *,
+    limit: int = 12,
+    concurrency: int = 1,
+) -> list[str]:
+    """Compile proof nodes as Phase 2 would see them before accepting a blueprint."""
+    if concurrency <= 0:
+        raise ValueError("concurrency must be positive")
+
+    def check_node(index_and_node: tuple[int, BlueprintNode]) -> tuple[int, str | None]:
+        index, node = index_and_node
+        result = compiler.check(_phase2_preflight_file(blueprint, node), allow_sorry=True)
+        if result.success:
+            return index, None
+        message = "\n".join(result.errors) or result.raw_output[-2000:]
+        return index, (
+            f"phase2_standalone_failed: node `{node.name}` does not compile when "
+            f"assembled as a standalone Phase 2 goal.\n{message}"
+        )
+
+    indexed_nodes = [
+        (index, node)
+        for index, node in enumerate(blueprint.nodes)
+        if node.kind in {"lemma", "theorem"}
+    ]
+    indexed_errors: list[tuple[int, str]] = []
+    if concurrency == 1 or len(indexed_nodes) <= 1:
+        for item in indexed_nodes:
+            index, error = check_node(item)
+            if error is not None:
+                indexed_errors.append((index, error))
+    else:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [executor.submit(check_node, item) for item in indexed_nodes]
+            for future in as_completed(futures):
+                index, error = future.result()
+                if error is not None:
+                    indexed_errors.append((index, error))
+
+    errors = [error for _, error in sorted(indexed_errors, key=lambda item: item[0])]
+    if limit:
+        errors = errors[:limit]
+    return errors
 
 
 def phase2_contract_errors(blueprint: Blueprint) -> list[str]:
@@ -466,12 +587,14 @@ def generate_blueprint(
     repo_retrieval=None,
     tracer=None,
     thm_name: str = "",
+    max_retries: int = MAX_RETRIES,
+    phase2_contract_check_concurrency: int = 1,
 ) -> Blueprint:
     """
     Generate a @[blueprint]-annotated Lean dependency graph for `theorem_stmt`.
 
     Uses the verbatim system prompt from Appendix C.1 of the paper.
-    Validates via lean_compile after each LLM attempt (up to MAX_RETRIES).
+    Validates via lean_compile after each LLM attempt (up to max_retries).
 
     repo_retrieval: optional RepoRetrieval, giving the model a repo_search
         tool for cross-file lookups repo_context itself can't provide (see
@@ -489,7 +612,7 @@ def generate_blueprint(
     ]
 
     last_lean_code = None
-    for attempt in range(MAX_RETRIES):
+    for attempt in range(max_retries):
         response = _call_with_repo_search(
             client, model, messages, repo_retrieval, _reasoning_kwargs(model), _max_tokens(),
             tracer=tracer, thm_name=thm_name, phase="phase1", attempt=attempt + 1,
@@ -512,13 +635,19 @@ def generate_blueprint(
                 parsed = _parse_blueprint(lean_code, target)
                 if parsed.nodes:
                     contract_errors = phase2_contract_errors(parsed)
+                    if not contract_errors:
+                        contract_errors = phase2_standalone_contract_errors(
+                            parsed,
+                            compiler,
+                            concurrency=phase2_contract_check_concurrency,
+                        )
                     if contract_errors:
                         _append_assistant_turn(messages, response)
                         messages.append({
                             "role": "user",
                             "content": (
                                 f"The file compiled, but the blueprint is not usable by Phase 2 "
-                                f"(attempt {attempt + 1}/{MAX_RETRIES}):\n\n"
+                                f"(attempt {attempt + 1}/{max_retries}):\n\n"
                                 f"{format_phase2_contract_errors(contract_errors)}\n\n"
                                 "Fix the blueprint contract and re-emit the whole file. Every "
                                 "`lemma` and `theorem` blueprint node must end with exactly one "
@@ -542,7 +671,7 @@ def generate_blueprint(
                     "role": "user",
                     "content": (
                         f"The file compiled, but contains no `@[blueprint ...]`-annotated "
-                        f"declarations (attempt {attempt + 1}/{MAX_RETRIES}). You must "
+                        f"declarations (attempt {attempt + 1}/{max_retries}). You must "
                         "annotate the target theorem (and any helper lemmas) with "
                         "`@[blueprint ...]` and give each a `sorry_using [...]` proof body. "
                         "Re-emit the blueprint with proper annotations."
@@ -555,7 +684,7 @@ def generate_blueprint(
             messages.append({
                 "role": "user",
                 "content": (
-                    f"lean_compile reported errors (attempt {attempt + 1}/{MAX_RETRIES}):\n\n"
+                    f"lean_compile reported errors (attempt {attempt + 1}/{max_retries}):\n\n"
                     f"{error_feedback}\n\n"
                     "Fix the issues and call lean_compile again."
                 ),
@@ -565,13 +694,19 @@ def generate_blueprint(
             parsed = _parse_blueprint(lean_code, target)
             if parsed.nodes:
                 contract_errors = phase2_contract_errors(parsed)
+                if not contract_errors and compiler is not None:
+                    contract_errors = phase2_standalone_contract_errors(
+                        parsed,
+                        compiler,
+                        concurrency=phase2_contract_check_concurrency,
+                    )
                 if contract_errors:
                     _append_assistant_turn(messages, response)
                     messages.append({
                         "role": "user",
                         "content": (
                             f"The blueprint is not usable by Phase 2 "
-                            f"(attempt {attempt + 1}/{MAX_RETRIES}):\n\n"
+                            f"(attempt {attempt + 1}/{max_retries}):\n\n"
                             f"{format_phase2_contract_errors(contract_errors)}\n\n"
                             "Re-emit the whole blueprint. Every `lemma` and `theorem` "
                             "blueprint node must end with exactly one "
@@ -594,7 +729,7 @@ def generate_blueprint(
                 "role": "user",
                 "content": (
                     f"Your response contains no `@[blueprint ...]`-annotated "
-                    f"declarations (attempt {attempt + 1}/{MAX_RETRIES}). You must "
+                    f"declarations (attempt {attempt + 1}/{max_retries}). You must "
                     "annotate the target theorem (and any helper lemmas) with "
                     "`@[blueprint ...]` and give each a `sorry_using [...]` proof body. "
                     "Re-emit the blueprint with proper annotations."
@@ -613,15 +748,21 @@ def generate_blueprint(
         parsed = _parse_blueprint(last_lean_code, target)
         if parsed.nodes:
             contract_errors = phase2_contract_errors(parsed)
+            if not contract_errors and compiler is not None:
+                contract_errors = phase2_standalone_contract_errors(
+                    parsed,
+                    compiler,
+                    concurrency=phase2_contract_check_concurrency,
+                )
             if contract_errors:
                 raise RuntimeError(
-                    f"Blueprint generation failed after {MAX_RETRIES} attempts "
+                    f"Blueprint generation failed after {max_retries} attempts "
                     f"(latest blueprint is not phase2-ready):\n"
                     f"{format_phase2_contract_errors(contract_errors)}"
                 )
             return parsed
     raise RuntimeError(
-        f"Blueprint generation failed after {MAX_RETRIES} attempts "
+        f"Blueprint generation failed after {max_retries} attempts "
         "(no attempt produced any @[blueprint]-annotated nodes)"
     )
 
@@ -635,6 +776,7 @@ def generate_blueprint_from_informal(
     tracer=None,
     thm_name: str = "",
     max_retries: int = MAX_RETRIES,
+    phase2_contract_check_concurrency: int = 1,
 ) -> Blueprint:
     """Generate and strictly validate a blueprint from informal text only.
 
@@ -709,6 +851,12 @@ def generate_blueprint_from_informal(
                 )
             else:
                 contract_errors = phase2_contract_errors(parsed)
+                if not contract_errors:
+                    contract_errors = phase2_standalone_contract_errors(
+                        parsed,
+                        compiler,
+                        concurrency=phase2_contract_check_concurrency,
+                    )
                 if not contract_errors:
                     parsed.fully_validated = result.validated
                     return parsed
@@ -815,7 +963,12 @@ def _parse_blueprint(lean_code: str, target_theorem: str) -> Blueprint:
             lean_declaration=m.group(0),
         ))
 
-    return Blueprint(nodes=nodes, lean_file=lean_code, target_theorem=target_theorem)
+    return Blueprint(
+        nodes=nodes,
+        lean_file=lean_code,
+        target_theorem=target_theorem,
+        phase2_header=_safe_phase2_header(lean_code),
+    )
 
 
 def _extract_attr(attrs: str, key: str) -> str:

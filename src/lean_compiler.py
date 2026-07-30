@@ -50,14 +50,161 @@ class CompilerResult:
 
 _SORRY_USING_RE = BLUEPRINT_PROOF_RE
 
-# Both prover_system.md and blueprint_system.md tell the model these are
-# forbidden — `axiom` lets it assert its own goal as true with zero proof,
-# `native_decide` trusts a compiled binary instead of the kernel checker.
-# Nothing previously enforced this; it was an honor-system instruction only.
-_FORBIDDEN_CONSTRUCT_RE = re.compile(r"\baxiom\b|\bnative_decide\b")
+_FORBIDDEN_COMMANDS = {
+    "axiom",
+    "class",
+    "inductive",
+    "instance",
+    "macro",
+    "namespace",
+    "notation",
+    "section",
+    "structure",
+    "syntax",
+    "variable",
+}
 
 
-def _assemble_node_attempt(node_decl: str, aux_lemmas: str, proof_body: str) -> str:
+def _mask_comments_and_strings(code: str) -> str:
+    """Return code with comments/strings replaced by spaces, preserving lines."""
+    out: list[str] = []
+    i = 0
+    block_depth = 0
+    in_line_comment = False
+    in_string = False
+    while i < len(code):
+        ch = code[i]
+        nxt = code[i + 1] if i + 1 < len(code) else ""
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+                out.append(ch)
+            else:
+                out.append(" ")
+            i += 1
+            continue
+
+        if block_depth:
+            if ch == "/" and nxt == "-":
+                block_depth += 1
+                out.extend("  ")
+                i += 2
+                continue
+            if ch == "-" and nxt == "/":
+                block_depth -= 1
+                out.extend("  ")
+                i += 2
+                continue
+            out.append("\n" if ch == "\n" else " ")
+            i += 1
+            continue
+
+        if in_string:
+            if ch == "\\" and nxt:
+                out.extend("  ")
+                i += 2
+                continue
+            if ch == "\"":
+                in_string = False
+            out.append("\n" if ch == "\n" else " ")
+            i += 1
+            continue
+
+        if ch == "-" and nxt == "-":
+            in_line_comment = True
+            out.extend("  ")
+            i += 2
+            continue
+        if ch == "/" and nxt == "-":
+            block_depth = 1
+            out.extend("  ")
+            i += 2
+            continue
+        if ch == "\"":
+            in_string = True
+            out.append(" ")
+            i += 1
+            continue
+
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _command_words(line: str) -> list[str]:
+    words: list[str] = []
+    current: list[str] = []
+    for ch in line.strip():
+        if ch.isalnum() or ch in {"_", "'"}:
+            current.append(ch)
+        else:
+            if current:
+                words.append("".join(current))
+                current = []
+            if len(words) >= 2:
+                break
+    if current:
+        words.append("".join(current))
+    return words[:2]
+
+
+def _find_forbidden_construct(code: str) -> str | None:
+    """Find disallowed commands/tokens while ignoring comments and strings."""
+    masked = _mask_comments_and_strings(code)
+    in_attr = False
+    for raw_line in masked.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if in_attr:
+            if "]" in line:
+                line = line.split("]", 1)[1].strip()
+                in_attr = False
+                if not line:
+                    continue
+            else:
+                continue
+        if line.startswith("@["):
+            if "]" in line:
+                line = line.split("]", 1)[1].strip()
+                if not line:
+                    continue
+            else:
+                in_attr = True
+                continue
+        words = _command_words(line)
+        if not words:
+            continue
+        if words[:2] == ["noncomputable", "section"]:
+            return "noncomputable section"
+        if words[:2] == ["partial", "def"]:
+            return "partial def"
+        if words[:2] == ["local", "notation"]:
+            return "local notation"
+        if words[0] in _FORBIDDEN_COMMANDS:
+            return words[0]
+
+    current: list[str] = []
+    for ch in masked:
+        if ch.isalnum() or ch in {"_", "'"}:
+            current.append(ch)
+        else:
+            token = "".join(current)
+            if token == "native_decide":
+                return token
+            current = []
+    if "".join(current) == "native_decide":
+        return "native_decide"
+    return None
+
+
+def _assemble_node_attempt(
+    node_decl: str,
+    aux_lemmas: str,
+    proof_body: str,
+    header: str | None = None,
+) -> str:
     """Build a standalone compilable file from a blueprint node's declaration.
 
     Strips the `@[blueprint ...]` attribute and swaps `:= by sorry_using [...]`
@@ -72,7 +219,7 @@ def _assemble_node_attempt(node_decl: str, aux_lemmas: str, proof_body: str) -> 
             "proof node declaration must contain exactly one "
             "`:= by sorry_using [...]` placeholder"
         )
-    parts = [MATHLIB_HEADER.rstrip("\n")]
+    parts = [(header or MATHLIB_HEADER).rstrip("\n")]
     if aux_lemmas.strip():
         parts.append(aux_lemmas.strip())
     parts.append(decl_text)
@@ -119,6 +266,8 @@ class LeanCompiler(AbstractLeanCompiler):
         prepend_header: bool = False,
         aux_lemmas: str = "",
         node_decl: str = "",
+        header: str | None = None,
+        allow_sorry: bool = False,
         **_,
     ) -> CompilerResult:
         """Compile a Lean snippet and return structured feedback.
@@ -135,7 +284,7 @@ class LeanCompiler(AbstractLeanCompiler):
         """
         if node_decl:
             try:
-                code = _assemble_node_attempt(node_decl, aux_lemmas, lean_code)
+                code = _assemble_node_attempt(node_decl, aux_lemmas, lean_code, header=header)
             except ValueError as exc:
                 message = f"Node assembly rejected: {exc}"
                 return CompilerResult(
@@ -147,16 +296,16 @@ class LeanCompiler(AbstractLeanCompiler):
         else:
             code = (MATHLIB_HEADER + lean_code) if prepend_header else lean_code
 
-        forbidden = _FORBIDDEN_CONSTRUCT_RE.search(code)
+        forbidden = _find_forbidden_construct(code)
         if forbidden:
             return CompilerResult(
                 success=False,
-                errors=[f"Safeguard rejected: forbidden construct `{forbidden.group(0)}` is not allowed."],
+                errors=[f"Safeguard rejected: forbidden construct `{forbidden}` is not allowed."],
                 raw_output="Safeguard rejected",
             )
 
         result = self._run_lean(code)
-        if result.success and result.has_sorry:
+        if result.success and result.has_sorry and not allow_sorry:
             return CompilerResult(
                 success=False,
                 goals=result.goals,
@@ -172,6 +321,13 @@ class LeanCompiler(AbstractLeanCompiler):
         Prepends import GoedelArch (which provides #validate_blueprint) if not
         already present, then appends the validation command.
         """
+        forbidden = _find_forbidden_construct(lean_code)
+        if forbidden:
+            return CompilerResult(
+                success=False,
+                errors=[f"Safeguard rejected: forbidden construct `{forbidden}` is not allowed."],
+                raw_output="Safeguard rejected",
+            )
         if "import GoedelArch" not in lean_code:
             # Insert GoedelArch import after the existing Architect import
             code = lean_code.replace(
