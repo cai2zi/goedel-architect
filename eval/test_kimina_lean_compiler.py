@@ -105,6 +105,29 @@ class KiminaLeanCompilerTest(unittest.TestCase):
         self.assertEqual(result.errors, ["type mismatch"])
         self.assertEqual(len(client.calls), 1)
 
+    def test_lean_messages_with_positions_are_preserved(self) -> None:
+        error = {
+            "severity": "error",
+            "pos": {"line": 12, "column": 3},
+            "endPos": {"line": 12, "column": 8},
+            "data": "type mismatch",
+        }
+        warning = {
+            "severity": "warning",
+            "pos": {"line": 27, "column": 6},
+            "endPos": {"line": 27, "column": 23},
+            "data": "declaration uses `sorry`",
+        }
+        data = _command_response(messages=[error, warning])
+        compiler, client = self.make_compiler([FakeResponse(200, data)])
+
+        result = compiler._run_lean("bad")
+
+        self.assertFalse(result.success)
+        self.assertEqual(json.loads(result.errors[0]), error)
+        self.assertEqual(json.loads(result.warnings[0]), warning)
+        self.assertEqual(len(client.calls), 1)
+
     def test_sorry_is_rejected_by_check_but_allowed_in_blueprint(self) -> None:
         sorry = [{"goal": "True", "pos": {"line": 1, "column": 1}}]
         data = _command_response(sorries=sorry)
@@ -124,6 +147,43 @@ class KiminaLeanCompilerTest(unittest.TestCase):
         self.assertTrue(blueprint.success)
         self.assertTrue(blueprint.has_sorry)
         self.assertIn("#validate_blueprint t", client.calls[1][1]["snippets"][0]["code"])
+
+    def test_sorry_and_admit_warnings_are_promoted_to_check_errors(self) -> None:
+        sorry_warning = {
+            "severity": "warning",
+            "pos": {"line": 27, "column": 6},
+            "endPos": {"line": 27, "column": 23},
+            "data": "declaration uses `sorry`",
+        }
+        admit_warning = {
+            "severity": "warning",
+            "pos": {"line": 31, "column": 8},
+            "endPos": {"line": 31, "column": 15},
+            "data": "declaration uses `admit`",
+        }
+        unrelated_warning = {
+            "severity": "warning",
+            "pos": {"line": 2, "column": 1},
+            "endPos": {"line": 2, "column": 2},
+            "data": "unused variable `h`",
+        }
+        data = _command_response(
+            messages=[sorry_warning, admit_warning, unrelated_warning]
+        )
+        compiler, client = self.make_compiler([FakeResponse(200, data)])
+
+        result = compiler.check("theorem t : True := by sorry")
+
+        self.assertFalse(result.success)
+        self.assertEqual(
+            result.errors,
+            [
+                "Proof contains `sorry` — not a complete proof.",
+                json.dumps(sorry_warning, ensure_ascii=False),
+                json.dumps(admit_warning, ensure_ascii=False),
+            ],
+        )
+        self.assertEqual(len(client.calls), 1)
 
     def test_top_level_timeout_is_unvalidated(self) -> None:
         data = {"results": [{"id": "test", "error": "Lean REPL command timed out"}]}

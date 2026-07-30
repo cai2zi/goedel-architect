@@ -17,6 +17,13 @@ from lean_compiler import CompilerResult, LeanCompiler
 _RETRY_DELAYS_S = (0.5, 1.0, 2.0)
 
 
+def _compiler_message_text(message: dict[str, Any]) -> str:
+    text = str(message.get("data") or message.get("message") or "")
+    if "pos" not in message and "endPos" not in message:
+        return text
+    return json.dumps(message, ensure_ascii=False)
+
+
 class KiminaLeanCompiler(LeanCompiler):
     """Run Lean snippets through a manually managed Kimina server."""
 
@@ -178,7 +185,7 @@ class KiminaLeanCompiler(LeanCompiler):
             if not isinstance(message, dict):
                 continue
             severity = str(message.get("severity") or "").lower()
-            text = str(message.get("data") or message.get("message") or "")
+            text = _compiler_message_text(message)
             if severity == "error":
                 errors.append(text)
             elif severity == "warning":

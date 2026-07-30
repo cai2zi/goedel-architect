@@ -41,11 +41,15 @@ class CompilerResult:
         return "Safeguard rejected" in self.raw_output
 
     @property
+    def sorry_warnings(self) -> list[str]:
+        return [
+            w for w in self.warnings
+            if "declaration uses" in w and ("sorry" in w or "admit" in w)
+        ]
+
+    @property
     def has_sorry(self) -> bool:
-        return any(
-            "declaration uses" in w and ("sorry" in w or "admit" in w)
-            for w in self.warnings
-        )
+        return bool(self.sorry_warnings)
 
 
 _SORRY_USING_RE = BLUEPRINT_PROOF_RE
@@ -309,7 +313,10 @@ class LeanCompiler(AbstractLeanCompiler):
             return CompilerResult(
                 success=False,
                 goals=result.goals,
-                errors=result.errors + ["Proof contains `sorry` — not a complete proof."],
+                errors=result.errors + [
+                    "Proof contains `sorry` — not a complete proof.",
+                    *result.sorry_warnings,
+                ],
                 warnings=result.warnings,
                 raw_output=result.raw_output,
             )
