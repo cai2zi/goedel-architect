@@ -15,7 +15,6 @@ VLLM_BASE_URL="${VLLM_BASE_URL:-http://127.0.0.1:8001/v1}"
 DATA_ROOT="${DATA_ROOT:-/ssd/czx/czx_work/RobustPABench}"
 OUTPUT_BASE="${OUTPUT_BASE:-/ssd/czx/czx_work/robustpa_refine}"
 RESUME="${RESUME:-false}"
-RERUN_FAILED="${RERUN_FAILED:-false}"
 LIMIT="${LIMIT:-null}"
 
 MAX_REFINEMENT_ITERATIONS="${MAX_REFINEMENT_ITERATIONS:-4}" # refine的次数
@@ -48,7 +47,6 @@ COMMON_OVERRIDES=(
   "data_root=${DATA_ROOT}"
   "output_base=${OUTPUT_BASE}"
   "resume=${RESUME}"
-  "rerun_failed=${RERUN_FAILED}"
   "limit=${LIMIT}"
   "max_refinement_iterations=${MAX_REFINEMENT_ITERATIONS}"
   "blueprint_max_retries=${BLUEPRINT_MAX_RETRIES}"

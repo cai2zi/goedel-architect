@@ -8,7 +8,6 @@ split: null
 limit: null
 problem_id: null
 resume: false
-rerun_failed: false
 max_refinement_iterations: 4
 blueprint_max_retries: 8
 node_max_prove_turns: 8

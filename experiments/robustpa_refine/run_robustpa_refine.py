@@ -4,9 +4,11 @@ import argparse
 import asyncio
 import csv
 import hashlib
+import json
 import os
 import shutil
 import sys
+import tempfile
 import time
 import traceback
 from collections import defaultdict
@@ -35,7 +37,7 @@ from shared.lean_runtime import (  # noqa: E402
 )
 from mathlib_retrieval import MathlibRetrieval  # noqa: E402
 from pipeline import run_phase2_async, run_phase3  # noqa: E402
-from tracer import JsonlTracer, TraceEvent  # noqa: E402
+from tracer import JsonlTracer  # noqa: E402
 
 
 DEFAULT_DATA_ROOT = REPO_ROOT.parent / "czx_work" / "RobustPABench"
@@ -160,7 +162,6 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
     args.limit = getattr(args, "limit", None)
     args.problem_id = getattr(args, "problem_id", None)
     args.resume = bool(getattr(args, "resume", False))
-    args.rerun_failed = bool(getattr(args, "rerun_failed", False))
     if not args.exp_name:
         args.exp_name = default_exp_name(args.model, args.split, args.subset)
     if args.openai_base_url:
@@ -447,13 +448,32 @@ def _existing_results(path: Path) -> dict[str, dict[str, Any]]:
         return {}
     rows: dict[str, dict[str, Any]] = {}
     with path.open("r", encoding="utf-8") as f:
-        import json
-
         for line in f:
             if line.strip():
                 row = json.loads(line)
                 rows[str(row["id"])] = row
     return rows
+
+
+def _remove_jsonl_rows(path: Path, record_ids: set[str]) -> None:
+    if not path.exists() or not record_ids:
+        return
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent, prefix=f".tmp_{path.name}_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as destination, path.open(
+            "r", encoding="utf-8"
+        ) as source:
+            for line in source:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if str(row.get("id")) in record_ids:
+                    continue
+                destination.write(line if line.endswith("\n") else f"{line}\n")
+        os.replace(tmp_path, path)
+    except Exception:
+        Path(tmp_path).unlink(missing_ok=True)
+        raise
 
 
 def _clear_record_outputs(output_root: Path, record: Record) -> None:
@@ -486,59 +506,43 @@ async def _run_record(
     loop = asyncio.get_running_loop()
     blueprint: Blueprint | None = None
     state: CheckpointState | None = None
-    phase = "resume"
+    phase = "phase1"
     try:
-        state = CheckpointState.load_or_none(checkpoint_path) if args.resume else None
-        if state is not None and state.theorem_stmt.strip() != record.informal_statement.strip():
-            raise RuntimeError(f"checkpoint input mismatch: {checkpoint_path}")
-        blueprint = state.get_blueprint() if state else None
-
-        if blueprint is None:
-            phase = "phase1"
-            phase1_tracer = tracer.with_context(phase="phase1", iteration=0)
-            async with phase1_sem:
-                tqdm.write(f"[phase1-start] {record.unique_id}")
-                blueprint = await loop.run_in_executor(
-                    phase_executor,
-                    partial(
-                        generate_blueprint_from_informal,
-                        informal_statement=record.informal_statement,
-                        informal_proof=record.informal_proof,
-                        target_name=record.theorem_name,
-                        model=args.model,
-                        compiler=runtime.compiler,
-                        tracer=phase1_tracer,
-                        thm_name=record.unique_id,
-                        max_retries=args.blueprint_max_retries,
-                        phase2_contract_check_concurrency=args.phase2_contract_check_concurrency,
-                    ),
-                )
-                state = CheckpointState(theorem_stmt=record.informal_statement, model=args.model)
-                state.set_blueprint(blueprint)
-                state.save(checkpoint_path)
-                path = _write_blueprint_snapshot(
-                    output_root, record, iteration=0, label="phase1", blueprint=blueprint
-                )
-                await _append_round(
-                    rounds_path,
-                    rounds_lock,
-                    record,
-                    phase="after_phase1",
-                    iteration=0,
-                    blueprint_path=path,
-                    blueprint=blueprint,
-                    state=state,
-                )
-                tqdm.write(f"[phase1-done] {record.unique_id} nodes={len(blueprint.nodes)}")
-        else:
-            tracer.emit(TraceEvent(
-                kind="resume",
-                thm_name=record.unique_id,
-                phase="resume",
-                iteration=state.iteration,
-                args={"iteration": state.iteration, "proved_cache_count": len(state.proved_cache)},
-                ok=True,
-            ))
+        phase1_tracer = tracer.with_context(phase="phase1", iteration=0)
+        async with phase1_sem:
+            tqdm.write(f"[phase1-start] {record.unique_id}")
+            blueprint = await loop.run_in_executor(
+                phase_executor,
+                partial(
+                    generate_blueprint_from_informal,
+                    informal_statement=record.informal_statement,
+                    informal_proof=record.informal_proof,
+                    target_name=record.theorem_name,
+                    model=args.model,
+                    compiler=runtime.compiler,
+                    tracer=phase1_tracer,
+                    thm_name=record.unique_id,
+                    max_retries=args.blueprint_max_retries,
+                    phase2_contract_check_concurrency=args.phase2_contract_check_concurrency,
+                ),
+            )
+            state = CheckpointState(theorem_stmt=record.informal_statement, model=args.model)
+            state.set_blueprint(blueprint)
+            state.save(checkpoint_path)
+            path = _write_blueprint_snapshot(
+                output_root, record, iteration=0, label="phase1", blueprint=blueprint
+            )
+            await _append_round(
+                rounds_path,
+                rounds_lock,
+                record,
+                phase="after_phase1",
+                iteration=0,
+                blueprint_path=path,
+                blueprint=blueprint,
+                state=state,
+            )
+            tqdm.write(f"[phase1-done] {record.unique_id} nodes={len(blueprint.nodes)}")
 
         while True:
             state = CheckpointState.load(checkpoint_path)
@@ -762,11 +766,7 @@ def _write_metrics(
 def _should_skip_existing(row: dict[str, Any] | None, args: argparse.Namespace) -> bool:
     if not args.resume or row is None:
         return False
-    if row.get("root_proved"):
-        return True
-    if row.get("terminal") and not args.rerun_failed:
-        return True
-    return False
+    return row.get("root_proved") is True or row.get("status") == "exhausted"
 
 
 async def _run_experiment(
@@ -791,11 +791,16 @@ async def _run_experiment(
         if _should_skip_existing(row, args):
             skipped += 1
             continue
-        if not args.resume:
-            _clear_record_outputs(output_root, record)
-        if args.rerun_failed and row and not row.get("root_proved"):
-            _clear_record_outputs(output_root, record)
         pending.append(record)
+
+    pending_ids = {record.unique_id for record in pending}
+    if args.resume:
+        _remove_jsonl_rows(results_path, pending_ids)
+        _remove_jsonl_rows(rounds_path, pending_ids)
+        for record_id in pending_ids:
+            existing.pop(record_id, None)
+    for record in pending:
+        _clear_record_outputs(output_root, record)
 
     print(f"[select] records={len(records)} pending={len(pending)} skipped={skipped} output={output_root}", flush=True)
     print(

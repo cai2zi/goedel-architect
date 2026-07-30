@@ -91,8 +91,14 @@ default:
 - `rounds.jsonl`: one audit row per phase/iteration, including node verdicts.
 - `metrics.json` and `metrics.csv`: global, subset, split, and subset/split
   accuracy summaries.
-- `checkpoints/`, `traces/`, `blueprints/`: resumable state and per-round Lean
-  blueprint snapshots.
+- `checkpoints/`, `traces/`, `blueprints/`: per-run intermediate state, traces,
+  and per-round Lean blueprint snapshots.
+
+With `resume: true`, only samples whose latest result has
+`root_proved: true` or `status: exhausted` are skipped. Every other selected
+sample is cleared from `results.jsonl` and `rounds.jsonl`, its checkpoint,
+trace, and blueprint artifacts are deleted, and it is rerun from Phase 1.
+Checkpoints are not resumed at the node or refinement-iteration level.
 
 Build a compact one-file bundle for web-chat analysis:
 

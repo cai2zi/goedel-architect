@@ -5,7 +5,6 @@ exp_name: phase2_context_debug
 subset: phase2_context_debug
 split: miniF2F
 resume: false
-rerun_failed: true
 
 phase1_concurrency: 1
 phase2_blueprint_concurrency: 1
