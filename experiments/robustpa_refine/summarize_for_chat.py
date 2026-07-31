@@ -57,15 +57,19 @@ SCHEMA = pa.schema(
         ("artifact_type", pa.string()),
         ("rel_path", pa.string()),
         ("file_path", pa.string()),
+        ("file_size_bytes", pa.int64()),
         ("file_index", pa.int64()),
         ("row_index", pa.int64()),
+        ("source_row_index", pa.int64()),
         ("trace_event_index", pa.int64()),
         ("id", pa.string()),
         ("record_id", pa.string()),
         ("source_id", pa.string()),
         ("subset", pa.string()),
         ("split", pa.string()),
+        ("parquet_path", pa.string()),
         ("theorem_name", pa.string()),
+        ("root_theorem", pa.string()),
         ("thm_name", pa.string()),
         ("phase", pa.string()),
         ("iteration", pa.int64()),
@@ -73,14 +77,52 @@ SCHEMA = pa.schema(
         ("kind", pa.string()),
         ("tool_name", pa.string()),
         ("call_id", pa.string()),
+        ("ts", pa.float64()),
+        ("model", pa.string()),
+        ("operation", pa.string()),
+        ("response_id", pa.string()),
+        ("finish_reason", pa.string()),
+        ("prompt_tokens", pa.int64()),
+        ("completion_tokens", pa.int64()),
+        ("total_tokens", pa.int64()),
+        ("tool_call_count", pa.int64()),
+        ("tool_calls_processed", pa.int64()),
+        ("tool_calls_dropped", pa.int64()),
+        ("parallel_tool_calls", pa.int64()),
+        ("wall_time_s", pa.float64()),
         ("ok", pa.string()),
         ("status", pa.string()),
+        ("success", pa.string()),
+        ("terminal", pa.string()),
+        ("blueprint_success", pa.string()),
         ("root_proved", pa.string()),
+        ("all_nodes_proved", pa.string()),
+        ("total_nodes", pa.int64()),
+        ("proved_node_count", pa.int64()),
+        ("proved_ratio", pa.float64()),
+        ("infra_error_node_count", pa.int64()),
+        ("validated", pa.string()),
+        ("checkpoint_path", pa.string()),
+        ("trace_path", pa.string()),
+        ("blueprint_dir", pa.string()),
+        ("blueprint_path", pa.string()),
+        ("blueprint_hash", pa.string()),
         ("error_category_hint", pa.string()),
         ("raw_text", pa.string()),
         ("raw_json", pa.string()),
         ("args_json", pa.string()),
+        ("nodes_json", pa.string()),
+        ("lean_runtime_json", pa.string()),
+        ("proved_nodes_json", pa.string()),
+        ("failed_nodes_json", pa.string()),
+        ("infra_error_nodes_json", pa.string()),
+        ("errors_json", pa.string()),
+        ("warnings_json", pa.string()),
+        ("goals_json", pa.string()),
+        ("raw_output", pa.string()),
         ("result_text", pa.string()),
+        ("error_text", pa.string()),
+        ("traceback_text", pa.string()),
         ("parse_error", pa.string()),
     ]
 )
@@ -126,6 +168,22 @@ def _int_or_none(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_value(*values: Any) -> Any:
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
 
 
 def _trace_ids_from_path(exp_dir: Path, path: Path) -> dict[str, str]:
@@ -235,15 +293,19 @@ def _empty_row(exp_dir: Path, generated_at: float) -> dict[str, Any]:
         "artifact_type": "",
         "rel_path": "",
         "file_path": "",
+        "file_size_bytes": None,
         "file_index": None,
         "row_index": None,
+        "source_row_index": None,
         "trace_event_index": None,
         "id": "",
         "record_id": "",
         "source_id": "",
         "subset": "",
         "split": "",
+        "parquet_path": "",
         "theorem_name": "",
+        "root_theorem": "",
         "thm_name": "",
         "phase": "",
         "iteration": None,
@@ -251,16 +313,132 @@ def _empty_row(exp_dir: Path, generated_at: float) -> dict[str, Any]:
         "kind": "",
         "tool_name": "",
         "call_id": "",
+        "ts": None,
+        "model": "",
+        "operation": "",
+        "response_id": "",
+        "finish_reason": "",
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+        "tool_call_count": None,
+        "tool_calls_processed": None,
+        "tool_calls_dropped": None,
+        "parallel_tool_calls": None,
+        "wall_time_s": None,
         "ok": "",
         "status": "",
+        "success": "",
+        "terminal": "",
+        "blueprint_success": "",
         "root_proved": "",
+        "all_nodes_proved": "",
+        "total_nodes": None,
+        "proved_node_count": None,
+        "proved_ratio": None,
+        "infra_error_node_count": None,
+        "validated": "",
+        "checkpoint_path": "",
+        "trace_path": "",
+        "blueprint_dir": "",
+        "blueprint_path": "",
+        "blueprint_hash": "",
         "error_category_hint": "",
         "raw_text": "",
         "raw_json": "",
         "args_json": "",
+        "nodes_json": "",
+        "lean_runtime_json": "",
+        "proved_nodes_json": "",
+        "failed_nodes_json": "",
+        "infra_error_nodes_json": "",
+        "errors_json": "",
+        "warnings_json": "",
+        "goals_json": "",
+        "raw_output": "",
         "result_text": "",
+        "error_text": "",
+        "traceback_text": "",
         "parse_error": "",
     }
+
+
+def _populate_common_json_fields(out: dict[str, Any], parsed: dict[str, Any]) -> None:
+    args = parsed.get("args") if isinstance(parsed.get("args"), dict) else {}
+    out.update(
+        {
+            "source_row_index": _int_or_none(parsed.get("row_index")),
+            "parquet_path": _str(parsed.get("parquet_path")),
+            "root_theorem": _str(parsed.get("root_theorem")),
+            "ts": _float_or_none(parsed.get("ts")),
+            "model": _str(_first_value(parsed.get("model"), args.get("model"))),
+            "operation": _str(_first_value(parsed.get("operation"), args.get("operation"))),
+            "response_id": _str(_first_value(parsed.get("response_id"), args.get("response_id"))),
+            "finish_reason": _str(_first_value(parsed.get("finish_reason"), args.get("finish_reason"))),
+            "prompt_tokens": _int_or_none(_first_value(parsed.get("prompt_tokens"), args.get("prompt_tokens"))),
+            "completion_tokens": _int_or_none(
+                _first_value(parsed.get("completion_tokens"), args.get("completion_tokens"))
+            ),
+            "total_tokens": _int_or_none(_first_value(parsed.get("total_tokens"), args.get("total_tokens"))),
+            "tool_call_count": _int_or_none(
+                _first_value(parsed.get("tool_call_count"), args.get("tool_call_count"))
+            ),
+            "tool_calls_processed": _int_or_none(
+                _first_value(parsed.get("tool_calls_processed"), args.get("tool_calls_processed"))
+            ),
+            "tool_calls_dropped": _int_or_none(
+                _first_value(parsed.get("tool_calls_dropped"), args.get("tool_calls_dropped"))
+            ),
+            "parallel_tool_calls": _int_or_none(
+                _first_value(parsed.get("parallel_tool_calls"), args.get("parallel_tool_calls"))
+            ),
+            "wall_time_s": _float_or_none(_first_value(parsed.get("wall_time_s"), args.get("wall_time_s"))),
+            "success": _str(_first_value(parsed.get("success"), args.get("success"))),
+            "terminal": _str(parsed.get("terminal")),
+            "blueprint_success": _str(parsed.get("blueprint_success")),
+            "all_nodes_proved": _str(parsed.get("all_nodes_proved")),
+            "total_nodes": _int_or_none(parsed.get("total_nodes")),
+            "proved_node_count": _int_or_none(parsed.get("proved_node_count")),
+            "proved_ratio": _float_or_none(parsed.get("proved_ratio")),
+            "infra_error_node_count": _int_or_none(parsed.get("infra_error_node_count")),
+            "validated": _str(_first_value(parsed.get("validated"), args.get("validated"))),
+            "checkpoint_path": _str(parsed.get("checkpoint_path")),
+            "trace_path": _str(parsed.get("trace_path")),
+            "blueprint_dir": _str(parsed.get("blueprint_dir")),
+            "blueprint_path": _str(parsed.get("blueprint_path")),
+            "blueprint_hash": _str(parsed.get("blueprint_hash")),
+            "nodes_json": _json_dumps(parsed.get("nodes")),
+            "lean_runtime_json": _json_dumps(parsed.get("lean_runtime")),
+            "proved_nodes_json": _json_dumps(parsed.get("proved_nodes")),
+            "failed_nodes_json": _json_dumps(parsed.get("failed_nodes")),
+            "infra_error_nodes_json": _json_dumps(parsed.get("infra_error_nodes")),
+            "errors_json": _json_dumps(_first_value(parsed.get("errors"), args.get("errors"))),
+            "warnings_json": _json_dumps(_first_value(parsed.get("warnings"), args.get("warnings"))),
+            "goals_json": _json_dumps(_first_value(parsed.get("goals"), args.get("goals"))),
+            "raw_output": _str(_first_value(parsed.get("raw_output"), args.get("raw_output"))),
+            "error_text": _str(_first_value(parsed.get("error"), args.get("error"))),
+            "traceback_text": _str(parsed.get("traceback")),
+        }
+    )
+
+
+def _fill_missing_result_context(out: dict[str, Any], result_row: dict[str, Any] | None) -> None:
+    if not result_row:
+        return
+    temp = _empty_row(Path(out.get("exp_dir") or "."), float(out.get("generated_at_unix") or 0.0))
+    temp.update(_record_keys(result_row))
+    temp.update(
+        {
+            "status": _str(result_row.get("status")),
+            "root_proved": _str(result_row.get("root_proved")),
+        }
+    )
+    _populate_common_json_fields(temp, result_row)
+    for key, value in temp.items():
+        if key in {"exp_dir", "exp_name", "generated_at_unix"}:
+            continue
+        if out.get(key) in (None, "") and value not in (None, ""):
+            out[key] = value
 
 
 def _row_from_jsonl(
@@ -284,6 +462,7 @@ def _row_from_jsonl(
             "artifact_type": artifact_type,
             "rel_path": rel_path,
             "file_path": str(path),
+            "file_size_bytes": path.stat().st_size,
             "file_index": file_index,
             "row_index": row_index,
             "raw_text": raw,
@@ -321,6 +500,10 @@ def _row_from_jsonl(
             "result_text": _str(parsed.get("result")),
         }
     )
+    _populate_common_json_fields(out, parsed)
+    if artifact_type != "result":
+        result_row = result_by_record.get(out["record_id"]) or result_by_id.get(out["id"]) or {}
+        _fill_missing_result_context(out, result_row)
     if not out["theorem_name"] and out["thm_name"]:
         out["theorem_name"] = out["thm_name"]
     return out
@@ -343,6 +526,7 @@ def _row_from_file(
             "artifact_type": artifact_type,
             "rel_path": str(rel_path),
             "file_path": str(path),
+            "file_size_bytes": path.stat().st_size,
             "file_index": file_index,
             "row_index": 1,
             "raw_text": raw_text,
@@ -354,10 +538,14 @@ def _row_from_file(
             parsed = json.loads(raw_text)
             out["raw_json"] = _json_dumps(parsed)
             out.update(_record_keys(parsed if isinstance(parsed, dict) else None))
+            if isinstance(parsed, dict):
+                _populate_common_json_fields(out, parsed)
+                if artifact_type == "lean_runtime":
+                    out["lean_runtime_json"] = out["raw_json"]
         except json.JSONDecodeError as exc:
             out["parse_error"] = str(exc)
 
-    if artifact_type in {"checkpoint", "blueprint"}:
+    if artifact_type in {"checkpoint", "blueprint", "trace_event"}:
         record_id = path.stem
         if artifact_type == "blueprint" and len(path.parts) >= 2:
             record_id = path.parent.name
@@ -365,6 +553,7 @@ def _row_from_file(
         keys = _record_keys(result_row)
         keys["record_id"] = keys["record_id"] or record_id
         out.update(keys)
+        _fill_missing_result_context(out, result_row)
     return out
 
 
@@ -377,8 +566,12 @@ def _artifact_type(exp_dir: Path, path: Path) -> str:
         return "round"
     if rel.name == "metrics.json":
         return "metrics"
+    if rel.name == "metrics.csv":
+        return "metrics_csv"
     if rel.name == "lean_runtime.json":
         return "lean_runtime"
+    if rel.name == "runtime_history.json":
+        return "runtime_history"
     if parts and parts[0] == "traces" and path.suffix == ".jsonl":
         return "trace_event"
     if parts and parts[0] == "checkpoints":
