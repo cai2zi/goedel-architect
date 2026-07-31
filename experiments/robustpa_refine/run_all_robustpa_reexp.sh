@@ -114,8 +114,8 @@ except Exception:
   fi
 }
 
-run_exp qwen3_5_397b_MiniF2F_orig_rePipe_debug44 miniF2F global_original
-run_exp qwen3_5_397b_math500_orig_rePipe_debug44 MATH500 global_original
+# run_exp qwen3_5_397b_MiniF2F_orig_rePipe_debug44 miniF2F global_original
+# run_exp qwen3_5_397b_math500_orig_rePipe_debug44 MATH500 global_original
 
 run_exp qwen3_5_397b_MiniF2F_global_gemini_rephrase_rePipe_debug44 miniF2F global_gemini_rephrase
 run_exp qwen3_5_397b_math500_global_gemini_rephrase_rePipe_debug44 MATH500 global_gemini_rephrase
