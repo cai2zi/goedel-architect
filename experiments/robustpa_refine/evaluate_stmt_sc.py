@@ -4,6 +4,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -14,6 +15,21 @@ from tqdm import tqdm
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_EVAL_BASE = REPO_ROOT.parent / "czx_work" / "robustpa_eval"
 DEFAULT_ROBUST_PA_ROOT = REPO_ROOT.parent / "robust-proof-autoformalization"
+PROOF_SC_SCOPE_FINAL_PROOF = "final-proof"
+PROOF_SC_SCOPE_CONTEXT_NO_PROOF = "context-no-proof"
+PROOF_SC_SCOPE_CONTEXT_WITH_PROOF = "context-with-proof"
+PROOF_SC_SCOPE_ALIASES = {
+    PROOF_SC_SCOPE_FINAL_PROOF: PROOF_SC_SCOPE_FINAL_PROOF,
+    PROOF_SC_SCOPE_CONTEXT_NO_PROOF: PROOF_SC_SCOPE_CONTEXT_NO_PROOF,
+    PROOF_SC_SCOPE_CONTEXT_WITH_PROOF: PROOF_SC_SCOPE_CONTEXT_WITH_PROOF,
+    "final-theorem": PROOF_SC_SCOPE_FINAL_PROOF,
+    "all-proofs": PROOF_SC_SCOPE_CONTEXT_WITH_PROOF,
+}
+
+_BY_MARKER_RE = re.compile(r":=\s*by\b")
+_DECL_RE = re.compile(r"(?m)^\s*(?:def|theorem|lemma|example)\s+\w*")
+_DECL_NAME_RE = re.compile(r"^\s*(def|theorem|lemma|example)\s+([^\s:]+)?")
+_PROOF_DECL_KINDS = {"theorem", "lemma", "example"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,7 +83,23 @@ def parse_args() -> argparse.Namespace:
         default=int(os.environ.get("FULL_SC_WORKERS", os.environ.get("STMT_SC_WORKERS", "8"))),
         help="Concurrent Gemini judge calls.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--proof-sc-scope",
+        choices=sorted(PROOF_SC_SCOPE_ALIASES),
+        default=os.environ.get("PROOF_SC_SCOPE", PROOF_SC_SCOPE_FINAL_PROOF),
+        help=(
+            "Lean content shown to ProofSC: final-proof judges only the final "
+            "declaration proof body; context-no-proof prepends preceding def and "
+            "lemma/theorem/example context with proofs elided; context-with-proof "
+            "prepends preceding def and lemma/theorem/example context including proofs. "
+            "Backward-compatible aliases: "
+            "final-theorem=final-proof, all-proofs=context-with-proof."
+        ),
+    )
+    args = parser.parse_args()
+    args.proof_sc_scope_requested = args.proof_sc_scope
+    args.proof_sc_scope = PROOF_SC_SCOPE_ALIASES[args.proof_sc_scope]
+    return args
 
 
 def _resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
@@ -143,7 +175,143 @@ def _empty_sc_result(reason: str) -> dict[str, Any]:
     }
 
 
-def _score_one(row: dict[str, Any], *, sample_key: str, model, sc_mod) -> dict[str, Any]:
+def _decl_label(statement: str) -> str:
+    match = _DECL_NAME_RE.match(statement)
+    if not match:
+        return "declaration"
+    kind = match.group(1)
+    name = match.group(2) or ""
+    return f"{kind} {name}".strip()
+
+
+def _decl_kind(block: str) -> str:
+    match = _DECL_NAME_RE.match(block)
+    return match.group(1) if match else ""
+
+
+def _comment_block(title: str, text: str) -> str:
+    lines = [f"-- {title}"]
+    for line in text.rstrip().splitlines():
+        lines.append(f"-- {line}" if line else "--")
+    return "\n".join(lines)
+
+
+def _elide_proof(block: str) -> str:
+    by_match = _BY_MARKER_RE.search(block)
+    if not by_match:
+        return block.strip()
+    return f"{block[: by_match.end()].rstrip()}\n  -- proof elided for ProofSC context"
+
+
+def _extract_final_proof_with_context(
+    generated_fl: str,
+    *,
+    include_context: bool,
+    include_context_proofs: bool,
+) -> tuple[str | None, str | None, dict[str, Any]]:
+    if not generated_fl:
+        return None, None, {
+            "proof_context_declaration_count": 0,
+            "proof_context_proofs_included": include_context_proofs,
+        }
+
+    decls = list(_DECL_RE.finditer(generated_fl))
+    declaration_blocks: list[tuple[str, str]] = []
+    for idx, decl in enumerate(decls):
+        start = decl.start()
+        end = decls[idx + 1].start() if idx + 1 < len(decls) else len(generated_fl)
+        block = generated_fl[start:end].strip()
+        kind = _decl_kind(block)
+        if kind:
+            declaration_blocks.append((kind, block))
+
+    final_index = None
+    final_statement = None
+    final_proof_body = None
+    for idx in range(len(declaration_blocks) - 1, -1, -1):
+        kind, block = declaration_blocks[idx]
+        if kind not in _PROOF_DECL_KINDS:
+            continue
+        by_match = _BY_MARKER_RE.search(block)
+        if not by_match:
+            continue
+        final_index = idx
+        final_statement = block[: by_match.start()].rstrip()
+        final_proof_body = block[by_match.end() :].strip()
+        break
+
+    details = {
+        "proof_context_declaration_count": 0,
+        "proof_context_proofs_included": include_context_proofs,
+    }
+    if final_index is None or not final_statement:
+        return None, None, details
+
+    proof_sections: list[str] = []
+    if include_context:
+        context_blocks: list[str] = []
+        for kind, block in declaration_blocks[:final_index]:
+            if kind == "def" or include_context_proofs:
+                context_blocks.append(block.strip())
+            else:
+                context_blocks.append(_elide_proof(block))
+        if context_blocks:
+            details["proof_context_declaration_count"] = len(context_blocks)
+            context_label = (
+                "Lean context before final theorem (definitions and lemma proofs included)"
+                if include_context_proofs
+                else "Lean context before final theorem (lemma proofs elided)"
+            )
+            proof_sections.append(_comment_block(context_label, "\n\n".join(context_blocks)))
+
+    if final_proof_body:
+        proof_sections.append(final_proof_body)
+
+    return final_statement, "\n\n".join(proof_sections).strip(), details
+
+
+def _generated_for_proof_scope(
+    generated_fl: str,
+    proof_sc_scope: str,
+) -> tuple[str, dict[str, Any]]:
+    details: dict[str, Any] = {
+        "proof_sc_scope": proof_sc_scope,
+        "proof_sc_scope_transform": "none",
+    }
+    if proof_sc_scope == PROOF_SC_SCOPE_FINAL_PROOF:
+        return generated_fl, details
+
+    if proof_sc_scope == PROOF_SC_SCOPE_CONTEXT_NO_PROOF:
+        final_statement, proof_body, extract_details = _extract_final_proof_with_context(
+            generated_fl,
+            include_context=True,
+            include_context_proofs=False,
+        )
+    elif proof_sc_scope == PROOF_SC_SCOPE_CONTEXT_WITH_PROOF:
+        final_statement, proof_body, extract_details = _extract_final_proof_with_context(
+            generated_fl,
+            include_context=True,
+            include_context_proofs=True,
+        )
+    else:
+        final_statement, proof_body, extract_details = None, None, {}
+    details.update(extract_details)
+    if not final_statement or not proof_body:
+        details["proof_sc_scope_transform"] = "fallback_original"
+        return generated_fl, details
+
+    details["proof_sc_scope_transform"] = "context_as_final_body"
+    return f"{final_statement} := by\n{proof_body}", details
+
+
+def _score_one(
+    row: dict[str, Any],
+    *,
+    sample_key: str,
+    proof_sc_scope: str,
+    model,
+    sc_mod,
+) -> dict[str, Any]:
     idx = sample_key.split("#")[-1] if "#" in sample_key else "1"
     generated_fl = str(row.get(sample_key, "") or "")
     enriched = dict(row)
@@ -154,18 +322,29 @@ def _score_one(row: dict[str, Any], *, sample_key: str, model, sc_mod) -> dict[s
         result = _empty_sc_result("error_output")
     else:
         tc_passes = _truthy_metric(row.get("GOEDEL_root_proved"))
+        scoped_generated_fl, scope_details = _generated_for_proof_scope(
+            generated_fl,
+            proof_sc_scope,
+        )
         result = sc_mod.run_sc_v3(
             informal_statement=str(row.get("informal_statement") or ""),
             informal_proof=str(row.get("informal_proof") or ""),
-            generated_fl=generated_fl,
+            generated_fl=scoped_generated_fl,
             tc_passes=tc_passes,
             model=model,
         )
+        details = dict(result.get("LLM_SC_details") or {})
+        details.update(scope_details)
+        result["LLM_SC_details"] = details
         details = result.get("LLM_SC_details") or {}
         stmt_call = details.get("stmt_call") or {}
         proof_call = details.get("proof_call") or {}
         result["LLM_StmtSC_score"] = stmt_call.get("stmt_score")
         result["LLM_ProofSC_score"] = proof_call.get("proof_score")
+
+    details = dict(result.get("LLM_SC_details") or {})
+    details.setdefault("proof_sc_scope", proof_sc_scope)
+    result["LLM_SC_details"] = details
 
     for key, value in result.items():
         enriched[f"{key}#{idx}"] = value
@@ -316,6 +495,7 @@ def _summary(scored_rows: list[dict[str, Any]], args: argparse.Namespace) -> dic
         ),
         "gemini_model": args.gemini_model,
         "sample_key": args.sample_key,
+        "proof_sc_scope": args.proof_sc_scope,
         "groups": groups,
     }
 
@@ -325,7 +505,10 @@ def run(args: argparse.Namespace) -> tuple[Path, Path]:
     rows = _read_jsonl(input_path)
     if args.limit > 0:
         rows = rows[: args.limit]
-    print(f"[full-sc] rows={len(rows)} input={input_path}")
+    print(
+        f"[full-sc] rows={len(rows)} input={input_path} "
+        f"proof_sc_scope={args.proof_sc_scope}"
+    )
 
     if not (os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")):
         raise SystemExit("Set GOOGLE_API_KEY or GEMINI_API_KEY before running full SC.")
@@ -341,6 +524,7 @@ def run(args: argparse.Namespace) -> tuple[Path, Path]:
                 _score_one,
                 row,
                 sample_key=args.sample_key,
+                proof_sc_scope=args.proof_sc_scope,
                 model=model,
                 sc_mod=sc_mod,
             ): idx

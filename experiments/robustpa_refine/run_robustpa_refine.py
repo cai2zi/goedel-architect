@@ -43,6 +43,7 @@ from tracer import JsonlTracer  # noqa: E402
 DEFAULT_DATA_ROOT = REPO_ROOT.parent / "czx_work" / "RobustPABench"
 DEFAULT_OUTPUT_BASE = REPO_ROOT.parent / "czx_work" / "robustpa_refine"
 DEFAULT_MODEL = "deepseek-v4-flash"
+RUNTIME_HISTORY_FILENAME = "runtime_history.json"
 
 
 def _exp_name_component(values: str | list[str] | None, fallback: str) -> str:
@@ -724,11 +725,122 @@ def _format_elapsed_time(seconds: float) -> str:
     return "".join(parts)
 
 
+def _parse_elapsed_time(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    total = 0
+    token = ""
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if char.isdigit():
+            token += char
+            i += 1
+            continue
+        if not token:
+            return None
+        number = int(token)
+        token = ""
+        if text.startswith("min", i):
+            total += number * 60
+            i += 3
+        elif char == "h":
+            total += number * 3600
+            i += 1
+        elif char == "s":
+            total += number
+            i += 1
+        else:
+            return None
+    if token:
+        total += int(token)
+    return float(total)
+
+
+def _runtime_history_path(output_root: Path) -> Path:
+    return output_root / RUNTIME_HISTORY_FILENAME
+
+
+def _load_runtime_history(output_root: Path) -> dict[str, Any]:
+    path = _runtime_history_path(output_root)
+    if not path.exists():
+        return {"total_elapsed_s": 0.0, "runs": []}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {"total_elapsed_s": 0.0, "runs": []}
+    if not isinstance(data, dict):
+        return {"total_elapsed_s": 0.0, "runs": []}
+    runs = data.get("runs")
+    if not isinstance(runs, list):
+        runs = []
+    total_elapsed_s = data.get("total_elapsed_s", 0.0)
+    try:
+        total_elapsed_s = float(total_elapsed_s)
+    except (TypeError, ValueError):
+        total_elapsed_s = 0.0
+    return {"total_elapsed_s": total_elapsed_s, "runs": runs}
+
+
+def _load_previous_elapsed_s(output_root: Path) -> float:
+    history = _load_runtime_history(output_root)
+    if history["total_elapsed_s"] > 0:
+        return float(history["total_elapsed_s"])
+
+    metrics_path = output_root / "metrics.json"
+    if not metrics_path.exists():
+        return 0.0
+    try:
+        with metrics_path.open("r", encoding="utf-8") as f:
+            metrics = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return 0.0
+    if not isinstance(metrics, dict):
+        return 0.0
+    elapsed_s = metrics.get("elapsed_time_s")
+    if isinstance(elapsed_s, (int, float)):
+        return float(elapsed_s)
+    parsed = _parse_elapsed_time(metrics.get("elapsed_time"))
+    return parsed or 0.0
+
+
+def _record_runtime_run(
+    output_root: Path,
+    *,
+    previous_elapsed_s: float,
+    run_elapsed_s: float,
+    completed: bool,
+) -> dict[str, Any]:
+    history = _load_runtime_history(output_root)
+    runs = list(history.get("runs") or [])
+    total_elapsed_s = previous_elapsed_s + run_elapsed_s
+    runs.append({
+        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "elapsed_s": round(run_elapsed_s, 3),
+        "elapsed_time": _format_elapsed_time(run_elapsed_s),
+        "completed": completed,
+    })
+    data = {
+        "total_elapsed_s": round(total_elapsed_s, 3),
+        "total_elapsed_time": _format_elapsed_time(total_elapsed_s),
+        "runs": runs,
+    }
+    write_json(_runtime_history_path(output_root), data)
+    return data
+
+
 def _write_metrics(
     output_root: Path,
     rows: list[dict[str, Any]],
     *,
     elapsed_s: float | None = None,
+    current_run_elapsed_s: float | None = None,
 ) -> dict[str, Any]:
     metric_rows: list[dict[str, Any]] = [_metric_row("global", rows)]
 
@@ -755,6 +867,10 @@ def _write_metrics(
     }
     if elapsed_s is not None:
         metrics["elapsed_time"] = _format_elapsed_time(elapsed_s)
+        metrics["elapsed_time_s"] = round(elapsed_s, 3)
+    if current_run_elapsed_s is not None:
+        metrics["current_run_elapsed_time"] = _format_elapsed_time(current_run_elapsed_s)
+        metrics["current_run_elapsed_time_s"] = round(current_run_elapsed_s, 3)
     write_json(output_root / "metrics.json", metrics)
     with (output_root / "metrics.csv").open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(metric_rows[0]))
@@ -775,6 +891,7 @@ async def _run_experiment(
     runtime: LeanRuntime,
     *,
     started_at: float | None = None,
+    previous_elapsed_s: float = 0.0,
 ) -> None:
     records = _select_records(args)
     results_path = output_root / "results.jsonl"
@@ -858,8 +975,18 @@ async def _run_experiment(
 
     selected_ids = {record.unique_id for record in records}
     final_rows = [row for row_id, row in existing.items() if row_id in selected_ids]
-    elapsed_s = time.perf_counter() - started_at if started_at is not None else None
-    metrics = _write_metrics(output_root, final_rows, elapsed_s=elapsed_s)
+    current_run_elapsed_s = time.perf_counter() - started_at if started_at is not None else None
+    elapsed_s = (
+        previous_elapsed_s + current_run_elapsed_s
+        if current_run_elapsed_s is not None
+        else None
+    )
+    metrics = _write_metrics(
+        output_root,
+        final_rows,
+        elapsed_s=elapsed_s,
+        current_run_elapsed_s=current_run_elapsed_s,
+    )
     print(f"[done] results={results_path}", flush=True)
     print(f"[rounds] {rounds_path}", flush=True)
     print(f"[metrics] primary root_proved_acc={metrics['groups'][0]['root_proved_acc']}", flush=True)
@@ -870,12 +997,38 @@ def main(cfg: DictConfig) -> None:
     args = parse_args(cfg)
     output_root = args.output_base / args.exp_name
     output_root.mkdir(parents=True, exist_ok=True)
+    if not args.resume:
+        unlink_if_exists(_runtime_history_path(output_root))
+    previous_elapsed_s = _load_previous_elapsed_s(output_root) if args.resume else 0.0
     runtime = make_lean_runtime(args)
     try:
         prepare_lean_runtime_metadata(output_root, resume=args.resume, metadata=runtime.metadata)
         start = time.perf_counter()
-        asyncio.run(_run_experiment(args, output_root, runtime, started_at=start))
-        print(f"[runtime] duration_s={time.perf_counter() - start:.3f}", flush=True)
+        completed = False
+        try:
+            asyncio.run(
+                _run_experiment(
+                    args,
+                    output_root,
+                    runtime,
+                    started_at=start,
+                    previous_elapsed_s=previous_elapsed_s,
+                )
+            )
+            completed = True
+        finally:
+            run_elapsed_s = time.perf_counter() - start
+            history = _record_runtime_run(
+                output_root,
+                previous_elapsed_s=previous_elapsed_s,
+                run_elapsed_s=run_elapsed_s,
+                completed=completed,
+            )
+            print(
+                f"[runtime] duration_s={run_elapsed_s:.3f} "
+                f"total_duration_s={history['total_elapsed_s']:.3f}",
+                flush=True,
+            )
     finally:
         runtime.close()
 

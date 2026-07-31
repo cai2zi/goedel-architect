@@ -90,9 +90,16 @@ def prepare_lean_runtime_metadata(
     path = output_root / "lean_runtime.json"
     if resume:
         if not path.exists():
-            raise RuntimeError(
-                f"Cannot resume: {path} is missing; refusing to mix output without Lean runtime metadata."
-            )
+            has_existing_output = output_root.exists() and any(output_root.iterdir())
+            if has_existing_output:
+                raise RuntimeError(
+                    f"Cannot resume: {path} is missing; refusing to mix output without Lean runtime metadata."
+                )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8") as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+            return path
         with path.open("r", encoding="utf-8") as f:
             existing = json.load(f)
         if existing != metadata:

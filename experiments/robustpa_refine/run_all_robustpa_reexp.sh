@@ -14,7 +14,7 @@ MODEL="${MODEL:-Qwen3.5-397B-A17B-FP8}"
 VLLM_BASE_URL="${VLLM_BASE_URL:-http://127.0.0.1:8001/v1}"
 DATA_ROOT="${DATA_ROOT:-/ssd/czx/czx_work/RobustPABench}"
 OUTPUT_BASE="${OUTPUT_BASE:-/ssd/czx/czx_work/robustpa_refine}"
-RESUME="${RESUME:-false}"
+RESUME="${RESUME:-true}"
 LIMIT="${LIMIT:-null}"
 
 MAX_REFINEMENT_ITERATIONS="${MAX_REFINEMENT_ITERATIONS:-4}" # refine的次数
@@ -86,8 +86,10 @@ run_exp() {
   local exp_name="$1"
   local split="$2"
   local subset="$3"
+  local output_root="${OUTPUT_BASE%/}/${exp_name}"
   local start
   local elapsed
+  local metric_elapsed
   start="$(date +%s)"
   "${PYTHON_BIN}" experiments/robustpa_refine/run_robustpa_refine.py \
     "${COMMON_OVERRIDES[@]}" \
@@ -95,7 +97,21 @@ run_exp() {
     "split=${split}" \
     "subset=${subset}"
   elapsed=$(($(date +%s) - start))
-  printf '[runtime] exp_name=%s elapsed_time=%s\n' "${exp_name}" "$(format_elapsed "${elapsed}")"
+  metric_elapsed="$(
+    "${PYTHON_BIN}" -c 'import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+try:
+    print(json.loads(path.read_text(encoding="utf-8")).get("elapsed_time", ""))
+except Exception:
+    print("")' "${output_root}/metrics.json"
+  )"
+  if [[ -n "${metric_elapsed}" ]]; then
+    printf '[runtime] exp_name=%s current_run_elapsed_time=%s total_elapsed_time=%s\n' \
+      "${exp_name}" "$(format_elapsed "${elapsed}")" "${metric_elapsed}"
+  else
+    printf '[runtime] exp_name=%s current_run_elapsed_time=%s\n' \
+      "${exp_name}" "$(format_elapsed "${elapsed}")"
+  fi
 }
 
 run_exp qwen3_5_397b_MiniF2F_orig_rePipe_debug44 miniF2F global_original

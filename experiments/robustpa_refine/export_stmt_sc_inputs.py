@@ -5,6 +5,7 @@ import hashlib
 import json
 import sys
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +25,8 @@ LEAN_SERVER_API_KEY_ENV = "KIMINA_API_KEY"
 LEAN_SERVER_TIMEOUT_S = 600
 LEAN_SERVER_REUSE = True
 LEAN_SERVER_DEBUG = False
-LEAN_CHECK_CONCURRENCY = 64
+DEFAULT_WORKERS = 16
+LEAN_CHECK_CONCURRENCY = 16
 _GOEDEL_HELPERS: tuple[Any, Any, Any, Any] | None = None
 
 
@@ -99,7 +101,24 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Export only the first N final result rows after de-duplication (0 = all).",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help="Number of export rows to process concurrently.",
+    )
+    parser.add_argument(
+        "--lean-check-concurrency",
+        type=int,
+        default=LEAN_CHECK_CONCURRENCY,
+        help="Concurrency passed to the Kimina Lean compiler client.",
+    )
+    args = parser.parse_args()
+    if args.workers <= 0:
+        raise SystemExit("--workers must be positive")
+    if args.lean_check_concurrency <= 0:
+        raise SystemExit("--lean-check-concurrency must be positive")
+    return args
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -133,6 +152,25 @@ class ParquetRowCache:
         if idx < 0 or idx >= len(rows):
             raise IndexError(f"row_index out of range: {parquet_path}:{row_index_1based}")
         return rows[idx]
+
+
+def _preload_source_rows(
+    result_rows: list[dict[str, Any]],
+    read_parquet_rows,
+) -> list[tuple[dict[str, Any], str]]:
+    parquet_cache = ParquetRowCache(read_parquet_rows)
+    source_rows: list[tuple[dict[str, Any], str]] = []
+    for result_row in tqdm(result_rows, desc="load-source-rows", unit="row"):
+        try:
+            source_row = parquet_cache.get_row(
+                Path(str(result_row.get("parquet_path") or "")),
+                int(result_row.get("row_index") or 0),
+            )
+        except BaseException as exc:
+            source_rows.append(({}, _result_text(exc)))
+        else:
+            source_rows.append((source_row, ""))
+    return source_rows
 
 
 def _result_text(exc: BaseException) -> str:
@@ -197,7 +235,7 @@ def _write_lean_file(
     return str(path), digest, len(lean_text)
 
 
-def _make_lean_compiler():
+def _make_lean_compiler(check_concurrency: int):
     from kimina_lean_compiler import KiminaLeanCompiler
 
     return KiminaLeanCompiler(
@@ -206,7 +244,7 @@ def _make_lean_compiler():
         timeout_s=LEAN_SERVER_TIMEOUT_S,
         reuse=LEAN_SERVER_REUSE,
         debug=LEAN_SERVER_DEBUG,
-        check_concurrency=LEAN_CHECK_CONCURRENCY,
+        check_concurrency=check_concurrency,
     )
 
 
@@ -272,6 +310,40 @@ def _make_export_row(
     }
 
 
+def _process_export_row(
+    index: int,
+    result_row: dict[str, Any],
+    source_row: dict[str, Any],
+    source_error: str,
+    lean_output_dir: Path,
+    compiler,
+) -> tuple[int, dict[str, Any], str]:
+    lean_text, assembly_kind, assembly_diag = _assemble_lean_from_checkpoint(
+        Path(str(result_row.get("checkpoint_path") or ""))
+    )
+    if source_error:
+        assembly_diag = dict(assembly_diag)
+        assembly_diag["source_row_error"] = source_error
+
+    lean_path, lean_hash, lean_chars = _write_lean_file(
+        lean_output_dir, result_row, lean_text, assembly_kind
+    )
+    lean_validated, lean_errors = _validate_export_lean(compiler, lean_text, assembly_kind)
+    export_row = _make_export_row(
+        result_row,
+        source_row,
+        lean_text,
+        assembly_kind,
+        assembly_diag,
+        lean_path,
+        lean_hash,
+        lean_chars,
+        lean_validated,
+        lean_errors,
+    )
+    return index, export_row, assembly_kind
+
+
 def export(args: argparse.Namespace) -> Path:
     _, _, _, read_parquet_rows = _load_goedel_helpers()
     if args.exp_dir is None:
@@ -294,55 +366,55 @@ def export(args: argparse.Namespace) -> Path:
     if args.limit > 0:
         result_rows = result_rows[: args.limit]
 
-    parquet_cache = ParquetRowCache(read_parquet_rows)
-    compiler = _make_lean_compiler()
+    source_rows = _preload_source_rows(result_rows, read_parquet_rows)
+    compiler = _make_lean_compiler(args.lean_check_concurrency)
     exported_rows: list[dict[str, Any]] = []
     counts: Counter[str] = Counter()
     validation_mismatches: list[str] = []
     validation_mismatch_rows: list[dict[str, Any]] = []
 
     try:
-        for result_row in tqdm(result_rows, desc="export-stmt-sc", unit="row"):
-            try:
-                source_row = parquet_cache.get_row(
-                    Path(str(result_row.get("parquet_path") or "")),
-                    int(result_row.get("row_index") or 0),
+        print(
+            f"[export] workers={args.workers} lean_check_concurrency={args.lean_check_concurrency}",
+            flush=True,
+        )
+        indexed_export_rows: list[dict[str, Any] | None] = [None] * len(result_rows)
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = [
+                executor.submit(
+                    _process_export_row,
+                    index,
+                    result_row,
+                    source_rows[index][0],
+                    source_rows[index][1],
+                    lean_output_dir,
+                    compiler,
                 )
-            except BaseException as exc:
-                source_row = {}
-                counts["source_row_error"] += 1
-                source_error = _result_text(exc)
-            else:
-                source_error = ""
-
-            lean_text, assembly_kind, assembly_diag = _assemble_lean_from_checkpoint(
-                Path(str(result_row.get("checkpoint_path") or ""))
-            )
-            if source_error:
-                assembly_diag = dict(assembly_diag)
-                assembly_diag["source_row_error"] = source_error
-
-            lean_path, lean_hash, lean_chars = _write_lean_file(
-                lean_output_dir, result_row, lean_text, assembly_kind
-            )
-            lean_validated, lean_errors = _validate_export_lean(compiler, lean_text, assembly_kind)
-            counts[assembly_kind] += 1
-            export_row = _make_export_row(
-                result_row,
-                source_row,
-                lean_text,
-                assembly_kind,
-                assembly_diag,
-                lean_path,
-                lean_hash,
-                lean_chars,
-                lean_validated,
-                lean_errors,
-            )
-            if lean_validated != bool(result_row.get("root_proved")):
-                validation_mismatches.append(str(result_row.get("id") or result_row.get("record_id") or ""))
+                for index, result_row in enumerate(result_rows)
+            ]
+            for future in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc="export-stmt-sc",
+                unit="row",
+            ):
+                index, export_row, assembly_kind = future.result()
+                source_error = source_rows[index][1]
+                if source_error:
+                    counts["source_row_error"] += 1
+                counts[assembly_kind] += 1
+                indexed_export_rows[index] = export_row
+        exported_rows = [
+            row
+            for row in indexed_export_rows
+            if row is not None
+        ]
+        for export_row in exported_rows:
+            if export_row["GOEDEL_export_lean_validated"] != export_row["GOEDEL_root_proved"]:
+                validation_mismatches.append(
+                    str(export_row.get("id") or export_row.get("record_id") or "")
+                )
                 validation_mismatch_rows.append(export_row)
-            exported_rows.append(export_row)
     finally:
         compiler.close()
 
