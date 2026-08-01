@@ -28,14 +28,15 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "experiments"))
 
 from blueprint import Blueprint, generate_blueprint_from_informal  # noqa: E402
-from checkpoint import CheckpointState  # noqa: E402
-from shared.io_utils import append_jsonl, safe_stem, unlink_if_exists, write_json  # noqa: E402
-from shared.lean_runtime import (  # noqa: E402
+from checkpoint import CheckpointState, RunStatus  # noqa: E402
+from robustpa_refine.io_utils import append_jsonl, safe_stem, unlink_if_exists, write_json  # noqa: E402
+from robustpa_refine.runtime import (  # noqa: E402
     LeanRuntime,
     make_lean_runtime,
-    prepare_lean_runtime_metadata,
+    write_lean_runtime_metadata,
 )
 from mathlib_retrieval import MathlibRetrieval  # noqa: E402
+from orchestrator import active_node_names  # noqa: E402
 from pipeline import run_phase2_async, run_phase3  # noqa: E402
 from tracer import JsonlTracer  # noqa: E402
 
@@ -91,23 +92,6 @@ def _optional_positive_int(value: Any) -> int | None:
         raise argparse.ArgumentTypeError("expected a positive integer or null") from exc
     if parsed <= 0:
         raise argparse.ArgumentTypeError("expected a positive integer or null")
-    return parsed
-
-
-def _optional_nonnegative_int(value: Any) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        raise argparse.ArgumentTypeError("expected a non-negative integer or null")
-    text = str(value).strip().lower()
-    if text in {"", "none", "null", "default", "omit"}:
-        return None
-    try:
-        parsed = int(text)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("expected a non-negative integer or null") from exc
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("expected a non-negative integer or null")
     return parsed
 
 
@@ -172,10 +156,7 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
     args.node_timeout_s = _optional_timeout(args.node_timeout_s)
     args.llm_api_timeout_s = _optional_timeout(args.llm_api_timeout_s)
     args.node_max_prove_turns = _optional_positive_int(args.node_max_prove_turns)
-    args.node_max_negation_probe_turns = _optional_nonnegative_int(
-        args.node_max_negation_probe_turns
-    )
-    args.parallel_tool_calls = _optional_positive_int(args.parallel_tool_calls)
+    args.max_tool_calls_per_turn = int(args.max_tool_calls_per_turn)
     _validate_args(args)
     return args
 
@@ -192,16 +173,14 @@ def _validate_args(args: argparse.Namespace) -> None:
     ):
         if getattr(args, name) <= 0:
             raise ValueError(f"{name} must be positive")
-    if args.node_max_negation_probe_turns is not None and args.node_max_negation_probe_turns < 0:
-        raise ValueError("node_max_negation_probe_turns must be non-negative or null")
     if args.max_refinement_iterations < 0:
         raise ValueError("max_refinement_iterations must be non-negative")
     if args.node_timeout_s is not None and args.node_timeout_s <= 0:
         raise ValueError("node_timeout_s must be positive or none/null/0")
     if args.llm_api_timeout_s is not None and args.llm_api_timeout_s <= 0:
         raise ValueError("llm_api_timeout_s must be positive or none/null/0")
-    if args.parallel_tool_calls is not None and args.parallel_tool_calls <= 0:
-        raise ValueError("parallel_tool_calls must be a positive integer or null")
+    if args.max_tool_calls_per_turn <= 0:
+        raise ValueError("max_tool_calls_per_turn must be a positive integer")
 
 
 def _read_parquet_rows(path: Path) -> list[dict[str, Any]]:
@@ -325,8 +304,6 @@ def _node_rows(blueprint: Blueprint | None, state: CheckpointState | None) -> li
             "signal": signal or "pending",
             "proof_body": result.get("proof_body", proved_cache.get(node.name, "")),
             "lean_errors": result.get("lean_errors", []),
-            "analysis": result.get("analysis", ""),
-            "suggested_fix": result.get("suggested_fix", ""),
         })
     return rows
 
@@ -336,7 +313,6 @@ def _score_state(blueprint: Blueprint | None, state: CheckpointState | None) -> 
         return {
             "root_theorem": "",
             "root_proved": False,
-            "all_nodes_proved": False,
             "total_nodes": 0,
             "proved_node_count": 0,
             "proved_ratio": 0.0,
@@ -345,8 +321,12 @@ def _score_state(blueprint: Blueprint | None, state: CheckpointState | None) -> 
             "infra_error_nodes": [],
             "infra_error_node_count": 0,
         }
-    node_names = {node.name for node in blueprint.nodes}
-    proved = node_names & set(state.proved_cache if state else {})
+    node_names = active_node_names(blueprint)
+    definition_names = {
+        node.name for node in blueprint.nodes
+        if node.kind == "definition" and node.name in node_names
+    }
+    proved = definition_names | (node_names & set(state.proved_cache if state else {}))
     failed = node_names - proved
     total_nodes = len(node_names)
     infra_error_nodes = sorted(
@@ -355,8 +335,7 @@ def _score_state(blueprint: Blueprint | None, state: CheckpointState | None) -> 
     )
     return {
         "root_theorem": blueprint.target_theorem,
-        "root_proved": blueprint.target_theorem in proved,
-        "all_nodes_proved": total_nodes > 0 and not failed,
+        "root_proved": bool(state and state.root_proved),
         "total_nodes": total_nodes,
         "proved_node_count": len(proved),
         "proved_ratio": round(len(proved) / total_nodes, 4) if total_nodes else 0.0,
@@ -426,8 +405,6 @@ def _result_row(
         "status": status,
         "phase": phase,
         "success": bool(score["root_proved"]),
-        "terminal": True,
-        "blueprint_success": bool(blueprint and blueprint.nodes and state),
         "iterations": state.iteration if state else 0,
         "checkpoint_path": str(checkpoint_path),
         "trace_path": str(trace_path),
@@ -435,8 +412,8 @@ def _result_row(
         "error": error,
         "lean_runtime": runtime.metadata,
         "node_max_prove_turns": args.node_max_prove_turns,
-        "node_max_negation_probe_turns": args.node_max_negation_probe_turns,
-        "parallel_tool_calls": args.parallel_tool_calls,
+        "negation_probe_turns": 1,
+        "max_tool_calls_per_turn": args.max_tool_calls_per_turn,
         **score,
     }
     if traceback_text:
@@ -527,7 +504,7 @@ async def _run_record(
                     phase2_contract_check_concurrency=args.phase2_contract_check_concurrency,
                 ),
             )
-            state = CheckpointState(theorem_stmt=record.informal_statement, model=args.model)
+            state = CheckpointState(informal_statement=record.informal_statement, model=args.model)
             state.set_blueprint(blueprint)
             state.save(checkpoint_path)
             path = _write_blueprint_snapshot(
@@ -550,13 +527,13 @@ async def _run_record(
             blueprint = state.get_blueprint()
             if blueprint is None:
                 raise RuntimeError(f"No blueprint in checkpoint {checkpoint_path}")
-            if state.done:
-                status = "solved" if state.success else "failed"
+            if state.status != RunStatus.RUNNING:
+                status = state.status.value
                 return _result_row(
                     record,
                     output_root,
                     status=status,
-                    phase="done",
+                    phase="terminal",
                     blueprint=blueprint,
                     state=state,
                     runtime=runtime,
@@ -570,15 +547,13 @@ async def _run_record(
                 orch_result = await run_phase2_async(
                     checkpoint_path=checkpoint_path,
                     compiler=runtime.compiler,
-                    compiler_factory=runtime.compiler_factory,
                     retrieval=MathlibRetrieval(),
                     tracer=phase2_tracer,
                     node_timeout_s=args.node_timeout_s,
                     llm_api_timeout_s=args.llm_api_timeout_s,
                     model=args.model,
                     node_max_prove_turns=args.node_max_prove_turns,
-                    node_max_negation_probe_turns=args.node_max_negation_probe_turns,
-                    parallel_tool_calls=args.parallel_tool_calls,
+                    max_tool_calls_per_turn=args.max_tool_calls_per_turn,
                     node_executor=node_executor,
                     node_semaphore=node_sem,
                 )
@@ -599,14 +574,15 @@ async def _run_record(
                 )
                 tqdm.write(
                     f"[phase2-done] {record.unique_id} iteration={state.iteration} "
-                    f"all_proved={orch_result.all_proved()}"
+                    f"root_solved={orch_result.root_solved} "
+                    f"status={state.status.value}"
                 )
 
-            if state.done and state.success:
+            if state.status != RunStatus.RUNNING:
                 return _result_row(
                     record,
                     output_root,
-                    status="solved",
+                    status=state.status.value,
                     phase="phase2",
                     blueprint=blueprint,
                     state=state,
@@ -615,8 +591,7 @@ async def _run_record(
                 )
 
             if state.iteration >= args.max_refinement_iterations:
-                state.done = True
-                state.success = False
+                state.status = RunStatus.EXHAUSTED
                 state.save(checkpoint_path)
                 return _result_row(
                     record,
@@ -688,8 +663,6 @@ async def _run_record(
 def _metric_row(scope: str, rows: list[dict[str, Any]], subset: str = "", split: str = "") -> dict[str, Any]:
     total = len(rows)
     root = sum(1 for row in rows if row.get("root_proved"))
-    all_nodes = sum(1 for row in rows if row.get("all_nodes_proved"))
-    blueprints = sum(1 for row in rows if row.get("blueprint_success"))
     return {
         "scope": scope,
         "subset": subset,
@@ -697,10 +670,6 @@ def _metric_row(scope: str, rows: list[dict[str, Any]], subset: str = "", split:
         "total": total,
         "root_proved_count": root,
         "root_proved_acc": root / total if total else 0.0,
-        "all_nodes_proved_count": all_nodes,
-        "all_nodes_proved_acc": all_nodes / total if total else 0.0,
-        "blueprint_success_count": blueprints,
-        "blueprint_success_rate": blueprints / total if total else 0.0,
         "avg_iterations": sum(float(row.get("iterations") or 0) for row in rows) / total if total else 0.0,
         "avg_total_nodes": sum(float(row.get("total_nodes") or 0) for row in rows) / total if total else 0.0,
         "avg_proved_ratio": sum(float(row.get("proved_ratio") or 0) for row in rows) / total if total else 0.0,
@@ -931,8 +900,8 @@ async def _run_experiment(
         f"node_timeout_s={args.node_timeout_s} "
         f"llm_api_timeout_s={args.llm_api_timeout_s} "
         f"node_max_prove_turns={args.node_max_prove_turns} "
-        f"node_max_negation_probe_turns={args.node_max_negation_probe_turns} "
-        f"parallel_tool_calls={args.parallel_tool_calls}",
+        "negation_probe_turns=1 "
+        f"max_tool_calls_per_turn={args.max_tool_calls_per_turn}",
         flush=True,
     )
 
@@ -1002,7 +971,7 @@ def main(cfg: DictConfig) -> None:
     previous_elapsed_s = _load_previous_elapsed_s(output_root) if args.resume else 0.0
     runtime = make_lean_runtime(args)
     try:
-        prepare_lean_runtime_metadata(output_root, resume=args.resume, metadata=runtime.metadata)
+        write_lean_runtime_metadata(output_root, runtime.metadata)
         start = time.perf_counter()
         completed = False
         try:

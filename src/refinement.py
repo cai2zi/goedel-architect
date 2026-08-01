@@ -11,8 +11,8 @@ from llm_client import make_client
 
 from blueprint import (
     Blueprint,
-    REPO_SEARCH_SUFFIX,
-    _call_with_repo_search,
+    _call_blueprint_model,
+    _emit_lean_check_result,
     _extract_lean_code,
     _max_tokens as _blueprint_max_tokens,
     _parse_blueprint,
@@ -21,7 +21,7 @@ from blueprint import (
     phase2_contract_errors,
     phase2_standalone_contract_errors,
 )
-from lean_compiler import AbstractLeanCompiler
+from kimina_lean_compiler import KiminaInfrastructureError, KiminaLeanCompiler
 from orchestrator import OrchestratorResult
 from goedel_prompts import load, render
 from prover import ProofSignal
@@ -38,12 +38,6 @@ MAX_RETRIES = 8
 # rounds instead of re-sending every prior round's full annotated Lean file
 # every time.
 MAX_HISTORY_ROUNDS = 3
-
-# Cap a single node's embedded diagnosis text (LLM-generated analysis +
-# suggested fix). Uncapped, a verbose per-node analysis gets replayed
-# round after round (within the MAX_HISTORY_ROUNDS window) for any node
-# that keeps failing, which is exactly the case that costs the most.
-MAX_DIAGNOSIS_CHARS = 800
 
 # Matches one @[blueprint ...] node's full text block (attribute + decl +
 # body), used to locate and edit individual node blocks by name rather than
@@ -66,13 +60,11 @@ _VERDICT_RE = re.compile(
 def refine_blueprint(
     blueprint: Blueprint,
     orch_result: OrchestratorResult,
-    compiler: AbstractLeanCompiler,
+    compiler: KiminaLeanCompiler,
     model: str = "labs-leanstral-1-5",
-    repo_context: str | None = None,
     history: list[str] | None = None,
     iteration: int = 0,
     max_iterations: int = 0,
-    repo_retrieval=None,
     tracer=None,
     thm_name: str = "",
     max_retries: int = MAX_RETRIES,
@@ -110,20 +102,10 @@ def refine_blueprint(
         prior_rounds = []
         dropped_rounds_summary = ""
 
-    system_content = REFINEMENT_SYSTEM_PROMPT
-    if repo_retrieval is not None:
-        system_content = system_content.strip() + "\n" + REPO_SEARCH_SUFFIX
-    # repo_context is a static per-theorem block (doesn't change round to
-    # round), so re-sending it in full on every refinement round is a fixed
-    # cost multiplied by however many rounds run. Only the first round gets
-    # it verbatim to bootstrap understanding; later rounds fall back on the
-    # live repo_search tool (already wired in via repo_retrieval above) for
-    # anything they still need to look up.
-    effective_repo_context = repo_context if iteration == 0 else None
     messages = [
-        {"role": "system", "content": system_content},
+        {"role": "system", "content": REFINEMENT_SYSTEM_PROMPT},
         {"role": "user", "content": _build_refinement_user_prompt(
-            annotated_lean, effective_repo_context, prior_rounds=prior_rounds,
+            annotated_lean, prior_rounds=prior_rounds,
             iteration=iteration, max_iterations=max_iterations,
             total_prior_rounds=total_prior_rounds,
             dropped_rounds_summary=dropped_rounds_summary,
@@ -132,11 +114,10 @@ def refine_blueprint(
 
     last_error_feedback = ""
     for attempt in range(max_retries):
-        response = _call_with_repo_search(
+        response = _call_blueprint_model(
             client,
             model,
             messages,
-            repo_retrieval,
             _reasoning_kwargs(model),
             _blueprint_max_tokens(),
             tracer=tracer, thm_name=thm_name, phase="phase3",
@@ -145,6 +126,18 @@ def refine_blueprint(
         lean_code = _extract_lean_code(content)
 
         result = compiler.check_blueprint(lean_code, blueprint.target_theorem)
+        _emit_lean_check_result(
+            tracer,
+            thm_name=thm_name,
+            phase="phase3",
+            attempt=attempt + 1,
+            target=blueprint.target_theorem,
+            result=result,
+        )
+        if result.failure_kind == "infra":
+            raise KiminaInfrastructureError(
+                "\n".join(result.diagnostics) or result.raw_output[-2000:]
+            )
         if result.success:
             parsed = _parse_blueprint(lean_code, blueprint.target_theorem)
             if parsed.nodes:
@@ -178,13 +171,10 @@ def refine_blueprint(
                         ),
                     })
                     continue
-                parsed.fully_validated = result.validated
                 print(f"  [refine] attempt {attempt + 1}/{max_retries}: check_blueprint OK", flush=True)
                 return parsed
             # Compiles, but has zero @[blueprint]-annotated declarations - an
-            # empty node set would make all_proved() vacuously true downstream
-            # with no actual proof recorded, so this must be retried rather
-            # than accepted (mirrors generate_blueprint's same guard).
+            # A zero-node response cannot contain the required root proof node.
             print(f"  [refine] attempt {attempt + 1}/{max_retries}: check_blueprint OK but zero nodes, retrying", flush=True)
             messages.append({"role": "assistant", "content": content})
             messages.append({
@@ -198,7 +188,7 @@ def refine_blueprint(
             continue
 
         # Feed compile errors back for next attempt
-        error_feedback = "\n".join(result.errors) or result.raw_output[-2000:]
+        error_feedback = "\n".join(result.diagnostics) or result.raw_output[-2000:]
         last_error_feedback = error_feedback
         print(f"  [refine] attempt {attempt + 1}/{max_retries}: check_blueprint FAILED - "
               f"{error_feedback[:300]!r}", flush=True)
@@ -245,7 +235,7 @@ def _annotate_with_verdicts(blueprint: Blueprint, orch_result: OrchestratorResul
                 elif nr.result.signal == ProofSignal.FORMALLY_NEGATED:
                     # Distinct red-node marker (Section 4.3 / Figure 1)
                     output_lines.append("-- FORMALLY_NEGATED")
-                    output_lines.append(_truncate_diagnosis(nr.result.diagnosis_block(name)))
+                    output_lines.append(nr.result.diagnosis_block(name))
                 elif nr.result.signal == ProofSignal.INFRA_ERROR:
                     # Infrastructure/tooling failure (timeout, exception), not
                     # a genuine proof-difficulty verdict - flagged distinctly
@@ -255,16 +245,16 @@ def _annotate_with_verdicts(blueprint: Blueprint, orch_result: OrchestratorResul
                         "-- INFRA_ERROR (infrastructure/tooling failure, not a "
                         "genuine proof-difficulty signal)"
                     )
-                    output_lines.append(_truncate_diagnosis(nr.result.diagnosis_block(name)))
+                    output_lines.append(nr.result.diagnosis_block(name))
                 elif nr.result.signal == ProofSignal.BLOCKED_BY_DEPENDENCY:
                     # The prover intentionally did not attempt this node because
                     # an upstream dependency failed. Keep this separate from a
                     # genuine proof attempt that exhausted its tool budget.
                     output_lines.append("-- BLOCKED_BY_DEPENDENCY")
-                    output_lines.append(_truncate_diagnosis(nr.result.diagnosis_block(name)))
+                    output_lines.append(nr.result.diagnosis_block(name))
                 else:
                     output_lines.append("-- UNPROVED")
-                    output_lines.append(_truncate_diagnosis(nr.result.diagnosis_block(name)))
+                    output_lines.append(nr.result.diagnosis_block(name))
         i += 1
 
     return "\n".join(output_lines)
@@ -290,14 +280,6 @@ def _strip_proof_sketch_for_solved(lean_file: str, orch_result: OrchestratorResu
     return _NODE_BLOCK_RE.sub(replace, lean_file)
 
 
-def _truncate_diagnosis(block: str, limit: int = MAX_DIAGNOSIS_CHARS) -> str:
-    if len(block) <= limit:
-        return block
-    truncated = block[:limit].rstrip()
-    omitted = len(block) - len(truncated)
-    return f"{truncated}\n... [diagnosis truncated, {omitted} more chars omitted]\n-/"
-
-
 def _summarize_dropped_rounds(dropped_rounds: list[str]) -> str:
     """One compact line per round dropped from the replayed history window,
     recovering just (node name -> verdict) pairs from that round's already-
@@ -316,7 +298,6 @@ def _summarize_dropped_rounds(dropped_rounds: list[str]) -> str:
 
 def _build_refinement_user_prompt(
     annotated_lean: str,
-    repo_context: str | None = None,
     prior_rounds: list[str] | None = None,
     iteration: int = 0,
     max_iterations: int = 0,
@@ -357,7 +338,6 @@ def _build_refinement_user_prompt(
     return render(
         REFINEMENT_USER_TEMPLATE,
         annotated_lean=annotated_lean,
-        repo_context=repo_context or "",
         prior_rounds=prior_rounds_text,
         round_info=round_info,
     )

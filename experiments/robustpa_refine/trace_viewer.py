@@ -14,9 +14,6 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_EXP_DIR = Path("/ssd/czx/czx_work/robustpa_refine/qwen3_5_397b_MiniF2F_orig_refine")
-
-
 def _jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -198,8 +195,11 @@ def _event_summary(event: dict[str, Any], max_text: int) -> dict[str, Any]:
             out["short"] = _norm(result, max_text)
     elif kind == "llm_usage":
         out["short"] = json.dumps(args or {}, ensure_ascii=False, sort_keys=True)
+    elif kind == "node_finished":
+        out["short"] = f"wall={float((args or {}).get('wall_time_s') or 0):.1f}s; signal={(args or {}).get('signal')}"
     elif kind == "final_verify":
-        out["short"] = f"wall={float((args or {}).get('wall_time_s') or 0):.1f}s; {_norm((args or {}).get('error'), max_text)}"
+        errors = (args or {}).get("lean_errors") or []
+        out["short"] = "root closure ok" if event.get("ok") else _norm(errors, max_text)
     elif kind == "lean_check_result":
         errors = (args or {}).get("errors") or []
         out["short"] = "ok" if event.get("ok") else _norm(errors[0] if errors else "", max_text)
@@ -252,7 +252,7 @@ def build_trace_payload(
         kind = event.get("kind")
         thm_name = str(event.get("thm_name") or "")
         turn = int(event.get("turn") or 0)
-        if kind in {"theorem_start", "llm_response", "tool_call", "tool_result", "model_text", "final_verify", "llm_usage", "llm_error"} and thm_name != unique_id:
+        if kind in {"theorem_start", "llm_response", "tool_call", "tool_result", "model_text", "node_finished", "llm_usage", "llm_error"} and thm_name != unique_id:
             grouped[(thm_name, turn)].append(event)
         else:
             phase_events.append(event)
@@ -302,9 +302,9 @@ def build_trace_payload(
             "checkpoint_path": str(ref.checkpoint_path) if ref.checkpoint_path else "",
         },
         "checkpoint": {
-            "theorem_stmt": (checkpoint or {}).get("theorem_stmt", ""),
-            "done": (checkpoint or {}).get("done"),
-            "success": (checkpoint or {}).get("success"),
+            "informal_statement": (checkpoint or {}).get("informal_statement", ""),
+            "status": (checkpoint or {}).get("status"),
+            "root_proved": (checkpoint or {}).get("status") == "solved",
             "iteration": (checkpoint or {}).get("iteration"),
             "proved_cache_count": len((checkpoint or {}).get("proved_cache") or {}),
             "refinement_history_count": len((checkpoint or {}).get("refinement_history") or []),
@@ -324,7 +324,6 @@ def build_trace_payload(
                 "kind": node.get("kind"),
                 "signal": node.get("signal"),
                 "dependencies": node.get("dependencies"),
-                "analysis": _norm(node.get("analysis"), max_text),
                 "errors": [_norm(error, max_text) for error in (node.get("lean_errors") or [])[:3]],
             }
             for node in latest_nodes
@@ -643,7 +642,6 @@ HTML_PAGE = r"""<!doctype html>
           <button data-node="${esc(node.name)}">View</button>
           <strong>${esc(node.name)}</strong> ${tag(node.signal, cls)} ${tag(node.kind || '')}
           <div class="small muted">${esc((node.dependencies || []).join(', '))}</div>
-          ${node.analysis ? `<div class="small">${esc(node.analysis)}</div>` : ''}
           ${(node.errors || []).map((err) => `<pre>${esc(err)}</pre>`).join('')}
         </div>`;
       }).join('');
@@ -713,8 +711,8 @@ HTML_PAGE = r"""<!doctype html>
               <div>${tag(p.record_id)} ${tag(p.theorem_name || '')}</div>
               ${p.error ? `<pre class="bad">${esc(p.error)}</pre>` : ''}
               <details open>
-                <summary><span>theorem statement</span><span></span><span></span></summary>
-                <div class="body">${jsonBlock(data.checkpoint.theorem_stmt || '')}</div>
+                <summary><span>informal statement</span><span></span><span></span></summary>
+                <div class="body">${jsonBlock(data.checkpoint.informal_statement || '')}</div>
               </details>
             </div>
           </div>
@@ -849,7 +847,7 @@ class ReusableTCPServer(socketserver.ThreadingTCPServer):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Serve a local RobustPA trace viewer.")
-    parser.add_argument("exp_dir", type=Path, nargs="?", default=DEFAULT_EXP_DIR)
+    parser.add_argument("exp_dir", type=Path)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     return parser.parse_args()

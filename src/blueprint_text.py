@@ -1,7 +1,7 @@
 """Shared text helpers for the ``@[blueprint]`` Lean grammar.
 
 This module deliberately has no project-local imports so both ``blueprint``
-and ``lean_compiler`` can use the same regexes without creating a circular
+and the Kimina compiler can use the same regexes without creating a circular
 dependency.
 """
 from __future__ import annotations
@@ -42,8 +42,7 @@ def extract_blueprint_signature(text: str) -> str:
     if proof_match:
         return text[:proof_match.start()].strip()
 
-    # Compatibility for old checkpoints or non-standard declarations that do
-    # not use the blueprint ``:= by sorry_using [...]`` proof placeholder.
+    # Definitions have executable ``:= ...`` bodies rather than proof placeholders.
     return text.split(":=", 1)[0].strip()
 
 

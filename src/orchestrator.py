@@ -1,8 +1,4 @@
-"""Phase 2: Parallel DAG traversal.
-
-Proves blueprint nodes in topological order, running each wave in parallel.
-Proved lemma bodies are threaded as context into dependent nodes.
-"""
+"""Phase 2 traversal of the root theorem's active dependency closure."""
 from __future__ import annotations
 
 import asyncio
@@ -10,12 +6,11 @@ import functools
 import time
 from concurrent.futures import Executor
 from dataclasses import dataclass, field
-from typing import Callable
 
 import networkx as nx
 
 from blueprint import Blueprint, BlueprintNode, render_solved_declaration
-from lean_compiler import AbstractLeanCompiler
+from kimina_lean_compiler import KiminaLeanCompiler
 from mathlib_retrieval import MathlibRetrieval
 from prover import ProofSignal, ProverResult, prove_node
 from tracer import NullTracer
@@ -30,33 +25,52 @@ class NodeResult:
 @dataclass
 class OrchestratorResult:
     node_results: dict[str, NodeResult] = field(default_factory=dict)
+    active_nodes: set[str] = field(default_factory=set)
+    root_name: str = ""
 
     @property
     def proved(self) -> set[str]:
-        return {n for n, r in self.node_results.items() if r.result.signal == ProofSignal.SOLVED}
+        return {
+            name for name, node_result in self.node_results.items()
+            if node_result.result.signal == ProofSignal.SOLVED
+        }
 
     @property
     def failed(self) -> dict[str, NodeResult]:
-        return {n: r for n, r in self.node_results.items() if r.result.signal != ProofSignal.SOLVED}
+        return {
+            name: node_result for name, node_result in self.node_results.items()
+            if node_result.result.signal != ProofSignal.SOLVED
+        }
 
-    def all_proved(self) -> bool:
-        # bool(self.node_results) guards against an empty result set being
-        # vacuously "all proved" - a blueprint/refinement fallback that
-        # produces zero nodes must never be reported as a successful proof.
-        return bool(self.node_results) and not self.failed
+    @property
+    def root_solved(self) -> bool:
+        result = self.node_results.get(self.root_name)
+        return result is not None and result.result.signal == ProofSignal.SOLVED
+
+
+def active_node_names(blueprint: Blueprint) -> set[str]:
+    """All definitions plus the root's transitive proof-node dependencies."""
+    root = blueprint.node_by_name(blueprint.target_theorem)
+    if root is None or root.kind not in {"lemma", "theorem"}:
+        raise ValueError(
+            f"Blueprint root `{blueprint.target_theorem}` is missing or is not a proof node"
+        )
+    node_map = blueprint.nodes_by_name()
+    active = {node.name for node in blueprint.nodes if node.kind == "definition"}
+    stack = [root.name]
+    while stack:
+        name = stack.pop()
+        if name in active:
+            continue
+        node = node_map.get(name)
+        if node is None:
+            continue
+        active.add(name)
+        stack.extend(dep for dep in node.dependencies if dep in node_map)
+    return active
 
 
 def _transitive_deps(node: BlueprintNode, blueprint: Blueprint) -> set[str]:
-    """All ancestor dependencies of `node`, direct and transitive.
-
-    A node's own proof only ever references its *direct* `sorry_using [...]`
-    deps by name, but a direct dependency's spliced-in proof body can itself
-    reference ITS OWN dependencies (e.g. `add_comm_succ_case`'s proof calls
-    `add_comm_succ_left_rewrite`, which is add_comm_succ_case's dependency,
-    not add_comm's). Splicing only direct deps as aux lemmas leaves those
-    transitive references unresolved - "unknown identifier" - even though
-    the underlying lemma is fully proved.
-    """
     seen: set[str] = set()
     stack = list(node.dependencies)
     while stack:
@@ -70,220 +84,154 @@ def _transitive_deps(node: BlueprintNode, blueprint: Blueprint) -> set[str]:
     return seen
 
 
-def _build_dag(blueprint: Blueprint) -> nx.DiGraph:
+def _build_dag(blueprint: Blueprint, active: set[str]) -> nx.DiGraph:
     dag = nx.DiGraph()
-    node_names = {node.name for node in blueprint.nodes}
+    for name in active:
+        dag.add_node(name)
     for node in blueprint.nodes:
-        dag.add_node(node.name)
-    for node in blueprint.nodes:
+        if node.name not in active:
+            continue
         for dep in node.dependencies:
-            if dep in node_names:
+            if dep in active:
                 dag.add_edge(dep, node.name)
     return dag
 
 
 async def prove_dag(
     blueprint: Blueprint,
-    compiler: AbstractLeanCompiler | None,
+    compiler: KiminaLeanCompiler,
     retrieval: MathlibRetrieval,
     model: str = "labs-leanstral-1-5",
     proved_cache: dict[str, str] | None = None,
     nodes_to_retry: set[str] | None = None,
-    compiler_factory: Callable[[], AbstractLeanCompiler] | None = None,
-    repo_retrieval=None,
     tracer=None,
     node_timeout_s: float | None = 300.0,
     llm_api_timeout_s: float | None = 120.0,
     node_max_prove_turns: int | None = None,
-    node_max_negation_probe_turns: int | None = None,
-    parallel_tool_calls: int | None = None,
+    max_tool_calls_per_turn: int = 3,
     node_executor: Executor | None = None,
     node_semaphore: asyncio.Semaphore | None = None,
 ) -> OrchestratorResult:
-    """
-    Prove all nodes in the blueprint DAG in parallel waves.
-
-    compiler_factory: if provided, called once per node to get a fresh compiler.
-    node_timeout_s: wall-clock bound per node (covers the whole multi-turn tool
-        loop). A node that exceeds this comes back as INFRA_ERROR instead of
-        blocking the rest of the wave indefinitely. None disables the bound.
-    node_max_prove_turns: optional cap on assistant responses in the normal
-        per-node proving loop. None keeps prover.py's default.
-    node_max_negation_probe_turns: optional cap on assistant responses in the
-        negation-probe loop after proving fails. 0 disables negation probing.
-    parallel_tool_calls: maximum number of tool calls to execute from one
-        assistant message in Phase2. A value of 1 asks the provider for serial
-        tool calls; values greater than 1 enable provider-side parallel tool
-        calls, but only the first N returned tool calls are executed.
-    llm_api_timeout_s: per-request timeout passed to the OpenAI-compatible
-        chat client used by prover.py. This bounds a single queued/generating
-        LLM HTTP request; None disables the client-side timeout.
-        node_timeout_s bounds the whole node proof loop.
-    node_executor/node_semaphore: optional shared limits for node proof work
-        across multiple concurrently-proved blueprints.
-    """
-    dag = _build_dag(blueprint)
-    dag_node_names = set(dag.nodes)
-    orch_result = OrchestratorResult()
-    cached_bodies = dict(proved_cache or {})
-    definition_nodes = [node for node in blueprint.nodes if node.kind == "definition"]
-    definition_names = {node.name for node in definition_nodes}
-    # Definitions are already checked as part of the fully validated Phase 1
-    # blueprint.  Never interpret a legacy cached value as their proof body:
-    # old checkpoints may contain a complete declaration submitted by the LLM.
-    proof_bodies: dict[str, str] = {
-        name: body
-        for name, body in cached_bodies.items()
-        if (node := blueprint.node_by_name(name)) is not None
+    active = active_node_names(blueprint)
+    dag = _build_dag(blueprint, active)
+    result = OrchestratorResult(active_nodes=active, root_name=blueprint.target_theorem)
+    definitions = [
+        node for node in blueprint.nodes
+        if node.kind == "definition" and node.name in active
+    ]
+    definition_names = {node.name for node in definitions}
+    proof_bodies = {
+        name: body for name, body in (proved_cache or {}).items()
+        if name in active
+        and (node := blueprint.node_by_name(name)) is not None
         and node.kind != "definition"
     }
-    available_names = definition_names | set(proof_bodies)
+    available = definition_names | set(proof_bodies)
     tracer = tracer or NullTracer()
 
-    for node in definition_nodes:
-        orch_result.node_results[node.name] = NodeResult(
-            node=node,
-            result=ProverResult(signal=ProofSignal.SOLVED, proof_body=""),
+    for node in definitions:
+        result.node_results[node.name] = NodeResult(
+            node, ProverResult(ProofSignal.SOLVED),
         )
-
     for name, body in proof_bodies.items():
         node = blueprint.node_by_name(name)
         if node:
-            orch_result.node_results[name] = NodeResult(
-                node=node,
-                result=ProverResult(signal=ProofSignal.SOLVED, proof_body=body),
+            result.node_results[name] = NodeResult(
+                node, ProverResult(ProofSignal.SOLVED, body),
             )
 
     for generation in nx.topological_generations(dag):
         candidates = [
             name for name in generation
-            if name not in available_names
+            if name not in available
+            and name not in definition_names
             and (nodes_to_retry is None or name in nodes_to_retry)
         ]
-        if not candidates:
-            continue
-
-        # A node whose blueprint-graph dependency isn't solved yet will always
-        # compile against an unresolved `sorry` stand-in for that dependency,
-        # so it is guaranteed to fail with a generic "declaration uses 'sorry'"
-        # error no matter what proof the model writes - and that error message
-        # is indistinguishable from "your own tactic left a hole", so the model
-        # can't tell it's structurally stuck and burns its whole tool-call
-        # budget guessing tactics. Skip the doomed attempt entirely instead.
         wave: list[str] = []
         for name in candidates:
             node = blueprint.node_by_name(name)
-            unresolved_deps = sorted(
-                dep for dep in node.dependencies
-                if dep in dag_node_names and dep not in available_names
+            assert node is not None
+            unresolved = sorted(
+                dep for dep in node.dependencies if dep in active and dep not in available
             )
-            if unresolved_deps:
-                print(f"    [node {name}] skipped - blocked on unresolved "
-                      f"dependency {'/'.join(unresolved_deps)}", flush=True)
-                orch_result.node_results[name] = NodeResult(
-                    node=node,
-                    result=ProverResult(
-                        signal=ProofSignal.BLOCKED_BY_DEPENDENCY,
-                        analysis=(
-                            f"Skipped without attempting a proof: dependency "
-                            f"{'/'.join(unresolved_deps)} is not yet proved, so "
-                            "this node would compile against an unresolved "
-                            "`sorry` stand-in regardless of its own tactic."
-                        ),
+            if unresolved:
+                result.node_results[name] = NodeResult(
+                    node,
+                    ProverResult(
+                        ProofSignal.BLOCKED_BY_DEPENDENCY,
+                        lean_errors=[f"Unresolved dependencies: {', '.join(unresolved)}"],
                     ),
                 )
             else:
                 wave.append(name)
-
         if not wave:
             continue
-
-        print(f"  [wave] starting {len(wave)} node(s): {sorted(wave)}", flush=True)
-
         tasks = [
             _prove_one(
                 name=name,
                 blueprint=blueprint,
                 proof_bodies=proof_bodies,
                 compiler=compiler,
-                compiler_factory=compiler_factory,
                 retrieval=retrieval,
-                repo_retrieval=repo_retrieval,
                 model=model,
                 tracer=tracer,
                 node_timeout_s=node_timeout_s,
                 llm_api_timeout_s=llm_api_timeout_s,
                 node_max_prove_turns=node_max_prove_turns,
-                node_max_negation_probe_turns=node_max_negation_probe_turns,
-                parallel_tool_calls=parallel_tool_calls,
+                max_tool_calls_per_turn=max_tool_calls_per_turn,
                 node_executor=node_executor,
                 node_semaphore=node_semaphore,
             )
             for name in wave
         ]
-        wave_results: list[NodeResult] = await asyncio.gather(*tasks)
-
-        for nr in wave_results:
-            orch_result.node_results[nr.node.name] = nr
-            if nr.result.signal == ProofSignal.SOLVED:
-                proof_bodies[nr.node.name] = nr.result.proof_body
-                available_names.add(nr.node.name)
-
-    return orch_result
+        wave_results = await asyncio.gather(*tasks)
+        for node_result in wave_results:
+            name = node_result.node.name
+            result.node_results[name] = node_result
+            if node_result.result.signal == ProofSignal.SOLVED:
+                proof_bodies[name] = node_result.result.proof_body
+                available.add(name)
+    return result
 
 
 async def _prove_one(
+    *,
     name: str,
     blueprint: Blueprint,
     proof_bodies: dict[str, str],
-    compiler: AbstractLeanCompiler | None,
+    compiler: KiminaLeanCompiler,
     retrieval: MathlibRetrieval,
     model: str,
-    compiler_factory: Callable[[], AbstractLeanCompiler] | None = None,
-    repo_retrieval=None,
-    tracer=None,
-    node_timeout_s: float | None = None,
-    llm_api_timeout_s: float | None = 120.0,
-    node_max_prove_turns: int | None = None,
-    node_max_negation_probe_turns: int | None = None,
-    parallel_tool_calls: int | None = None,
-    node_executor: Executor | None = None,
-    node_semaphore: asyncio.Semaphore | None = None,
+    tracer,
+    node_timeout_s: float | None,
+    llm_api_timeout_s: float | None,
+    node_max_prove_turns: int | None,
+    max_tool_calls_per_turn: int,
+    node_executor: Executor | None,
+    node_semaphore: asyncio.Semaphore | None,
 ) -> NodeResult:
     node = blueprint.node_by_name(name)
     assert node is not None
-
     ancestor_deps = _transitive_deps(node, blueprint)
-    # Splice order must be topological - Lean rejects forward references, and
-    # a set (from _transitive_deps) has no defined iteration order.
-    ordered_deps = [
-        n.name for n in blueprint.dependency_order()
-        if n.kind != "definition"
-        and n.name in ancestor_deps
-        and n.name in proof_bodies
+    ordered_parents = [
+        candidate for candidate in blueprint.dependency_order()
+        if candidate.kind != "definition"
+        and candidate.name in ancestor_deps
+        and candidate.name in proof_bodies
     ]
-    parent_proofs = {dep: proof_bodies[dep] for dep in ordered_deps}
-    active_compiler = compiler_factory() if compiler_factory else compiler
-    assert active_compiler is not None
-
-    # Restore every blueprint definition as global context. Their executable
-    # bodies are not encoded in sorry_using dependencies, but statements and
-    # proofs can still refer to them across the DAG.
-    declaration_context = [
+    definitions = [
         definition.full_declaration()
-        for definition in blueprint.nodes
-        if definition.kind == "definition"
+        for definition in blueprint.nodes if definition.kind == "definition"
     ]
-    declaration_context.extend(
-        render_solved_declaration(dep_node, body)
-        for dep, body in parent_proofs.items()
-        if (dep_node := blueprint.node_by_name(dep)) is not None
-    )
-    parent_lemma_decls = "\n\n".join(declaration_context)
+    parent_signatures = [parent.signature() for parent in ordered_parents]
+    compiled_context = definitions + [
+        render_solved_declaration(parent, proof_bodies[parent.name])
+        for parent in ordered_parents
+    ]
+    parent_lemma_decls = "\n\n".join(compiled_context)
 
-    async def attempt(timeout_s: float | None) -> tuple[ProverResult, float]:
-        t0 = time.monotonic()
-        loop = asyncio.get_event_loop()
+    async def attempt() -> ProverResult:
+        loop = asyncio.get_running_loop()
         if node_semaphore is not None:
             await node_semaphore.acquire()
         future = loop.run_in_executor(
@@ -292,58 +240,43 @@ async def _prove_one(
                 prove_node,
                 node_name=name,
                 canonical_stmt=node.lean_declaration,
-                parent_proofs=parent_proofs,
+                parent_signatures=parent_signatures,
+                definition_decls=definitions,
                 parent_lemma_decls=parent_lemma_decls,
                 header=blueprint.phase2_header,
-                compiler=active_compiler,
+                compiler=compiler,
                 retrieval=retrieval,
                 model=model,
                 node_statement_nl=node.statement,
                 node_proof_sketch_nl=node.proof_sketch,
-                repo_retrieval=repo_retrieval,
                 tracer=tracer,
                 api_timeout_s=llm_api_timeout_s,
                 max_prove_turns=node_max_prove_turns,
-                max_negation_probe_turns=node_max_negation_probe_turns,
-                parallel_tool_calls=parallel_tool_calls,
+                max_tool_calls_per_turn=max_tool_calls_per_turn,
             ),
         )
         if node_semaphore is not None:
-            future.add_done_callback(lambda _future: node_semaphore.release())
-        try:
-            result = await asyncio.wait_for(asyncio.shield(future), timeout=timeout_s)
-        except asyncio.TimeoutError:
-            dt = time.monotonic() - t0
-            print(f"    [node {name}] TIMED OUT after {dt:.1f}s (bound={timeout_s}s, model={model}) "
-                  f"- the underlying call keeps running in its worker thread, "
-                  f"but this node is marked infra_error so the wave can proceed", flush=True)
-            # Note: run_in_executor uses a real OS thread, which asyncio.wait_for
-            # cannot forcibly kill - GoedelProver's own api_timeout_s (client-level
-            # request timeout) is what actually bounds the underlying OpenAI call.
-            # INFRA_ERROR (not PROOF_TOO_HARD): a timeout says nothing about
-            # whether the sub-goal is actually hard, so it must not be fed to
-            # Phase 3 refinement as if the model had genuinely tried and failed.
-            result = ProverResult(
-                signal=ProofSignal.INFRA_ERROR,
-                analysis=f"Node timed out after {timeout_s}s (orchestrator bound).",
-            )
-        except Exception as exc:
-            # An unhandled exception here (network blip, rate limit, etc.) would
-            # otherwise propagate through asyncio.gather and take down the whole
-            # wave - including sibling nodes that were succeeding - so it's
-            # caught per-node the same way a timeout is. INFRA_ERROR, not
-            # PROOF_TOO_HARD - see comment above.
-            dt = time.monotonic() - t0
-            print(f"    [node {name}] ERRORED after {dt:.1f}s (model={model}) -> {exc!r} "
-                  f"- marked infra_error so the wave can proceed", flush=True)
-            result = ProverResult(
-                signal=ProofSignal.INFRA_ERROR,
-                analysis=f"Node raised {type(exc).__name__}: {exc}",
-            )
-        return result, time.monotonic() - t0
+            future.add_done_callback(lambda _: node_semaphore.release())
+        if node_timeout_s is None:
+            return await future
+        return await asyncio.wait_for(asyncio.shield(future), timeout=node_timeout_s)
 
-    print(f"    [node {name}] started", flush=True)
-
-    result, dt = await attempt(node_timeout_s)
-    print(f"    [node {name}] finished after {dt:.1f}s -> {result.signal.value}", flush=True)
-    return NodeResult(node=node, result=result)
+    started = time.monotonic()
+    try:
+        proof_result = await attempt()
+    except asyncio.TimeoutError:
+        proof_result = ProverResult(
+            ProofSignal.INFRA_ERROR,
+            lean_errors=[f"Node timed out after {node_timeout_s}s"],
+        )
+    except Exception as exc:
+        proof_result = ProverResult(
+            ProofSignal.INFRA_ERROR,
+            lean_errors=[f"Node raised {type(exc).__name__}: {exc}"],
+        )
+    print(
+        f"    [node {name}] finished after {time.monotonic() - started:.1f}s "
+        f"-> {proof_result.signal.value}",
+        flush=True,
+    )
+    return NodeResult(node, proof_result)

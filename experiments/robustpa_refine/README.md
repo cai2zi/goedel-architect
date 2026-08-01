@@ -1,156 +1,92 @@
-# RobustPA Informal-Only Refine
+# RobustPA Kimina-Only Refine
 
-Runs Goedel-Architect on RobustPABench using only `informal_statement` and
-`informal_proof`. The experiment ignores `formal_statement` and `formal_proof`.
+This experiment uses only each RobustPABench row's `informal_statement` and
+`informal_proof`. The formal statement and proof in the dataset are not passed
+to the pipeline.
 
-Lean checks use a manually managed Kimina server by default:
+## Services
+
+Kimina must expose `POST /api/check` at the configured `lean_api_url` (default
+`http://127.0.0.1:8000`). The OpenAI-compatible model endpoint is configured
+separately (the examples use `http://127.0.0.1:8001/v1`).
+
+The Kimina image/environment must include Mathlib, `Architect`, `sorry_using`,
+and `#validate_blueprint`. No local Lean compiler is used by this repository.
+
+## Run One Record
+
+The runner uses Hydra overrides, not argparse flags:
 
 ```bash
-cd /ssd/czx/kimina-lean-server
-/ssd/miniconda3/envs/lean4-czx/bin/python -m server
+/ssd/miniconda3/envs/lean4-czx/bin/python \
+  experiments/robustpa_refine/run_robustpa_refine.py \
+  exp_name=kimina_smoke \
+  subset=global_original \
+  split=MATH500 \
+  problem_id=test_prealgebra_1924 \
+  model=Qwen3.5-397B-A17B-FP8 \
+  openai_base_url=http://127.0.0.1:8001/v1
 ```
 
-The default config points RobustPA refine at `http://localhost:8000`.
+Important defaults in `configs/base.yaml`:
 
-```bash
-conda activate lean4-czx
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 vllm serve /ssd/czx/models/Qwen3.5-397B-A17B-FP8 \
-  --served-model-name Qwen3.5-397B-A17B-FP8 \
-  --host 0.0.0.0 \
-  --port 8001 \
-  --tensor-parallel-size 8 \
-  --max-model-len 65536 \
-  --max-num-seqs 128 \
-  --gpu-memory-utilization 0.95 \
-  --trust-remote-code \
-  --enable-auto-tool-choice \
-  --tool-call-parser qwen3_xml
-```
-Example:
-
-
-```bash
-python experiments/robustpa_refine/run_robustpa_refine.py \
-  --exp-name vllm_qwen_run1 \
-  --model <vllm-model-name> \
-  --openai-base-url http://localhost:8000/v1 \
-  --resume
+```yaml
+max_refinement_iterations: 4
+node_max_prove_turns: 8
+max_tool_calls_per_turn: 3
+lean_check_concurrency: 64
 ```
 
-Useful smoke test:
+The negation probe is fixed in code to one turn with one `lean_compile` call.
+It is not configurable. `node_timeout_s` and `llm_api_timeout_s` may be `null`
+for local long-running inference.
+
+## Proof Protocol
+
+Normal turns expose `lean_compile`, `step_lean_compile`, and `mathlib_search`.
+Within a turn, valid calls are deduplicated and capped before the assistant
+message is added to history. Dropped calls produce one aggregate trace event
+and no ignored tool messages. Lean calls are sent in one Kimina batch while
+searches run concurrently; tool results are restored to original call order.
+
+`step_lean_compile` accepts a complete standalone Lean file and cannot solve a
+node. The final proving turn exposes only `lean_compile` with required tool
+choice. Cross-turn duplicate calls reuse the node-session cache.
+
+Only a successful no-sorry Kimina compile of the assembled root dependency
+closure sets `status=solved` and `root_proved=true`. Refinement exhaustion is
+recorded as `exhausted`; Kimina infrastructure failure is `error`.
+
+## Outputs
+
+Outputs are written under
+`/ssd/czx/czx_work/robustpa_refine/<exp_name>` by default:
+
+- `results.jsonl`: one terminal result per selected record.
+- `rounds.jsonl`: phase and refinement audit rows.
+- `metrics.json`, `metrics.csv`: aggregate and grouped metrics.
+- `checkpoints/`: current-schema checkpoints.
+- `traces/`: tool, node, and final verification JSONL traces.
+- `blueprints/`: blueprint snapshots by iteration.
+
+`final_verify` appears only for the assembled root closure compilation;
+individual nodes finish with `node_finished`. Existing checkpoints from older
+schemas are deliberately unsupported.
+
+## Inspect Results
 
 ```bash
-python experiments/robustpa_refine/run_robustpa_refine.py \
-  --exp-name smoke \
-  --subset global_original \
-  --split miniF2F \
-  --limit 1 \
-  --model <vllm-model-name> \
-  --openai-base-url http://localhost:8000/v1 \
-  --llm-api-timeout-s none
-```
+/ssd/miniconda3/envs/lean4-czx/bin/python \
+  experiments/robustpa_refine/summarize_for_chat.py \
+  /ssd/czx/czx_work/robustpa_refine/<exp_name>
 
-`--llm-api-timeout-s` controls the timeout for one OpenAI-compatible LLM HTTP
-request. `--node-timeout-s` controls the whole Phase2 proof loop for one node,
-which may contain multiple LLM calls and Lean tool calls. RobustPA defaults
-both to `null` for local vLLM runs. Passing `0`, `none`, or `null` on the
-command line has the same effect.
-
-`parallel_tool_calls=N` controls the per-turn Phase2 tool-call budget. `1`
-asks the provider for at most one tool call per assistant message and processes
-only one; values greater than `1` allow provider-side parallel tool calls, but
-the runner executes only the first `N` tool calls from a turn and ignores the
-rest. `node_max_prove_turns` controls how many assistant responses are allowed
-in the normal proving loop, and `node_max_negation_probe_turns` controls the
-same budget for the negation probe after proving fails. Setting
-`node_max_negation_probe_turns: 0` disables the negation probe. The default
-config sets `parallel_tool_calls: 4`, `node_max_prove_turns: 8`, and
-`node_max_negation_probe_turns: 4`.
-
-Subset filtering:
-
-`--subset` may be passed more than once. If omitted, the runner uses every
-subset under the data root that contains parquet files. Current available
-subsets in `/ssd/czx/czx_work/RobustPABench` are:
-
-- `global_gemini_rephrase`
-- `global_gemini_step`
-- `global_original`
-- `global_qwen3_rephrase`
-- `global_qwen3_step`
-- `local_number_edit_proof`
-- `local_number_edit_statement`
-- `local_step_delete`
-- `local_symbol_edit_proof`
-- `local_symbol_edit_statement`
-
-Outputs are written to `/ssd/czx/czx_work/robustpa_refine/<exp_name>` by
-default:
-
-- `results.jsonl`: one final row per selected sample.
-- `rounds.jsonl`: one audit row per phase/iteration, including node verdicts.
-- `metrics.json` and `metrics.csv`: global, subset, split, and subset/split
-  accuracy summaries.
-- `checkpoints/`, `traces/`, `blueprints/`: per-run intermediate state, traces,
-  and per-round Lean blueprint snapshots.
-
-With `resume: true`, only samples whose latest result has
-`root_proved: true` or `status: exhausted` are skipped. Every other selected
-sample is cleared from `results.jsonl` and `rounds.jsonl`, its checkpoint,
-trace, and blueprint artifacts are deleted, and it is rerun from Phase 1.
-Checkpoints are not resumed at the node or refinement-iteration level.
-
-Build a compact one-file bundle for web-chat analysis:
-
-```bash
-python experiments/robustpa_refine/summarize_for_chat.py \
-  /ssd/czx/czx_work/robustpa_refine/<exp_name> \
-  --output /ssd/czx/czx_work/robustpa_refine/<exp_name>/chat_bundle.md
-```
-
-The bundle summarizes `metrics.json`, `results.jsonl`, `rounds.jsonl`, and
-`traces/**/*.jsonl` without pasting raw trace logs. Use `--problem-rows all` if
-you want compact rows for every selected problem rather than failures only.
-
-Browse per-problem trace conversations in a local web UI:
-
-```bash
-python experiments/robustpa_refine/trace_viewer.py \
+/ssd/miniconda3/envs/lean4-czx/bin/python \
+  experiments/robustpa_refine/trace_viewer.py \
   /ssd/czx/czx_work/robustpa_refine/<exp_name> \
   --port 8765
 ```
 
-Open the printed URL, enter a `source_id`, `record_id`, or full unique id, and
-optionally filter by node name.
-
-## RobustPABench-Aligned StmtSC
-
-The runner intentionally keeps inference output in Goedel's native checkpoint
-format. To evaluate statement semantic consistency with the same StmtSC prompt
-and parser as `/ssd/czx/robust-proof-autoformalization`, export the final
-checkpoints first, then run the StmtSC judge.
-
-Artifacts are written under `/ssd/czx/czx_work/robustpa_eval/<exp_name>`:
-
-- `stmt_sc_inputs.jsonl` — RobustPABench-style rows with `LLM_Output#1`.
-- `stmt_sc_scored.jsonl` — rows enriched with `LLM_StmtSC?#1` and details.
-- `stmt_sc_summary.json` — overall and grouped StmtSC accuracy.
-- `lean_outputs/<subset>/<split>/<record_id>.lean` — assembled final/partial
-  Lean files reconstructed from checkpoints.
-
-Example:
-
-```bash
-python experiments/robustpa_refine/export_stmt_sc_inputs.py \
-  --exp-dir /ssd/czx/czx_work/robustpa_refine/qwen3_5_397b_MiniF2F_orig_reExp
-
-python experiments/robustpa_refine/evaluate_stmt_sc.py \
-  --exp-name qwen3_5_397b_MiniF2F_orig_reExp \
-  --gemini-model gemini-2.5-flash
-```
-
-The exporter evaluates only the final checkpoint for each problem. It includes
-all final `results.jsonl` rows in the denominator: solved, exhausted, and error
-rows. If a checkpoint cannot be assembled or no theorem can be extracted, the
-StmtSC scorer records `LLM_StmtSC?#1 = "no"` and reports the reason in the
-summary counts.
+StmtSC export and evaluation remain available through
+`export_stmt_sc_inputs.py` and `evaluate_stmt_sc.py`; semantic agreement with
+the original natural-language statement is judged there rather than by
+forbidding root declaration changes during Phase 3.

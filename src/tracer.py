@@ -16,7 +16,7 @@ from typing import Any
 
 @dataclass
 class TraceEvent:
-    kind: str          # theorem_start | tool_call | tool_result | model_text | final_verify
+    kind: str          # theorem_start | tool_call | tool_result | node_finished | final_verify
     thm_name: str
     turn: int = 0
     call_id: str | None = None

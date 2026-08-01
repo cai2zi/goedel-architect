@@ -1,37 +1,32 @@
-"""Top-level pipeline: Blueprint → Parallel Proving → Refinement loop.
-
-Wires all three phases together and runs up to 8 refinement iterations
-(matching Appendix A of the paper).
-
-The `compiler` parameter is injectable so the same pipeline works with:
-  - LeanCompiler (standalone Lean projects via `lake env lean`)
-  - VSBLeanCompiler (VeriSoftBench repos via LeanREPL)
-"""
+"""Kimina-only Blueprint -> Proving -> Refinement pipeline."""
 from __future__ import annotations
 
 import asyncio
-import re
 from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
 
 from blueprint import (
     Blueprint,
     format_phase2_contract_errors,
     generate_blueprint,
     phase2_contract_errors,
-    proof_body_to_decl_suffix,
     render_solved_declaration,
 )
-from checkpoint import CheckpointState
-from lean_compiler import AbstractLeanCompiler, LeanCompiler
+from checkpoint import CheckpointState, RunStatus
+from kimina_lean_compiler import KiminaInfrastructureError, KiminaLeanCompiler
 from mathlib_retrieval import MathlibRetrieval
-from orchestrator import NodeResult, OrchestratorResult, prove_dag
+from orchestrator import (
+    NodeResult,
+    OrchestratorResult,
+    active_node_names,
+    prove_dag,
+)
+from prover import ProofSignal, ProverResult
 from refinement import refine_blueprint
-from tracer import NullTracer
+from tracer import NullTracer, TraceEvent
 
-# From Appendix A
+
 MAX_REFINEMENT_ITERATIONS = 8
 
 
@@ -39,667 +34,62 @@ MAX_REFINEMENT_ITERATIONS = 8
 class ProofResult:
     success: bool
     theorem_name: str
-    proof_body: str = ""        # proof body of the root node if solved
-    final_lean_file: str = ""   # full assembled Lean file
-    aux_lemma_decls: str = ""   # every other proved node, re-declared as a real
-                                # lemma/theorem, so a caller compiling just
-                                # proof_body against the root's bare signature
-                                # (e.g. VeriSoftBench's own verify_proof) can
-                                # still resolve the root proof's references to
-                                # its dependencies by name
+    proof_body: str = ""
+    final_lean_file: str = ""
+    final_lean_errors: list[str] = field(default_factory=list)
     iterations: int = 0
     proved_nodes: list[str] = field(default_factory=list)
     failed_nodes: list[str] = field(default_factory=list)
 
 
 def _invalidate_stale_proofs(
-    new_blueprint: Blueprint,
+    blueprint: Blueprint,
     proved_cache: dict[str, str],
     proof_cache_keys: dict[str, str],
 ) -> dict[str, str]:
-    """Drop cached proofs that no longer match the node they were compiled against.
-
-    proved_cache tracks nodes by NAME only. Refinement (Phase 3) can reuse a
-    node's name while restructuring its signature or dependency list (e.g.
-    splitting a hypothesis, changing its goal shape, adding a new
-    sorry_using [...] dependency) - the paper's rule only promises
-    SOLVED/FORMALLY_NEGATED nodes carry forward byte-identical, but nothing
-    enforces that, and a name collision with a differently-shaped node would
-    otherwise leave a proof compiled against the OLD shape marked "already
-    solved" forever, never recompiled against the new one.
-
-    Rather than diffing the immediately-previous blueprint (which misses a
-    node deleted at round N and reintroduced with a different shape at round
-    N+2 - neither adjacent diff N->N+1 or N+1->N+2 ever sees both shapes at
-    once), this compares against `proof_cache_keys[name]`: the exact
-    BlueprintNode.cache_key() recorded at the moment the proof was accepted.
-    A name missing from `proof_cache_keys` (e.g. an older checkpoint written
-    before this field existed) is treated as stale and re-checked once.
-    """
-    pruned = dict(proved_cache)
-    for name in list(pruned):
-        new_node = new_blueprint.node_by_name(name)
-        if new_node is None or proof_cache_keys.get(name) != new_node.cache_key():
-            del pruned[name]
-    return pruned
-
-
-def _aux_lemma_decls(blueprint: Blueprint, proved_cache: dict[str, str], root_name: str) -> str:
-    return "\n\n".join(
-        render_solved_declaration(node, proved_cache[node.name])
-        for node in blueprint.dependency_order()
-        if node.name != root_name and node.name in proved_cache
-    )
-
-
-def prove_theorem(
-    theorem_stmt: str,
-    nl_proof: str | None = None,
-    model: str = "labs-leanstral-1-5",
-    compiler: AbstractLeanCompiler | None = None,
-    compiler_factory: Callable[[], AbstractLeanCompiler] | None = None,
-    retrieval: MathlibRetrieval | None = None,
-    repo_retrieval=None,
-    max_iterations: int = MAX_REFINEMENT_ITERATIONS,
-    tracer=None,
-    project_root: Path | None = None,
-    repo_context: str | None = None,
-    node_timeout_s: float | None = 300.0,
-    llm_api_timeout_s: float | None = 120.0,
-    checkpoint_path: Path | None = None,
-    thm_name: str = "",
-    node_max_prove_turns: int | None = None,
-    node_max_negation_probe_turns: int | None = None,
-    parallel_tool_calls: int | None = None,
-    blueprint_max_retries: int | None = None,
-    phase2_contract_check_concurrency: int = 1,
-) -> ProofResult:
-    """
-    Full Goedel-Architect pipeline for a single theorem.
-
-    1. Generate @[blueprint]-annotated dependency graph (Phase 1)
-    2. Prove each node in parallel (Phase 2)
-    3. Refine blueprint on failures and repeat (Phase 3)
-    Up to `max_iterations` refinement loops (default 8, per Appendix A).
-
-    Args:
-        compiler: Shared compiler instance (used for all nodes).
-        compiler_factory: Called once per node to get a fresh compiler.
-            Use this for VSBLeanCompiler which tracks call state per-theorem.
-            If both are provided, compiler_factory takes precedence.
-        repo_retrieval: Optional RepoRetrieval for repo_search tool.
-        tracer: Optional tracer for emitting events.
-        node_timeout_s: Per-node wall-clock bound in Phase 2 (see
-            orchestrator.prove_dag). None disables the bound.
-        llm_api_timeout_s: Per-request timeout for Phase 2 LLM HTTP calls.
-            Increase this when a local OpenAI-compatible server queues
-            requests for longer than the default 120s. None disables the
-            client-side timeout.
-        checkpoint_path: If given, state is saved after every phase and, if
-            the file already exists, resumed from wherever it left off
-            (skipping Phase 1 and any already-proved nodes). See checkpoint.py
-            and run_phase1/run_phase2/run_phase3 below for running phases
-            standalone instead of through this all-in-one loop.
-    """
-    tracer = tracer or NullTracer()
-
-    if compiler is None and compiler_factory is None:
-        root = project_root or Path(__file__).parent.parent / "goedel_lean"
-        compiler = LeanCompiler(root)
-
-    retrieval = retrieval or MathlibRetrieval()
-
-    state = CheckpointState.load_or_none(checkpoint_path)
-
-    if state and state.theorem_stmt and state.theorem_stmt != theorem_stmt:
-        # checkpoint_path is normally keyed by theorem name (see
-        # path_for_theorem), so this should never fire in normal use - a
-        # mismatch means something unusual happened (a manually-overridden
-        # checkpoint_path, a copy/paste error). Silently resuming or
-        # returning a cached result for the WRONG theorem statement is worse
-        # than refusing outright.
-        raise ValueError(
-            f"Checkpoint {checkpoint_path} was created for a different "
-            f"theorem_stmt than requested - refusing to resume/reuse it.\n"
-            f"  checkpoint theorem_stmt: {state.theorem_stmt!r}\n"
-            f"  requested theorem_stmt:  {theorem_stmt!r}"
-        )
-
-    if state and state.done:
-        # A prior run already finished this theorem (success or exhausted
-        # all iterations) — reconstruct the result from the checkpoint
-        # instead of re-running Phase 2/3 (which would burn API calls
-        # re-deriving an answer that's already on disk).
-        print(f"[Resume] checkpoint at {checkpoint_path} already done "
-              f"(success={state.success}) — returning cached result", flush=True)
-        return _proof_result_from_checkpoint(state)
-
-    resumed_blueprint = state.get_blueprint() if state else None
-
-    if resumed_blueprint is not None:
-        blueprint = resumed_blueprint
-        proved_cache: dict[str, str] = dict(state.proved_cache)
-        proof_cache_keys: dict[str, str] = dict(state.proof_cache_keys)
-        refinement_history: list[str] = list(state.refinement_history)
-        start_iteration = state.iteration
-        print(f"[Resume] loaded checkpoint at iteration {start_iteration + 1}, "
-              f"{len(proved_cache)} node(s) already proved", flush=True)
-    else:
-        # Phase 1: Blueprint generation
-        # Don't use compiler_factory for blueprint validation: factory compilers are
-        # stateful (track call counts, write temp files) and Phase 1 would exhaust
-        # retries on type-signature errors the LLM can't fix without repo context.
-        # Pass only an explicitly-shared compiler (e.g. standalone LeanCompiler).
-        blueprint_compiler = compiler  # None when only compiler_factory is provided
-        blueprint = generate_blueprint(
-            theorem_stmt=theorem_stmt,
-            nl_proof=nl_proof,
-            model=model,
-            compiler=blueprint_compiler,
-            repo_context=repo_context,
-            repo_retrieval=repo_retrieval,
-            tracer=tracer,
-            thm_name=thm_name,
-            max_retries=blueprint_max_retries or 8,
-            phase2_contract_check_concurrency=phase2_contract_check_concurrency,
-        )
-        proved_cache = {}
-        proof_cache_keys = {}
-        refinement_history = []
-        start_iteration = 0
-        state = CheckpointState(theorem_stmt=theorem_stmt, model=model, repo_context=repo_context or "")
-        state.set_blueprint(blueprint)
-        if checkpoint_path:
-            state.save(checkpoint_path)
-
-    orch_result: OrchestratorResult | None = None
-
-    for iteration in range(start_iteration, max_iterations):
-        # Phase 2: Parallel proving
-        nodes_to_try = set(blueprint.nodes_by_name()) - set(proved_cache)
-        print(f"\n[Phase 2 iteration {iteration+1}] Proving {len(nodes_to_try)} nodes: {sorted(nodes_to_try)}", flush=True)
-
-        orch_result = asyncio.run(
-            prove_dag(
-                blueprint=blueprint,
-                compiler=compiler,
-                compiler_factory=compiler_factory,
-                retrieval=retrieval,
-                repo_retrieval=repo_retrieval,
-                model=model,
-                proved_cache=proved_cache,
-                nodes_to_retry=nodes_to_try,
-                tracer=tracer,
-                node_timeout_s=node_timeout_s,
-                llm_api_timeout_s=llm_api_timeout_s,
-                node_max_prove_turns=node_max_prove_turns,
-                node_max_negation_probe_turns=node_max_negation_probe_turns,
-                parallel_tool_calls=parallel_tool_calls,
-            )
-        )
-
-        for name, nr in orch_result.node_results.items():
-            status = nr.result.signal.value
-            proof_preview = repr(nr.result.proof_body[:60]) if nr.result.proof_body else ""
-            print(f"  node '{name}': {status} {proof_preview}", flush=True)
-            if status == "solved":
-                proved_cache[name] = nr.result.proof_body
-                node = blueprint.node_by_name(name)
-                if node:
-                    proof_cache_keys[name] = node.cache_key()
-
-        print(f"  proved so far: {sorted(proved_cache.keys())}", flush=True)
-
-        if checkpoint_path:
-            state.iteration = iteration
-            state.proved_cache = dict(proved_cache)
-            state.proof_cache_keys = dict(proof_cache_keys)
-            state.set_node_results(orch_result.node_results)
-
-        if orch_result.all_proved():
-            root_name = blueprint.target_theorem
-            root_proof = proved_cache.get(root_name, "")
-            if checkpoint_path:
-                state.done = True
-                state.success = True
-                state.save(checkpoint_path)
-            return ProofResult(
-                success=True,
-                theorem_name=root_name,
-                proof_body=root_proof,
-                final_lean_file=_assemble_final_file(blueprint, orch_result),
-                aux_lemma_decls=_aux_lemma_decls(blueprint, proved_cache, root_name),
-                iterations=iteration + 1,
-                proved_nodes=list(orch_result.proved),
-                failed_nodes=[],
-            )
-
-        if checkpoint_path:
-            state.save(checkpoint_path)
-
-        if iteration == max_iterations - 1:
-            break
-
-        # Phase 3: Refinement
-        print(f"\n[Phase 3 iteration {iteration+1}] Refining blueprint ...", flush=True)
-        failed = [n for n in orch_result.node_results if orch_result.node_results[n].result.signal.value != "solved"]
-        print(f"  failed nodes: {failed}", flush=True)
-        refinement_compiler = compiler or (compiler_factory() if compiler_factory else None)
-        if refinement_compiler is None:
-            break
-        try:
-            blueprint = refine_blueprint(
-                blueprint=blueprint,
-                orch_result=orch_result,
-                compiler=refinement_compiler,
-                model=model,
-                repo_context=repo_context,
-                history=refinement_history,
-                iteration=iteration,
-                max_iterations=max_iterations,
-                repo_retrieval=repo_retrieval,
-                tracer=tracer,
-                thm_name=thm_name,
-                max_retries=blueprint_max_retries or 8,
-                phase2_contract_check_concurrency=phase2_contract_check_concurrency,
-            )
-            print(f"  new blueprint has {len(blueprint.nodes)} nodes: {[n.name for n in blueprint.nodes]}", flush=True)
-        except RuntimeError as e:
-            print(f"  refinement failed: {e}", flush=True)
-            # refine_blueprint mutates `history` in place before its own
-            # retry loop, so this round's attempt is already in memory even
-            # though refinement ultimately failed - persist it so the
-            # checkpoint's refinement_history isn't silently shorter than
-            # what was actually tried (matters for post-mortem diagnosis).
-            if checkpoint_path:
-                state.refinement_history = list(refinement_history)
-                state.save(checkpoint_path)
-            break  # refinement failed, stop iterations
-
-        stale = set(proved_cache) - set(_invalidate_stale_proofs(blueprint, proved_cache, proof_cache_keys))
-        if stale:
-            print(f"  invalidated stale proof(s) (no longer match the current node shape): {sorted(stale)}", flush=True)
-        proved_cache = _invalidate_stale_proofs(blueprint, proved_cache, proof_cache_keys)
-        proof_cache_keys = {name: key for name, key in proof_cache_keys.items() if name in proved_cache}
-
-        if checkpoint_path:
-            state.set_blueprint(blueprint)
-            state.refinement_history = list(refinement_history)
-            state.iteration = iteration + 1
-            state.proved_cache = dict(proved_cache)
-            state.proof_cache_keys = dict(proof_cache_keys)
-            state.node_results = {}  # stale against the new blueprint
-            state.save(checkpoint_path)
-
-    proved = list(orch_result.proved) if orch_result else []
-    failed = list(orch_result.failed.keys()) if orch_result else []
-    root_proof = proved_cache.get(blueprint.target_theorem, "")
-    if checkpoint_path:
-        state.done = True
-        state.success = False
-        state.save(checkpoint_path)
-    return ProofResult(
-        success=False,
-        theorem_name=blueprint.target_theorem,
-        proof_body=root_proof,
-        final_lean_file=_assemble_partial_file(blueprint, orch_result, proved_cache),
-        aux_lemma_decls=_aux_lemma_decls(blueprint, proved_cache, blueprint.target_theorem),
-        iterations=max_iterations,
-        proved_nodes=proved,
-        failed_nodes=failed,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Standalone phase entry points
-#
-# Each function does exactly one phase against a checkpoint file on disk, so
-# a caller can run e.g. Phase 2 without Phase 1 having just run in the same
-# process (only having run at some point and left a checkpoint behind), and
-# Phase 3 without re-running Phase 1 or Phase 2.
-# ---------------------------------------------------------------------------
-
-def run_phase1(
-    theorem_stmt: str,
-    nl_proof: str | None = None,
-    model: str = "labs-leanstral-1-5",
-    compiler: AbstractLeanCompiler | None = None,
-    repo_context: str | None = None,
-    checkpoint_path: Path | None = None,
-    repo_retrieval=None,
-    tracer=None,
-    thm_name: str = "",
-    phase2_contract_check_concurrency: int = 1,
-) -> Blueprint:
-    """Run Phase 1 (blueprint generation) alone and checkpoint the result."""
-    blueprint = generate_blueprint(
-        theorem_stmt=theorem_stmt,
-        nl_proof=nl_proof,
-        model=model,
-        compiler=compiler,
-        repo_context=repo_context,
-        repo_retrieval=repo_retrieval,
-        tracer=tracer,
-        thm_name=thm_name,
-        phase2_contract_check_concurrency=phase2_contract_check_concurrency,
-    )
-    if checkpoint_path:
-        state = CheckpointState(theorem_stmt=theorem_stmt, model=model, repo_context=repo_context or "")
-        state.set_blueprint(blueprint)
-        state.save(checkpoint_path)
-    return blueprint
-
-
-async def run_phase2_async(
-    checkpoint_path: Path,
-    compiler: AbstractLeanCompiler | None = None,
-    compiler_factory: Callable[[], AbstractLeanCompiler] | None = None,
-    retrieval: MathlibRetrieval | None = None,
-    repo_retrieval=None,
-    tracer=None,
-    node_timeout_s: float | None = 300.0,
-    llm_api_timeout_s: float | None = 120.0,
-    model: str | None = None,
-    node_max_prove_turns: int | None = None,
-    node_max_negation_probe_turns: int | None = None,
-    parallel_tool_calls: int | None = None,
-    node_executor: Executor | None = None,
-    node_semaphore: asyncio.Semaphore | None = None,
-) -> OrchestratorResult:
-    """Run one Phase 2 (parallel proving) pass against a checkpointed blueprint.
-
-    Requires Phase 1 to have already produced a checkpoint at `checkpoint_path`
-    (raises if it's missing or has no blueprint). Only nodes not already in
-    `proved_cache` are attempted; the checkpoint is updated with the new
-    `proved_cache` and `node_results` (the latter needed by Phase 3).
-    """
-    state = CheckpointState.load(checkpoint_path)
-    blueprint = state.get_blueprint()
-    if blueprint is None:
-        raise RuntimeError(f"No blueprint in checkpoint {checkpoint_path} — run Phase 1 first.")
-    contract_errors = phase2_contract_errors(blueprint)
-    if contract_errors:
-        raise RuntimeError(
-            f"Checkpoint blueprint is not phase2-ready; rerun Phase 1 for {checkpoint_path}.\n"
-            f"{format_phase2_contract_errors(contract_errors)}"
-        )
-
-    retrieval = retrieval or MathlibRetrieval()
-    proved_cache = dict(state.proved_cache)
-    proof_cache_keys = dict(state.proof_cache_keys)
-    nodes_to_try = set(blueprint.nodes_by_name()) - set(proved_cache)
-
-    orch_result = await prove_dag(
-        blueprint=blueprint,
-        compiler=compiler,
-        compiler_factory=compiler_factory,
-        retrieval=retrieval,
-        repo_retrieval=repo_retrieval,
-        model=model or state.model,
-        proved_cache=proved_cache,
-        nodes_to_retry=nodes_to_try,
-        tracer=tracer,
-        node_timeout_s=node_timeout_s,
-        llm_api_timeout_s=llm_api_timeout_s,
-        node_max_prove_turns=node_max_prove_turns,
-        node_max_negation_probe_turns=node_max_negation_probe_turns,
-        parallel_tool_calls=parallel_tool_calls,
-        node_executor=node_executor,
-        node_semaphore=node_semaphore,
-    )
-
-    for name, nr in orch_result.node_results.items():
-        if nr.result.signal.value == "solved":
-            proved_cache[name] = nr.result.proof_body
-            node = blueprint.node_by_name(name)
-            if node:
-                proof_cache_keys[name] = node.cache_key()
-
-    state.proved_cache = proved_cache
-    state.proof_cache_keys = proof_cache_keys
-    state.set_node_results(orch_result.node_results)
-    state.done = orch_result.all_proved()
-    state.success = state.done
-    state.save(checkpoint_path)
-    return orch_result
-
-
-def run_phase2(
-    checkpoint_path: Path,
-    compiler: AbstractLeanCompiler | None = None,
-    compiler_factory: Callable[[], AbstractLeanCompiler] | None = None,
-    retrieval: MathlibRetrieval | None = None,
-    repo_retrieval=None,
-    tracer=None,
-    node_timeout_s: float | None = 300.0,
-    llm_api_timeout_s: float | None = 120.0,
-    model: str | None = None,
-    node_max_prove_turns: int | None = None,
-    node_max_negation_probe_turns: int | None = None,
-    parallel_tool_calls: int | None = None,
-    node_executor: Executor | None = None,
-    node_semaphore: asyncio.Semaphore | None = None,
-) -> OrchestratorResult:
-    return asyncio.run(
-        run_phase2_async(
-            checkpoint_path=checkpoint_path,
-            compiler=compiler,
-            compiler_factory=compiler_factory,
-            retrieval=retrieval,
-            repo_retrieval=repo_retrieval,
-            tracer=tracer,
-            node_timeout_s=node_timeout_s,
-            llm_api_timeout_s=llm_api_timeout_s,
-            model=model,
-            node_max_prove_turns=node_max_prove_turns,
-            node_max_negation_probe_turns=node_max_negation_probe_turns,
-            parallel_tool_calls=parallel_tool_calls,
-            node_executor=node_executor,
-            node_semaphore=node_semaphore,
-        )
-    )
-
-
-def run_phase3(
-    checkpoint_path: Path,
-    compiler: AbstractLeanCompiler,
-    model: str | None = None,
-    repo_context: str | None = None,
-    max_iterations: int = MAX_REFINEMENT_ITERATIONS,
-    repo_retrieval=None,
-    tracer=None,
-    thm_name: str = "",
-    blueprint_max_retries: int | None = None,
-    phase2_contract_check_concurrency: int = 1,
-) -> Blueprint:
-    """Run one Phase 3 (refinement) pass against a checkpointed blueprint.
-
-    Requires Phase 2 to have already run against this checkpoint (i.e.
-    `node_results` present with at least one failure) — refinement needs
-    those diagnostics to know what to fix. Raises if the checkpoint has no
-    blueprint, no node results, or every node already solved.
-    """
-    state = CheckpointState.load(checkpoint_path)
-    blueprint = state.get_blueprint()
-    if blueprint is None:
-        raise RuntimeError(f"No blueprint in checkpoint {checkpoint_path} — run Phase 1 first.")
-    if not state.node_results:
-        raise RuntimeError(f"No node results in checkpoint {checkpoint_path} — run Phase 2 first.")
-    if state.iteration >= max_iterations:
-        # prove_theorem's own all-in-one loop already self-limits at
-        # max_iterations; standalone Phase 3 calls (this function) had no
-        # equivalent check, so a caller driving Phase 1/2/3 by hand via
-        # checkpoints could refine past the paper's bound indefinitely.
-        raise RuntimeError(
-            f"Checkpoint {checkpoint_path} is already at iteration "
-            f"{state.iteration} >= max_iterations={max_iterations} — "
-            "refusing another refinement round."
-        )
-
-    orch_result = _orch_result_from_checkpoint(state, blueprint)
-    if orch_result.all_proved():
-        raise RuntimeError(f"All nodes already proved in checkpoint {checkpoint_path} — nothing to refine.")
-
-    refinement_history = list(state.refinement_history)
-    new_blueprint = refine_blueprint(
-        blueprint=blueprint,
-        orch_result=orch_result,
-        compiler=compiler,
-        model=model or state.model,
-        repo_context=repo_context if repo_context is not None else state.repo_context,
-        history=refinement_history,
-        iteration=state.iteration,
-        max_iterations=max_iterations,
-        repo_retrieval=repo_retrieval,
-        tracer=tracer,
-        thm_name=thm_name,
-        max_retries=blueprint_max_retries or 8,
-        phase2_contract_check_concurrency=phase2_contract_check_concurrency,
-    )
-
-    new_proved_cache = _invalidate_stale_proofs(new_blueprint, state.proved_cache, state.proof_cache_keys)
-    state.proved_cache = new_proved_cache
-    state.proof_cache_keys = {
-        name: key for name, key in state.proof_cache_keys.items() if name in new_proved_cache
+    active = active_node_names(blueprint)
+    return {
+        name: proof
+        for name, proof in proved_cache.items()
+        if name in active
+        and (node := blueprint.node_by_name(name)) is not None
+        and node.kind in {"lemma", "theorem"}
+        and proof_cache_keys.get(name) == node.cache_key()
     }
-    state.set_blueprint(new_blueprint)
-    state.refinement_history = refinement_history
-    state.iteration += 1
-    state.node_results = {}  # stale against the new blueprint
-    state.done = False
-    state.success = False
-    state.save(checkpoint_path)
-    return new_blueprint
 
 
-def _orch_result_from_checkpoint(state: CheckpointState, blueprint: Blueprint) -> OrchestratorResult:
-    prover_results = state.get_prover_results()
-    return OrchestratorResult(node_results={
-        name: NodeResult(node=blueprint.node_by_name(name), result=pr)
-        for name, pr in prover_results.items()
-        if blueprint.node_by_name(name) is not None
-    })
+def _proof_bodies(
+    blueprint: Blueprint,
+    orch_result: OrchestratorResult | None,
+    proved_cache: dict[str, str] | None = None,
+) -> dict[str, str]:
+    bodies = dict(proved_cache or {})
+    if orch_result is not None:
+        for name, node_result in orch_result.node_results.items():
+            if node_result.result.signal == ProofSignal.SOLVED and node_result.result.proof_body:
+                bodies[name] = node_result.result.proof_body
+    return bodies
 
 
-def _proof_result_from_checkpoint(state: CheckpointState) -> ProofResult:
-    blueprint = state.get_blueprint()
-    proved_cache = dict(state.proved_cache)
-    orch_result = _orch_result_from_checkpoint(state, blueprint)
-    root_name = blueprint.target_theorem
-    root_proof = proved_cache.get(root_name, "")
-    if state.success:
-        return ProofResult(
-            success=True,
-            theorem_name=root_name,
-            proof_body=root_proof,
-            final_lean_file=_assemble_final_file(blueprint, orch_result),
-            aux_lemma_decls=_aux_lemma_decls(blueprint, proved_cache, root_name),
-            iterations=state.iteration + 1,
-            proved_nodes=list(orch_result.proved),
-            failed_nodes=[],
-        )
-    return ProofResult(
-        success=False,
-        theorem_name=root_name,
-        proof_body=root_proof,
-        final_lean_file=_assemble_partial_file(blueprint, orch_result, proved_cache),
-        aux_lemma_decls=_aux_lemma_decls(blueprint, proved_cache, root_name),
-        iterations=state.iteration + 1,
-        proved_nodes=list(orch_result.proved),
-        failed_nodes=list(orch_result.failed.keys()),
-    )
-
-
-@dataclass(frozen=True)
-class _LeanDeclSpan:
-    kind: str
-    name: str
-    start: int
-    end: int
-
-
-_LEAN_DECL_START_RE = re.compile(
-    r"(?m)^[ \t]*(?:(?:private|protected|noncomputable)\s+)*"
-    r"(?P<kind>theorem|lemma|def|abbrev)\s+"
-    r"(?P<name>[^\s:({]+)\b"
-)
-_SORRY_USING_PLACEHOLDER_RE = re.compile(
-    r":=\s*by\s*sorry_using\s*\[.*?\]",
-    flags=re.DOTALL,
-)
-
-
-def _lean_decl_spans(lean: str) -> list[_LeanDeclSpan]:
-    matches = list(_LEAN_DECL_START_RE.finditer(lean))
-    return [
-        _LeanDeclSpan(
-            kind=match.group("kind"),
-            name=match.group("name"),
-            start=match.start(),
-            end=matches[idx + 1].start() if idx + 1 < len(matches) else len(lean),
-        )
-        for idx, match in enumerate(matches)
-    ]
-
-
-def _substitute_proofs(
-    lean: str,
-    proof_bodies: dict[str, str],
-    decl_spans: list[_LeanDeclSpan] | None = None,
+def _assemble_final_file(
+    blueprint: Blueprint,
+    orch_result: OrchestratorResult | None = None,
+    proved_cache: dict[str, str] | None = None,
 ) -> str:
-    """Replace theorem/lemma placeholders by exact declaration-name matching.
-
-    The declaration spans must belong to the same `lean` string. This helper
-    performs all substitutions in one pass so replacement text cannot invalidate
-    offsets for later declarations.
-    """
-    if not proof_bodies:
-        return lean
-
-    spans = decl_spans if decl_spans is not None else _lean_decl_spans(lean)
-    if not spans:
-        return lean
-
-    out: list[str] = []
-    last = 0
-    for span in spans:
-        out.append(lean[last:span.start])
-        block = lean[span.start:span.end]
-        proof_body = proof_bodies.get(span.name)
-        if span.kind in {"theorem", "lemma"} and proof_body:
-            suffix = proof_body_to_decl_suffix(proof_body)
-            block, count = _SORRY_USING_PLACEHOLDER_RE.subn(
-                lambda _m: suffix, block, count=1
-            )
-            if count != 1:
-                block = lean[span.start:span.end]
-        out.append(block)
-        last = span.end
-    out.append(lean[last:])
-    return "".join(out)
-
-
-def _substitute_proof(
-    lean: str,
-    name: str,
-    proof_body: str,
-    decl_spans: list[_LeanDeclSpan] | None = None,
-) -> str:
-    """Replace one proof node by exact declaration-name matching."""
-    return _substitute_proofs(lean, {name: proof_body}, decl_spans=decl_spans)
-
-
-def _assemble_final_file(blueprint: Blueprint, orch_result: OrchestratorResult) -> str:
-    proof_bodies: dict[str, str] = {}
+    active = active_node_names(blueprint)
+    bodies = _proof_bodies(blueprint, orch_result, proved_cache)
+    parts = [blueprint.phase2_header.rstrip()]
     for node in blueprint.dependency_order():
-        if node.kind not in {"lemma", "theorem"}:
+        if node.name not in active:
             continue
-        nr = orch_result.node_results.get(node.name)
-        if nr is not None and nr.result.proof_body:
-            proof_bodies[node.name] = nr.result.proof_body
-    return _substitute_proofs(
-        blueprint.lean_file, proof_bodies, _lean_decl_spans(blueprint.lean_file)
-    )
+        if node.kind == "definition":
+            parts.append(node.full_declaration().strip())
+            continue
+        body = bodies.get(node.name)
+        if not body:
+            raise ValueError(f"Active proof node `{node.name}` has no solved proof")
+        parts.append(render_solved_declaration(node, body).strip())
+    return "\n\n".join(part for part in parts if part) + "\n"
 
 
 def _assemble_partial_file(
@@ -707,15 +97,314 @@ def _assemble_partial_file(
     orch_result: OrchestratorResult | None,
     proved_cache: dict[str, str],
 ) -> str:
-    if orch_result is None:
-        return blueprint.lean_file
-    proof_bodies: dict[str, str] = {}
+    active = active_node_names(blueprint)
+    bodies = _proof_bodies(blueprint, orch_result, proved_cache)
+    parts = [blueprint.phase2_header.rstrip()]
     for node in blueprint.dependency_order():
-        if node.kind not in {"lemma", "theorem"}:
+        if node.name not in active:
             continue
-        body = proved_cache.get(node.name)
-        if body:
-            proof_bodies[node.name] = body
-    return _substitute_proofs(
-        blueprint.lean_file, proof_bodies, _lean_decl_spans(blueprint.lean_file)
+        body = bodies.get(node.name)
+        if node.kind == "definition":
+            parts.append(node.full_declaration().strip())
+        elif body:
+            parts.append(render_solved_declaration(node, body).strip())
+        else:
+            parts.append(node.full_declaration().strip())
+    return "\n\n".join(part for part in parts if part) + "\n"
+
+
+def run_phase1(
+    theorem_stmt: str,
+    *,
+    compiler: KiminaLeanCompiler,
+    nl_proof: str | None = None,
+    model: str = "labs-leanstral-1-5",
+    checkpoint_path: Path | None = None,
+    tracer=None,
+    thm_name: str = "",
+    phase2_contract_check_concurrency: int = 1,
+) -> Blueprint:
+    blueprint = generate_blueprint(
+        theorem_stmt=theorem_stmt,
+        nl_proof=nl_proof,
+        model=model,
+        compiler=compiler,
+        tracer=tracer,
+        thm_name=thm_name,
+        phase2_contract_check_concurrency=phase2_contract_check_concurrency,
     )
+    if checkpoint_path is not None:
+        state = CheckpointState(informal_statement=theorem_stmt, model=model)
+        state.set_blueprint(blueprint)
+        state.save(checkpoint_path)
+    return blueprint
+
+
+async def run_phase2_async(
+    *,
+    checkpoint_path: Path,
+    compiler: KiminaLeanCompiler,
+    retrieval: MathlibRetrieval | None = None,
+    tracer=None,
+    node_timeout_s: float | None = 300.0,
+    llm_api_timeout_s: float | None = 120.0,
+    model: str | None = None,
+    node_max_prove_turns: int | None = None,
+    max_tool_calls_per_turn: int = 3,
+    node_executor: Executor | None = None,
+    node_semaphore: asyncio.Semaphore | None = None,
+) -> OrchestratorResult:
+    state = CheckpointState.load(checkpoint_path)
+    blueprint = state.get_blueprint()
+    if blueprint is None:
+        raise RuntimeError(f"No blueprint in checkpoint {checkpoint_path}")
+    contract_errors = phase2_contract_errors(blueprint)
+    if contract_errors:
+        raise RuntimeError(format_phase2_contract_errors(contract_errors))
+    retrieval = retrieval or MathlibRetrieval()
+    state.proved_cache = _invalidate_stale_proofs(
+        blueprint, state.proved_cache, state.proof_cache_keys,
+    )
+    active = active_node_names(blueprint)
+    nodes_to_try = active - set(state.proved_cache)
+    orch_result = await prove_dag(
+        blueprint=blueprint,
+        compiler=compiler,
+        retrieval=retrieval,
+        model=model or state.model,
+        proved_cache=state.proved_cache,
+        nodes_to_retry=nodes_to_try,
+        tracer=tracer,
+        node_timeout_s=node_timeout_s,
+        llm_api_timeout_s=llm_api_timeout_s,
+        node_max_prove_turns=node_max_prove_turns,
+        max_tool_calls_per_turn=max_tool_calls_per_turn,
+        node_executor=node_executor,
+        node_semaphore=node_semaphore,
+    )
+    for name, node_result in orch_result.node_results.items():
+        node = blueprint.node_by_name(name)
+        if (
+            node is not None
+            and node.kind in {"lemma", "theorem"}
+            and node_result.result.signal == ProofSignal.SOLVED
+        ):
+            state.proved_cache[name] = node_result.result.proof_body
+            state.proof_cache_keys[name] = node.cache_key()
+    state.set_node_results(orch_result.node_results)
+
+    infra_nodes = [
+        name for name, node_result in orch_result.node_results.items()
+        if node_result.result.signal == ProofSignal.INFRA_ERROR
+    ]
+    if infra_nodes:
+        state.status = RunStatus.ERROR
+        state.save(checkpoint_path)
+        return orch_result
+
+    root_result = orch_result.node_results.get(blueprint.target_theorem)
+    if root_result is not None and root_result.result.signal == ProofSignal.SOLVED:
+        final_lean = _assemble_final_file(blueprint, orch_result, state.proved_cache)
+        final_result = compiler.check(final_lean, allow_sorry=False)
+        final_diagnostics = final_result.diagnostics
+        (tracer or NullTracer()).emit(TraceEvent(
+            kind="final_verify",
+            thm_name=blueprint.target_theorem,
+            ok=final_result.success,
+            args={
+                "lean_errors": final_diagnostics,
+                "failure_kind": final_result.failure_kind,
+                "lean_code": final_lean,
+            },
+        ))
+        state.final_lean_file = final_lean
+        state.final_lean_errors = final_diagnostics
+        if final_result.success:
+            state.status = RunStatus.SOLVED
+        elif final_result.failure_kind == "infra":
+            state.status = RunStatus.ERROR
+        else:
+            root_name = blueprint.target_theorem
+            root_node = blueprint.node_by_name(root_name)
+            root_proof = state.proved_cache.pop(root_name, "")
+            state.proof_cache_keys.pop(root_name, None)
+            if root_node is not None:
+                root_failure = NodeResult(
+                    root_node,
+                    ProverResult(
+                        ProofSignal.PROOF_TOO_HARD,
+                        root_proof,
+                        final_diagnostics,
+                    ),
+                )
+                orch_result.node_results[root_name] = root_failure
+                state.set_node_results(orch_result.node_results)
+            state.status = RunStatus.RUNNING
+    else:
+        state.status = RunStatus.RUNNING
+    state.save(checkpoint_path)
+    return orch_result
+
+
+def run_phase2(**kwargs) -> OrchestratorResult:
+    return asyncio.run(run_phase2_async(**kwargs))
+
+
+def run_phase3(
+    *,
+    checkpoint_path: Path,
+    compiler: KiminaLeanCompiler,
+    model: str | None = None,
+    max_iterations: int = MAX_REFINEMENT_ITERATIONS,
+    tracer=None,
+    thm_name: str = "",
+    blueprint_max_retries: int | None = None,
+    phase2_contract_check_concurrency: int = 1,
+) -> Blueprint:
+    state = CheckpointState.load(checkpoint_path)
+    if state.status != RunStatus.RUNNING:
+        raise RuntimeError(f"Checkpoint status is {state.status.value}; refinement is not allowed")
+    blueprint = state.get_blueprint()
+    if blueprint is None or not state.node_results:
+        raise RuntimeError("Phase 3 requires a blueprint and Phase 2 node results")
+    if state.iteration >= max_iterations:
+        raise RuntimeError("Refinement iteration limit reached")
+    orch_result = _orch_result_from_checkpoint(state, blueprint)
+    history = list(state.refinement_history)
+    try:
+        revised = refine_blueprint(
+            blueprint=blueprint,
+            orch_result=orch_result,
+            compiler=compiler,
+            model=model or state.model,
+            history=history,
+            iteration=state.iteration,
+            max_iterations=max_iterations,
+            tracer=tracer,
+            thm_name=thm_name,
+            max_retries=blueprint_max_retries or 8,
+            phase2_contract_check_concurrency=phase2_contract_check_concurrency,
+        )
+    except KiminaInfrastructureError as exc:
+        state.status = RunStatus.ERROR
+        state.final_lean_errors = [str(exc)]
+        state.refinement_history = history
+        state.save(checkpoint_path)
+        return blueprint
+    except RuntimeError as exc:
+        state.status = RunStatus.EXHAUSTED
+        state.final_lean_errors = [str(exc)]
+        state.refinement_history = history
+        state.save(checkpoint_path)
+        return blueprint
+    state.proved_cache = _invalidate_stale_proofs(
+        revised, state.proved_cache, state.proof_cache_keys,
+    )
+    state.proof_cache_keys = {
+        name: key for name, key in state.proof_cache_keys.items()
+        if name in state.proved_cache
+    }
+    state.set_blueprint(revised)
+    state.refinement_history = history
+    state.iteration += 1
+    state.node_results = {}
+    state.final_lean_file = ""
+    state.final_lean_errors = []
+    state.status = RunStatus.RUNNING
+    state.save(checkpoint_path)
+    return revised
+
+
+def _orch_result_from_checkpoint(
+    state: CheckpointState,
+    blueprint: Blueprint,
+) -> OrchestratorResult:
+    results = state.get_prover_results()
+    return OrchestratorResult(
+        node_results={
+            name: NodeResult(node, proof_result)
+            for name, proof_result in results.items()
+            if (node := blueprint.node_by_name(name)) is not None
+        },
+        active_nodes=active_node_names(blueprint),
+        root_name=blueprint.target_theorem,
+    )
+
+
+def _proof_result_from_checkpoint(state: CheckpointState) -> ProofResult:
+    blueprint = state.get_blueprint()
+    if blueprint is None:
+        raise RuntimeError("Checkpoint has no blueprint")
+    orch_result = _orch_result_from_checkpoint(state, blueprint)
+    return ProofResult(
+        success=state.root_proved,
+        theorem_name=blueprint.target_theorem,
+        proof_body=state.proved_cache.get(blueprint.target_theorem, ""),
+        final_lean_file=state.final_lean_file or _assemble_partial_file(
+            blueprint, orch_result, state.proved_cache,
+        ),
+        final_lean_errors=list(state.final_lean_errors),
+        iterations=state.iteration + 1,
+        proved_nodes=sorted(orch_result.proved),
+        failed_nodes=sorted(orch_result.failed),
+    )
+
+
+def prove_theorem(
+    theorem_stmt: str,
+    *,
+    compiler: KiminaLeanCompiler,
+    nl_proof: str | None = None,
+    model: str = "labs-leanstral-1-5",
+    retrieval: MathlibRetrieval | None = None,
+    max_iterations: int = MAX_REFINEMENT_ITERATIONS,
+    tracer=None,
+    checkpoint_path: Path,
+    thm_name: str = "",
+    node_timeout_s: float | None = 300.0,
+    llm_api_timeout_s: float | None = 120.0,
+    node_max_prove_turns: int | None = None,
+    max_tool_calls_per_turn: int = 3,
+) -> ProofResult:
+    tracer = tracer or NullTracer()
+    state = CheckpointState.load_or_none(checkpoint_path)
+    if state is None:
+        run_phase1(
+            theorem_stmt,
+            compiler=compiler,
+            nl_proof=nl_proof,
+            model=model,
+            checkpoint_path=checkpoint_path,
+            tracer=tracer,
+            thm_name=thm_name,
+        )
+    while True:
+        state = CheckpointState.load(checkpoint_path)
+        if state.status in {RunStatus.SOLVED, RunStatus.ERROR, RunStatus.EXHAUSTED}:
+            return _proof_result_from_checkpoint(state)
+        run_phase2(
+            checkpoint_path=checkpoint_path,
+            compiler=compiler,
+            retrieval=retrieval,
+            tracer=tracer,
+            node_timeout_s=node_timeout_s,
+            llm_api_timeout_s=llm_api_timeout_s,
+            model=model,
+            node_max_prove_turns=node_max_prove_turns,
+            max_tool_calls_per_turn=max_tool_calls_per_turn,
+        )
+        state = CheckpointState.load(checkpoint_path)
+        if state.status != RunStatus.RUNNING:
+            return _proof_result_from_checkpoint(state)
+        if state.iteration >= max_iterations:
+            state.status = RunStatus.EXHAUSTED
+            state.save(checkpoint_path)
+            return _proof_result_from_checkpoint(state)
+        run_phase3(
+            checkpoint_path=checkpoint_path,
+            compiler=compiler,
+            model=model,
+            max_iterations=max_iterations,
+            tracer=tracer,
+            thm_name=thm_name,
+        )

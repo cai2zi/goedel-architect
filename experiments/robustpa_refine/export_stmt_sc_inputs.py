@@ -15,7 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "experiments"))
 
-from shared.io_utils import safe_stem, write_jsonl  # noqa: E402
+from robustpa_refine.io_utils import safe_stem, write_jsonl  # noqa: E402
 
 
 DEFAULT_OUTPUT_BASE = REPO_ROOT.parent / "czx_work" / "robustpa_eval"
@@ -197,11 +197,12 @@ def _assemble_lean_from_checkpoint(checkpoint_path: Path) -> tuple[str, str, dic
             )
         orch_result = orch_result_from_checkpoint(state, blueprint)
         lean = assemble_partial_file(blueprint, orch_result, dict(state.proved_cache))
-        root_proved = blueprint.target_theorem in state.proved_cache
-        kind = "final" if state.success and root_proved else "partial"
+        root_proved = state.root_proved
+        lean = state.final_lean_file or lean
+        kind = "final" if root_proved else "partial"
         diagnostics = {
-            "state_done": state.done,
-            "state_success": state.success,
+            "state_status": state.status.value,
+            "state_root_proved": state.root_proved,
             "state_iteration": state.iteration,
             "blueprint_target": blueprint.target_theorem,
             "proved_cache_count": len(state.proved_cache),
@@ -255,7 +256,7 @@ def _validate_export_lean(compiler, lean_text: str, assembly_kind: str) -> tuple
         result = compiler.check(lean_text)
     except BaseException as exc:
         return False, [_result_text(exc)]
-    validated = bool(result.validated and result.success)
+    validated = bool(result.success)
     errors = list(result.errors or [])
     if not errors and not validated and result.raw_output:
         errors = [str(result.raw_output)[:4000]]
@@ -285,7 +286,7 @@ def _make_export_row(
         "row_index": result_row.get("row_index", ""),
         "parquet_path": result_row.get("parquet_path", ""),
         "theorem_name": result_row.get("theorem_name", ""),
-        "informal_statement": str(source_row.get("informal_statement") or result_row.get("theorem_stmt") or ""),
+        "informal_statement": str(source_row.get("informal_statement") or ""),
         "informal_proof": str(source_row.get("informal_proof") or ""),
         "LLM_Output#1": lean_text,
         "INFERENCE_DONE": "yes",
@@ -293,7 +294,6 @@ def _make_export_row(
         "GOEDEL_phase": result_row.get("phase", ""),
         "GOEDEL_success": bool(result_row.get("success")),
         "GOEDEL_root_proved": bool(result_row.get("root_proved")),
-        "GOEDEL_all_nodes_proved": bool(result_row.get("all_nodes_proved")),
         "GOEDEL_iterations": result_row.get("iterations", 0),
         "GOEDEL_total_nodes": result_row.get("total_nodes", 0),
         "GOEDEL_proved_node_count": result_row.get("proved_node_count", 0),

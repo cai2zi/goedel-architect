@@ -5,15 +5,12 @@ and validates the resulting @[blueprint]-annotated Lean file via LeanArchitect.
 """
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 from dataclasses import dataclass, field
 import json
 import os
 import re
 from pathlib import Path
-
-from openai import OpenAI
 
 from blueprint_text import (
     BLUEPRINT_DECL_KW as _BLUEPRINT_DECL_KW,
@@ -24,7 +21,13 @@ from blueprint_text import (
     proof_body_to_decl_suffix,
     strip_blueprint_attr,
 )
-from lean_compiler import AbstractLeanCompiler, LeanCompiler, CompilerResult, MATHLIB_HEADER
+from kimina_lean_compiler import (
+    CompileRequest,
+    CompilerResult,
+    KiminaInfrastructureError,
+    KiminaLeanCompiler,
+    MATHLIB_HEADER,
+)
 from llm_client import chat_completion_with_retry, make_client
 from goedel_prompts import load, render
 from tracer import TraceEvent
@@ -48,54 +51,6 @@ def _max_tokens() -> int:
 
 
 MAX_RETRIES = 8
-
-# `repo_context` is built from only the target file's own preceding content
-# (see eval/run_verisoftbench.py's _build_verif_context) - it never follows
-# `import` statements, so a theorem needing a type/def declared in a merely
-# imported sibling file gets no information about it and fabricates a
-# placeholder. repo_search (same tool Phase 2 already has) lets Phase 1/3
-# look up cross-file declarations on demand instead. Optional: passing
-# repo_retrieval=None (the default) reproduces the old no-tools behavior
-# exactly, so existing callers are unaffected.
-REPO_SEARCH_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "repo_search",
-        "description": (
-            "Semantic search over the target repository's .lean files, "
-            "including files merely imported by (not textually preceding) "
-            "the theorem's own file."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Natural language or identifier fragment."},
-                "k": {"type": "integer", "description": "Number of results (default 10).", "default": 10},
-            },
-            "required": ["query"],
-        },
-    },
-}
-
-# Bounds the extra repo_search back-and-forth before a call must produce a
-# final text response, separate from MAX_RETRIES (whole-attempt retries after
-# a failed compile). Kept small - this is a targeted lookup for missing
-# cross-file context, not an open-ended exploration loop.
-MAX_SEARCH_TURNS = 4
-
-REPO_SEARCH_SUFFIX = """
-
-## repo_search tool
-
-You also have a `repo_search` tool: semantic search over the target
-repository's .lean files, including files merely `import`-ed by (not
-textually preceding) the theorem's own file. The repo context above only
-shows the target file's own preceding content - if the theorem's statement
-needs a type or definition not visible there (e.g. it lives in an imported
-sibling file), call repo_search for it before inventing a placeholder
-definition.
-"""
-
 
 def _emit_usage(tracer, thm_name: str, phase: str, model: str, response) -> None:
     """Log token usage from a chat.completions/responses API response, if a
@@ -189,42 +144,25 @@ def _emit_lean_check_result(
             "warnings": result.warnings,
             "goals": result.goals,
             "raw_output": result.raw_output,
-            "validated": result.validated,
+            "failure_kind": result.failure_kind,
         },
         ok=result.success,
     ))
 
 
 def _append_assistant_turn(messages: list[dict], response) -> None:
-    """Append an assistant message from `response` to `messages`, preserving
-    tool_calls if present, followed by a synthetic tool reply for each one.
-
-    Some models (e.g. Leanstral) emit a tool_call even on turns where no
-    tools were declared in the request. Dropping the tool_calls here (keeping
-    only `.content`) leaves the replayed history inconsistent with any
-    tool-role messages a caller expects; the API then rejects the *next*
-    call either way - "Assistant message must have either content or
-    tool_calls" if dropped, or "tool call id X has no response" if kept
-    without a reply. A synthetic reply satisfies the latter.
-    """
+    """Replay only text; Phase 1/3 do not expose tools."""
     msg = response.choices[0].message
-    assistant_msg: dict = {"role": "assistant", "content": msg.content or ""}
-    if msg.tool_calls:
-        assistant_msg["tool_calls"] = [tc.model_dump() for tc in msg.tool_calls]
-    messages.append(assistant_msg)
-    for tc in msg.tool_calls or []:
-        messages.append({
-            "role": "tool",
-            "tool_call_id": tc.id,
-            "content": f"Tool unavailable: {tc.function.name}. No tools are available for this request.",
-        })
+    messages.append({
+        "role": "assistant",
+        "content": msg.content or "No valid Lean blueprint was emitted.",
+    })
 
 
-def _call_with_repo_search(
-    client: OpenAI,
+def _call_blueprint_model(
+    client,
     model: str,
     messages: list[dict],
-    repo_retrieval,
     reasoning_kwargs: dict,
     max_tokens: int,
     tracer=None,
@@ -232,72 +170,14 @@ def _call_with_repo_search(
     phase: str = "",
     attempt: int = 0,
 ):
-    """chat.completions.create, transparently handling repo_search tool calls.
-
-    `messages` is mutated in place (tool round-trips appended) so the
-    caller's own subsequent messages (e.g. compile-error feedback) continue
-    to append correctly after this exchange, matching the existing retry
-    loops in generate_blueprint/refine_blueprint. Returns the first response
-    that isn't a tool-calls-only response.
-    """
-    tools = [REPO_SEARCH_TOOL] if repo_retrieval is not None else None
-    for turn in range(1, MAX_SEARCH_TURNS + 1):
-        # chat.completions rejects function tools + reasoning_effort together
-        # for gpt-5.x ("Function tools with reasoning_effort are not
-        # supported ... Please use /v1/responses instead") - drop
-        # reasoning_effort on tool-enabled turns; it still applies to the
-        # no-tools finalization call below (and to every call when
-        # repo_retrieval is None, unchanged from before this tool existed).
-        call_kwargs = {"tools": tools} if tools else dict(reasoning_kwargs)
-        response = chat_completion_with_retry(
-            client,
-            tracer=tracer,
-            thm_name=thm_name,
-            phase=phase,
-            model_id=model,
-            operation="blueprint_generate",
-            trace_args={"attempt": attempt, "turn": turn},
-            model=model,
-            messages=messages,
-            max_completion_tokens=max_tokens,
-            **call_kwargs,
-        )
-        _emit_usage(tracer, thm_name, phase, model, response)
-        _emit_llm_response(
-            tracer,
-            thm_name=thm_name,
-            phase=phase,
-            model=model,
-            response=response,
-            attempt=attempt,
-            turn=turn,
-        )
-        msg = response.choices[0].message
-        if not msg.tool_calls:
-            return response
-        messages.append({
-            "role": "assistant",
-            "content": msg.content or "",
-            "tool_calls": [tc.model_dump() for tc in msg.tool_calls],
-        })
-        for tc in msg.tool_calls:
-            if tc.function.name == "repo_search":
-                args = json.loads(tc.function.arguments)
-                hits = repo_retrieval.search(args.get("query", ""), args.get("k", 10))
-                result = "\n\n".join(h.format() for h in hits) or "No results in repo."
-            else:
-                result = f"Tool unavailable: {tc.function.name}"
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-    # Exhausted search turns without a final text response - one last call
-    # with tools withheld forces the model to commit to an answer.
     response = chat_completion_with_retry(
         client,
         tracer=tracer,
         thm_name=thm_name,
         phase=phase,
         model_id=model,
-        operation="blueprint_finalize",
-        trace_args={"attempt": attempt, "turn": MAX_SEARCH_TURNS + 1},
+        operation="blueprint_generate",
+        trace_args={"attempt": attempt, "turn": 1},
         model=model, messages=messages, max_completion_tokens=max_tokens, **reasoning_kwargs,
     )
     _emit_usage(tracer, thm_name, phase, model, response)
@@ -308,7 +188,7 @@ def _call_with_repo_search(
         model=model,
         response=response,
         attempt=attempt,
-        turn=MAX_SEARCH_TURNS + 1,
+        turn=1,
     )
     return response
 
@@ -379,11 +259,6 @@ class Blueprint:
     lean_file: str  # full compilable @[blueprint]-annotated Lean file
     target_theorem: str
     phase2_header: str = MATHLIB_HEADER
-    # True only when this exact lean_file was confirmed to compile by a real
-    # Lean invocation (not a structural-only fallback, and not a give-up
-    # after MAX_RETRIES). Defaults to False so any code path that forgets to
-    # set it explicitly fails safe rather than silently claiming validation.
-    fully_validated: bool = False
 
     def node_by_name(self, name: str) -> BlueprintNode | None:
         return next((n for n in self.nodes if n.name == name), None)
@@ -498,7 +373,7 @@ def _phase2_preflight_file(blueprint: Blueprint, node: BlueprintNode) -> str:
 
 def phase2_standalone_contract_errors(
     blueprint: Blueprint,
-    compiler: AbstractLeanCompiler,
+    compiler: KiminaLeanCompiler,
     *,
     limit: int = 12,
     concurrency: int = 1,
@@ -507,37 +382,30 @@ def phase2_standalone_contract_errors(
     if concurrency <= 0:
         raise ValueError("concurrency must be positive")
 
-    def check_node(index_and_node: tuple[int, BlueprintNode]) -> tuple[int, str | None]:
-        index, node = index_and_node
-        result = compiler.check(_phase2_preflight_file(blueprint, node), allow_sorry=True)
+    nodes = [
+        node for node in blueprint.nodes
+        if node.kind in {"lemma", "theorem"}
+    ]
+    results = compiler.check_many([
+        CompileRequest(
+            _phase2_preflight_file(blueprint, node),
+            allow_sorry=True,
+            request_id=f"phase2-contract-{index}-{node.name}",
+        )
+        for index, node in enumerate(nodes)
+    ])
+    errors: list[str] = []
+    for node, result in zip(nodes, results, strict=True):
+        if result.failure_kind == "infra":
+            message = "\n".join(result.diagnostics) or result.raw_output[-2000:]
+            raise KiminaInfrastructureError(message)
         if result.success:
-            return index, None
-        message = "\n".join(result.errors) or result.raw_output[-2000:]
-        return index, (
+            continue
+        message = "\n".join(result.diagnostics) or result.raw_output[-2000:]
+        errors.append(
             f"phase2_standalone_failed: node `{node.name}` does not compile when "
             f"assembled as a standalone Phase 2 goal.\n{message}"
         )
-
-    indexed_nodes = [
-        (index, node)
-        for index, node in enumerate(blueprint.nodes)
-        if node.kind in {"lemma", "theorem"}
-    ]
-    indexed_errors: list[tuple[int, str]] = []
-    if concurrency == 1 or len(indexed_nodes) <= 1:
-        for item in indexed_nodes:
-            index, error = check_node(item)
-            if error is not None:
-                indexed_errors.append((index, error))
-    else:
-        with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = [executor.submit(check_node, item) for item in indexed_nodes]
-            for future in as_completed(futures):
-                index, error = future.result()
-                if error is not None:
-                    indexed_errors.append((index, error))
-
-    errors = [error for _, error in sorted(indexed_errors, key=lambda item: item[0])]
     if limit:
         errors = errors[:limit]
     return errors
@@ -582,9 +450,8 @@ def generate_blueprint(
     theorem_stmt: str,
     nl_proof: str | None = None,
     model: str = "labs-leanstral-1-5",
-    compiler: AbstractLeanCompiler | None = None,
-    repo_context: str | None = None,
-    repo_retrieval=None,
+    *,
+    compiler: KiminaLeanCompiler,
     tracer=None,
     thm_name: str = "",
     max_retries: int = MAX_RETRIES,
@@ -596,105 +463,42 @@ def generate_blueprint(
     Uses the verbatim system prompt from Appendix C.1 of the paper.
     Validates via lean_compile after each LLM attempt (up to max_retries).
 
-    repo_retrieval: optional RepoRetrieval, giving the model a repo_search
-        tool for cross-file lookups repo_context itself can't provide (see
-        REPO_SEARCH_TOOL). Omit for the old no-tools behavior.
     """
     client = make_client(model)
-
-    system_content = BLUEPRINT_SYSTEM_PROMPT
-    if repo_retrieval is not None:
-        system_content = system_content.strip() + "\n" + REPO_SEARCH_SUFFIX
-    user_content = _build_user_prompt(theorem_stmt, nl_proof, repo_context)
+    user_content = _build_user_prompt(theorem_stmt, nl_proof)
     messages = [
-        {"role": "system", "content": system_content},
+        {"role": "system", "content": BLUEPRINT_SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
     ]
 
     last_lean_code = None
     for attempt in range(max_retries):
-        response = _call_with_repo_search(
-            client, model, messages, repo_retrieval, _reasoning_kwargs(model), _max_tokens(),
+        response = _call_blueprint_model(
+            client, model, messages, _reasoning_kwargs(model), _max_tokens(),
             tracer=tracer, thm_name=thm_name, phase="phase1", attempt=attempt + 1,
         )
         lean_code = _extract_lean_code(response.choices[0].message.content)
         last_lean_code = lean_code
 
-        if compiler is not None:
-            target = _extract_target_name(lean_code, theorem_stmt)
-            result = compiler.check_blueprint(lean_code, target)
-            _emit_lean_check_result(
-                tracer,
-                thm_name=thm_name,
-                phase="phase1",
-                attempt=attempt + 1,
-                target=target,
-                result=result,
+        target = _extract_target_name(lean_code, theorem_stmt)
+        result = compiler.check_blueprint(lean_code, target)
+        _emit_lean_check_result(
+            tracer,
+            thm_name=thm_name,
+            phase="phase1",
+            attempt=attempt + 1,
+            target=target,
+            result=result,
+        )
+        if result.failure_kind == "infra":
+            raise KiminaInfrastructureError(
+                "\n".join(result.diagnostics) or result.raw_output[-2000:]
             )
-            if result.success:
-                parsed = _parse_blueprint(lean_code, target)
-                if parsed.nodes:
-                    contract_errors = phase2_contract_errors(parsed)
-                    if not contract_errors:
-                        contract_errors = phase2_standalone_contract_errors(
-                            parsed,
-                            compiler,
-                            concurrency=phase2_contract_check_concurrency,
-                        )
-                    if contract_errors:
-                        _append_assistant_turn(messages, response)
-                        messages.append({
-                            "role": "user",
-                            "content": (
-                                f"The file compiled, but the blueprint is not usable by Phase 2 "
-                                f"(attempt {attempt + 1}/{max_retries}):\n\n"
-                                f"{format_phase2_contract_errors(contract_errors)}\n\n"
-                                "Fix the blueprint contract and re-emit the whole file. Every "
-                                "`lemma` and `theorem` blueprint node must end with exactly one "
-                                "`:= by sorry_using [...]` placeholder; do not provide completed "
-                                "proofs or plain `sorry` bodies in blueprint proof nodes. "
-                                "Definitions may keep executable bodies. The dependency graph "
-                                "must be acyclic."
-                            ),
-                        })
-                        continue
-                    parsed.fully_validated = result.validated
-                    return parsed
-                # Compiles, but has zero @[blueprint]-annotated declarations —
-                # e.g. the model wrote a plain (already-complete or sorry-free)
-                # theorem with no blueprint/sorry_using annotations at all.
-                # Downstream, an empty node set makes all_proved() vacuously
-                # true with no actual proof recorded, so this must be retried
-                # rather than accepted as a usable blueprint.
-                _append_assistant_turn(messages, response)
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        f"The file compiled, but contains no `@[blueprint ...]`-annotated "
-                        f"declarations (attempt {attempt + 1}/{max_retries}). You must "
-                        "annotate the target theorem (and any helper lemmas) with "
-                        "`@[blueprint ...]` and give each a `sorry_using [...]` proof body. "
-                        "Re-emit the blueprint with proper annotations."
-                    ),
-                })
-                continue
-            # Feed errors back to the model for the next attempt
-            error_feedback = "\n".join(result.errors) or result.raw_output[-2000:]
-            _append_assistant_turn(messages, response)
-            messages.append({
-                "role": "user",
-                "content": (
-                    f"lean_compile reported errors (attempt {attempt + 1}/{max_retries}):\n\n"
-                    f"{error_feedback}\n\n"
-                    "Fix the issues and call lean_compile again."
-                ),
-            })
-        else:
-            target = _extract_target_name(lean_code, theorem_stmt)
+        if result.success:
             parsed = _parse_blueprint(lean_code, target)
             if parsed.nodes:
                 contract_errors = phase2_contract_errors(parsed)
-                if not contract_errors and compiler is not None:
+                if not contract_errors:
                     contract_errors = phase2_standalone_contract_errors(
                         parsed,
                         compiler,
@@ -705,65 +509,44 @@ def generate_blueprint(
                     messages.append({
                         "role": "user",
                         "content": (
-                            f"The blueprint is not usable by Phase 2 "
+                            f"The file compiled, but the blueprint is not usable by Phase 2 "
                             f"(attempt {attempt + 1}/{max_retries}):\n\n"
                             f"{format_phase2_contract_errors(contract_errors)}\n\n"
-                            "Re-emit the whole blueprint. Every `lemma` and `theorem` "
-                            "blueprint node must end with exactly one "
-                            "`:= by sorry_using [...]` placeholder; definitions may keep "
-                            "executable bodies. The dependency graph must be acyclic."
+                            "Fix the blueprint contract and re-emit the whole file. Every "
+                            "`lemma` and `theorem` blueprint node must end with exactly one "
+                            "`:= by sorry_using [...]` placeholder; do not provide completed "
+                            "proofs or plain `sorry` bodies in blueprint proof nodes. "
+                            "Definitions may keep executable bodies. The dependency graph "
+                            "must be acyclic."
                         ),
                     })
                     continue
                 return parsed
-            # No compiler here to validate against (see comment above this
-            # branch), but a response with zero @[blueprint]-annotated
-            # declarations - a refusal, an apology, a plain sorry-free proof -
-            # is pure text-parsing to detect and needs no compiler at all.
-            # Silently accepting it as a "blueprint" would make all_proved()
-            # vacuously true downstream with no actual proof recorded, so
-            # this must be retried the same way the compiler branch already
-            # retries its own zero-node case above.
             _append_assistant_turn(messages, response)
             messages.append({
                 "role": "user",
                 "content": (
-                    f"Your response contains no `@[blueprint ...]`-annotated "
+                    f"The file compiled, but contains no `@[blueprint ...]`-annotated "
                     f"declarations (attempt {attempt + 1}/{max_retries}). You must "
                     "annotate the target theorem (and any helper lemmas) with "
                     "`@[blueprint ...]` and give each a `sorry_using [...]` proof body. "
                     "Re-emit the blueprint with proper annotations."
                 ),
             })
-
-    # All attempts failed compilation — use the last generated blueprint anyway
-    # if it has real nodes (Phase 2/3 will encounter and surface type errors
-    # during node proving). But an empty node set is never usable: it makes
-    # all_proved() vacuously true downstream with no actual proof recorded,
-    # so that must be a hard failure rather than a silent fake success.
-    # `parsed.fully_validated` is deliberately left at its default False here -
-    # this blueprint was never actually accepted by a real compile.
-    if last_lean_code:
-        target = _extract_target_name(last_lean_code, theorem_stmt)
-        parsed = _parse_blueprint(last_lean_code, target)
-        if parsed.nodes:
-            contract_errors = phase2_contract_errors(parsed)
-            if not contract_errors and compiler is not None:
-                contract_errors = phase2_standalone_contract_errors(
-                    parsed,
-                    compiler,
-                    concurrency=phase2_contract_check_concurrency,
-                )
-            if contract_errors:
-                raise RuntimeError(
-                    f"Blueprint generation failed after {max_retries} attempts "
-                    f"(latest blueprint is not phase2-ready):\n"
-                    f"{format_phase2_contract_errors(contract_errors)}"
-                )
-            return parsed
+            continue
+        error_feedback = "\n".join(result.diagnostics) or result.raw_output[-2000:]
+        _append_assistant_turn(messages, response)
+        messages.append({
+            "role": "user",
+            "content": (
+                f"lean_compile reported errors (attempt {attempt + 1}/{max_retries}):\n\n"
+                f"{error_feedback}\n\n"
+                "Fix the issues and call lean_compile again."
+            ),
+        })
     raise RuntimeError(
         f"Blueprint generation failed after {max_retries} attempts "
-        "(no attempt produced any @[blueprint]-annotated nodes)"
+        "without a validated blueprint"
     )
 
 
@@ -772,7 +555,8 @@ def generate_blueprint_from_informal(
     informal_proof: str | None,
     target_name: str,
     model: str = "labs-leanstral-1-5",
-    compiler: AbstractLeanCompiler | None = None,
+    *,
+    compiler: KiminaLeanCompiler,
     tracer=None,
     thm_name: str = "",
     max_retries: int = MAX_RETRIES,
@@ -785,9 +569,6 @@ def generate_blueprint_from_informal(
     but the theorem identifier is fixed by target_name so downstream
     checkpointing, validation, and scoring remain stable.
     """
-    if compiler is None:
-        compiler = LeanCompiler()
-
     client = make_client(model)
     messages = [
         {"role": "system", "content": ROBUSTPA_BLUEPRINT_SYSTEM_PROMPT},
@@ -804,11 +585,10 @@ def generate_blueprint_from_informal(
     
     last_error_feedback = ""
     for attempt in range(max_retries):
-        response = _call_with_repo_search(
+        response = _call_blueprint_model(
             client,
             model,
             messages,
-            repo_retrieval=None,
             reasoning_kwargs=_reasoning_kwargs(model),
             max_tokens=_max_tokens(),
             tracer=tracer,
@@ -843,6 +623,10 @@ def generate_blueprint_from_informal(
             target=target_name,
             result=result,
         )
+        if result.failure_kind == "infra":
+            raise KiminaInfrastructureError(
+                "\n".join(result.diagnostics) or result.raw_output[-2000:]
+            )
         if result.success:
             parsed = _parse_blueprint(lean_code, target_name)
             if not parsed.nodes:
@@ -858,14 +642,13 @@ def generate_blueprint_from_informal(
                         concurrency=phase2_contract_check_concurrency,
                     )
                 if not contract_errors:
-                    parsed.fully_validated = result.validated
                     return parsed
                 last_error_feedback = (
                     "The file compiled, but the blueprint is not usable by Phase 2:\n\n"
                     f"{format_phase2_contract_errors(contract_errors)}"
                 )
         else:
-            last_error_feedback = "\n".join(result.errors) or result.raw_output[-2000:]
+            last_error_feedback = "\n".join(result.diagnostics) or result.raw_output[-2000:]
 
         _append_assistant_turn(messages, response)
         messages.append({
@@ -883,8 +666,8 @@ def generate_blueprint_from_informal(
     )
 
 
-def _build_user_prompt(theorem_stmt: str, nl_proof: str | None, repo_context: str | None = None) -> str:
-    return render(BLUEPRINT_USER_TEMPLATE, theorem_stmt=theorem_stmt, nl_proof=nl_proof or "", repo_context=repo_context or "")
+def _build_user_prompt(theorem_stmt: str, nl_proof: str | None) -> str:
+    return render(BLUEPRINT_USER_TEMPLATE, theorem_stmt=theorem_stmt, nl_proof=nl_proof or "")
 
 
 # Matches the first line that looks like real Lean source, used to strip a

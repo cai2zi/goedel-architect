@@ -18,12 +18,10 @@ DEFAULT_ROBUST_PA_ROOT = REPO_ROOT.parent / "robust-proof-autoformalization"
 PROOF_SC_SCOPE_FINAL_PROOF = "final-proof"
 PROOF_SC_SCOPE_CONTEXT_NO_PROOF = "context-no-proof"
 PROOF_SC_SCOPE_CONTEXT_WITH_PROOF = "context-with-proof"
-PROOF_SC_SCOPE_ALIASES = {
-    PROOF_SC_SCOPE_FINAL_PROOF: PROOF_SC_SCOPE_FINAL_PROOF,
-    PROOF_SC_SCOPE_CONTEXT_NO_PROOF: PROOF_SC_SCOPE_CONTEXT_NO_PROOF,
-    PROOF_SC_SCOPE_CONTEXT_WITH_PROOF: PROOF_SC_SCOPE_CONTEXT_WITH_PROOF,
-    "final-theorem": PROOF_SC_SCOPE_FINAL_PROOF,
-    "all-proofs": PROOF_SC_SCOPE_CONTEXT_WITH_PROOF,
+PROOF_SC_SCOPES = {
+    PROOF_SC_SCOPE_FINAL_PROOF,
+    PROOF_SC_SCOPE_CONTEXT_NO_PROOF,
+    PROOF_SC_SCOPE_CONTEXT_WITH_PROOF,
 }
 
 _BY_MARKER_RE = re.compile(r":=\s*by\b")
@@ -85,20 +83,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--proof-sc-scope",
-        choices=sorted(PROOF_SC_SCOPE_ALIASES),
+        choices=sorted(PROOF_SC_SCOPES),
         default=os.environ.get("PROOF_SC_SCOPE", PROOF_SC_SCOPE_FINAL_PROOF),
         help=(
             "Lean content shown to ProofSC: final-proof judges only the final "
             "declaration proof body; context-no-proof prepends preceding def and "
             "lemma/theorem/example context with proofs elided; context-with-proof "
-            "prepends preceding def and lemma/theorem/example context including proofs. "
-            "Backward-compatible aliases: "
-            "final-theorem=final-proof, all-proofs=context-with-proof."
+            "prepends preceding def and lemma/theorem/example context including proofs."
         ),
     )
     args = parser.parse_args()
-    args.proof_sc_scope_requested = args.proof_sc_scope
-    args.proof_sc_scope = PROOF_SC_SCOPE_ALIASES[args.proof_sc_scope]
     return args
 
 

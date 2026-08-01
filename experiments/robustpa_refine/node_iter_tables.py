@@ -122,7 +122,7 @@ def collect_node_attempts(
                     turn = event.get("turn")
                     if isinstance(turn, int):
                         proof_turn_by_key[key] = max(proof_turn_by_key[key], turn)
-            elif kind == "final_verify":
+            elif kind == "node_finished":
                 finals[key] = event
 
         if timestamps:
@@ -348,7 +348,7 @@ def main() -> int:
 
     if incomplete:
         print(
-            f"warning: {len(incomplete)} phase2 node(s) have theorem_start but no final_verify; excluded",
+            f"warning: {len(incomplete)} phase2 node(s) have theorem_start but no node_finished; excluded",
             file=sys.stderr,
         )
         for record_id, iteration, node in incomplete[:10]:

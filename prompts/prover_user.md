@@ -19,7 +19,7 @@ Prove the following Lean 4 declaration. Produce a complete proof with no `sorry`
 {{/if}}
 {{#if parent_proofs}}
 
-## Proved parent lemmas (available as hypotheses)
+## Available declarations
 
 {{parent_proofs}}
 {{/if}}

@@ -1,38 +1,38 @@
 from __future__ import annotations
 
-import os
+import sys
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
 
-from experiments.robustpa_refine.run_robustpa_refine import parse_args
-
-
-BASE_ARGS = [
-    "--config",
-    "/tmp/no_such_robustpa_config.yaml",
-    "--model",
-    "Qwen3.5-397B-A17B-FP8",
-    "--split",
-    "miniF2F",
-    "--subset",
-    "local_number_edit_proof",
-]
+from omegaconf import OmegaConf
 
 
-def test_robustpa_refine_exp_name_defaults_to_model_split_subset() -> None:
-    args = parse_args(BASE_ARGS)
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "src"))
+sys.path.insert(0, str(REPO_ROOT / "experiments"))
 
-    assert args.exp_name == "Qwen3_5_397B_A17B_FP8_miniF2F_local_number_edit_proof"
-
-
-def test_robustpa_refine_exp_name_cli_override_wins() -> None:
-    args = parse_args(["--exp-name", "manual"] + BASE_ARGS)
-
-    assert args.exp_name == "manual"
+from robustpa_refine.run_robustpa_refine import _validate_args  # noqa: E402
 
 
-def test_local_openai_base_url_forces_dummy_key(monkeypatch) -> None:
-    monkeypatch.setenv("GOEDEL_OPENAI_API_KEY", "stale-invalid-token")
+class RobustPAConfigTest(unittest.TestCase):
+    def test_base_config_is_kimina_only_with_new_tool_budget(self) -> None:
+        config = OmegaConf.load(
+            REPO_ROOT / "experiments/robustpa_refine/configs/base.yaml"
+        )
+        self.assertNotIn("lean_backend", config)
+        self.assertNotIn("parallel_tool_calls", config)
+        self.assertNotIn("node_max_negation_probe_turns", config)
+        self.assertEqual(config.max_tool_calls_per_turn, 3)
 
-    parse_args(BASE_ARGS + ["--openai-base-url", "http://127.0.0.1:8001/v1"])
+    def test_tool_budget_must_be_positive(self) -> None:
+        config = OmegaConf.load(
+            REPO_ROOT / "experiments/robustpa_refine/configs/base.yaml"
+        )
+        config.max_tool_calls_per_turn = 0
+        with self.assertRaisesRegex(ValueError, "max_tool_calls_per_turn"):
+            _validate_args(SimpleNamespace(**OmegaConf.to_container(config, resolve=False)))
 
-    assert os.environ["GOEDEL_OPENAI_BASE_URL"] == "http://127.0.0.1:8001/v1"
-    assert os.environ["GOEDEL_OPENAI_API_KEY"] == "dummy"
+
+if __name__ == "__main__":
+    unittest.main()

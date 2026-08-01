@@ -19,12 +19,8 @@ from blueprint import (  # noqa: E402
     render_solved_declaration,
     strip_blueprint_attr,
 )
-from lean_compiler import (  # noqa: E402
-    CompilerResult,
-    LeanCompiler,
-    _assemble_node_attempt,
-    _extract_current_node_decl,
-)
+from blueprint_text import extract_current_node_decl  # noqa: E402
+from kimina_lean_compiler import assemble_node_attempt  # noqa: E402
 
 
 ZMOD_NODE = """@[blueprint
@@ -172,50 +168,21 @@ theorem mathd_algebra_478 : True := by
 """
         expected = "theorem mathd_algebra_478 : True := by\n  sorry_using []"
 
-        self.assertEqual(_extract_current_node_decl(declaration), expected)
+        self.assertEqual(extract_current_node_decl(declaration), expected)
 
-        assembled = _assemble_node_attempt(declaration, "", "by trivial")
+        assembled = assemble_node_attempt(declaration, "", "by trivial", "import Mathlib")
         self.assertNotIn("@[blueprint", assembled)
         self.assertNotIn("theorem statement", assembled)
         self.assertIn("theorem mathd_algebra_478 : True := by trivial", assembled)
 
     def test_proof_node_without_placeholder_fails_before_backend(self) -> None:
-        class RecordingCompiler(LeanCompiler):
-            def __init__(self) -> None:
-                super().__init__()
-                self.codes: list[str] = []
-
-            def _run_lean(self, code: str) -> CompilerResult:
-                self.codes.append(code)
-                return CompilerResult(success=True)
-
-        compiler = RecordingCompiler()
-        result = compiler.check(
-            "by trivial",
-            node_decl="theorem already_complete : True := by trivial",
-        )
-
-        self.assertFalse(result.success)
-        self.assertFalse(result.validated)
-        self.assertIn("exactly one", result.errors[0])
-        self.assertEqual(compiler.codes, [])
-
-    def test_complete_definition_can_be_checked_directly(self) -> None:
-        class RecordingCompiler(LeanCompiler):
-            def __init__(self) -> None:
-                super().__init__()
-                self.codes: list[str] = []
-
-            def _run_lean(self, code: str) -> CompilerResult:
-                self.codes.append(code)
-                return CompilerResult(success=True)
-
-        compiler = RecordingCompiler()
-        declaration = "def value : Nat := 1"
-        result = compiler.check(declaration)
-
-        self.assertTrue(result.success)
-        self.assertEqual(compiler.codes, [declaration])
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            assemble_node_attempt(
+                "theorem already_complete : True := by trivial",
+                "",
+                "by trivial",
+                "import Mathlib",
+            )
 
     def test_phase2_contract_accepts_definitions_and_sorry_using_proof_nodes(self) -> None:
         lean_code = """@[blueprint (statement := /-- Helper value. -/)]

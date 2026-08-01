@@ -1,263 +1,273 @@
-"""Regression tests for Phase 2 definition-node scheduling."""
 from __future__ import annotations
 
 import asyncio
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from blueprint import Blueprint, BlueprintNode  # noqa: E402
-from checkpoint import CheckpointState  # noqa: E402
-from lean_compiler import _assemble_node_attempt  # noqa: E402
-from orchestrator import NodeResult, OrchestratorResult, prove_dag  # noqa: E402
-from pipeline import _assemble_final_file, _aux_lemma_decls, run_phase2  # noqa: E402
+from blueprint import _parse_blueprint  # noqa: E402
+from checkpoint import CheckpointState, RunStatus  # noqa: E402
+from kimina_lean_compiler import CompilerResult, KiminaInfrastructureError  # noqa: E402
+from orchestrator import (  # noqa: E402
+    NodeResult,
+    OrchestratorResult,
+    _prove_one,
+    active_node_names,
+    prove_dag,
+)
+from pipeline import (  # noqa: E402
+    _assemble_final_file,
+    _invalidate_stale_proofs,
+    run_phase3,
+    run_phase2_async,
+)
 from prover import ProofSignal, ProverResult  # noqa: E402
+from refinement import _annotate_with_verdicts  # noqa: E402
 
 
-def _definition(name: str, declaration: str) -> BlueprintNode:
-    return BlueprintNode(
-        name=name,
-        kind="definition",
-        statement="",
-        proof_sketch="",
-        lean_declaration=declaration,
+LEAN = """import Mathlib
+import Architect
+
+@[blueprint (statement := /-- A global definition. -/)]
+def base : Nat := 1
+
+@[blueprint (statement := /-- Used helper. -/) (proof := /-- Trivial. -/)]
+lemma used : base = 1 := by sorry_using []
+
+@[blueprint (statement := /-- Unrelated helper. -/) (proof := /-- Trivial. -/)]
+lemma unused : True := by sorry_using []
+
+@[blueprint (statement := /-- Root. -/) (proof := /-- Use helper. -/)]
+theorem root : base = 1 := by sorry_using [used]
+"""
+
+
+class FakeCompiler:
+    def __init__(self, final_result: CompilerResult) -> None:
+        self.final_result = final_result
+        self.codes: list[str] = []
+
+    def check(self, code: str, allow_sorry: bool = False) -> CompilerResult:
+        self.codes.append(code)
+        return self.final_result
+
+
+def solved_result(blueprint) -> OrchestratorResult:
+    results = {}
+    for node in blueprint.nodes:
+        if node.kind == "definition":
+            proof = ""
+        elif node.name == "used":
+            proof = "by rfl"
+        elif node.name == "root":
+            proof = "by exact used"
+        else:
+            continue
+        results[node.name] = NodeResult(node, ProverResult(ProofSignal.SOLVED, proof))
+    return OrchestratorResult(
+        results,
+        active_node_names(blueprint),
+        blueprint.target_theorem,
     )
 
 
-def _proof_node(
-    name: str,
-    declaration: str,
-    dependencies: list[str],
-    *,
-    kind: str = "lemma",
-) -> BlueprintNode:
-    return BlueprintNode(
-        name=name,
-        kind=kind,
-        statement="",
-        proof_sketch="",
-        dependencies=dependencies,
-        lean_declaration=declaration,
-    )
-
-
-class DefinitionNodeSchedulingTest(unittest.TestCase):
+class RootClosureTest(unittest.TestCase):
     def setUp(self) -> None:
-        base = _definition(
-            "base_val",
-            """@[blueprint (statement := /-- The base. -/)]
-def base_val : ℝ := (30 : ℝ)
-""",
-        )
-        height = _definition(
-            "height_val",
-            """@[blueprint (statement := /-- The height. -/)]
-noncomputable def height_val : ℝ := (13 : ℝ) / 2
-""",
-        )
-        mult = _proof_node(
-            "mult_30_13_over_2",
-            """@[blueprint
-  (statement := /-- The product calculation. -/)
-  (proof := /-- Normalize the definitions. -/)]
-lemma mult_30_13_over_2 : base_val * height_val = 195 := by
-  sorry_using [base_val, height_val]
-""",
-            ["base_val", "height_val"],
-        )
-        root = _proof_node(
-            "mathd_algebra_478",
-            """@[blueprint
-  (statement := /-- The target. -/)
-  (proof := /-- Use the calculation. -/)]
-theorem mathd_algebra_478 : base_val * height_val = 195 := by
-  sorry_using [mult_30_13_over_2]
-""",
-            ["mult_30_13_over_2"],
-            kind="theorem",
-        )
-        self.blueprint = Blueprint(
-            nodes=[base, height, mult, root],
-            lean_file="\n".join(
-                node.lean_declaration for node in [base, height, mult, root]
-            ),
-            target_theorem="mathd_algebra_478",
-            fully_validated=True,
-        )
+        self.blueprint = _parse_blueprint(LEAN, "root")
 
-    def test_definitions_skip_prover_and_rebuild_clean_context(self) -> None:
-        calls: list[dict] = []
+    def test_active_set_keeps_all_definitions_and_root_dependencies(self) -> None:
+        self.assertEqual(active_node_names(self.blueprint), {"base", "used", "root"})
 
-        def fake_prove_node(**kwargs) -> ProverResult:
-            calls.append(kwargs)
-            return ProverResult(signal=ProofSignal.SOLVED, proof_body="by norm_num")
+    def test_unrelated_proof_node_is_not_scheduled(self) -> None:
+        attempted: list[str] = []
 
-        polluted_definition = (
-            "@[blueprint] def base_val : ℝ := @[blueprint] "
-            "def base_val : ℝ := (999 : ℝ)"
-        )
-        with patch("orchestrator.prove_node", side_effect=fake_prove_node):
-            result = asyncio.run(
-                prove_dag(
-                    blueprint=self.blueprint,
-                    compiler=object(),
-                    retrieval=object(),
-                    proved_cache={"base_val": polluted_definition},
-                    node_timeout_s=None,
-                )
-            )
-
-        self.assertEqual(
-            [call["node_name"] for call in calls],
-            ["mult_30_13_over_2", "mathd_algebra_478"],
-        )
-        self.assertTrue(result.all_proved())
-        self.assertEqual(result.node_results["base_val"].result.proof_body, "")
-        self.assertEqual(result.node_results["height_val"].result.proof_body, "")
-
-        mult_call = calls[0]
-        context = mult_call["parent_lemma_decls"]
-        self.assertEqual(context.count("def base_val"), 1)
-        self.assertEqual(context.count("def height_val"), 1)
-        self.assertNotIn("@[blueprint", context)
-        self.assertNotIn(":= @[blueprint", context)
-        self.assertNotIn("999", context)
-        self.assertEqual(mult_call["parent_proofs"], {})
-
-        mult_node = self.blueprint.node_by_name("mult_30_13_over_2")
-        assert mult_node is not None
-        assembled = _assemble_node_attempt(
-            mult_node.lean_declaration,
-            context,
-            "by norm_num",
-        )
-        self.assertEqual(assembled.count("def base_val"), 1)
-        self.assertEqual(assembled.count("def height_val"), 1)
-        self.assertNotIn(":= @[blueprint", assembled)
-        self.assertIn(
-            "lemma mult_30_13_over_2 : base_val * height_val = 195 := by norm_num",
-            assembled,
-        )
-
-        root_call = calls[1]
-        self.assertEqual(
-            root_call["parent_proofs"],
-            {"mult_30_13_over_2": "by norm_num"},
-        )
-        self.assertIn(
-            "theorem mult_30_13_over_2 : base_val * height_val = 195 := by norm_num",
-            root_call["parent_lemma_decls"],
-        )
-
-    def test_unproved_dependency_marks_dependent_node_blocked(self) -> None:
-        calls: list[str] = []
-
-        def fake_prove_node(**kwargs) -> ProverResult:
-            calls.append(kwargs["node_name"])
-            return ProverResult(
-                signal=ProofSignal.PROOF_TOO_HARD,
-                analysis="upstream proof attempt failed",
-            )
-
-        with patch("orchestrator.prove_node", side_effect=fake_prove_node):
-            result = asyncio.run(
-                prove_dag(
-                    blueprint=self.blueprint,
-                    compiler=object(),
-                    retrieval=object(),
-                    node_timeout_s=None,
-                )
-            )
-
-        self.assertEqual(calls, ["mult_30_13_over_2"])
-        self.assertEqual(
-            result.node_results["mult_30_13_over_2"].result.signal,
-            ProofSignal.PROOF_TOO_HARD,
-        )
-        self.assertEqual(
-            result.node_results["mathd_algebra_478"].result.signal,
-            ProofSignal.BLOCKED_BY_DEPENDENCY,
-        )
-        self.assertIn(
-            "Skipped without attempting a proof: dependency mult_30_13_over_2",
-            result.node_results["mathd_algebra_478"].result.analysis,
-        )
-
-    def test_aux_and_final_output_keep_definition_rhs_once(self) -> None:
-        proved_cache = {
-            "base_val": "",
-            "height_val": "",
-            "mult_30_13_over_2": "by norm_num",
-            "mathd_algebra_478": "by exact mult_30_13_over_2",
-        }
-        aux = _aux_lemma_decls(
-            self.blueprint, proved_cache, "mathd_algebra_478",
-        )
-
-        self.assertEqual(aux.count("def base_val"), 1)
-        self.assertEqual(aux.count("def height_val"), 1)
-        self.assertIn("def base_val : ℝ := (30 : ℝ)", aux)
-        self.assertIn("noncomputable def height_val : ℝ := (13 : ℝ) / 2", aux)
-        self.assertNotIn("@[blueprint", aux)
-
-        orch_result = OrchestratorResult(node_results={
-            node.name: NodeResult(
-                node=node,
-                result=ProverResult(
-                    signal=ProofSignal.SOLVED,
-                    proof_body=proved_cache[node.name],
-                ),
-            )
-            for node in self.blueprint.nodes
-        })
-        final_file = _assemble_final_file(self.blueprint, orch_result)
-        self.assertEqual(final_file.count("def base_val"), 1)
-        self.assertEqual(final_file.count("def height_val"), 1)
-        self.assertIn("def base_val : ℝ := (30 : ℝ)", final_file)
-
-    def test_phase2_rewrites_polluted_definition_checkpoint_entries(self) -> None:
-        polluted = "@[blueprint] def base_val : ℝ := (999 : ℝ)"
-
-        def fake_prove_node(**_kwargs) -> ProverResult:
-            return ProverResult(signal=ProofSignal.SOLVED, proof_body="by norm_num")
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            checkpoint_path = Path(tmp_dir) / "checkpoint.json"
-            state = CheckpointState(theorem_stmt="theorem mathd_algebra_478 : True")
-            state.set_blueprint(self.blueprint)
-            state.proved_cache = {
-                "base_val": polluted,
-                "height_val": "noncomputable def height_val : ℝ := 999",
-            }
-            state.proof_cache_keys = {
-                "base_val": "old-signature-only-key",
-                "height_val": "old-signature-only-key",
-            }
-            state.save(checkpoint_path)
-
-            with patch("orchestrator.prove_node", side_effect=fake_prove_node):
-                result = run_phase2(
-                    checkpoint_path=checkpoint_path,
-                    compiler=object(),
-                    retrieval=object(),
-                    node_timeout_s=None,
-                )
-
-            restored = CheckpointState.load(checkpoint_path)
-
-        self.assertTrue(result.all_proved())
-        self.assertEqual(restored.proved_cache["base_val"], "")
-        self.assertEqual(restored.proved_cache["height_val"], "")
-        for name in ("base_val", "height_val"):
+        async def fake_prove_one(**kwargs):
+            name = kwargs["name"]
+            attempted.append(name)
             node = self.blueprint.node_by_name(name)
-            assert node is not None
-            self.assertEqual(restored.proof_cache_keys[name], node.cache_key())
+            return NodeResult(node, ProverResult(ProofSignal.SOLVED, "by trivial"))
+
+        async def run():
+            with patch("orchestrator._prove_one", side_effect=fake_prove_one):
+                return await prove_dag(
+                    self.blueprint,
+                    compiler=object(),
+                    retrieval=object(),
+                )
+
+        result = asyncio.run(run())
+        self.assertEqual(attempted, ["used", "root"])
+        self.assertNotIn("unused", result.node_results)
+
+    def test_every_definition_is_injected_into_node_context(self) -> None:
+        with patch(
+            "orchestrator.prove_node",
+            return_value=ProverResult(ProofSignal.SOLVED, "by rfl"),
+        ) as prove:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                asyncio.run(_prove_one(
+                    name="used",
+                    blueprint=self.blueprint,
+                    proof_bodies={},
+                    compiler=object(),
+                    retrieval=object(),
+                    model="model",
+                    tracer=object(),
+                    node_timeout_s=None,
+                    llm_api_timeout_s=None,
+                    node_max_prove_turns=1,
+                    max_tool_calls_per_turn=3,
+                    node_executor=executor,
+                    node_semaphore=None,
+                ))
+        arguments = prove.call_args.kwargs
+        self.assertEqual(len(arguments["definition_decls"]), 1)
+        self.assertIn("def base", arguments["definition_decls"][0])
+        self.assertIn("def base", arguments["parent_lemma_decls"])
+        self.assertEqual(arguments["parent_signatures"], [])
+
+    def test_final_file_drops_unrelated_lemma(self) -> None:
+        assembled = _assemble_final_file(self.blueprint, solved_result(self.blueprint))
+        self.assertIn("def base", assembled)
+        self.assertIn("theorem used", assembled)
+        self.assertIn("theorem root", assembled)
+        self.assertNotIn("lemma unused", assembled)
+        self.assertNotIn("sorry_using", assembled)
+        self.assertNotIn("@[blueprint", assembled)
+
+    def test_changed_root_invalidates_cached_proof(self) -> None:
+        old_root = self.blueprint.node_by_name("root")
+        cache = {"root": "by exact used", "unused": "by trivial"}
+        keys = {"root": old_root.cache_key(), "unused": self.blueprint.node_by_name("unused").cache_key()}
+        revised = _parse_blueprint(LEAN.replace("theorem root : base = 1", "theorem root : base = base"), "root")
+        self.assertEqual(_invalidate_stale_proofs(revised, cache, keys), {})
+
+    def test_phase3_writes_revised_root_declaration(self) -> None:
+        revised = _parse_blueprint(
+            LEAN.replace("theorem root : base = 1", "theorem root : base = base"),
+            "root",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            state = CheckpointState("informal", "model")
+            state.set_blueprint(self.blueprint)
+            failed = solved_result(self.blueprint)
+            failed.node_results["root"] = NodeResult(
+                self.blueprint.node_by_name("root"),
+                ProverResult(ProofSignal.PROOF_TOO_HARD, "by exact used", ["bad"]),
+            )
+            state.set_node_results(failed.node_results)
+            state.save(path)
+            with patch("pipeline.refine_blueprint", return_value=revised):
+                run_phase3(
+                    checkpoint_path=path,
+                    compiler=FakeCompiler(CompilerResult(True)),
+                )
+            loaded = CheckpointState.load(path)
+        self.assertIn("theorem root : base = base", loaded.blueprint_lean_file)
+        self.assertEqual(loaded.status, RunStatus.RUNNING)
+        self.assertEqual(loaded.iteration, 1)
+        self.assertNotIn("root", loaded.proved_cache)
+
+    def test_checkpoint_round_trip_uses_new_schema(self) -> None:
+        state = CheckpointState("informal", "model", status=RunStatus.SOLVED)
+        state.set_blueprint(self.blueprint)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            state.save(path)
+            loaded = CheckpointState.load(path)
+        self.assertTrue(loaded.root_proved)
+        self.assertEqual(loaded.informal_statement, "informal")
+
+    def test_final_verify_success_is_only_success_state(self) -> None:
+        asyncio.run(self._run_final_case(CompilerResult(True), RunStatus.SOLVED, True))
+
+    def test_final_verify_failure_removes_root_and_keeps_diagnosis(self) -> None:
+        error = '{"severity":"error","pos":{"line":4,"column":2},"data":"bad"}'
+        goal = '{"severity":"info","data":"x : Nat\\n⊢ x = x"}'
+        state = asyncio.run(self._run_final_case(
+            CompilerResult(False, errors=[error], goals=[goal], failure_kind="lean"),
+            RunStatus.RUNNING,
+            False,
+        ))
+        self.assertNotIn("root", state.proved_cache)
+        self.assertEqual(state.node_results["root"]["proof_body"], "by exact used")
+        self.assertEqual(state.node_results["root"]["lean_errors"], [error, goal])
+        self.assertEqual(state.final_lean_errors, [error, goal])
+
+    def test_phase3_retry_exhaustion_is_exhausted_not_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            state = CheckpointState("informal", "model")
+            state.set_blueprint(self.blueprint)
+            failed = solved_result(self.blueprint)
+            failed.node_results["root"] = NodeResult(
+                self.blueprint.node_by_name("root"),
+                ProverResult(ProofSignal.PROOF_TOO_HARD, "by exact used", ["bad"]),
+            )
+            state.set_node_results(failed.node_results)
+            state.save(path)
+            with patch("pipeline.refine_blueprint", side_effect=RuntimeError("retry limit")):
+                returned = run_phase3(
+                    checkpoint_path=path,
+                    compiler=FakeCompiler(CompilerResult(True)),
+                )
+            loaded = CheckpointState.load(path)
+        self.assertEqual(returned.lean_file, self.blueprint.lean_file)
+        self.assertEqual(loaded.status, RunStatus.EXHAUSTED)
+        self.assertEqual(loaded.final_lean_errors, ["retry limit"])
+
+    def test_phase3_kimina_failure_is_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            state = CheckpointState("informal", "model")
+            state.set_blueprint(self.blueprint)
+            state.set_node_results(solved_result(self.blueprint).node_results)
+            state.save(path)
+            with patch(
+                "pipeline.refine_blueprint",
+                side_effect=KiminaInfrastructureError("kimina unavailable"),
+            ):
+                run_phase3(
+                    checkpoint_path=path,
+                    compiler=FakeCompiler(CompilerResult(True)),
+                )
+            loaded = CheckpointState.load(path)
+        self.assertEqual(loaded.status, RunStatus.ERROR)
+        self.assertEqual(loaded.final_lean_errors, ["kimina unavailable"])
+
+    def test_refinement_diagnosis_keeps_complete_error(self) -> None:
+        failure = solved_result(self.blueprint)
+        long_error = "E" * 1600 + "END"
+        failure.node_results["root"] = NodeResult(
+            self.blueprint.node_by_name("root"),
+            ProverResult(ProofSignal.PROOF_TOO_HARD, "by exact used", [long_error]),
+        )
+        annotated = _annotate_with_verdicts(self.blueprint, failure)
+        self.assertIn(long_error, annotated)
+        self.assertNotIn("diagnosis truncated", annotated)
+
+    async def _run_final_case(self, result, expected_status, expect_root) -> CheckpointState:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            state = CheckpointState("informal", "model")
+            state.set_blueprint(self.blueprint)
+            state.save(path)
+            compiler = FakeCompiler(result)
+            with patch("pipeline.prove_dag", new=AsyncMock(return_value=solved_result(self.blueprint))):
+                await run_phase2_async(checkpoint_path=path, compiler=compiler, retrieval=object())
+            loaded = CheckpointState.load(path)
+        self.assertEqual(loaded.status, expected_status)
+        self.assertEqual(loaded.root_proved, expect_root)
+        self.assertEqual(len(compiler.codes), 1)
+        return loaded
 
 
 if __name__ == "__main__":

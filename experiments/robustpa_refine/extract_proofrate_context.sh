@@ -62,13 +62,12 @@ FILES=(
   "src/prover.py"
   "src/checkpoint.py"
   "src/tracer.py"
-  "src/lean_compiler.py"
   "src/kimina_lean_compiler.py"
   "src/mathlib_retrieval.py"
   "src/llm_client.py"
   "src/goedel_prompts.py"
-  "experiments/shared/lean_runtime.py"
-  "experiments/shared/io_utils.py"
+  "experiments/robustpa_refine/runtime.py"
+  "experiments/robustpa_refine/io_utils.py"
 )
 
 PROMPTS=(
@@ -97,7 +96,7 @@ append_command "Recent Commits" git log --oneline -n 12
 
 append_command \
   "Proof-Rate Related Search Hits" \
-  rg -n "max_retries|node_max_prove|negation|infra_error|timeout|success|done|proved_cache|failed_nodes|refine|contract_check|parallel_tool_calls|tool_choice|reasoning_effort|GOEDEL_" \
+  rg -n "max_retries|node_max_prove|negation|infra_error|timeout|status|proved_cache|failed_nodes|refine|contract_check|max_tool_calls_per_turn|tool_choice|reasoning_effort|GOEDEL_" \
     src experiments/robustpa_refine prompts
 
 append_command \
