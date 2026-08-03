@@ -182,16 +182,34 @@ def _first_value(*values: Any) -> Any:
     return None
 
 
-def _trace_ids_from_path(exp_dir: Path, path: Path) -> dict[str, str]:
+ResultRecordKey = tuple[str, str, str]
+
+
+def _artifact_ids_from_path(
+    exp_dir: Path,
+    path: Path,
+    artifact_type: str,
+) -> dict[str, str]:
+    root_name = {
+        "trace_event": "traces",
+        "checkpoint": "checkpoints",
+        "blueprint": "blueprints",
+    }.get(artifact_type, "")
     try:
-        rel = path.relative_to(exp_dir / "traces")
+        rel = path.relative_to(exp_dir / root_name)
         parts = rel.parts
-    except ValueError:
+    except (ValueError, TypeError):
         parts = ()
     subset = parts[0] if len(parts) >= 3 else ""
     split = parts[1] if len(parts) >= 3 else ""
-    record_id = path.stem
-    return {"subset": subset, "split": split, "record_id": record_id}
+    record_id = Path(parts[2]).stem if len(parts) >= 3 else ""
+    unique_id = f"{subset}__{split}__{record_id}" if subset and split and record_id else ""
+    return {
+        "id": unique_id,
+        "subset": subset,
+        "split": split,
+        "record_id": record_id,
+    }
 
 
 def _record_keys(row: dict[str, Any] | None) -> dict[str, str]:
@@ -215,8 +233,10 @@ def _phase(row: dict[str, Any]) -> str:
     return ""
 
 
-def _build_result_maps(exp_dir: Path) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
-    by_record: dict[str, dict[str, Any]] = {}
+def _build_result_maps(
+    exp_dir: Path,
+) -> tuple[dict[ResultRecordKey, dict[str, Any]], dict[str, dict[str, Any]]]:
+    by_record: dict[ResultRecordKey, dict[str, Any]] = {}
     by_id: dict[str, dict[str, Any]] = {}
     results_path = exp_dir / "results.jsonl"
     if not results_path.exists():
@@ -224,11 +244,66 @@ def _build_result_maps(exp_dir: Path) -> tuple[dict[str, dict[str, Any]], dict[s
     for _idx, _raw, row, _err in _jsonl_lines(results_path):
         if not row:
             continue
-        if row.get("record_id"):
-            by_record[_str(row.get("record_id"))] = row
+        record_key = (
+            _str(row.get("subset")),
+            _str(row.get("split")),
+            _str(row.get("record_id")),
+        )
+        if all(record_key):
+            by_record[record_key] = row
         if row.get("id"):
             by_id[_str(row.get("id"))] = row
     return by_record, by_id
+
+
+def _lookup_result(
+    keys: dict[str, str],
+    result_by_record: dict[ResultRecordKey, dict[str, Any]],
+    result_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    unique_id = keys.get("id", "")
+    if unique_id and unique_id in result_by_id:
+        return result_by_id[unique_id]
+    record_key = (
+        keys.get("subset", ""),
+        keys.get("split", ""),
+        keys.get("record_id", ""),
+    )
+    if all(record_key):
+        return result_by_record.get(record_key, {})
+    return {}
+
+
+def _new_success_by_refinement_iteration(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, int]]:
+    result_rows = [row for row in rows if row.get("artifact_type") == "result"]
+    observed_iterations = [max(0, int(row.get("iteration") or 0)) for row in result_rows]
+    max_iteration = max(observed_iterations, default=0)
+    counts = {iteration: 0 for iteration in range(max_iteration + 1)}
+    for row, iteration in zip(result_rows, observed_iterations):
+        if str(row.get("root_proved") or "").strip().lower() == "true":
+            counts[iteration] += 1
+    return [
+        {
+            "refinement_iterations": iteration,
+            "new_success_count": counts[iteration],
+        }
+        for iteration in range(max_iteration + 1)
+    ]
+
+
+def _format_new_success_by_refinement_iteration(rows: list[dict[str, Any]]) -> str:
+    buckets = _new_success_by_refinement_iteration(rows)
+    iterations = [str(bucket["refinement_iterations"]) for bucket in buckets]
+    counts = [str(bucket["new_success_count"]) for bucket in buckets]
+    return "\n".join(
+        [
+            "| result \\ refine_iterations | " + " | ".join(iterations) + " |",
+            "| " + " | ".join(["---"] * (len(iterations) + 1)) + " |",
+            "| new_success_count | " + " | ".join(counts) + " |",
+        ]
+    )
 
 
 def _classify_error(row: dict[str, Any] | None) -> str:
@@ -438,7 +513,7 @@ def _row_from_jsonl(
     parse_error: str,
     *,
     artifact_type: str,
-    result_by_record: dict[str, dict[str, Any]],
+    result_by_record: dict[ResultRecordKey, dict[str, Any]],
     result_by_id: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     out = _empty_row(exp_dir, generated_at)
@@ -461,9 +536,9 @@ def _row_from_jsonl(
 
     keys = _record_keys(parsed)
     if artifact_type == "trace_event":
-        path_keys = _trace_ids_from_path(exp_dir, path)
+        path_keys = _artifact_ids_from_path(exp_dir, path, artifact_type)
         keys.update({k: v for k, v in path_keys.items() if not keys.get(k) and v})
-        result_row = result_by_record.get(keys["record_id"]) or result_by_id.get(keys["id"]) or {}
+        result_row = _lookup_result(keys, result_by_record, result_by_id)
         result_keys = _record_keys(result_row)
         keys.update({k: v for k, v in result_keys.items() if not keys.get(k) and v})
         out["trace_event_index"] = row_index
@@ -473,7 +548,7 @@ def _row_from_jsonl(
         {
             "thm_name": _str(parsed.get("thm_name")),
             "phase": _phase(parsed),
-            "iteration": _int_or_none(parsed.get("iteration")),
+            "iteration": _int_or_none(_first_value(parsed.get("iteration"), parsed.get("iterations"))),
             "turn": _int_or_none(parsed.get("turn")),
             "kind": _str(parsed.get("kind")),
             "tool_name": _str(parsed.get("tool_name")),
@@ -488,7 +563,7 @@ def _row_from_jsonl(
     )
     _populate_common_json_fields(out, parsed)
     if artifact_type != "result":
-        result_row = result_by_record.get(out["record_id"]) or result_by_id.get(out["id"]) or {}
+        result_row = _lookup_result(_record_keys(out), result_by_record, result_by_id)
         _fill_missing_result_context(out, result_row)
     if not out["theorem_name"] and out["thm_name"]:
         out["theorem_name"] = out["thm_name"]
@@ -502,7 +577,8 @@ def _row_from_file(
     file_index: int,
     *,
     artifact_type: str,
-    result_by_record: dict[str, dict[str, Any]],
+    result_by_record: dict[ResultRecordKey, dict[str, Any]],
+    result_by_id: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     out = _empty_row(exp_dir, generated_at)
     raw_text, parse_error = _read_text(path)
@@ -531,13 +607,13 @@ def _row_from_file(
         except json.JSONDecodeError as exc:
             out["parse_error"] = str(exc)
 
-    if artifact_type in {"checkpoint", "blueprint", "trace_event"}:
-        record_id = path.stem
-        if artifact_type == "blueprint" and len(path.parts) >= 2:
-            record_id = path.parent.name
-        result_row = result_by_record.get(record_id) or {}
-        keys = _record_keys(result_row)
-        keys["record_id"] = keys["record_id"] or record_id
+    if artifact_type in {"checkpoint", "blueprint"}:
+        keys = _record_keys(out)
+        path_keys = _artifact_ids_from_path(exp_dir, path, artifact_type)
+        keys.update({k: v for k, v in path_keys.items() if not keys.get(k) and v})
+        result_row = _lookup_result(keys, result_by_record, result_by_id)
+        result_keys = _record_keys(result_row)
+        keys.update({k: v for k, v in result_keys.items() if not keys.get(k) and v})
         out.update(keys)
         _fill_missing_result_context(out, result_row)
     return out
@@ -604,6 +680,7 @@ def aggregate_experiment(exp_dir: Path) -> list[dict[str, Any]]:
                     file_index,
                     artifact_type=artifact_type,
                     result_by_record=result_by_record,
+                    result_by_id=result_by_id,
                 )
             )
     return rows
@@ -642,6 +719,8 @@ def main() -> None:
     print(f"[wrote] {output}")
     print(f"[rows] {len(rows)}")
     print(f"[artifact_counts] {json.dumps(counts, ensure_ascii=False, sort_keys=True)}")
+    print("[new-success-by-refinement-iteration]")
+    print(_format_new_success_by_refinement_iteration(rows))
 
 
 if __name__ == "__main__":

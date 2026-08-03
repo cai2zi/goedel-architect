@@ -17,6 +17,9 @@ class LeanRuntime:
     def close(self) -> None:
         self.compiler.close()
 
+    def current_metadata(self) -> dict[str, Any]:
+        return {**self.metadata, "stats": self.compiler.stats()}
+
 
 def make_lean_runtime(args) -> LeanRuntime:
     metadata = {
@@ -25,7 +28,8 @@ def make_lean_runtime(args) -> LeanRuntime:
         "timeout_s": args.lean_server_timeout,
         "reuse": args.lean_server_reuse,
         "debug": args.lean_server_debug,
-        "check_concurrency": args.lean_check_concurrency,
+        "max_inflight_snippets": args.lean_max_inflight_snippets,
+        "batch_size": args.lean_batch_size,
     }
     compiler = KiminaLeanCompiler(
         api_url=args.lean_api_url,
@@ -33,7 +37,8 @@ def make_lean_runtime(args) -> LeanRuntime:
         timeout_s=args.lean_server_timeout,
         reuse=args.lean_server_reuse,
         debug=args.lean_server_debug,
-        check_concurrency=args.lean_check_concurrency,
+        max_inflight_snippets=args.lean_max_inflight_snippets,
+        batch_size=args.lean_batch_size,
     )
     return LeanRuntime(compiler, metadata)
 

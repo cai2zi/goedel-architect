@@ -18,16 +18,17 @@ phase1_concurrency: 1024
 phase2_blueprint_concurrency: 512
 phase2_node_concurrency: 4096
 refine_concurrency: 1024
-phase2_contract_check_concurrency: 4
-lean_check_concurrency: 64
+phase2_contract_check_concurrency: 8
+lean_max_inflight_snippets: 128
+lean_batch_size: 8
 lean_api_url: http://localhost:8000
 lean_api_key_env: KIMINA_API_KEY
 lean_server_timeout: 600
 lean_server_reuse: true
 lean_server_debug: false
 environment:
-  GOEDEL_BLUEPRINT_MAX_TOKENS: "32768"
-  GOEDEL_PROVER_MAX_TOKENS: "16384"
+  GOEDEL_BLUEPRINT_MAX_TOKENS: "16384"
+  GOEDEL_PROVER_MAX_TOKENS: "8192"
   GOEDEL_LLM_MAX_RETRIES: "6"
   GOEDEL_LLM_RETRY_BASE_DELAY_S: "2"
   GOEDEL_LLM_RETRY_MAX_DELAY_S: "60"

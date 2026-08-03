@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-OUT="/ssd/czx/robustpa_refine_proofrate_context.md"
-REPO_ROOT="/ssd/czx/goedel-architect"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+OUT="${1:-/ssd/czx/robustpa_refine_proofrate_context.md}"
+
+if [[ $# -gt 1 ]]; then
+  printf 'usage: %s [OUT]\n' "$0" >&2
+  exit 2
+fi
 
 cd "${REPO_ROOT}"
 mkdir -p "$(dirname "${OUT}")"
@@ -24,7 +30,7 @@ append_command() {
   {
     printf '\n## %s\n\n' "${title}"
     printf '```text\n'
-    "$@" || true
+    "$@" 2>&1 || true
     printf '```\n'
   } >> "${OUT}"
 }
@@ -50,10 +56,19 @@ append_file() {
 }
 
 FILES=(
+  "README.md"
+  "requirements.txt"
+  "experiments/robustpa_refine/README.md"
   "experiments/robustpa_refine/run_robustpa_refine.py"
   "experiments/robustpa_refine/run_all_robustpa_reexp.sh"
+  "experiments/robustpa_refine/run_eval.sh"
+  "experiments/robustpa_refine/export_stmt_sc_inputs.py"
+  "experiments/robustpa_refine/evaluate_stmt_sc.py"
+  "experiments/robustpa_refine/node_iter_tables.py"
+  "experiments/robustpa_refine/summarize_for_chat.py"
+  "experiments/robustpa_refine/trace_viewer.py"
+  "experiments/robustpa_refine/extract_proofrate_context.sh"
   "experiments/robustpa_refine/configs/base.yaml"
-  "experiments/robustpa_refine/configs/phase2_context_debug.yaml"
   "src/pipeline.py"
   "src/orchestrator.py"
   "src/blueprint.py"
@@ -68,6 +83,14 @@ FILES=(
   "src/goedel_prompts.py"
   "experiments/robustpa_refine/runtime.py"
   "experiments/robustpa_refine/io_utils.py"
+  "eval/test_blueprint_text_helpers.py"
+  "eval/test_definition_node_scheduling.py"
+  "eval/test_kimina_lean_compiler.py"
+  "eval/test_node_iter_tables.py"
+  "eval/test_prover_tool_protocol.py"
+  "eval/test_robustpa_refine_args.py"
+  "eval/test_summarize_for_chat.py"
+  "eval/test_tracer.py"
 )
 
 PROMPTS=(
@@ -96,7 +119,7 @@ append_command "Recent Commits" git log --oneline -n 12
 
 append_command \
   "Proof-Rate Related Search Hits" \
-  rg -n "max_retries|node_max_prove|negation|infra_error|timeout|status|proved_cache|failed_nodes|refine|contract_check|max_tool_calls_per_turn|tool_choice|reasoning_effort|GOEDEL_" \
+  rg -n "max_retries|node_max_prove|negation|infra_error|llm_error|timeout|status|signal|proved_cache|failed_nodes|refine|contract_check|max_tool_calls_per_turn|tool_calls_dropped|final_verify|lean_max_inflight_snippets|lean_batch_size|tool_choice|reasoning_effort|GOEDEL_" \
     src experiments/robustpa_refine prompts
 
 append_command \

@@ -168,6 +168,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         "phase2_node_concurrency",
         "refine_concurrency",
         "phase2_contract_check_concurrency",
+        "lean_max_inflight_snippets",
+        "lean_batch_size",
         "blueprint_max_retries",
         "node_max_prove_turns",
     ):
@@ -804,6 +806,37 @@ def _record_runtime_run(
     return data
 
 
+def _new_success_by_refinement_iteration(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, int]]:
+    observed_iterations = [max(0, int(row.get("iterations") or 0)) for row in rows]
+    max_iteration = max(observed_iterations, default=0)
+    counts: dict[int, int] = defaultdict(int)
+    for row, iteration in zip(rows, observed_iterations):
+        if row.get("root_proved") is True:
+            counts[iteration] += 1
+    return [
+        {
+            "refinement_iterations": iteration,
+            "new_success_count": counts[iteration],
+        }
+        for iteration in range(max_iteration + 1)
+    ]
+
+
+def _format_new_success_by_refinement_iteration(rows: list[dict[str, Any]]) -> str:
+    buckets = _new_success_by_refinement_iteration(rows)
+    iterations = [str(bucket["refinement_iterations"]) for bucket in buckets]
+    counts = [str(bucket["new_success_count"]) for bucket in buckets]
+    return "\n".join(
+        [
+            "| result \\ refine_iterations | " + " | ".join(iterations) + " |",
+            "| " + " | ".join(["---"] * (len(iterations) + 1)) + " |",
+            "| new_success_count | " + " | ".join(counts) + " |",
+        ]
+    )
+
+
 def _write_metrics(
     output_root: Path,
     rows: list[dict[str, Any]],
@@ -833,6 +866,7 @@ def _write_metrics(
     metrics = {
         "primary_metric": "root_proved_acc",
         "groups": metric_rows,
+        "new_success_by_refinement_iteration": _new_success_by_refinement_iteration(rows),
     }
     if elapsed_s is not None:
         metrics["elapsed_time"] = _format_elapsed_time(elapsed_s)
@@ -896,7 +930,8 @@ async def _run_experiment(
         f"phase2_node={args.phase2_node_concurrency} "
         f"refine={args.refine_concurrency} "
         f"phase2_contract_check={args.phase2_contract_check_concurrency} "
-        f"lean_check={args.lean_check_concurrency} "
+        f"lean_max_inflight_snippets={args.lean_max_inflight_snippets} "
+        f"lean_batch_size={args.lean_batch_size} "
         f"node_timeout_s={args.node_timeout_s} "
         f"llm_api_timeout_s={args.llm_api_timeout_s} "
         f"node_max_prove_turns={args.node_max_prove_turns} "
@@ -959,6 +994,8 @@ async def _run_experiment(
     print(f"[done] results={results_path}", flush=True)
     print(f"[rounds] {rounds_path}", flush=True)
     print(f"[metrics] primary root_proved_acc={metrics['groups'][0]['root_proved_acc']}", flush=True)
+    print("[new-success-by-refinement-iteration]", flush=True)
+    print(_format_new_success_by_refinement_iteration(final_rows), flush=True)
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="base")
@@ -971,7 +1008,7 @@ def main(cfg: DictConfig) -> None:
     previous_elapsed_s = _load_previous_elapsed_s(output_root) if args.resume else 0.0
     runtime = make_lean_runtime(args)
     try:
-        write_lean_runtime_metadata(output_root, runtime.metadata)
+        write_lean_runtime_metadata(output_root, runtime.current_metadata())
         start = time.perf_counter()
         completed = False
         try:
@@ -986,6 +1023,7 @@ def main(cfg: DictConfig) -> None:
             )
             completed = True
         finally:
+            write_lean_runtime_metadata(output_root, runtime.current_metadata())
             run_elapsed_s = time.perf_counter() - start
             history = _record_runtime_run(
                 output_root,

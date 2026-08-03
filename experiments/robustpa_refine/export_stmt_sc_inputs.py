@@ -26,7 +26,8 @@ LEAN_SERVER_TIMEOUT_S = 600
 LEAN_SERVER_REUSE = True
 LEAN_SERVER_DEBUG = False
 DEFAULT_WORKERS = 16
-LEAN_CHECK_CONCURRENCY = 16
+LEAN_MAX_INFLIGHT_SNIPPETS = 16
+LEAN_BATCH_SIZE = 8
 _GOEDEL_HELPERS: tuple[Any, Any, Any, Any] | None = None
 
 
@@ -108,16 +109,16 @@ def parse_args() -> argparse.Namespace:
         help="Number of export rows to process concurrently.",
     )
     parser.add_argument(
-        "--lean-check-concurrency",
+        "--lean-max-inflight-snippets",
         type=int,
-        default=LEAN_CHECK_CONCURRENCY,
-        help="Concurrency passed to the Kimina Lean compiler client.",
+        default=LEAN_MAX_INFLIGHT_SNIPPETS,
+        help="Maximum number of in-flight Kimina snippets.",
     )
     args = parser.parse_args()
     if args.workers <= 0:
         raise SystemExit("--workers must be positive")
-    if args.lean_check_concurrency <= 0:
-        raise SystemExit("--lean-check-concurrency must be positive")
+    if args.lean_max_inflight_snippets <= 0:
+        raise SystemExit("--lean-max-inflight-snippets must be positive")
     return args
 
 
@@ -236,7 +237,7 @@ def _write_lean_file(
     return str(path), digest, len(lean_text)
 
 
-def _make_lean_compiler(check_concurrency: int):
+def _make_lean_compiler(max_inflight_snippets: int):
     from kimina_lean_compiler import KiminaLeanCompiler
 
     return KiminaLeanCompiler(
@@ -245,7 +246,8 @@ def _make_lean_compiler(check_concurrency: int):
         timeout_s=LEAN_SERVER_TIMEOUT_S,
         reuse=LEAN_SERVER_REUSE,
         debug=LEAN_SERVER_DEBUG,
-        check_concurrency=check_concurrency,
+        max_inflight_snippets=max_inflight_snippets,
+        batch_size=LEAN_BATCH_SIZE,
     )
 
 
@@ -367,7 +369,7 @@ def export(args: argparse.Namespace) -> Path:
         result_rows = result_rows[: args.limit]
 
     source_rows = _preload_source_rows(result_rows, read_parquet_rows)
-    compiler = _make_lean_compiler(args.lean_check_concurrency)
+    compiler = _make_lean_compiler(args.lean_max_inflight_snippets)
     exported_rows: list[dict[str, Any]] = []
     counts: Counter[str] = Counter()
     validation_mismatches: list[str] = []
@@ -375,7 +377,8 @@ def export(args: argparse.Namespace) -> Path:
 
     try:
         print(
-            f"[export] workers={args.workers} lean_check_concurrency={args.lean_check_concurrency}",
+            f"[export] workers={args.workers} "
+            f"lean_max_inflight_snippets={args.lean_max_inflight_snippets}",
             flush=True,
         )
         indexed_export_rows: list[dict[str, Any] | None] = [None] * len(result_rows)

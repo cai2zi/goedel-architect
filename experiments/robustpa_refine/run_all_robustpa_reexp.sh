@@ -33,7 +33,8 @@ LEAN_API_URL="${LEAN_API_URL:-http://localhost:8000}"
 LEAN_SERVER_TIMEOUT="${LEAN_SERVER_TIMEOUT:-600}"
 LEAN_SERVER_REUSE="${LEAN_SERVER_REUSE:-true}"
 LEAN_SERVER_DEBUG="${LEAN_SERVER_DEBUG:-false}"
-LEAN_CHECK_CONCURRENCY="${LEAN_CHECK_CONCURRENCY:-64}"
+LEAN_MAX_INFLIGHT_SNIPPETS="${LEAN_MAX_INFLIGHT_SNIPPETS:-128}"
+LEAN_BATCH_SIZE="${LEAN_BATCH_SIZE:-8}"
 
 # Local vLLM usually ignores the key, but the OpenAI SDK requires one.
 export GOEDEL_OPENAI_API_KEY="${GOEDEL_OPENAI_API_KEY:-dummy}"
@@ -60,7 +61,8 @@ COMMON_OVERRIDES=(
   "lean_server_timeout=${LEAN_SERVER_TIMEOUT}"
   "lean_server_reuse=${LEAN_SERVER_REUSE}"
   "lean_server_debug=${LEAN_SERVER_DEBUG}"
-  "lean_check_concurrency=${LEAN_CHECK_CONCURRENCY}"
+  "lean_max_inflight_snippets=${LEAN_MAX_INFLIGHT_SNIPPETS}"
+  "lean_batch_size=${LEAN_BATCH_SIZE}"
 )
 
 format_elapsed() {
@@ -109,7 +111,7 @@ except Exception:
   fi
 }
 
-run_exp orig_reAll miniF2F global_original
+# run_exp orig_reAll miniF2F global_original
 run_exp all_splits_subsets_reAll null null
 # run_exp math500_orig_reAll MATH500 global_original
 

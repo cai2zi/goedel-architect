@@ -16,11 +16,12 @@ from blueprint import (  # noqa: E402
     extract_blueprint_signature,
     phase2_contract_error_counts,
     phase2_contract_errors,
+    phase2_standalone_contract_errors,
     render_solved_declaration,
     strip_blueprint_attr,
 )
 from blueprint_text import extract_current_node_decl  # noqa: E402
-from kimina_lean_compiler import assemble_node_attempt  # noqa: E402
+from kimina_lean_compiler import CompilerResult, assemble_node_attempt  # noqa: E402
 
 
 ZMOD_NODE = """@[blueprint
@@ -33,6 +34,41 @@ lemma mod7_2003_eq_1 :
 
 
 class BlueprintTextHelpersTest(unittest.TestCase):
+    def test_standalone_contract_forwards_batch_concurrency(self) -> None:
+        declarations = []
+        for index in range(17):
+            declarations.append(f"""@[blueprint
+  (statement := /-- Node {index}. -/)
+  (proof := /-- Trivial. -/)]
+lemma node_{index} : True := by
+  sorry_using []
+""")
+        declarations.append("""@[blueprint
+  (statement := /-- Root. -/)
+  (proof := /-- Trivial. -/)]
+theorem root : True := by
+  sorry_using []
+""")
+        blueprint = _parse_blueprint("\n".join(declarations), "root")
+
+        class RecordingCompiler:
+            batch_concurrency = 0
+            request_count = 0
+
+            def check_many(self, requests, *, batch_concurrency=1):
+                self.batch_concurrency = batch_concurrency
+                self.request_count = len(requests)
+                return [CompilerResult(True) for _ in requests]
+
+        compiler = RecordingCompiler()
+        errors = phase2_standalone_contract_errors(
+            blueprint, compiler, concurrency=8,
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(compiler.batch_concurrency, 8)
+        self.assertEqual(compiler.request_count, 18)
+
     def test_extract_lean_code_treats_none_content_as_empty(self) -> None:
         self.assertEqual(_extract_lean_code(None), "")
 

@@ -386,14 +386,17 @@ def phase2_standalone_contract_errors(
         node for node in blueprint.nodes
         if node.kind in {"lemma", "theorem"}
     ]
-    results = compiler.check_many([
-        CompileRequest(
-            _phase2_preflight_file(blueprint, node),
-            allow_sorry=True,
-            request_id=f"phase2-contract-{index}-{node.name}",
-        )
-        for index, node in enumerate(nodes)
-    ])
+    results = compiler.check_many(
+        [
+            CompileRequest(
+                _phase2_preflight_file(blueprint, node),
+                allow_sorry=True,
+                request_id=f"phase2-contract-{index}-{node.name}",
+            )
+            for index, node in enumerate(nodes)
+        ],
+        batch_concurrency=concurrency,
+    )
     errors: list[str] = []
     for node, result in zip(nodes, results, strict=True):
         if result.failure_kind == "infra":

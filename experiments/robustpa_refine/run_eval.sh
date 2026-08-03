@@ -2,7 +2,7 @@
 set -euo pipefail
 cd /ssd/czx/goedel-architect
 # Only change this experiment name.
-EXP_NAME="${EXP_NAME:-qwen3_5_397b_math500_orig_rePipe_debug44}"
+EXP_NAME="${EXP_NAME:-orig_reAll}"
 
 PYTHON_BIN="/ssd/miniconda3/envs/lean4-czx/bin/python"
 

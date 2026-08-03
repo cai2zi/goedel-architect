@@ -34,7 +34,8 @@ Important defaults in `configs/base.yaml`:
 max_refinement_iterations: 4
 node_max_prove_turns: 8
 max_tool_calls_per_turn: 3
-lean_check_concurrency: 64
+lean_max_inflight_snippets: 128
+lean_batch_size: 8
 ```
 
 The negation probe is fixed in code to one turn with one `lean_compile` call.

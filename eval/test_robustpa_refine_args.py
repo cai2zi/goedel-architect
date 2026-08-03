@@ -12,7 +12,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "experiments"))
 
-from robustpa_refine.run_robustpa_refine import _validate_args  # noqa: E402
+from robustpa_refine.run_robustpa_refine import (  # noqa: E402
+    _format_new_success_by_refinement_iteration,
+    _new_success_by_refinement_iteration,
+    _validate_args,
+)
 
 
 class RobustPAConfigTest(unittest.TestCase):
@@ -32,6 +36,34 @@ class RobustPAConfigTest(unittest.TestCase):
         config.max_tool_calls_per_turn = 0
         with self.assertRaisesRegex(ValueError, "max_tool_calls_per_turn"):
             _validate_args(SimpleNamespace(**OmegaConf.to_container(config, resolve=False)))
+
+    def test_new_successes_are_bucketed_by_refinement_count(self) -> None:
+        rows = [
+            {"iterations": 0, "root_proved": True},
+            {"iterations": 1, "root_proved": True},
+            {"iterations": 1, "root_proved": True},
+            {"iterations": 2, "root_proved": False},
+            {"iterations": 3, "root_proved": True},
+        ]
+        self.assertEqual(
+            _new_success_by_refinement_iteration(rows),
+            [
+                {"refinement_iterations": 0, "new_success_count": 1},
+                {"refinement_iterations": 1, "new_success_count": 2},
+                {"refinement_iterations": 2, "new_success_count": 0},
+                {"refinement_iterations": 3, "new_success_count": 1},
+            ],
+        )
+        self.assertEqual(
+            _format_new_success_by_refinement_iteration(rows),
+            "\n".join(
+                [
+                    "| result \\ refine_iterations | 0 | 1 | 2 | 3 |",
+                    "| --- | --- | --- | --- | --- |",
+                    "| new_success_count | 1 | 2 | 0 | 1 |",
+                ]
+            ),
+        )
 
 
 if __name__ == "__main__":

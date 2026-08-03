@@ -38,22 +38,30 @@ PROBLEM_TIME_BINS: list[tuple[str, float, float | None]] = [
     ("8h+", 8 * 60 * 60, None),
 ]
 
-PROOF_OPERATIONS = {"prove_node_initial", "prove_node_next"}
+PROOF_OPERATIONS = {
+    "prove_node_initial",
+    "prove_node_next",
+    "prove_node",
+    "prove_node_final",
+}
 
 
 @dataclass(frozen=True)
 class NodeAttempt:
+    unique_id: str
     record_id: str
     iteration: int
     node: str
     proof_turn: int
     ok: bool
+    signal: str
     wall_time_s: float
     total_tokens: int
 
 
 @dataclass(frozen=True)
 class ProblemAttempt:
+    unique_id: str
     record_id: str
     iteration: int
     ok: bool
@@ -62,19 +70,52 @@ class ProblemAttempt:
 
 def _jsonl(path: Path) -> Iterable[dict[str, Any]]:
     with path.open("r", encoding="utf-8", errors="replace") as f:
-        for line in f:
+        for line_number, line in enumerate(f, 1):
             if line.strip():
-                yield json.loads(line)
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError as exc:
+                    print(
+                        f"warning: skipped malformed JSONL row {path}:{line_number}: {exc}",
+                        file=sys.stderr,
+                    )
 
 
-def _event_key(record_id: str, event: dict[str, Any]) -> tuple[str, int, str] | None:
+def _trace_identity(traces_dir: Path, path: Path) -> tuple[str, str]:
+    try:
+        parts = path.relative_to(traces_dir).parts
+    except ValueError:
+        parts = ()
+    record_id = path.stem
+    if len(parts) >= 3:
+        subset, split = parts[0], parts[1]
+        return f"{subset}__{split}__{record_id}", record_id
+    return record_id, record_id
+
+
+def _event_key(unique_id: str, event: dict[str, Any]) -> tuple[str, int, str] | None:
     if event.get("phase") != "phase2":
         return None
     iteration = event.get("iteration")
     node = event.get("thm_name")
     if not isinstance(iteration, int) or not node:
         return None
-    return record_id, iteration, str(node)
+    return unique_id, iteration, str(node)
+
+
+def _proof_turn(event: dict[str, Any]) -> int | None:
+    args = event.get("args") if isinstance(event.get("args"), dict) else {}
+    stage = str(args.get("stage") or "")
+    operation = str(args.get("operation") or "")
+    is_proof_event = stage == "prove" or (
+        event.get("kind") == "llm_response" and operation in PROOF_OPERATIONS
+    )
+    if not is_proof_event:
+        return None
+    turn = event.get("turn")
+    if not isinstance(turn, int) or turn <= 0:
+        turn = args.get("turn")
+    return turn if isinstance(turn, int) and turn > 0 else None
 
 
 def _usage_tokens(event: dict[str, Any]) -> int:
@@ -97,7 +138,7 @@ def collect_node_attempts(
     trace_durations: dict[str, float] = {}
 
     for path in sorted(traces_dir.rglob("*.jsonl")):
-        record_id = path.stem
+        unique_id, record_id = _trace_identity(traces_dir, path)
         tokens_by_key: collections.Counter[tuple[str, int, str]] = collections.Counter()
         proof_turn_by_key: collections.Counter[tuple[str, int, str]] = collections.Counter()
         starts: set[tuple[str, int, str]] = set()
@@ -108,25 +149,22 @@ def collect_node_attempts(
             ts = event.get("ts")
             if isinstance(ts, (int, float)):
                 timestamps.append(float(ts))
-            key = _event_key(record_id, event)
+            key = _event_key(unique_id, event)
             if key is None:
                 continue
+            proof_turn = _proof_turn(event)
+            if proof_turn is not None:
+                proof_turn_by_key[key] = max(proof_turn_by_key[key], proof_turn)
             kind = event.get("kind")
             if kind == "theorem_start":
                 starts.add(key)
             elif kind == "llm_usage":
                 tokens_by_key[key] += _usage_tokens(event)
-            elif kind == "llm_response":
-                args = event.get("args") or {}
-                if args.get("operation") in PROOF_OPERATIONS:
-                    turn = event.get("turn")
-                    if isinstance(turn, int):
-                        proof_turn_by_key[key] = max(proof_turn_by_key[key], turn)
             elif kind == "node_finished":
                 finals[key] = event
 
         if timestamps:
-            trace_durations[record_id] = max(timestamps) - min(timestamps)
+            trace_durations[unique_id] = max(timestamps) - min(timestamps)
 
         for key in sorted(starts):
             final = finals.get(key)
@@ -136,11 +174,13 @@ def collect_node_attempts(
             args = final.get("args") or {}
             attempts.append(
                 NodeAttempt(
-                    record_id=key[0],
+                    unique_id=key[0],
+                    record_id=record_id,
                     iteration=key[1],
                     node=key[2],
                     proof_turn=int(proof_turn_by_key.get(key, 0)),
                     ok=bool(final.get("ok")),
+                    signal=str(args.get("signal") or ("solved" if final.get("ok") else "failed")),
                     wall_time_s=float(args.get("wall_time_s") or 0.0),
                     total_tokens=int(tokens_by_key.get(key, 0)),
                 )
@@ -159,27 +199,37 @@ def collect_problem_attempts(
 
     problems: list[ProblemAttempt] = []
     missing_duration: list[str] = []
-    result_record_ids: set[str] = set()
+    result_ids: set[str] = set()
 
     for row in _jsonl(results_path):
         record_id = str(row.get("record_id") or "")
-        if not record_id:
+        unique_id = str(row.get("id") or "")
+        if not unique_id and record_id:
+            subset = str(row.get("subset") or "")
+            split = str(row.get("split") or "")
+            if subset and split:
+                unique_id = f"{subset}__{split}__{record_id}"
+        if not unique_id:
             continue
-        result_record_ids.add(record_id)
+        result_ids.add(unique_id)
         try:
             iteration = int(row.get("iterations") or 0)
         except (TypeError, ValueError):
             iteration = 0
-        duration = trace_durations.get(record_id)
+        duration = trace_durations.get(unique_id)
         if duration is None:
             trace_path = row.get("trace_path")
             if trace_path:
-                duration = _trace_duration(Path(str(trace_path)))
+                path = Path(str(trace_path))
+                if not path.is_absolute():
+                    path = exp_dir / path
+                duration = _trace_duration(path)
         if duration is None:
             duration = 0.0
-            missing_duration.append(record_id)
+            missing_duration.append(unique_id)
         problems.append(
             ProblemAttempt(
+                unique_id=unique_id,
                 record_id=record_id,
                 iteration=iteration,
                 ok=bool(row.get("root_proved")),
@@ -187,7 +237,7 @@ def collect_problem_attempts(
             )
         )
 
-    trace_only = sorted(set(trace_durations) - result_record_ids)
+    trace_only = sorted(set(trace_durations) - result_ids)
     return problems, missing_duration, trace_only
 
 
@@ -209,11 +259,15 @@ def _iterations(attempts: list[NodeAttempt]) -> list[int]:
 
 
 def _problem_iterations(problems: list[ProblemAttempt]) -> list[int]:
-    return sorted({problem.iteration for problem in problems})
+    return list(range(max((problem.iteration for problem in problems), default=0) + 1))
 
 
 def _proof_turns(attempts: list[NodeAttempt]) -> list[int]:
-    return sorted({attempt.proof_turn for attempt in attempts})
+    observed = {attempt.proof_turn for attempt in attempts}
+    if not observed:
+        return [0]
+    first = 0 if 0 in observed else 1
+    return list(range(first, max(observed) + 1))
 
 
 def _token_label(lo: int, hi: int | None) -> str:
@@ -258,9 +312,32 @@ def node_compile_table(attempts: list[NodeAttempt], turns: list[int]) -> str:
         else:
             failure[attempt.proof_turn] += 1
     return _markdown_table(
-        "Proof Turn vs Lean Compile Result",
+        "Proof Turn vs Final Node Result",
         "result",
         [("success", success), ("failure", failure)],
+        turns,
+    )
+
+
+def node_signal_table(attempts: list[NodeAttempt], turns: list[int]) -> str:
+    counts: dict[str, collections.Counter[int]] = collections.defaultdict(collections.Counter)
+    for attempt in attempts:
+        counts[attempt.signal][attempt.proof_turn] += 1
+    preferred_order = [
+        "solved",
+        "proof_too_hard",
+        "formally_negated",
+        "protocol_error",
+        "infra_error",
+        "blocked_by_dependency",
+        "failed",
+    ]
+    labels = [label for label in preferred_order if label in counts]
+    labels.extend(sorted(set(counts) - set(labels)))
+    return _markdown_table(
+        "Proof Turn vs Final Node Signal",
+        "signal",
+        [(label, counts[label]) for label in labels],
         turns,
     )
 
@@ -305,9 +382,9 @@ def problem_success_table(problems: list[ProblemAttempt], iterations: list[int])
         else:
             failure[problem.iteration] += 1
     return _markdown_table(
-        "Problem Iter vs Overall Result",
+        "Refinement Iterations vs Terminal Problem Result",
         "result",
-        [("success", success), ("failure", failure)],
+        [("new_success", success), ("terminal_failure", failure)],
         iterations,
     )
 
@@ -318,8 +395,8 @@ def problem_time_table(problems: list[ProblemAttempt], iterations: list[int]) ->
     for problem in problems:
         counts[_time_bin(problem.wall_time_s, PROBLEM_TIME_BINS)][problem.iteration] += 1
     return _markdown_table(
-        "Problem Iter vs Wall Time Distribution",
-        "wall_time",
+        "Refinement Iterations vs Observed Trace Span",
+        "trace_span",
         [(label, counts[label]) for label in labels],
         iterations,
     )
@@ -339,6 +416,7 @@ def main() -> int:
     problem_iterations = _problem_iterations(problems)
     parts = [
         node_compile_table(attempts, proof_turns),
+        node_signal_table(attempts, proof_turns),
         node_token_table(attempts, proof_turns),
         node_time_table(attempts, proof_turns),
         problem_success_table(problems, problem_iterations),
@@ -351,8 +429,8 @@ def main() -> int:
             f"warning: {len(incomplete)} phase2 node(s) have theorem_start but no node_finished; excluded",
             file=sys.stderr,
         )
-        for record_id, iteration, node in incomplete[:10]:
-            print(f"  {record_id} iter={iteration} node={node}", file=sys.stderr)
+        for unique_id, iteration, node in incomplete[:10]:
+            print(f"  {unique_id} iter={iteration} node={node}", file=sys.stderr)
         if len(incomplete) > 10:
             print(f"  ... +{len(incomplete) - 10} more", file=sys.stderr)
     if missing_duration:
@@ -365,8 +443,8 @@ def main() -> int:
             f"warning: {len(trace_only)} trace file(s) have no results row; excluded from problem tables",
             file=sys.stderr,
         )
-        for record_id in trace_only[:10]:
-            print(f"  {record_id}", file=sys.stderr)
+        for unique_id in trace_only[:10]:
+            print(f"  {unique_id}", file=sys.stderr)
         if len(trace_only) > 10:
             print(f"  ... +{len(trace_only) - 10} more", file=sys.stderr)
 

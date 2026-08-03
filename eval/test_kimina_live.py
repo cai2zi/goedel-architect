@@ -23,7 +23,7 @@ class KiminaLiveTest(unittest.TestCase):
         cls.compiler = KiminaLeanCompiler(
             api_url=os.environ.get("KIMINA_API_URL", "http://127.0.0.1:8000"),
             timeout_s=600,
-            check_concurrency=8,
+            max_inflight_snippets=8,
         )
 
     @classmethod
