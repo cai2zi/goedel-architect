@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,7 +24,7 @@ from cot_blueprint_refine.common import (
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "experiments"))
 
-from blueprint import Blueprint, render_solved_declaration  # noqa: E402
+from blueprint import Blueprint, _extract_lean_code, render_solved_declaration  # noqa: E402
 from checkpoint import CheckpointState  # noqa: E402
 from kimina_lean_compiler import KiminaLeanCompiler  # noqa: E402
 from orchestrator import active_node_names  # noqa: E402
@@ -37,6 +38,10 @@ PROMPT_SIGNAL_MAP = {
     "blocked_by_dependency": "BLOCKED_BY_DEPENDENCY",
     "formally_negated": "FORMALLY_NEGATED",
 }
+
+VERIFIED = "VERIFIED"
+INVALID_BLUEPRINT_CANDIDATE = "INVALID_BLUEPRINT_CANDIDATE"
+INFRA_ERROR = "INFRA_ERROR"
 
 
 def prompt_signal(raw_signal: str, *, proved: bool = False) -> str:
@@ -67,6 +72,7 @@ def _status_explanation(signal: str) -> str:
 def render_blueprint_context(
     blueprint: Blueprint,
     state: CheckpointState,
+    node_overrides: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[str, list[dict[str, Any]], bool]:
     active = active_node_names(blueprint)
     parts = [blueprint.phase2_header.rstrip()]
@@ -76,9 +82,18 @@ def render_blueprint_context(
     for node in blueprint.dependency_order():
         if node.name not in active:
             continue
-        result = dict(state.node_results.get(node.name) or {})
+        has_override = node.name in (node_overrides or {})
+        result = dict(
+            (node_overrides or {}).get(node.name)
+            or state.node_results.get(node.name)
+            or {}
+        )
         raw_signal = str(result.get("signal") or "")
-        proof_body = str(result.get("proof_body") or state.proved_cache.get(node.name) or "")
+        proof_body = str(
+            result.get("proof_body")
+            or ("" if has_override else state.proved_cache.get(node.name))
+            or ""
+        )
         lean_errors = [str(value) for value in (result.get("lean_errors") or [])]
         if raw_signal == "infra_error":
             has_infra_error = True
@@ -87,7 +102,12 @@ def render_blueprint_context(
             signal = "PROVED"
             rendered = node.full_declaration().strip()
         else:
-            proved = node.name in state.proved_cache or (raw_signal == "solved" and bool(proof_body))
+            proved = (
+                raw_signal == "solved" and bool(proof_body)
+                if has_override
+                else node.name in state.proved_cache
+                or (raw_signal == "solved" and bool(proof_body))
+            )
             signal = prompt_signal(raw_signal, proved=proved)
             if signal == "PROVED":
                 rendered = render_solved_declaration(node, proof_body).strip()
@@ -102,7 +122,9 @@ def render_blueprint_context(
         ]
         if signal != "PROVED":
             block.extend(prompt_safe_comment_lines("STATUS_MEANING", _status_explanation(signal)))
-            block.extend(prompt_safe_comment_lines("LAST_SUBMITTED_PROOF", proof_body or "(none)"))
+            if proof_body and signal == "NOT_PROVED":
+                block.append("-- The following proof attempt did not compile and is reference only:")
+                block.extend(f"-- {line}" for line in proof_body.splitlines())
             block.extend(prompt_safe_comment_lines("LEAN_DIAGNOSTICS", "\n".join(lean_errors) or "(none)"))
         parts.append("\n".join(block))
         node_rows.append({
@@ -117,6 +139,141 @@ def render_blueprint_context(
             "lean_errors": lean_errors,
         })
     return "\n\n".join(part for part in parts if part) + "\n", node_rows, has_infra_error
+
+
+def _transitive_dependency_names(blueprint: Blueprint, node_name: str) -> set[str]:
+    node_map = blueprint.nodes_by_name()
+    seen: set[str] = set()
+    node = node_map.get(node_name)
+    stack = list(node.dependencies if node is not None else [])
+    while stack:
+        name = stack.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        dependency = node_map.get(name)
+        if dependency is not None:
+            stack.extend(dependency.dependencies)
+    return seen
+
+
+def revalidate_proved_nodes(
+    blueprint: Blueprint,
+    state: CheckpointState,
+    compiler: KiminaLeanCompiler,
+) -> tuple[dict[str, dict[str, Any]], bool]:
+    """Recheck cached proofs against the final blueprint; return overrides and infra flag."""
+    active = active_node_names(blueprint)
+    node_map = blueprint.nodes_by_name()
+    definitions = [
+        node.full_declaration()
+        for node in blueprint.nodes
+        if node.kind == "definition"
+    ]
+    verified: dict[str, str] = {}
+    overrides: dict[str, dict[str, Any]] = {}
+    for node in blueprint.dependency_order():
+        if node.name not in active or node.kind == "definition":
+            continue
+        stored = dict(state.node_results.get(node.name) or {})
+        proof_body = str(stored.get("proof_body") or state.proved_cache.get(node.name) or "")
+        claimed_proved = node.name in state.proved_cache or (
+            str(stored.get("signal") or "") == "solved" and bool(proof_body)
+        )
+        if not claimed_proved:
+            continue
+        unavailable = [
+            dep
+            for dep in node.dependencies
+            if dep in active
+            and (dependency := node_map.get(dep)) is not None
+            and dependency.kind != "definition"
+            and dep not in verified
+        ]
+        if unavailable:
+            overrides[node.name] = {
+                "signal": "blocked_by_dependency",
+                "proof_body": "",
+                "lean_errors": [f"Unresolved dependencies: {', '.join(sorted(unavailable))}"],
+            }
+            continue
+        ancestors = _transitive_dependency_names(blueprint, node.name)
+        parent_declarations = definitions + [
+            render_solved_declaration(parent, verified[parent.name])
+            for parent in blueprint.dependency_order()
+            if parent.kind != "definition"
+            and parent.name in ancestors
+            and parent.name in verified
+        ]
+        result = compiler.check_node(
+            proof_body,
+            node_decl=node.lean_declaration,
+            parent_lemma_decls="\n\n".join(parent_declarations),
+            header=blueprint.phase2_header,
+        )
+        if result.failure_kind == "infra":
+            return overrides, True
+        if result.success:
+            verified[node.name] = proof_body
+            overrides[node.name] = {
+                "signal": "solved",
+                "proof_body": proof_body,
+                "lean_errors": [],
+            }
+        else:
+            overrides[node.name] = {
+                "signal": "proof_too_hard",
+                "proof_body": proof_body,
+                "lean_errors": list(result.diagnostics),
+            }
+    return overrides, False
+
+
+def _candidate_from_trace(trace_path: Path) -> str:
+    candidate = ""
+    if not trace_path.exists():
+        return candidate
+    for line in trace_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        event_candidate = ""
+        if event.get("kind") == "llm_response":
+            extracted = _extract_lean_code(str(event.get("result") or ""))
+            if "@[blueprint" in extracted or extracted.lstrip().startswith("import "):
+                event_candidate = extracted
+        elif event.get("kind") == "lean_check_result":
+            raw_output = str((event.get("args") or {}).get("raw_output") or "")
+            try:
+                raw = json.loads(raw_output)
+                snippets = raw.get("request", {}).get("snippets", [])
+                if snippets:
+                    event_candidate = str(snippets[0].get("code") or "")
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                pass
+        if event_candidate.strip():
+            candidate = event_candidate.strip()
+    return candidate
+
+
+def recover_invalid_blueprint(result_row: dict[str, Any]) -> tuple[str, str]:
+    """Prefer the new saved artifact, then fall back to the historical trace."""
+    candidate_path_text = str(result_row.get("failed_blueprint_candidate_path") or "")
+    if candidate_path_text:
+        candidate_path = Path(candidate_path_text)
+        if candidate_path.exists():
+            candidate = candidate_path.read_text(encoding="utf-8").strip()
+            if candidate:
+                return candidate, "saved_artifact"
+    trace_path_text = str(result_row.get("trace_path") or "")
+    if trace_path_text:
+        candidate = _candidate_from_trace(Path(trace_path_text))
+        if candidate:
+            return candidate, "trace_fallback"
+    return "", ""
 
 
 def _make_compiler(config: DictConfig) -> KiminaLeanCompiler:
@@ -158,15 +315,33 @@ def _process_export_row(
     base_row = _base_export_row(result_row, generation)
     checkpoint_path = Path(base_row["checkpoint_path"])
     if generation is None:
-        base_row.update(status="pipeline_error", error="missing_generation_input")
+        base_row.update(
+            status="pipeline_error",
+            error="missing_generation_input",
+            context_quality=INFRA_ERROR,
+            refine_eligible=True,
+            lean_context="",
+            lean_validated=False,
+        )
         counts["pipeline_error"] += 1
+        counts[f"context_{INFRA_ERROR}"] += 1
         return index, base_row, counts
     if str(result_row.get("status") or "") == "error" or not checkpoint_path.exists():
+        candidate, candidate_source = recover_invalid_blueprint(result_row)
+        quality = INVALID_BLUEPRINT_CANDIDATE if candidate else INFRA_ERROR
         base_row.update(
             status="pipeline_error",
             error=str(result_row.get("error") or "missing_or_error_checkpoint"),
+            context_quality=quality,
+            refine_eligible=True,
+            lean_context=candidate,
+            lean_validated=False,
+            lean_validation_errors=[str(result_row.get("error") or "missing_or_error_checkpoint")],
+            invalid_blueprint_source=candidate_source,
+            nodes=[],
         )
         counts["pipeline_error"] += 1
+        counts[f"context_{quality}"] += 1
         return index, base_row, counts
     try:
         state = CheckpointState.load(checkpoint_path)
@@ -178,20 +353,52 @@ def _process_export_row(
             base_row.update(
                 status="pipeline_error",
                 error="checkpoint contains infra_error node",
+                context_quality=INFRA_ERROR,
+                refine_eligible=True,
+                lean_context=lean_context,
+                lean_validated=False,
                 nodes=nodes,
             )
             counts["pipeline_error"] += 1
+            counts[f"context_{INFRA_ERROR}"] += 1
             return index, base_row, counts
         validation = compiler.check(lean_context, allow_sorry=not state.root_proved)
+        if not validation.success and validation.failure_kind == "lean":
+            overrides, revalidation_infra = revalidate_proved_nodes(blueprint, state, compiler)
+            if revalidation_infra:
+                base_row.update(
+                    status="pipeline_error",
+                    error="proof revalidation failed because the Lean service returned an infra error",
+                    context_quality=INFRA_ERROR,
+                    refine_eligible=True,
+                    lean_context=lean_context,
+                    lean_validated=False,
+                    lean_validation_errors=validation.diagnostics,
+                    nodes=nodes,
+                )
+                counts["pipeline_error"] += 1
+                counts[f"context_{INFRA_ERROR}"] += 1
+                return index, base_row, counts
+            lean_context, nodes, _ = render_blueprint_context(
+                blueprint, state, node_overrides=overrides,
+            )
+            validation = compiler.check(lean_context, allow_sorry=True)
         lean_path = lean_dir / f"{safe_stem(str(result_row.get('source_id') or ''), prefix='cot_')}.lean"
         lean_path.parent.mkdir(parents=True, exist_ok=True)
         lean_path.write_text(lean_context, encoding="utf-8")
-        status = "ready" if validation.success else (
-            "pipeline_error" if validation.failure_kind == "infra" else "export_error"
+        quality = (
+            VERIFIED if validation.success
+            else INFRA_ERROR if validation.failure_kind == "infra"
+            else INVALID_BLUEPRINT_CANDIDATE
+        )
+        status = "ready" if quality == VERIFIED else (
+            "pipeline_error" if quality == INFRA_ERROR else "export_error"
         )
         base_row.update({
             "status": status,
             "error": "" if validation.success else "\n".join(validation.diagnostics),
+            "context_quality": quality,
+            "refine_eligible": True,
             "target_theorem": blueprint.target_theorem,
             "lean_context": lean_context,
             "lean_context_path": str(lean_path),
@@ -201,11 +408,20 @@ def _process_export_row(
             "nodes": nodes,
         })
         counts[status] += 1
+        counts[f"context_{quality}"] += 1
         counts.update(f"node_{node['prompt_signal']}" for node in nodes)
         return index, base_row, counts
     except Exception as exc:  # noqa: BLE001
-        base_row.update(status="export_error", error=f"{type(exc).__name__}: {exc}")
-        counts["export_error"] += 1
+        base_row.update(
+            status="pipeline_error",
+            error=f"{type(exc).__name__}: {exc}",
+            context_quality=INFRA_ERROR,
+            refine_eligible=True,
+            lean_context="",
+            lean_validated=False,
+        )
+        counts["pipeline_error"] += 1
+        counts[f"context_{INFRA_ERROR}"] += 1
         return index, base_row, counts
 
 
@@ -274,13 +490,41 @@ def export_contexts(config: DictConfig) -> dict[str, Any]:
             "original_cot": generation["post_think_cot"],
             "status": "pipeline_error",
             "error": "missing_robustpa_result",
+            "context_quality": INFRA_ERROR,
+            "refine_eligible": True,
+            "lean_context": "",
+            "lean_validated": False,
             "root_proved": False,
         })
         counts["pipeline_error"] += 1
+        counts[f"context_{INFRA_ERROR}"] += 1
 
     output_path = out_dir / "blueprint_contexts.jsonl"
-    metrics = {"rows": len(exported), "counts": dict(sorted(counts.items())), "output": str(output_path)}
+    quality_counts = Counter(str(row.get("context_quality") or INFRA_ERROR) for row in exported)
+    invalid_ids = [
+        str(row.get("ID") or "")
+        for row in exported
+        if row.get("context_quality") == INVALID_BLUEPRINT_CANDIDATE
+    ]
+    infra_ids = [
+        str(row.get("ID") or "")
+        for row in exported
+        if row.get("context_quality") == INFRA_ERROR
+    ]
+    metrics = {
+        "rows": len(exported),
+        "counts": dict(sorted(counts.items())),
+        "context_quality_counts": dict(sorted(quality_counts.items())),
+        "invalid_blueprint_candidate_ids": invalid_ids,
+        "infra_error_ids": infra_ids,
+        "output": str(output_path),
+    }
     write_jsonl(output_path, exported)
     write_json(out_dir / "export_metrics.json", metrics)
     print(f"[export] rows={len(exported)} counts={metrics['counts']} output={output_path}", flush=True)
+    print(
+        f"[export-context] quality={metrics['context_quality_counts']} "
+        f"invalid_ids={invalid_ids} infra_ids={infra_ids}",
+        flush=True,
+    )
     return metrics

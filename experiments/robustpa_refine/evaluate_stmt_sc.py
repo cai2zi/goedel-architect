@@ -92,8 +92,38 @@ def parse_args() -> argparse.Namespace:
             "prepends preceding def and lemma/theorem/example context including proofs."
         ),
     )
+    parser.add_argument(
+        "--include-subset",
+        action="append",
+        default=[],
+        help=(
+            "Only evaluate rows from this subset. May be repeated or comma-separated. "
+            "When omitted, all subsets are evaluated."
+        ),
+    )
+    parser.add_argument(
+        "--include-split",
+        action="append",
+        default=[],
+        help=(
+            "Only evaluate rows from this split. May be repeated or comma-separated. "
+            "When omitted, all splits are evaluated."
+        ),
+    )
     args = parser.parse_args()
+    args.include_subset = _parse_filter_values(args.include_subset)
+    args.include_split = _parse_filter_values(args.include_split)
     return args
+
+
+def _parse_filter_values(raw_values: list[str]) -> list[str]:
+    values: list[str] = []
+    for raw_value in raw_values:
+        for value in str(raw_value).split(","):
+            value = value.strip()
+            if value:
+                values.append(value)
+    return values
 
 
 def _resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
@@ -136,6 +166,40 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
             if line.strip():
                 rows.append(json.loads(line))
     return rows
+
+
+def _filter_rows_by_scope(
+    rows: list[dict[str, Any]],
+    *,
+    include_subsets: list[str],
+    include_splits: list[str],
+) -> list[dict[str, Any]]:
+    subset_filter = set(include_subsets)
+    split_filter = set(include_splits)
+    if not subset_filter and not split_filter:
+        return rows
+    return [
+        row
+        for row in rows
+        if (not subset_filter or str(row.get("subset") or "") in subset_filter)
+        and (not split_filter or str(row.get("split") or "") in split_filter)
+    ]
+
+
+def _scope_counts(rows: list[dict[str, Any]]) -> Counter[str]:
+    return Counter(
+        f"{row.get('subset') or ''}/{row.get('split') or ''}"
+        for row in rows
+    )
+
+
+def _print_scope(prefix: str, rows: list[dict[str, Any]]) -> None:
+    subsets = sorted({str(row.get("subset") or "") for row in rows})
+    splits = sorted({str(row.get("split") or "") for row in rows})
+    print(f"[{prefix}] adopted_subsets={subsets}", flush=True)
+    print(f"[{prefix}] adopted_splits={splits}", flush=True)
+    for subset_split, count in sorted(_scope_counts(rows).items()):
+        print(f"[{prefix}] adopted_subset_split={subset_split} rows={count}", flush=True)
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -496,13 +560,25 @@ def _summary(scored_rows: list[dict[str, Any]], args: argparse.Namespace) -> dic
 
 def run(args: argparse.Namespace) -> tuple[Path, Path]:
     input_path, output_path, summary_path = _resolve_paths(args)
-    rows = _read_jsonl(input_path)
+    all_rows = _read_jsonl(input_path)
+    rows = _filter_rows_by_scope(
+        all_rows,
+        include_subsets=args.include_subset,
+        include_splits=args.include_split,
+    )
     if args.limit > 0:
         rows = rows[: args.limit]
     print(
-        f"[full-sc] rows={len(rows)} input={input_path} "
+        f"[full-sc] loaded_rows={len(all_rows)} rows={len(rows)} input={input_path} "
         f"proof_sc_scope={args.proof_sc_scope}"
     )
+    if args.include_subset or args.include_split:
+        print(
+            f"[full-sc] include_subsets={args.include_subset or 'ALL'} "
+            f"include_splits={args.include_split or 'ALL'}",
+            flush=True,
+        )
+    _print_scope("full-sc", rows)
 
     if not (os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")):
         raise SystemExit("Set GOOGLE_API_KEY or GEMINI_API_KEY before running full SC.")

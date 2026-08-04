@@ -75,6 +75,24 @@ def summarize_comparisons(
     for row in comparisons:
         node_status_counts.update(row.get("node_status_counts") or {})
     full_run = total == global_eligible_total
+    context_quality_counts = Counter(
+        str(row.get("context_quality") or "INFRA_ERROR") for row in comparisons
+    )
+    invalid_ids = sorted(
+        str(row.get("ID") or "")
+        for row in comparisons
+        if row.get("context_quality") == "INVALID_BLUEPRINT_CANDIDATE"
+    )
+    infra_ids = sorted(
+        str(row.get("ID") or "")
+        for row in comparisons
+        if row.get("context_quality") == "INFRA_ERROR"
+    )
+    truncated_ids = sorted(
+        str(row.get("ID") or "")
+        for row in comparisons
+        if bool(row.get("blueprint_truncated"))
+    )
     return {
         "dataset": {
             "total": dataset_total,
@@ -100,6 +118,11 @@ def summarize_comparisons(
             "refined_ok": sum(row.get("refine_status") == "ok" for row in comparisons),
             "transitions": dict(sorted(transitions.items())),
             "node_status_counts": dict(sorted(node_status_counts.items())),
+            "context_quality_counts": dict(sorted(context_quality_counts.items())),
+            "invalid_blueprint_candidate_ids": invalid_ids,
+            "infra_error_ids": infra_ids,
+            "blueprint_truncated_count": len(truncated_ids),
+            "blueprint_truncated_ids": truncated_ids,
         },
         "full_after": {
             "available": full_run,
@@ -174,8 +197,10 @@ def evaluate(config: DictConfig) -> dict[str, Any]:
             "before_extracted_pred": before.get("extracted_pred", []),
             "after_extracted_pred": after.get("extracted_pred", []),
             "blueprint_status": str(context.get("status") or "missing"),
+            "context_quality": str(context.get("context_quality") or "INFRA_ERROR"),
             "root_proved": bool(context.get("root_proved")),
             "refine_status": str(refinement.get("status") or "missing"),
+            "blueprint_truncated": bool(refinement.get("blueprint_truncated")),
             "refined_cot": str(refinement.get("refined_cot") or ""),
             "node_status_counts": dict(sorted(node_counts.items())),
         })
@@ -197,7 +222,8 @@ def evaluate(config: DictConfig) -> dict[str, Any]:
             handle,
             fieldnames=[
                 "ID", "source", "before_correct", "after_correct", "transition",
-                "blueprint_status", "root_proved", "refine_status",
+                "blueprint_status", "context_quality", "root_proved", "refine_status",
+                "blueprint_truncated",
             ],
         )
         writer.writeheader()
@@ -217,6 +243,13 @@ def evaluate(config: DictConfig) -> dict[str, Any]:
         f"before={metrics['selected']['before_accuracy']:.6f} "
         f"after={metrics['selected']['after_accuracy']:.6f} "
         f"full_after_available={metrics['full_after']['available']}",
+        flush=True,
+    )
+    print(
+        f"[evaluate-context] quality={metrics['selected']['context_quality_counts']} "
+        f"invalid_ids={metrics['selected']['invalid_blueprint_candidate_ids']} "
+        f"infra_ids={metrics['selected']['infra_error_ids']} "
+        f"truncated_ids={metrics['selected']['blueprint_truncated_ids']}",
         flush=True,
     )
     return metrics

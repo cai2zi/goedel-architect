@@ -5,6 +5,7 @@ import json
 import re
 import time
 import traceback
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,8 @@ from cot_blueprint_refine.common import (
 PROMPTS_DIR = EXPERIMENT_DIR / "prompts"
 FINAL_OPEN_RE = re.compile(r"<final_refined_solution\s*>", re.IGNORECASE)
 FINAL_CLOSE_RE = re.compile(r"</final_refined_solution\s*>", re.IGNORECASE)
+CONTEXT_QUALITIES = {"VERIFIED", "INVALID_BLUEPRINT_CANDIDATE", "INFRA_ERROR"}
+INFRA_ERROR = "INFRA_ERROR"
 
 
 def _render(template: str, **values: str) -> str:
@@ -36,7 +39,30 @@ def _render(template: str, **values: str) -> str:
     return template
 
 
-def build_messages(row: dict[str, Any]) -> list[dict[str, str]]:
+def _context_guidance(quality: str) -> str:
+    if quality == "INVALID_BLUEPRINT_CANDIDATE":
+        return (
+            "This is the last blueprint candidate produced upstream. It did not pass Lean or "
+            "the blueprint contract, but its decomposition may still be useful when refining the "
+            "original solution. Use it as fallible reference together with the diagnostics, not as "
+            "a machine-checked proof."
+        )
+    if quality == "INFRA_ERROR":
+        return (
+            "Formal checking did not complete because of an infrastructure failure. Any blueprint "
+            "text below is reference only; independently verify the original solution."
+        )
+    return (
+        "This blueprint context passed the export validation. Interpret each node according to its "
+        "COT_BLUEPRINT_NODE_STATUS comment."
+    )
+
+
+def build_messages(
+    row: dict[str, Any],
+    *,
+    lean_context: str | None = None,
+) -> list[dict[str, str]]:
     system = (PROMPTS_DIR / "cot_refine_system.md").read_text(encoding="utf-8").strip()
     user_template = (PROMPTS_DIR / "cot_refine_user.md").read_text(encoding="utf-8")
     user = _render(
@@ -44,9 +70,115 @@ def build_messages(row: dict[str, Any]) -> list[dict[str, str]]:
         problem=str(row.get("problem") or ""),
         claimed_answer=str(row.get("claimed_answer") or ""),
         original_cot=str(row.get("original_cot") or ""),
-        lean_context=str(row.get("lean_context") or ""),
+        lean_context=str(row.get("lean_context") or "") if lean_context is None else lean_context,
+        context_quality=str(row.get("context_quality") or "INFRA_ERROR"),
+        context_guidance=_context_guidance(str(row.get("context_quality") or "INFRA_ERROR")),
+        blueprint_diagnostics=str(row.get("error") or "(none)"),
     ).strip()
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+@lru_cache(maxsize=4)
+def _load_tokenizer(path: str):
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+
+
+def _message_token_count(messages: list[dict[str, str]], tokenizer: Any) -> int:
+    encoded = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+    )
+    input_ids = encoded.get("input_ids", []) if hasattr(encoded, "get") else encoded
+    if input_ids and isinstance(input_ids[0], list):
+        input_ids = input_ids[0]
+    return len(input_ids)
+
+
+def _compress_verified_proofs(context: str, nodes: list[dict[str, Any]]) -> str:
+    compressed = context
+    replacement = "by\n  -- Verified proof omitted from the prompt to fit the context window.\n  sorry"
+    for node in nodes:
+        if node.get("prompt_signal") != "PROVED":
+            continue
+        proof = str(node.get("proof_body") or "")
+        if len(proof) < 160:
+            continue
+        compressed = compressed.replace(proof, replacement, 1)
+    return compressed
+
+
+def _truncate_tokens_head_tail(text: str, token_budget: int, tokenizer: Any) -> str:
+    tokens = tokenizer.encode(text, add_special_tokens=False)
+    if len(tokens) <= token_budget:
+        return text
+    if token_budget <= 16:
+        return tokenizer.decode(tokens[:max(0, token_budget)], skip_special_tokens=True)
+    marker = "\n\n-- BLUEPRINT CONTENT OMITTED TO FIT THE MODEL CONTEXT --\n\n"
+    marker_tokens = tokenizer.encode(marker, add_special_tokens=False)
+    available = max(1, token_budget - len(marker_tokens))
+    head_count = max(1, int(available * 0.65))
+    tail_count = max(0, available - head_count)
+    kept = tokens[:head_count] + marker_tokens + (tokens[-tail_count:] if tail_count else [])
+    return tokenizer.decode(kept, skip_special_tokens=True)
+
+
+def fit_messages_to_context(
+    row: dict[str, Any],
+    config: DictConfig,
+    *,
+    extra_safety_tokens: int = 0,
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    tokenizer = _load_tokenizer(str(config.refine.tokenizer_path))
+    context = str(row.get("lean_context") or "")
+    original_context_tokens = len(tokenizer.encode(context, add_special_tokens=False))
+    max_input_tokens = (
+        int(config.refine.context_window)
+        - int(config.refine.max_tokens)
+        - int(config.refine.context_safety_margin)
+        - int(extra_safety_tokens)
+    )
+    if max_input_tokens <= 0:
+        raise ValueError("refine context budget is non-positive")
+    messages = build_messages(row, lean_context=context)
+    input_tokens = _message_token_count(messages, tokenizer)
+    truncated = False
+    if input_tokens > max_input_tokens:
+        context = _compress_verified_proofs(context, list(row.get("nodes") or []))
+        truncated = context != str(row.get("lean_context") or "")
+        messages = build_messages(row, lean_context=context)
+        input_tokens = _message_token_count(messages, tokenizer)
+    if input_tokens > max_input_tokens:
+        empty_messages = build_messages(row, lean_context="")
+        fixed_tokens = _message_token_count(empty_messages, tokenizer)
+        if fixed_tokens >= max_input_tokens:
+            raise ValueError(
+                f"non-blueprint prompt uses {fixed_tokens} tokens, exceeding input budget "
+                f"{max_input_tokens}"
+            )
+        blueprint_budget = max(1, max_input_tokens - fixed_tokens - 16)
+        context = _truncate_tokens_head_tail(context, blueprint_budget, tokenizer)
+        truncated = True
+        messages = build_messages(row, lean_context=context)
+        input_tokens = _message_token_count(messages, tokenizer)
+        while input_tokens > max_input_tokens and blueprint_budget > 16:
+            blueprint_budget = max(16, blueprint_budget - max(16, input_tokens - max_input_tokens))
+            context = _truncate_tokens_head_tail(context, blueprint_budget, tokenizer)
+            messages = build_messages(row, lean_context=context)
+            input_tokens = _message_token_count(messages, tokenizer)
+    if input_tokens > max_input_tokens:
+        raise ValueError(
+            f"prompt remains too long after blueprint truncation: {input_tokens}>{max_input_tokens}"
+        )
+    return messages, {
+        "blueprint_truncated": truncated,
+        "blueprint_tokens_original": original_context_tokens,
+        "blueprint_tokens_used": len(tokenizer.encode(context, add_special_tokens=False)),
+        "input_tokens": input_tokens,
+        "effective_max_tokens": int(config.refine.max_tokens),
+    }
 
 
 def _response_json(response: Any) -> dict[str, Any]:
@@ -131,8 +263,9 @@ async def _call_one(
         "claimed_answer": str(row.get("claimed_answer") or ""),
         "root_proved": bool(row.get("root_proved")),
         "blueprint_context_status": str(row.get("status") or ""),
+        "context_quality": str(row.get("context_quality") or "INFRA_ERROR"),
     }
-    if row.get("status") != "ready" or not row.get("lean_validated"):
+    if not bool(row.get("refine_eligible", True)):
         return {
             **base,
             "status": "pipeline_error",
@@ -140,13 +273,19 @@ async def _call_one(
             "attempts": 0,
         }
 
-    messages = build_messages(row)
     timeout_s = config.refine.timeout_s
     start = time.time()
     last_error = ""
+    fit_metadata: dict[str, Any] = {}
+    extra_safety_tokens = 0
     async with semaphore:
         for attempt in range(1, int(config.refine.max_retries) + 1):
             try:
+                messages, fit_metadata = fit_messages_to_context(
+                    row,
+                    config,
+                    extra_safety_tokens=extra_safety_tokens,
+                )
                 kwargs: dict[str, Any] = {
                     "model": str(config.refine.model),
                     "messages": messages,
@@ -163,6 +302,7 @@ async def _call_one(
                 status = "ok" if not output_error else "invalid_output"
                 return {
                     **base,
+                    **fit_metadata,
                     "status": status,
                     "error": output_error or None,
                     "refined_cot": refined_cot,
@@ -180,6 +320,8 @@ async def _call_one(
                 }
             except Exception as exc:  # noqa: BLE001
                 last_error = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+                if "maximum context length" in last_error.lower():
+                    extra_safety_tokens += 512
                 if attempt >= int(config.refine.max_retries):
                     break
                 delay = min(
@@ -189,6 +331,7 @@ async def _call_one(
                 await asyncio.sleep(delay)
     return {
         **base,
+        **fit_metadata,
         "status": "error",
         "error": last_error,
         "refined_cot": "",
@@ -203,6 +346,7 @@ async def refine(config: DictConfig) -> dict[str, Any]:
     root = output_root(config)
     contexts_path = root / "blueprint_contexts" / "blueprint_contexts.jsonl"
     contexts = latest_rows(contexts_path, "ID")
+    contexts_by_id = {str(row.get("ID") or ""): row for row in contexts}
     output_path = root / "refinement" / "refined_predictions.jsonl"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     existing = latest_rows(output_path, "ID") if bool(config.resume) and output_path.exists() else []
@@ -224,6 +368,11 @@ async def refine(config: DictConfig) -> dict[str, Any]:
         with output_path.open("w", encoding="utf-8") as handle:
             for row in existing_by_id.values():
                 if row.get("status") == "ok":
+                    context = contexts_by_id.get(str(row.get("ID") or ""), {})
+                    row = {
+                        **row,
+                        "context_quality": str(context.get("context_quality") or "INFRA_ERROR"),
+                    }
                     handle.write(json.dumps(row, ensure_ascii=False) + "\n")
             for task in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="cot-refine", unit="row"):
                 result = await task
@@ -236,7 +385,43 @@ async def refine(config: DictConfig) -> dict[str, Any]:
     for row in final_rows:
         status = str(row.get("status") or "unknown")
         counts[status] = counts.get(status, 0) + 1
-    metrics = {"rows": len(final_rows), "pending": len(pending), "counts": counts, "output": str(output_path)}
+    quality_counts: dict[str, int] = {}
+    invalid_ids: list[str] = []
+    infra_ids: list[str] = []
+    truncated_ids: list[str] = []
+    for row in final_rows:
+        row_id = str(row.get("ID") or "")
+        context = contexts_by_id.get(row_id, {})
+        quality = str(context.get("context_quality") or INFRA_ERROR)
+        quality_counts[quality] = quality_counts.get(quality, 0) + 1
+        if quality == "INVALID_BLUEPRINT_CANDIDATE":
+            invalid_ids.append(row_id)
+        elif quality == "INFRA_ERROR":
+            infra_ids.append(row_id)
+        if bool(row.get("blueprint_truncated")):
+            truncated_ids.append(row_id)
+    metrics = {
+        "rows": len(final_rows),
+        "pending": len(pending),
+        "counts": counts,
+        "context_quality_counts": dict(sorted(quality_counts.items())),
+        "invalid_blueprint_candidate_ids": sorted(invalid_ids),
+        "infra_error_ids": sorted(infra_ids),
+        "blueprint_truncated_count": len(truncated_ids),
+        "blueprint_truncated_ids": sorted(truncated_ids),
+        "output": str(output_path),
+    }
     write_json(root / "refinement" / "refinement_metrics.json", metrics)
     print(f"[refine] rows={len(final_rows)} pending={len(pending)} counts={counts}", flush=True)
+    print(
+        f"[refine-context] quality={metrics['context_quality_counts']} "
+        f"invalid_ids={metrics['invalid_blueprint_candidate_ids']} "
+        f"infra_ids={metrics['infra_error_ids']}",
+        flush=True,
+    )
+    print(
+        f"[refine-context] truncated={metrics['blueprint_truncated_count']} "
+        f"ids={metrics['blueprint_truncated_ids']}",
+        flush=True,
+    )
     return metrics

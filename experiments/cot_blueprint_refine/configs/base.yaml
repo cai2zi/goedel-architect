@@ -36,7 +36,10 @@ refine:
   api_key: dummy
   temperature: 0.6
   max_tokens: 8192
-  concurrency: 128
+  context_window: 40960
+  context_safety_margin: 256
+  tokenizer_path: /ssd/czx/models/Qwen3-8B
+  concurrency: 1024
   timeout_s: 600
   max_retries: 3
   retry_base_delay_s: 2.0

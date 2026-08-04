@@ -20,4 +20,6 @@ export:
 refine:
   model: Qwen3.5-397B-A17B-FP8
   openai_base_url: http://127.0.0.1:8001/v1
+  context_window: 65536
+  tokenizer_path: /ssd/czx/models/Qwen3.5-397B-A17B-FP8
   concurrency: 2

@@ -16,7 +16,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "experiments"))
 
-from blueprint import Blueprint, _parse_blueprint  # noqa: E402
+from blueprint import (  # noqa: E402
+    Blueprint,
+    BlueprintGenerationError,
+    _parse_blueprint,
+    generate_blueprint_from_informal,
+)
 from checkpoint import CheckpointState  # noqa: E402
 from cot_blueprint_refine.common import (  # noqa: E402
     claimed_answer,
@@ -27,10 +32,16 @@ from cot_blueprint_refine.evaluate import summarize_comparisons  # noqa: E402
 from cot_blueprint_refine.export_blueprint_contexts import (  # noqa: E402
     export_contexts,
     prompt_signal,
+    recover_invalid_blueprint,
+    revalidate_proved_nodes,
     render_blueprint_context,
 )
 from cot_blueprint_refine.prepare_inputs import make_generation_row, prepare  # noqa: E402
-from cot_blueprint_refine.run_cot_refinement import normalize_refined_output  # noqa: E402
+from cot_blueprint_refine.run_cot_refinement import (  # noqa: E402
+    build_messages,
+    fit_messages_to_context,
+    normalize_refined_output,
+)
 from cot_blueprint_refine.run_experiment import ExperimentLock, blueprint_results_complete  # noqa: E402
 
 
@@ -189,6 +200,124 @@ theorem target : True := by sorry_using [checked_step]
         self.assertEqual(prompt_signal("formally_negated"), "FORMALLY_NEGATED")
         self.assertEqual(prompt_signal("protocol_error"), "NOT_PROVED")
         self.assertEqual(prompt_signal("solved", proved=True), "PROVED")
+
+    def test_stale_proof_becomes_not_proved_and_dependent_is_blocked(self) -> None:
+        blueprint = self._blueprint()
+        state = CheckpointState(informal_statement="test", model="model")
+        state.set_blueprint(blueprint)
+        state.proved_cache = {
+            "checked_step": "by stale_tactic",
+            "target": "by exact checked_step",
+        }
+        state.node_results = {
+            "checked_step": {"signal": "solved", "proof_body": "by stale_tactic"},
+            "target": {"signal": "solved", "proof_body": "by exact checked_step"},
+        }
+
+        class FakeCompiler:
+            def check_node(self, _proof: str, *, node_decl: str, **_kwargs):
+                self.last_decl = node_decl
+                return SimpleNamespace(
+                    success=False,
+                    failure_kind="lean",
+                    diagnostics=["unsolved goal"],
+                )
+
+        overrides, infra = revalidate_proved_nodes(blueprint, state, FakeCompiler())
+        self.assertFalse(infra)
+        self.assertEqual(overrides["checked_step"]["signal"], "proof_too_hard")
+        self.assertEqual(overrides["target"]["signal"], "blocked_by_dependency")
+        context, nodes, _ = render_blueprint_context(blueprint, state, overrides)
+        self.assertEqual([node["prompt_signal"] for node in nodes], [
+            "NOT_PROVED", "BLOCKED_BY_DEPENDENCY",
+        ])
+        self.assertIn("by sorry_using []", context)
+        self.assertIn("proof attempt did not compile", context)
+        self.assertIn("unsolved goal", context)
+        self.assertNotIn("LAST_SUBMITTED_PROOF", context)
+
+
+class InvalidBlueprintRecoveryTest(unittest.TestCase):
+    def test_saved_artifact_is_preferred_then_trace_is_used(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            saved = root / "failed.lean"
+            saved.write_text("import Mathlib\n@[blueprint] theorem saved : True := by sorry\n")
+            trace = root / "trace.jsonl"
+            trace.write_text(json.dumps({
+                "kind": "llm_response",
+                "result": "```lean\nimport Mathlib\n@[blueprint] theorem traced : True := by sorry\n```",
+            }) + "\n")
+            row = {
+                "failed_blueprint_candidate_path": str(saved),
+                "trace_path": str(trace),
+            }
+            candidate, source = recover_invalid_blueprint(row)
+            self.assertEqual(source, "saved_artifact")
+            self.assertIn("theorem saved", candidate)
+            saved.unlink()
+            candidate, source = recover_invalid_blueprint(row)
+            self.assertEqual(source, "trace_fallback")
+            self.assertIn("theorem traced", candidate)
+
+    def test_generation_error_carries_last_invalid_candidate(self) -> None:
+        response = SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(
+                content="```lean\nimport Mathlib\ntheorem wrong_name : True := by trivial\n```",
+            ),
+            finish_reason="stop",
+        )])
+        with patch("blueprint.make_client", return_value=object()), patch(
+            "blueprint._call_blueprint_model", return_value=response,
+        ):
+            with self.assertRaises(BlueprintGenerationError) as caught:
+                generate_blueprint_from_informal(
+                    "statement", "proof", "required_name",
+                    compiler=SimpleNamespace(), max_retries=1,
+                )
+        self.assertIn("wrong_name", caught.exception.last_candidate)
+        self.assertEqual(caught.exception.failure_stage, "blueprint_contract")
+
+
+class ContextBudgetTest(unittest.TestCase):
+    class CharacterTokenizer:
+        def encode(self, text: str, add_special_tokens: bool = False):
+            return [ord(char) for char in text]
+
+        def decode(self, tokens, skip_special_tokens: bool = True):
+            return "".join(chr(token) for token in tokens)
+
+        def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True):
+            text = "".join(message["role"] + message["content"] for message in messages)
+            if add_generation_prompt:
+                text += "assistant"
+            return {"input_ids": self.encode(text), "attention_mask": [1] * len(text)}
+
+    def test_invalid_candidate_is_reference_and_blueprint_is_truncated(self) -> None:
+        row = {
+            "problem": "Compute 1+1.",
+            "claimed_answer": "2",
+            "original_cot": "One plus one is two. \\boxed{2}",
+            "lean_context": "A" * 12000,
+            "context_quality": "INVALID_BLUEPRINT_CANDIDATE",
+            "error": "syntax error",
+            "nodes": [],
+        }
+        config = OmegaConf.create({"refine": {
+            "tokenizer_path": "unused",
+            "context_window": 7000,
+            "context_safety_margin": 100,
+            "max_tokens": 1000,
+        }})
+        with patch(
+            "cot_blueprint_refine.run_cot_refinement._load_tokenizer",
+            return_value=self.CharacterTokenizer(),
+        ):
+            messages, metadata = fit_messages_to_context(row, config)
+        self.assertTrue(metadata["blueprint_truncated"])
+        self.assertLessEqual(metadata["input_tokens"] + 1100, 7000)
+        self.assertIn("fallible reference", messages[1]["content"])
+        self.assertIn("syntax error", messages[1]["content"])
 
 
 class ExportContextsTest(unittest.TestCase):

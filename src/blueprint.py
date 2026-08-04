@@ -52,6 +52,28 @@ def _max_tokens() -> int:
 
 MAX_RETRIES = 8
 
+
+class BlueprintGenerationError(RuntimeError):
+    """Terminal Phase-1 failure with the last unusable candidate attached."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        last_candidate: str = "",
+        diagnostics: list[str] | None = None,
+        attempt: int = 0,
+        finish_reason: str | None = None,
+        failure_stage: str = "model_output",
+    ) -> None:
+        super().__init__(message)
+        self.last_candidate = last_candidate
+        self.diagnostics = list(diagnostics or [])
+        self.attempt = attempt
+        self.finish_reason = finish_reason
+        self.failure_stage = failure_stage
+
+
 def _emit_usage(tracer, thm_name: str, phase: str, model: str, response) -> None:
     """Log token usage from a chat.completions/responses API response, if a
     tracer was given. `response.usage` is present on both APIs but with
@@ -587,6 +609,10 @@ def generate_blueprint_from_informal(
     ]
     
     last_error_feedback = ""
+    last_candidate = ""
+    last_diagnostics: list[str] = []
+    last_finish_reason: str | None = None
+    last_failure_stage = "model_output"
     for attempt in range(max_retries):
         response = _call_blueprint_model(
             client,
@@ -599,13 +625,18 @@ def generate_blueprint_from_informal(
             phase="phase1",
             attempt=attempt + 1,
         )
-        lean_code = _extract_lean_code(response.choices[0].message.content)
+        choice = response.choices[0]
+        lean_code = _extract_lean_code(choice.message.content)
+        last_candidate = lean_code
+        last_finish_reason = getattr(choice, "finish_reason", None)
         emitted_target = _extract_target_name(lean_code, "")
         if emitted_target != target_name:
             last_error_feedback = (
                 f"The main theorem must be named `{target_name}`, but the "
                 f"latest output's final theorem is `{emitted_target or '<missing>'}`."
             )
+            last_diagnostics = [last_error_feedback]
+            last_failure_stage = "blueprint_contract"
             _append_assistant_turn(messages, response)
             messages.append({
                 "role": "user",
@@ -631,11 +662,19 @@ def generate_blueprint_from_informal(
                 "\n".join(result.diagnostics) or result.raw_output[-2000:]
             )
         if result.success:
-            parsed = _parse_blueprint(lean_code, target_name)
-            if not parsed.nodes:
+            try:
+                parsed = _parse_blueprint(lean_code, target_name)
+            except Exception as exc:  # noqa: BLE001
+                parsed = None
+                last_error_feedback = f"Blueprint parsing failed: {type(exc).__name__}: {exc}"
+                last_failure_stage = "parse"
+            if parsed is None:
+                pass
+            elif not parsed.nodes:
                 last_error_feedback = (
                     "The file compiled, but contains no `@[blueprint ...]`-annotated declarations."
                 )
+                last_failure_stage = "parse"
             else:
                 contract_errors = phase2_contract_errors(parsed)
                 if not contract_errors:
@@ -650,8 +689,11 @@ def generate_blueprint_from_informal(
                     "The file compiled, but the blueprint is not usable by Phase 2:\n\n"
                     f"{format_phase2_contract_errors(contract_errors)}"
                 )
+                last_failure_stage = "blueprint_contract"
         else:
             last_error_feedback = "\n".join(result.diagnostics) or result.raw_output[-2000:]
+            last_failure_stage = "lean_check"
+        last_diagnostics = list(result.diagnostics) or [last_error_feedback]
 
         _append_assistant_turn(messages, response)
         messages.append({
@@ -663,9 +705,17 @@ def generate_blueprint_from_informal(
             ),
         })
 
-    raise RuntimeError(
+    message = (
         f"Informal blueprint generation failed after {max_retries} attempts. "
         f"Last error:\n{last_error_feedback[-2000:]}"
+    )
+    raise BlueprintGenerationError(
+        message,
+        last_candidate=last_candidate,
+        diagnostics=last_diagnostics,
+        attempt=max_retries,
+        finish_reason=last_finish_reason,
+        failure_stage=last_failure_stage,
     )
 
 

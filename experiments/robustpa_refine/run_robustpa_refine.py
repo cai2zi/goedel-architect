@@ -27,7 +27,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "experiments"))
 
-from blueprint import Blueprint, generate_blueprint_from_informal  # noqa: E402
+from blueprint import (  # noqa: E402
+    Blueprint,
+    BlueprintGenerationError,
+    generate_blueprint_from_informal,
+)
 from checkpoint import CheckpointState, RunStatus  # noqa: E402
 from robustpa_refine.io_utils import append_jsonl, safe_stem, unlink_if_exists, write_json  # noqa: E402
 from robustpa_refine.runtime import (  # noqa: E402
@@ -479,7 +483,7 @@ async def _run_record(
     rounds_path: Path,
     rounds_lock: asyncio.Lock,
 ) -> dict[str, Any]:
-    checkpoint_path, trace_path, _blueprint_dir = _record_paths(output_root, record)
+    checkpoint_path, trace_path, blueprint_dir = _record_paths(output_root, record)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     trace_path.parent.mkdir(parents=True, exist_ok=True)
     tracer = JsonlTracer(trace_path)
@@ -646,7 +650,7 @@ async def _run_record(
             blueprint = state.get_blueprint() if state else blueprint
         except Exception:
             pass
-        return _result_row(
+        row = _result_row(
             record,
             output_root,
             status="error",
@@ -658,6 +662,23 @@ async def _run_record(
             error=str(exc),
             traceback_text=traceback.format_exc(),
         )
+        if isinstance(exc, BlueprintGenerationError) and exc.last_candidate.strip():
+            blueprint_dir.mkdir(parents=True, exist_ok=True)
+            candidate_path = blueprint_dir / "phase1_failed_last.lean"
+            diagnostics_path = blueprint_dir / "phase1_failed_last.json"
+            candidate_path.write_text(exc.last_candidate.rstrip() + "\n", encoding="utf-8")
+            write_json(diagnostics_path, {
+                "attempt": exc.attempt,
+                "failure_stage": exc.failure_stage,
+                "finish_reason": exc.finish_reason,
+                "diagnostics": exc.diagnostics,
+            })
+            row.update({
+                "failed_blueprint_candidate_path": str(candidate_path),
+                "failed_blueprint_diagnostics_path": str(diagnostics_path),
+                "failed_blueprint_failure_stage": exc.failure_stage,
+            })
+        return row
     finally:
         tracer.close()
 

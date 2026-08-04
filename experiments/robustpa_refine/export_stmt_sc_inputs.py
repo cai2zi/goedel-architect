@@ -114,12 +114,50 @@ def parse_args() -> argparse.Namespace:
         default=LEAN_MAX_INFLIGHT_SNIPPETS,
         help="Maximum number of in-flight Kimina snippets.",
     )
+    parser.add_argument(
+        "--lean-batch-size",
+        type=int,
+        default=LEAN_BATCH_SIZE,
+        help="Kimina snippet batch size for Lean validation requests.",
+    )
+    parser.add_argument(
+        "--include-subset",
+        action="append",
+        default=[],
+        help=(
+            "Only export rows from this subset. May be repeated or comma-separated. "
+            "When omitted, all subsets are exported."
+        ),
+    )
+    parser.add_argument(
+        "--include-split",
+        action="append",
+        default=[],
+        help=(
+            "Only export rows from this split. May be repeated or comma-separated. "
+            "When omitted, all splits are exported."
+        ),
+    )
     args = parser.parse_args()
     if args.workers <= 0:
         raise SystemExit("--workers must be positive")
     if args.lean_max_inflight_snippets <= 0:
         raise SystemExit("--lean-max-inflight-snippets must be positive")
+    if args.lean_batch_size <= 0:
+        raise SystemExit("--lean-batch-size must be positive")
+    args.include_subset = _parse_filter_values(args.include_subset)
+    args.include_split = _parse_filter_values(args.include_split)
     return args
+
+
+def _parse_filter_values(raw_values: list[str]) -> list[str]:
+    values: list[str] = []
+    for raw_value in raw_values:
+        for value in str(raw_value).split(","):
+            value = value.strip()
+            if value:
+                values.append(value)
+    return values
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -138,6 +176,40 @@ def _latest_result_rows(results_path: Path) -> list[dict[str, Any]]:
         if row_id:
             latest[row_id] = row
     return list(latest.values())
+
+
+def _filter_rows_by_scope(
+    rows: list[dict[str, Any]],
+    *,
+    include_subsets: list[str],
+    include_splits: list[str],
+) -> list[dict[str, Any]]:
+    subset_filter = set(include_subsets)
+    split_filter = set(include_splits)
+    if not subset_filter and not split_filter:
+        return rows
+    return [
+        row
+        for row in rows
+        if (not subset_filter or str(row.get("subset") or "") in subset_filter)
+        and (not split_filter or str(row.get("split") or "") in split_filter)
+    ]
+
+
+def _scope_counts(rows: list[dict[str, Any]]) -> Counter[str]:
+    return Counter(
+        f"{row.get('subset') or ''}/{row.get('split') or ''}"
+        for row in rows
+    )
+
+
+def _print_scope(prefix: str, rows: list[dict[str, Any]]) -> None:
+    subsets = sorted({str(row.get("subset") or "") for row in rows})
+    splits = sorted({str(row.get("split") or "") for row in rows})
+    print(f"[{prefix}] adopted_subsets={subsets}", flush=True)
+    print(f"[{prefix}] adopted_splits={splits}", flush=True)
+    for subset_split, count in sorted(_scope_counts(rows).items()):
+        print(f"[{prefix}] adopted_subset_split={subset_split} rows={count}", flush=True)
 
 
 class ParquetRowCache:
@@ -237,7 +309,7 @@ def _write_lean_file(
     return str(path), digest, len(lean_text)
 
 
-def _make_lean_compiler(max_inflight_snippets: int):
+def _make_lean_compiler(max_inflight_snippets: int, batch_size: int):
     from kimina_lean_compiler import KiminaLeanCompiler
 
     return KiminaLeanCompiler(
@@ -247,7 +319,7 @@ def _make_lean_compiler(max_inflight_snippets: int):
         reuse=LEAN_SERVER_REUSE,
         debug=LEAN_SERVER_DEBUG,
         max_inflight_snippets=max_inflight_snippets,
-        batch_size=LEAN_BATCH_SIZE,
+        batch_size=batch_size,
     )
 
 
@@ -364,12 +436,30 @@ def export(args: argparse.Namespace) -> Path:
     if not results_path.exists():
         raise FileNotFoundError(f"results.jsonl not found: {results_path}")
 
-    result_rows = _latest_result_rows(results_path)
+    all_result_rows = _latest_result_rows(results_path)
+    result_rows = _filter_rows_by_scope(
+        all_result_rows,
+        include_subsets=args.include_subset,
+        include_splits=args.include_split,
+    )
     if args.limit > 0:
         result_rows = result_rows[: args.limit]
+    skipped_rows = len(all_result_rows) - len(result_rows)
+    print(
+        f"[export] loaded_rows={len(all_result_rows)} adopted_rows={len(result_rows)} "
+        f"skipped_rows={skipped_rows}",
+        flush=True,
+    )
+    if args.include_subset or args.include_split:
+        print(
+            f"[export] include_subsets={args.include_subset or 'ALL'} "
+            f"include_splits={args.include_split or 'ALL'}",
+            flush=True,
+        )
+    _print_scope("export", result_rows)
 
     source_rows = _preload_source_rows(result_rows, read_parquet_rows)
-    compiler = _make_lean_compiler(args.lean_max_inflight_snippets)
+    compiler = _make_lean_compiler(args.lean_max_inflight_snippets, args.lean_batch_size)
     exported_rows: list[dict[str, Any]] = []
     counts: Counter[str] = Counter()
     validation_mismatches: list[str] = []
@@ -378,7 +468,8 @@ def export(args: argparse.Namespace) -> Path:
     try:
         print(
             f"[export] workers={args.workers} "
-            f"lean_max_inflight_snippets={args.lean_max_inflight_snippets}",
+            f"lean_max_inflight_snippets={args.lean_max_inflight_snippets} "
+            f"lean_batch_size={args.lean_batch_size}",
             flush=True,
         )
         indexed_export_rows: list[dict[str, Any] | None] = [None] * len(result_rows)
