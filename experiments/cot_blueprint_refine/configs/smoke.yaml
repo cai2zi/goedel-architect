@@ -1,0 +1,23 @@
+exp_name: smoke_397b_2
+include_ids:
+  - MATH-500/test/algebra/2592.json
+  - MATH-500/test/precalculus/742.json
+
+blueprint:
+  model: Qwen3.5-397B-A17B-FP8
+  openai_base_url: http://127.0.0.1:8001/v1
+  phase1_concurrency: 2
+  phase2_blueprint_concurrency: 2
+  phase2_node_concurrency: 16
+  refine_concurrency: 2
+  phase2_contract_check_concurrency: 2
+  lean_max_inflight_snippets: 16
+  lean_batch_size: 8
+
+export:
+  workers: 2
+
+refine:
+  model: Qwen3.5-397B-A17B-FP8
+  openai_base_url: http://127.0.0.1:8001/v1
+  concurrency: 2

@@ -17,7 +17,7 @@ OUTPUT_BASE="${OUTPUT_BASE:-/ssd/czx/czx_work/robustpa_refine}"
 RESUME="${RESUME:-true}"
 LIMIT="${LIMIT:-null}"
 
-MAX_REFINEMENT_ITERATIONS="${MAX_REFINEMENT_ITERATIONS:-4}" # refine的次数
+MAX_REFINEMENT_ITERATIONS="${MAX_REFINEMENT_ITERATIONS:-2}" # refine的次数
 BLUEPRINT_MAX_RETRIES="${BLUEPRINT_MAX_RETRIES:-4}" # 生成blueprint的次数
 NODE_MAX_PROVE_TURNS="${NODE_MAX_PROVE_TURNS:-4}" # node的prove的轮数
 NODE_TIMEOUT_S="${NODE_TIMEOUT_S:-null}"
@@ -111,8 +111,8 @@ except Exception:
   fi
 }
 
-# run_exp orig_reAll miniF2F global_original
-run_exp all_splits_subsets_reAll null null
+run_exp orig_reAll_reduce_token_24 miniF2F global_original
+# run_exp all_splits_subsets_reAll null null
 # run_exp math500_orig_reAll MATH500 global_original
 
 # run_exp global_gemini_rephrase_reAll miniF2F global_gemini_rephrase
