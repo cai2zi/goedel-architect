@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import sys
 import tempfile
 import unittest
@@ -28,7 +29,13 @@ from cot_blueprint_refine.common import (  # noqa: E402
     extract_boxed_contents,
     extract_post_think,
 )
-from cot_blueprint_refine.evaluate import summarize_comparisons  # noqa: E402
+from cot_blueprint_refine.evaluate import (  # noqa: E402
+    ANALYSIS_SCHEMA,
+    summarize_comparisons,
+    write_analysis_parquet,
+    write_full_analysis_prompt,
+    write_pipeline_code_snapshot,
+)
 from cot_blueprint_refine.export_blueprint_contexts import (  # noqa: E402
     export_contexts,
     prompt_signal,
@@ -38,9 +45,12 @@ from cot_blueprint_refine.export_blueprint_contexts import (  # noqa: E402
 )
 from cot_blueprint_refine.prepare_inputs import make_generation_row, prepare  # noqa: E402
 from cot_blueprint_refine.run_cot_refinement import (  # noqa: E402
+    _call_one,
     build_messages,
+    conversation_path,
     fit_messages_to_context,
     normalize_refined_output,
+    synthesize_legacy_conversation,
 )
 from cot_blueprint_refine.run_experiment import ExperimentLock, blueprint_results_complete  # noqa: E402
 
@@ -318,6 +328,115 @@ class ContextBudgetTest(unittest.TestCase):
         self.assertLessEqual(metadata["input_tokens"] + 1100, 7000)
         self.assertIn("fallible reference", messages[1]["content"])
         self.assertIn("syntax error", messages[1]["content"])
+
+
+class RefinementConversationTest(unittest.TestCase):
+    def test_records_complete_request_response_and_normalization(self) -> None:
+        class FakeResponse:
+            choices = [SimpleNamespace(
+                message=SimpleNamespace(
+                    content=r"Checked steps. Final \boxed{2}",
+                    reasoning_content="internal reasoning",
+                    model_extra={},
+                ),
+                finish_reason="stop",
+            )]
+
+            def model_dump(self, mode="json"):
+                return {
+                    "id": "response-1",
+                    "choices": [{
+                        "message": {
+                            "content": r"Checked steps. Final \boxed{2}",
+                            "reasoning_content": "internal reasoning",
+                        },
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18},
+                }
+
+        class FakeCompletions:
+            async def create(self, **_kwargs):
+                return FakeResponse()
+
+        client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+        with tempfile.TemporaryDirectory() as temporary:
+            config = OmegaConf.create({
+                "output_base": temporary,
+                "exp_name": "unit",
+                "refine": {
+                    "timeout_s": 30,
+                    "max_retries": 2,
+                    "retry_max_delay_s": 1,
+                    "retry_base_delay_s": 0,
+                    "model": "model",
+                    "openai_base_url": "http://localhost/v1",
+                    "temperature": 0.6,
+                    "max_tokens": 100,
+                },
+            })
+            row = {
+                "ID": "sample/1", "source": "s", "problem": "1+1?",
+                "claimed_answer": "2", "context_quality": "VERIFIED",
+                "status": "ready", "refine_eligible": True,
+            }
+            messages = [{"role": "user", "content": "complete input"}]
+            with patch(
+                "cot_blueprint_refine.run_cot_refinement.fit_messages_to_context",
+                return_value=(messages, {"input_tokens": 10, "effective_max_tokens": 100}),
+            ):
+                result = asyncio.run(_call_one(client, asyncio.Semaphore(1), row, config))
+            self.assertEqual(result["status"], "ok")
+            artifact = conversation_path(Path(temporary) / "unit", "sample/1")
+            payload = json.loads(artifact.read_text(encoding="utf-8"))
+            self.assertFalse(payload["reconstructed"])
+            self.assertEqual(payload["events"][0]["request"]["messages"], messages)
+            self.assertEqual(payload["events"][0]["response"]["id"], "response-1")
+            self.assertEqual(payload["events"][0]["assistant_reasoning_content"], "internal reasoning")
+            self.assertEqual(payload["events"][0]["normalization"]["status"], "ok")
+
+    def test_legacy_conversation_preserves_existing_prompt_and_response(self) -> None:
+        row = {
+            "ID": "old", "status": "ok", "attempts": 1,
+            "prompt": [{"role": "user", "content": "input"}],
+            "raw_response": {"id": "old-response"},
+            "raw_content": r"Answer \boxed{1}", "refined_cot": r"Answer \boxed{1}",
+        }
+        payload = synthesize_legacy_conversation(row)
+        event = payload["events"][0]
+        self.assertTrue(payload["reconstructed"])
+        self.assertEqual(event["request"]["messages"], row["prompt"])
+        self.assertEqual(event["response"], row["raw_response"])
+
+
+class AnalysisArtifactTest(unittest.TestCase):
+    def test_writes_typed_parquet_code_snapshot_and_full_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            row = {field.name: None for field in ANALYSIS_SCHEMA}
+            row.update({
+                "ID": "id", "source": "s", "before_correct": False,
+                "after_correct": True, "transition": "wrong_to_correct",
+                "conversation_json": '{"events": []}',
+            })
+            parquet_path = root / "analysis.parquet"
+            write_analysis_parquet(parquet_path, [row])
+            table = pq.read_table(parquet_path)
+            self.assertEqual(table.num_rows, 1)
+            self.assertIn("transition", table.column_names)
+
+            (root / "config_resolved.yaml").write_text("exp_name: unit\n", encoding="utf-8")
+            code_path = write_pipeline_code_snapshot(root)
+            code = code_path.read_text(encoding="utf-8")
+            self.assertIn("experiments/cot_blueprint_refine/run_cot_refinement.py", code)
+            self.assertIn("experiments/robustpa_refine/run_robustpa_refine.py", code)
+            self.assertIn("config_resolved.yaml", code)
+
+            prompt_path = write_full_analysis_prompt(root, parquet_path, code_path)
+            prompt = prompt_path.read_text(encoding="utf-8")
+            self.assertIn("conversation_json", prompt)
+            self.assertIn("correct→wrong", prompt)
+            self.assertIn(parquet_path.name, prompt)
 
 
 class ExportContextsTest(unittest.TestCase):

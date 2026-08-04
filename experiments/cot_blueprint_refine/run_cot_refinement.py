@@ -5,6 +5,7 @@ import json
 import re
 import time
 import traceback
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ from cot_blueprint_refine.common import (
     extract_post_think,
     latest_rows,
     output_root,
+    stable_name,
     write_json,
 )
 
@@ -31,6 +33,82 @@ FINAL_OPEN_RE = re.compile(r"<final_refined_solution\s*>", re.IGNORECASE)
 FINAL_CLOSE_RE = re.compile(r"</final_refined_solution\s*>", re.IGNORECASE)
 CONTEXT_QUALITIES = {"VERIFIED", "INVALID_BLUEPRINT_CANDIDATE", "INFRA_ERROR"}
 INFRA_ERROR = "INFRA_ERROR"
+CONVERSATION_SCHEMA_VERSION = 1
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def conversation_path(root: Path, row_id: str) -> Path:
+    return root / "refinement" / "conversations" / f"{stable_name(row_id)}.json"
+
+
+def _persist_conversation(root: Path, payload: dict[str, Any]) -> str:
+    path = conversation_path(root, str(payload.get("ID") or ""))
+    payload["updated_at"] = _utc_now()
+    write_json(path, payload)
+    return str(path)
+
+
+def synthesize_legacy_conversation(
+    refinement: dict[str, Any],
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Backfill a conversation artifact from pre-logging refinement rows."""
+    context = context or {}
+    messages = refinement.get("prompt")
+    response = refinement.get("raw_response")
+    event: dict[str, Any] = {
+        "attempt": int(refinement.get("attempts") or 0),
+        "status": "legacy_row_reconstructed",
+        "started_at": None,
+        "finished_at": None,
+        "latency_s": refinement.get("latency_s"),
+        "request": {
+            "base_url": str(refinement.get("openai_base_url") or ""),
+            "model": str(refinement.get("model") or ""),
+            "messages": messages if isinstance(messages, list) else [],
+            "temperature": refinement.get("temperature"),
+            "max_tokens": refinement.get("effective_max_tokens"),
+            "timeout_s": refinement.get("timeout_s"),
+        },
+        "response": response if isinstance(response, dict) else None,
+        "assistant_content": str(refinement.get("raw_content") or ""),
+        "assistant_reasoning_content": refinement.get("reasoning_content"),
+        "finish_reason": refinement.get("finish_reason"),
+        "normalization": {
+            "status": str(refinement.get("status") or ""),
+            "error": refinement.get("error"),
+            "refined_cot": str(refinement.get("refined_cot") or ""),
+            "think_stripped": bool(refinement.get("think_stripped")),
+            "boxed_answer_count": refinement.get("boxed_answer_count"),
+        },
+        "exception": None,
+        "reconstructed_from_refined_predictions": True,
+    }
+    if not messages and not response and refinement.get("status") not in {"ok", "invalid_output"}:
+        event["status"] = "legacy_error_row_without_request_payload"
+        event["exception"] = {
+            "type": "UnknownLegacyError",
+            "message": str(refinement.get("error") or ""),
+            "traceback": "",
+        }
+    return {
+        "schema_version": CONVERSATION_SCHEMA_VERSION,
+        "ID": str(refinement.get("ID") or context.get("ID") or ""),
+        "source": str(refinement.get("source") or context.get("source") or ""),
+        "context_quality": str(
+            refinement.get("context_quality") or context.get("context_quality") or INFRA_ERROR
+        ),
+        "blueprint_context_status": str(
+            refinement.get("blueprint_context_status") or context.get("status") or ""
+        ),
+        "created_at": None,
+        "updated_at": _utc_now(),
+        "events": [event],
+        "reconstructed": True,
+    }
 
 
 def _render(template: str, **values: str) -> str:
@@ -256,6 +334,7 @@ async def _call_one(
     row: dict[str, Any],
     config: DictConfig,
 ) -> dict[str, Any]:
+    root = output_root(config)
     base = {
         "ID": str(row.get("ID") or ""),
         "source": str(row.get("source") or ""),
@@ -265,12 +344,32 @@ async def _call_one(
         "blueprint_context_status": str(row.get("status") or ""),
         "context_quality": str(row.get("context_quality") or "INFRA_ERROR"),
     }
+    conversation: dict[str, Any] = {
+        "schema_version": CONVERSATION_SCHEMA_VERSION,
+        **base,
+        "created_at": _utc_now(),
+        "updated_at": _utc_now(),
+        "events": [],
+        "reconstructed": False,
+    }
     if not bool(row.get("refine_eligible", True)):
+        conversation["events"].append({
+            "attempt": 0,
+            "status": "skipped",
+            "started_at": _utc_now(),
+            "finished_at": _utc_now(),
+            "request": None,
+            "response": None,
+            "exception": None,
+            "reason": str(row.get("error") or "blueprint context is not ready"),
+        })
+        artifact_path = _persist_conversation(root, conversation)
         return {
             **base,
             "status": "pipeline_error",
             "error": str(row.get("error") or "blueprint context is not ready"),
             "attempts": 0,
+            "conversation_path": artifact_path,
         }
 
     timeout_s = config.refine.timeout_s
@@ -280,6 +379,25 @@ async def _call_one(
     extra_safety_tokens = 0
     async with semaphore:
         for attempt in range(1, int(config.refine.max_retries) + 1):
+            attempt_start = time.time()
+            event: dict[str, Any] = {
+                "attempt": attempt,
+                "status": "preparing_request",
+                "started_at": _utc_now(),
+                "finished_at": None,
+                "latency_s": None,
+                "fit_metadata": None,
+                "request": None,
+                "response": None,
+                "assistant_content": "",
+                "assistant_reasoning_content": None,
+                "finish_reason": None,
+                "normalization": None,
+                "exception": None,
+                "retry_delay_s": None,
+            }
+            conversation["events"].append(event)
+            _persist_conversation(root, conversation)
             try:
                 messages, fit_metadata = fit_messages_to_context(
                     row,
@@ -294,12 +412,40 @@ async def _call_one(
                 }
                 if timeout_s is not None:
                     kwargs["timeout"] = float(timeout_s)
+                event["fit_metadata"] = dict(fit_metadata)
+                event["request"] = {
+                    "base_url": str(config.refine.openai_base_url),
+                    "model": str(config.refine.model),
+                    "messages": messages,
+                    "temperature": float(config.refine.temperature),
+                    "max_tokens": int(config.refine.max_tokens),
+                    "timeout_s": None if timeout_s is None else float(timeout_s),
+                }
+                event["status"] = "request_started"
+                _persist_conversation(root, conversation)
                 response = await client.chat.completions.create(**kwargs)
                 content, reasoning, finish_reason = _message_parts(response)
                 refined_cot, output_error, think_stripped, box_count = normalize_refined_output(
                     content, finish_reason,
                 )
                 status = "ok" if not output_error else "invalid_output"
+                event.update({
+                    "status": status,
+                    "finished_at": _utc_now(),
+                    "latency_s": time.time() - attempt_start,
+                    "response": _response_json(response),
+                    "assistant_content": content,
+                    "assistant_reasoning_content": reasoning,
+                    "finish_reason": finish_reason,
+                    "normalization": {
+                        "status": status,
+                        "error": output_error or None,
+                        "refined_cot": refined_cot,
+                        "think_stripped": think_stripped,
+                        "boxed_answer_count": box_count,
+                    },
+                })
+                artifact_path = _persist_conversation(root, conversation)
                 return {
                     **base,
                     **fit_metadata,
@@ -317,18 +463,37 @@ async def _call_one(
                     "latency_s": time.time() - start,
                     "model": str(config.refine.model),
                     "openai_base_url": str(config.refine.openai_base_url),
+                    "temperature": float(config.refine.temperature),
+                    "timeout_s": None if timeout_s is None else float(timeout_s),
+                    "conversation_path": artifact_path,
                 }
             except Exception as exc:  # noqa: BLE001
                 last_error = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+                event.update({
+                    "status": "exception",
+                    "finished_at": _utc_now(),
+                    "latency_s": time.time() - attempt_start,
+                    "exception": {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                        "traceback": "".join(
+                            traceback.format_exception(type(exc), exc, exc.__traceback__)
+                        ),
+                    },
+                })
                 if "maximum context length" in last_error.lower():
                     extra_safety_tokens += 512
                 if attempt >= int(config.refine.max_retries):
+                    _persist_conversation(root, conversation)
                     break
                 delay = min(
                     float(config.refine.retry_max_delay_s),
                     float(config.refine.retry_base_delay_s) * (2 ** (attempt - 1)),
                 )
+                event["retry_delay_s"] = delay
+                _persist_conversation(root, conversation)
                 await asyncio.sleep(delay)
+    artifact_path = _persist_conversation(root, conversation)
     return {
         **base,
         **fit_metadata,
@@ -339,6 +504,9 @@ async def _call_one(
         "latency_s": time.time() - start,
         "model": str(config.refine.model),
         "openai_base_url": str(config.refine.openai_base_url),
+        "temperature": float(config.refine.temperature),
+        "timeout_s": None if timeout_s is None else float(timeout_s),
+        "conversation_path": artifact_path,
     }
 
 
@@ -369,9 +537,14 @@ async def refine(config: DictConfig) -> dict[str, Any]:
             for row in existing_by_id.values():
                 if row.get("status") == "ok":
                     context = contexts_by_id.get(str(row.get("ID") or ""), {})
+                    artifact = conversation_path(root, str(row.get("ID") or ""))
+                    if not artifact.exists():
+                        legacy = synthesize_legacy_conversation(row, context)
+                        _persist_conversation(root, legacy)
                     row = {
                         **row,
                         "context_quality": str(context.get("context_quality") or "INFRA_ERROR"),
+                        "conversation_path": str(artifact),
                     }
                     handle.write(json.dumps(row, ensure_ascii=False) + "\n")
             for task in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="cot-refine", unit="row"):
