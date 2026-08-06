@@ -33,19 +33,23 @@ FINAL_OPEN_RE = re.compile(r"<final_refined_solution\s*>", re.IGNORECASE)
 FINAL_CLOSE_RE = re.compile(r"</final_refined_solution\s*>", re.IGNORECASE)
 CONTEXT_QUALITIES = {"VERIFIED", "INVALID_BLUEPRINT_CANDIDATE", "INFRA_ERROR"}
 INFRA_ERROR = "INFRA_ERROR"
-CONVERSATION_SCHEMA_VERSION = 1
+CONVERSATION_SCHEMA_VERSION = 2
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def conversation_path(root: Path, row_id: str) -> Path:
-    return root / "refinement" / "conversations" / f"{stable_name(row_id)}.json"
+def conversation_path(root: Path, row_id: str, variant_name: str = "blueprint") -> Path:
+    return root / "refinement" / variant_name / "conversations" / f"{stable_name(row_id)}.json"
 
 
 def _persist_conversation(root: Path, payload: dict[str, Any]) -> str:
-    path = conversation_path(root, str(payload.get("ID") or ""))
+    path = conversation_path(
+        root,
+        str(payload.get("ID") or ""),
+        str(payload.get("refine_variant") or "blueprint"),
+    )
     payload["updated_at"] = _utc_now()
     write_json(path, payload)
     return str(path)
@@ -98,6 +102,12 @@ def synthesize_legacy_conversation(
         "schema_version": CONVERSATION_SCHEMA_VERSION,
         "ID": str(refinement.get("ID") or context.get("ID") or ""),
         "source": str(refinement.get("source") or context.get("source") or ""),
+        "refine_variant": str(refinement.get("refine_variant") or "blueprint"),
+        "prompt_mode": str(refinement.get("prompt_mode") or "blueprint"),
+        "blueprint_used": bool(refinement.get("blueprint_used", True)),
+        "source_solution_model_label": str(
+            refinement.get("source_solution_model_label") or "Qwen3-8B"
+        ),
         "context_quality": str(
             refinement.get("context_quality") or context.get("context_quality") or INFRA_ERROR
         ),
@@ -139,20 +149,41 @@ def _context_guidance(quality: str) -> str:
 def build_messages(
     row: dict[str, Any],
     *,
+    prompt_mode: str = "blueprint",
+    source_solution_model_label: str = "Qwen3-8B",
     lean_context: str | None = None,
 ) -> list[dict[str, str]]:
-    system = (PROMPTS_DIR / "cot_refine_system.md").read_text(encoding="utf-8").strip()
-    user_template = (PROMPTS_DIR / "cot_refine_user.md").read_text(encoding="utf-8")
-    user = _render(
-        user_template,
-        problem=str(row.get("problem") or ""),
-        claimed_answer=str(row.get("claimed_answer") or ""),
-        original_cot=str(row.get("original_cot") or ""),
-        lean_context=str(row.get("lean_context") or "") if lean_context is None else lean_context,
-        context_quality=str(row.get("context_quality") or "INFRA_ERROR"),
-        context_guidance=_context_guidance(str(row.get("context_quality") or "INFRA_ERROR")),
-        blueprint_diagnostics=str(row.get("error") or "(none)"),
-    ).strip()
+    if prompt_mode not in {"blueprint", "cot_only"}:
+        raise ValueError(f"unknown refinement prompt mode: {prompt_mode!r}")
+    common_system = (PROMPTS_DIR / "cot_refine_system_base.md").read_text(encoding="utf-8")
+    arm_system = (PROMPTS_DIR / f"cot_refine_system_{prompt_mode}.md").read_text(
+        encoding="utf-8"
+    )
+    system = _render(
+        common_system.strip() + "\n\n" + arm_system.strip(),
+        source_solution_model_label=source_solution_model_label,
+    )
+    user_template = (PROMPTS_DIR / f"cot_refine_user_{prompt_mode}.md").read_text(
+        encoding="utf-8"
+    )
+    values = {
+        "problem": str(row.get("problem") or ""),
+        "claimed_answer": str(row.get("claimed_answer") or ""),
+        "original_cot": str(row.get("original_cot") or ""),
+        "source_solution_model_label": source_solution_model_label,
+    }
+    if prompt_mode == "blueprint":
+        values.update({
+            "lean_context": (
+                str(row.get("lean_context") or "") if lean_context is None else lean_context
+            ),
+            "context_quality": str(row.get("context_quality") or "INFRA_ERROR"),
+            "context_guidance": _context_guidance(
+                str(row.get("context_quality") or "INFRA_ERROR")
+            ),
+            "blueprint_diagnostics": str(row.get("error") or "(none)"),
+        })
+    user = _render(user_template, **values).strip()
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
@@ -203,10 +234,12 @@ def _truncate_tokens_head_tail(text: str, token_budget: int, tokenizer: Any) -> 
     return tokenizer.decode(kept, skip_special_tokens=True)
 
 
-def fit_messages_to_context(
+def fit_refinement_messages(
     row: dict[str, Any],
     config: DictConfig,
     *,
+    prompt_mode: str,
+    source_solution_model_label: str,
     extra_safety_tokens: int = 0,
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
     tokenizer = _load_tokenizer(str(config.refine.tokenizer_path))
@@ -220,16 +253,48 @@ def fit_messages_to_context(
     )
     if max_input_tokens <= 0:
         raise ValueError("refine context budget is non-positive")
-    messages = build_messages(row, lean_context=context)
+    if prompt_mode == "cot_only":
+        context = ""
+        original_context_tokens = 0
+    messages = build_messages(
+        row,
+        prompt_mode=prompt_mode,
+        source_solution_model_label=source_solution_model_label,
+        lean_context=context,
+    )
     input_tokens = _message_token_count(messages, tokenizer)
     truncated = False
+    if prompt_mode == "cot_only":
+        if input_tokens > max_input_tokens:
+            raise ValueError(
+                f"cot-only prompt uses {input_tokens} tokens, exceeding input budget "
+                f"{max_input_tokens}"
+            )
+        return messages, {
+            "max_input_tokens": max_input_tokens,
+            "blueprint_truncated": False,
+            "blueprint_tokens_original": 0,
+            "blueprint_tokens_used": 0,
+            "input_tokens": input_tokens,
+            "effective_max_tokens": int(config.refine.max_tokens),
+        }
     if input_tokens > max_input_tokens:
         context = _compress_verified_proofs(context, list(row.get("nodes") or []))
         truncated = context != str(row.get("lean_context") or "")
-        messages = build_messages(row, lean_context=context)
+        messages = build_messages(
+            row,
+            prompt_mode=prompt_mode,
+            source_solution_model_label=source_solution_model_label,
+            lean_context=context,
+        )
         input_tokens = _message_token_count(messages, tokenizer)
     if input_tokens > max_input_tokens:
-        empty_messages = build_messages(row, lean_context="")
+        empty_messages = build_messages(
+            row,
+            prompt_mode=prompt_mode,
+            source_solution_model_label=source_solution_model_label,
+            lean_context="",
+        )
         fixed_tokens = _message_token_count(empty_messages, tokenizer)
         if fixed_tokens >= max_input_tokens:
             raise ValueError(
@@ -239,12 +304,22 @@ def fit_messages_to_context(
         blueprint_budget = max(1, max_input_tokens - fixed_tokens - 16)
         context = _truncate_tokens_head_tail(context, blueprint_budget, tokenizer)
         truncated = True
-        messages = build_messages(row, lean_context=context)
+        messages = build_messages(
+            row,
+            prompt_mode=prompt_mode,
+            source_solution_model_label=source_solution_model_label,
+            lean_context=context,
+        )
         input_tokens = _message_token_count(messages, tokenizer)
         while input_tokens > max_input_tokens and blueprint_budget > 16:
             blueprint_budget = max(16, blueprint_budget - max(16, input_tokens - max_input_tokens))
             context = _truncate_tokens_head_tail(context, blueprint_budget, tokenizer)
-            messages = build_messages(row, lean_context=context)
+            messages = build_messages(
+                row,
+                prompt_mode=prompt_mode,
+                source_solution_model_label=source_solution_model_label,
+                lean_context=context,
+            )
             input_tokens = _message_token_count(messages, tokenizer)
     if input_tokens > max_input_tokens:
         raise ValueError(
@@ -258,6 +333,24 @@ def fit_messages_to_context(
         "input_tokens": input_tokens,
         "effective_max_tokens": int(config.refine.max_tokens),
     }
+
+
+def fit_messages_to_context(
+    row: dict[str, Any],
+    config: DictConfig,
+    *,
+    extra_safety_tokens: int = 0,
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """Backward-compatible blueprint-arm wrapper used by existing tooling/tests."""
+    return fit_refinement_messages(
+        row,
+        config,
+        prompt_mode="blueprint",
+        source_solution_model_label=str(
+            config.refine.get("source_solution_model_label", "Qwen3-8B")
+        ),
+        extra_safety_tokens=extra_safety_tokens,
+    )
 
 
 def _response_json(response: Any) -> dict[str, Any]:
@@ -334,8 +427,16 @@ async def _call_one(
     semaphore: asyncio.Semaphore,
     row: dict[str, Any],
     config: DictConfig,
+    variant_name: str = "blueprint",
+    variant_config: DictConfig | None = None,
 ) -> dict[str, Any]:
     root = output_root(config)
+    prompt_mode = str(
+        variant_config.get("prompt_mode", variant_name) if variant_config is not None else variant_name
+    )
+    source_solution_model_label = str(
+        config.refine.get("source_solution_model_label", "Qwen3-8B")
+    )
     base = {
         "ID": str(row.get("ID") or ""),
         "source": str(row.get("source") or ""),
@@ -344,6 +445,10 @@ async def _call_one(
         "root_proved": bool(row.get("root_proved")),
         "blueprint_context_status": str(row.get("status") or ""),
         "context_quality": str(row.get("context_quality") or "INFRA_ERROR"),
+        "refine_variant": variant_name,
+        "prompt_mode": prompt_mode,
+        "blueprint_used": prompt_mode == "blueprint",
+        "source_solution_model_label": source_solution_model_label,
     }
     conversation: dict[str, Any] = {
         "schema_version": CONVERSATION_SCHEMA_VERSION,
@@ -353,7 +458,7 @@ async def _call_one(
         "events": [],
         "reconstructed": False,
     }
-    if not bool(row.get("refine_eligible", True)):
+    if prompt_mode == "blueprint" and not bool(row.get("refine_eligible", True)):
         conversation["events"].append({
             "attempt": 0,
             "status": "skipped",
@@ -400,11 +505,20 @@ async def _call_one(
             conversation["events"].append(event)
             _persist_conversation(root, conversation)
             try:
-                messages, fit_metadata = fit_messages_to_context(
-                    row,
-                    config,
-                    extra_safety_tokens=extra_safety_tokens,
-                )
+                if prompt_mode == "blueprint":
+                    messages, fit_metadata = fit_messages_to_context(
+                        row,
+                        config,
+                        extra_safety_tokens=extra_safety_tokens,
+                    )
+                else:
+                    messages, fit_metadata = fit_refinement_messages(
+                        row,
+                        config,
+                        prompt_mode=prompt_mode,
+                        source_solution_model_label=source_solution_model_label,
+                        extra_safety_tokens=extra_safety_tokens,
+                    )
                 kwargs: dict[str, Any] = {
                     "model": str(config.refine.model),
                     "messages": messages,
@@ -511,12 +625,22 @@ async def _call_one(
     }
 
 
-async def refine(config: DictConfig) -> dict[str, Any]:
+async def refine(
+    config: DictConfig,
+    variant_name: str = "blueprint",
+    variant_config: DictConfig | None = None,
+) -> dict[str, Any]:
     root = output_root(config)
+    if variant_config is None:
+        variants = config.refine.get("variants")
+        variant_config = variants.get(variant_name) if variants is not None else None
+    prompt_mode = str(
+        variant_config.get("prompt_mode", variant_name) if variant_config is not None else variant_name
+    )
     contexts_path = root / "blueprint_contexts" / "blueprint_contexts.jsonl"
     contexts = latest_rows(contexts_path, "ID")
     contexts_by_id = {str(row.get("ID") or ""): row for row in contexts}
-    output_path = root / "refinement" / "refined_predictions.jsonl"
+    output_path = root / "refinement" / variant_name / "refined_predictions.jsonl"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     existing = latest_rows(output_path, "ID") if bool(config.resume) and output_path.exists() else []
     existing_by_id = {str(row.get("ID") or ""): row for row in existing}
@@ -532,23 +656,39 @@ async def refine(config: DictConfig) -> dict[str, Any]:
         base_url=str(config.refine.openai_base_url).rstrip("/"),
     )
     semaphore = asyncio.Semaphore(int(config.refine.concurrency))
-    tasks = [asyncio.create_task(_call_one(client, semaphore, row, config)) for row in pending]
+    tasks = [
+        asyncio.create_task(
+            _call_one(client, semaphore, row, config, variant_name, variant_config)
+        )
+        for row in pending
+    ]
     try:
         with output_path.open("w", encoding="utf-8") as handle:
             for row in existing_by_id.values():
                 if row.get("status") == "ok":
                     context = contexts_by_id.get(str(row.get("ID") or ""), {})
-                    artifact = conversation_path(root, str(row.get("ID") or ""))
+                    artifact = conversation_path(root, str(row.get("ID") or ""), variant_name)
                     if not artifact.exists():
                         legacy = synthesize_legacy_conversation(row, context)
                         _persist_conversation(root, legacy)
                     row = {
                         **row,
+                        "refine_variant": variant_name,
+                        "prompt_mode": prompt_mode,
+                        "blueprint_used": prompt_mode == "blueprint",
+                        "source_solution_model_label": str(
+                            config.refine.get("source_solution_model_label", "Qwen3-8B")
+                        ),
                         "context_quality": str(context.get("context_quality") or "INFRA_ERROR"),
                         "conversation_path": str(artifact),
                     }
                     handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-            for task in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="cot-refine", unit="row"):
+            for task in tqdm(
+                asyncio.as_completed(tasks),
+                total=len(tasks),
+                desc=f"cot-refine/{variant_name}",
+                unit="row",
+            ):
                 result = await task
                 handle.write(json.dumps(result, ensure_ascii=False) + "\n")
                 handle.flush()
@@ -575,6 +715,8 @@ async def refine(config: DictConfig) -> dict[str, Any]:
         if bool(row.get("blueprint_truncated")):
             truncated_ids.append(row_id)
     metrics = {
+        "refine_variant": variant_name,
+        "prompt_mode": prompt_mode,
         "rows": len(final_rows),
         "pending": len(pending),
         "counts": counts,
@@ -585,8 +727,11 @@ async def refine(config: DictConfig) -> dict[str, Any]:
         "blueprint_truncated_ids": sorted(truncated_ids),
         "output": str(output_path),
     }
-    write_json(root / "refinement" / "refinement_metrics.json", metrics)
-    print(f"[refine] rows={len(final_rows)} pending={len(pending)} counts={counts}", flush=True)
+    write_json(root / "refinement" / variant_name / "refinement_metrics.json", metrics)
+    print(
+        f"[refine/{variant_name}] rows={len(final_rows)} pending={len(pending)} counts={counts}",
+        flush=True,
+    )
     print(
         f"[refine-context] quality={metrics['context_quality_counts']} "
         f"invalid_ids={metrics['invalid_blueprint_candidate_ids']} "

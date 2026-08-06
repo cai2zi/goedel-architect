@@ -6,11 +6,11 @@ EXPERIMENT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 exec "${EXPERIMENT_DIR}/run_all.sh" \
   input_predictions=/ssd/czx/czx_work/math_verify_eval/qwen3_8b_math_verify/predictions.jsonl \
-  exp_name=qwen3_8b_blueprint_refine_40 \
+  exp_name=qwen3_8b_397b_refine_ablation \
   vllm.auto_start=true \
   vllm.auto_destroy=true \
   blueprint.prover_max_tokens=4096 \
-  blueprint.max_refinement_iterations=0 \
+  blueprint.max_refinement_iterations=1 \
   blueprint.node_max_negation_probe_turns=0 \
   refine.model=Qwen3-8B \
   refine.openai_base_url=http://127.0.0.1:7999/v1 \

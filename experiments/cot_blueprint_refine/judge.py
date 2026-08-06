@@ -401,8 +401,10 @@ async def judge_equivalences(
     results: dict[tuple[str, str], dict[str, Any]] = {}
     pending_by_key: dict[str, dict[str, Any]] = {}
     request_keys_by_cache: dict[str, list[tuple[str, str]]] = {}
+    request_metadata: dict[tuple[str, str], dict[str, Any]] = {}
     for request in prepared:
         result_key = (str(request.get("ID") or ""), str(request.get("side") or ""))
+        request_metadata[result_key] = request
         cache_key = str(request["cache_key"])
         request_keys_by_cache.setdefault(cache_key, []).append(result_key)
         cached = successful_cache.get(cache_key)
@@ -411,6 +413,7 @@ async def judge_equivalences(
                 **cached,
                 "ID": result_key[0],
                 "side": result_key[1],
+                "variant": str(request.get("variant") or cached.get("variant") or ""),
                 "cache_hit": True,
             }
         else:
@@ -438,6 +441,11 @@ async def judge_equivalences(
                     **result,
                     "ID": result_key[0],
                     "side": result_key[1],
+                    "variant": str(
+                        request_metadata[result_key].get("variant")
+                        or result.get("variant")
+                        or ""
+                    ),
                 }
     finally:
         await client.close()

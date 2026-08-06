@@ -30,13 +30,16 @@ from cot_blueprint_refine.common import (  # noqa: E402
     claimed_answer,
     extract_boxed_contents,
     extract_post_think,
+    load_config,
 )
 from cot_blueprint_refine.evaluate import (  # noqa: E402
     ANALYSIS_SCHEMA,
     COMPARISON_CSV_FIELDS,
     _judge_decision,
+    evaluate,
     grade_final_answer,
     grade_response,
+    summarize_ablation,
     summarize_comparisons,
     write_analysis_parquet,
     write_full_analysis_prompt,
@@ -59,12 +62,17 @@ from cot_blueprint_refine.run_cot_refinement import (  # noqa: E402
     _call_one,
     build_messages,
     conversation_path,
+    fit_refinement_messages,
     fit_messages_to_context,
     normalize_refined_output,
     synthesize_legacy_conversation,
 )
 from cot_blueprint_refine.run_experiment import ExperimentLock, blueprint_results_complete  # noqa: E402
-from cot_blueprint_refine.vllm_runtime import VLLMServer, validate_service_config  # noqa: E402
+from cot_blueprint_refine.vllm_runtime import (  # noqa: E402
+    PersistentVLLMRuntime,
+    VLLMServer,
+    validate_service_config,
+)
 
 
 class CotCleaningTest(unittest.TestCase):
@@ -405,6 +413,45 @@ class ContextBudgetTest(unittest.TestCase):
 
         base = OmegaConf.load(REPO_ROOT / "experiments/cot_blueprint_refine/configs/base.yaml")
         self.assertEqual(base.refine.max_tokens, 20480)
+
+    def test_cot_only_prompt_has_no_blueprint_data_and_zero_blueprint_tokens(self) -> None:
+        row = {
+            "problem": "Compute 1+1.",
+            "claimed_answer": "2",
+            "original_cot": r"The source solution adds the terms. \boxed{2}",
+            "lean_context": "SECRET_LEAN_CONTEXT",
+            "context_quality": "SECRET_CONTEXT_QUALITY",
+            "error": "SECRET_DIAGNOSTIC",
+            "nodes": [{"proof_sketch": "SECRET_NODE"}],
+        }
+        config = OmegaConf.create({"refine": {
+            "tokenizer_path": "unused",
+            "context_window": 8000,
+            "context_safety_margin": 100,
+            "max_tokens": 1000,
+        }})
+        with patch(
+            "cot_blueprint_refine.run_cot_refinement._load_tokenizer",
+            return_value=self.CharacterTokenizer(),
+        ):
+            messages, metadata = fit_refinement_messages(
+                row,
+                config,
+                prompt_mode="cot_only",
+                source_solution_model_label="Qwen3-8B",
+            )
+        prompt = "\n".join(message["content"] for message in messages)
+        self.assertIn("Qwen3-8B", prompt)
+        self.assertIn(row["problem"], prompt)
+        self.assertIn(row["original_cot"], prompt)
+        for secret in (
+            "SECRET_LEAN_CONTEXT", "SECRET_CONTEXT_QUALITY",
+            "SECRET_DIAGNOSTIC", "SECRET_NODE",
+        ):
+            self.assertNotIn(secret, prompt)
+        self.assertEqual(metadata["blueprint_tokens_original"], 0)
+        self.assertEqual(metadata["blueprint_tokens_used"], 0)
+        self.assertFalse(metadata["blueprint_truncated"])
 
 
 class RefinementConversationTest(unittest.TestCase):
@@ -756,19 +803,28 @@ class JudgeTest(unittest.TestCase):
                 "retry_max_delay_s": 0, "concurrency": 2,
             },
         })
-        request = [{
-            "ID": "one", "side": "before", "problem": "half?",
-            "gold": "1/2", "candidate": "0.5",
-        }]
+        request = [
+            {
+                "ID": "one", "side": "after:blueprint", "variant": "blueprint",
+                "problem": "half?", "gold": "1/2", "candidate": "0.5",
+            },
+            {
+                "ID": "one", "side": "after:cot_only", "variant": "cot_only",
+                "problem": "half?", "gold": "1/2", "candidate": "0.5",
+            },
+        ]
         with tempfile.TemporaryDirectory() as temporary, patch(
             "cot_blueprint_refine.judge.AsyncOpenAI", FakeClient,
         ):
             path = Path(temporary) / "judge.jsonl"
             first = asyncio.run(judge_equivalences(request, config, path))
             second = asyncio.run(judge_equivalences(request, config, path))
-        self.assertTrue(first[("one", "before")]["equivalent"])
-        self.assertFalse(first[("one", "before")]["cache_hit"])
-        self.assertTrue(second[("one", "before")]["cache_hit"])
+        self.assertTrue(first[("one", "after:blueprint")]["equivalent"])
+        self.assertFalse(first[("one", "after:blueprint")]["cache_hit"])
+        self.assertEqual(first[("one", "after:blueprint")]["variant"], "blueprint")
+        self.assertEqual(first[("one", "after:cot_only")]["variant"], "cot_only")
+        self.assertTrue(second[("one", "after:blueprint")]["cache_hit"])
+        self.assertTrue(second[("one", "after:cot_only")]["cache_hit"])
         self.assertEqual(FakeClient.completions.calls, 1)
 
     def test_judge_retries_transient_failures(self) -> None:
@@ -1025,6 +1081,179 @@ class JudgeTest(unittest.TestCase):
         self.assertEqual(second[("one", "before")]["status"], "error")
         self.assertEqual(FakeClient.completions.calls, 2)
         self.assertEqual(len(saved_rows), 2)
+
+
+class AblationConfigurationTest(unittest.TestCase):
+    def test_qwen8b_profile_uses_one_397b_service_and_two_arms(self) -> None:
+        config = load_config("qwen3_8b_397b_refine_ablation", [])
+        self.assertFalse(config.resume)
+        self.assertEqual(config.refine.source_solution_model_label, "Qwen3-8B")
+        self.assertEqual(set(config.refine.variants), {"blueprint", "cot_only"})
+        self.assertEqual(config.refine.variants.blueprint.prompt_mode, "blueprint")
+        self.assertEqual(config.refine.variants.cot_only.prompt_mode, "cot_only")
+        for stage in (config.blueprint, config.refine, config.judge):
+            self.assertEqual(stage.model, "Qwen3.5-397B-A17B-FP8")
+            self.assertEqual(stage.openai_base_url, "http://127.0.0.1:8001/v1")
+            self.assertEqual(stage.vllm.reasoning_parser, "qwen3")
+            self.assertEqual(stage.vllm.tool_call_parser, "qwen3_xml")
+            validate_service_config(str(stage.model), str(stage.openai_base_url), stage.vllm)
+        self.assertEqual(
+            config.refine.tokenizer_path,
+            "/ssd/czx/models/Qwen3.5-397B-A17B-FP8",
+        )
+
+    def test_paired_metrics_keep_errors_in_primary_denominator(self) -> None:
+        paired = [
+            {
+                "ID": "both", "original_correct": False,
+                "original_math_verify_correct": False,
+                "blueprint_correct": True, "blueprint_math_verify_correct": True,
+                "cot_only_correct": True, "cot_only_math_verify_correct": True,
+                "blueprint_refine_status": "ok", "cot_only_refine_status": "ok",
+                "paired_outcome": "both_correct",
+            },
+            {
+                "ID": "bp-error", "original_correct": True,
+                "original_math_verify_correct": True,
+                "blueprint_correct": False, "blueprint_math_verify_correct": False,
+                "cot_only_correct": True, "cot_only_math_verify_correct": True,
+                "blueprint_refine_status": "error", "cot_only_refine_status": "ok",
+                "paired_outcome": "cot_only_only_correct",
+            },
+        ]
+        comparison_stub = {
+            "blueprint": [
+                {"ID": "both", "refine_status": "ok", "transition": "wrong_to_correct"},
+                {"ID": "bp-error", "refine_status": "error", "transition": "correct_to_wrong"},
+            ],
+            "cot_only": [
+                {"ID": "both", "refine_status": "ok", "transition": "wrong_to_correct"},
+                {"ID": "bp-error", "refine_status": "ok", "transition": "correct_to_correct"},
+            ],
+        }
+        metrics = summarize_ablation(paired, comparison_stub)
+        self.assertEqual(metrics["total"], 2)
+        self.assertEqual(metrics["arms"]["blueprint"]["math_verify_or_llm_judge"]["correct"], 1)
+        self.assertEqual(metrics["paired_outcome_counts"]["cot_only_only_correct"], 1)
+        self.assertEqual(metrics["both_generated_ok_diagnostic"]["total"], 1)
+
+    def test_two_sample_ablation_smoke_writes_all_three_answer_sets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            predictions = root / "predictions.jsonl"
+            predictions.write_text("".join(
+                json.dumps(row) + "\n" for row in (
+                    {
+                        "ID": "a", "source": "unit", "status": "ok",
+                        "finish_reason": "stop", "problem": "What is one?", "gold": "1",
+                        "raw_cot": r"<think>hidden-a</think>Draft. \boxed{1}",
+                    },
+                    {
+                        "ID": "b", "source": "unit", "status": "ok",
+                        "finish_reason": "stop", "problem": "What is two?", "gold": "2",
+                        "raw_cot": r"<think>hidden-b</think>Draft. \boxed{3}",
+                    },
+                )
+            ), encoding="utf-8")
+            output = root / "out" / "unit"
+
+            def write_rows(path: Path, rows: list[dict]) -> None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+                )
+
+            write_rows(output / "prepared/generation_inputs.jsonl", [
+                {"name": "a", "post_think_cot": r"Draft. \boxed{1}", "claimed_answer": "1"},
+                {"name": "b", "post_think_cot": r"Draft. \boxed{3}", "claimed_answer": "3"},
+            ])
+            write_rows(output / "blueprint_contexts/blueprint_contexts.jsonl", [
+                {"ID": row_id, "status": "ready", "context_quality": "VERIFIED", "nodes": []}
+                for row_id in ("a", "b")
+            ])
+            for variant, answers in (
+                ("blueprint", {"a": "1", "b": "2"}),
+                ("cot_only", {"a": "4", "b": "2"}),
+            ):
+                write_rows(output / f"refinement/{variant}/refined_predictions.jsonl", [
+                    {
+                        "ID": row_id, "status": "ok", "refine_variant": variant,
+                        "prompt_mode": variant, "blueprint_used": variant == "blueprint",
+                        "refined_cot": rf"Refined. \boxed{{{answer}}}", "attempts": 1,
+                    }
+                    for row_id, answer in answers.items()
+                ])
+            config = OmegaConf.create({
+                "input_predictions": str(predictions),
+                "output_base": str(root / "out"),
+                "exp_name": "unit",
+                "resume": False,
+                "refine": {
+                    "model": "397b", "openai_base_url": "http://localhost/v1",
+                    "temperature": 0.6, "max_tokens": 100, "timeout_s": 10,
+                    "source_solution_model_label": "Qwen3-8B",
+                    "variants": {
+                        "blueprint": {"enabled": True, "prompt_mode": "blueprint"},
+                        "cot_only": {"enabled": True, "prompt_mode": "cot_only"},
+                    },
+                },
+                "judge": {"enabled": False},
+            })
+            metrics = evaluate(config)
+            self.assertEqual(metrics["ablation"]["total"], 2)
+            paired = [
+                json.loads(line) for line in
+                (output / "evaluation/ablation/paired_comparison.jsonl")
+                .read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                {"original_answer", "blueprint_answer", "cot_only_answer"} - set(paired[0]),
+                set(),
+            )
+            self.assertTrue((output / "evaluation/blueprint/metrics.json").exists())
+            self.assertTrue((output / "evaluation/cot_only/metrics.json").exists())
+            self.assertEqual(metrics["ablation"]["paired_outcome_counts"], {
+                "blueprint_only_correct": 1,
+                "both_correct": 1,
+            })
+
+
+class PersistentVLLMRuntimeTest(unittest.TestCase):
+    def test_identical_stages_start_once_reuse_pid_and_stop_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = VLLMServerTest._config(Path(temporary))
+
+            def fake_start(server):
+                server.started_at = "start"
+                server.process = SimpleNamespace(pid=397, returncode=None)
+
+            def fake_stop(server, **_kwargs):
+                server.process.returncode = 0
+
+            with patch.object(VLLMServer, "start", autospec=True, side_effect=fake_start) as start, patch.object(
+                VLLMServer, "stop", autospec=True, side_effect=fake_stop,
+            ) as stop:
+                runtime = PersistentVLLMRuntime(config)
+                for stage in ("blueprint", "export", "refine/blueprint", "refine/cot_only", "evaluate/judge"):
+                    runtime.ensure(
+                        stage=stage,
+                        client_model="model",
+                        base_url="http://127.0.0.1:8123/v1",
+                        service=config.service,
+                    )
+                self.assertEqual(runtime.pid, 397)
+                runtime.close()
+            self.assertEqual(start.call_count, 1)
+            self.assertEqual(stop.call_count, 1)
+            session = json.loads(runtime.session_path.read_text(encoding="utf-8"))
+            self.assertEqual(session["start_count"], 1)
+            self.assertEqual(session["stop_count"], 1)
+            self.assertEqual(session["reuse_count"], 4)
+            attachments = [
+                json.loads(line)
+                for line in runtime.attachments_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual({row["pid"] for row in attachments}, {397})
 
 
 class VLLMServerTest(unittest.TestCase):

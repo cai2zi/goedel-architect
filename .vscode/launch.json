@@ -1,0 +1,36 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "COT Blueprint Refine: 8B → 397B Ablation (3 samples)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "/ssd/miniconda3/envs/lean4-czx/bin/python",
+      "program": "${workspaceFolder}/experiments/cot_blueprint_refine/run_experiment.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "subProcess": true,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src:${workspaceFolder}/experiments",
+        "GOEDEL_OPENAI_API_KEY": "dummy"
+      },
+      "args": [
+        "--profile",
+        "qwen3_8b_397b_refine_ablation",
+        "--stage",
+        "all",
+        "exp_name=qwen3_8b_397b_refine_ablation_debug_3",
+        "include_ids=[MATH-500/test/precalculus/807.json,MATH-500/test/intermediate_algebra/1994.json,MATH-500/test/algebra/2584.json]",
+        "blueprint.phase1_concurrency=3",
+        "blueprint.phase2_blueprint_concurrency=3",
+        "blueprint.phase2_node_concurrency=16",
+        "blueprint.refine_concurrency=3",
+        "blueprint.phase2_contract_check_concurrency=3",
+        "export.workers=3",
+        "refine.concurrency=3",
+        "judge.concurrency=3"
+      ]
+    }
+  ]
+}

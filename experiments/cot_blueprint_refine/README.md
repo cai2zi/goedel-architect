@@ -19,17 +19,28 @@ PYTHONPATH=src:experiments /ssd/miniconda3/envs/lean4-czx/bin/python \
   --profile smoke --stage export
 ```
 
-The runner automatically starts and stops a stage-owned vLLM service for
-`blueprint`, `refine`, and the final answer-equivalence judge. `prepare` and
-`export` do not use vLLM. Startup requires an exclusive configured port; an
-existing listener is rejected so the runner never kills or reconfigures a
-service it does not own. Logs and lifecycle metadata are written below the
-experiment output in `vllm/`.
+For `--stage all`, the runner starts one experiment-owned 397B vLLM service
+after `prepare`, keeps it resident through blueprint generation, export, both
+refinement arms, and the final answer-equivalence judge, then stops it once.
+Single model-stage runs still start and stop one process. Startup requires an
+exclusive configured port; an existing listener is rejected so the runner
+never kills or reconfigures a service it does not own. PID, stage attachment,
+reuse, start, and stop metadata are written below the experiment output in
+`vllm/`.
 
-The base profile uses the 397B model at port 8001 for blueprint/proving and
-judge, and Qwen3-8B at port 7999 for refinement. The smoke profile uses the
-397B model for all three model stages. Each model stage gets a fresh service,
-including when consecutive stages use the same model.
+Blueprint/proving, COT refinement, and judge all use
+`Qwen3.5-397B-A17B-FP8` at port 8001 with one shared service definition. The
+refinement stage runs `blueprint` and `cot_only` arms with identical decoding
+settings. The latter receives only the original problem, claimed answer, and
+post-thinking source-model solution; it receives no Lean or blueprint data.
+
+Run the Qwen3-8B → 397B ablation from a clean output directory with:
+
+```bash
+PYTHONPATH=src:experiments /ssd/miniconda3/envs/lean4-czx/bin/python \
+  experiments/cot_blueprint_refine/run_experiment.py \
+  --profile qwen3_8b_397b_refine_ablation --stage all
+```
 
 Automatic lifecycle management is enabled by default. To use a manually
 managed endpoint, disable startup and destruction:
@@ -39,9 +50,9 @@ PROFILE=smoke bash experiments/cot_blueprint_refine/run_all.sh \
   vllm.auto_start=false vllm.auto_destroy=false
 ```
 
-`vllm.auto_destroy=false` leaves a service started by a single-stage run alive.
-Because automatic startup uses exclusive ports, this mode is intended for a
-single stage rather than `--stage all`.
+`vllm.auto_destroy=false` leaves an automatically started process alive after
+the run. Because automatic startup uses exclusive ports, manually managed
+services should use `vllm.auto_start=false`.
 
 Service settings can be overridden with the same dot-list syntax, for example
 `vllm.cuda_visible_devices=0,1,2,3 blueprint.vllm.tensor_parallel_size=4`.
@@ -63,8 +74,11 @@ response snapshot. In particular, SDK/API response decoding failures are
 separate from failures of `json.loads` on assistant content. Set
 `judge.enabled=false` to retain Math-Verify-only evaluation.
 
-COT refinement reserves 20,480 output tokens. With the Qwen3-8B 40,960-token
-context and 256-token safety margin this leaves 20,224 tokens for input.
+COT refinement reserves 20,480 output tokens. With the configured 65,536-token
+397B context and 256-token safety margin this leaves 44,800 tokens for input.
+Artifacts are isolated under `refinement/<variant>/` and
+`evaluation/<variant>/`; paired arm outcomes and complete-denominator metrics
+are written under `evaluation/ablation/`.
 
 Outputs are isolated under
 `/ssd/czx/czx_work/cot_blueprint_refine/<exp_name>/`. A per-experiment lock

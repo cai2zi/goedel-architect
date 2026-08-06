@@ -13,9 +13,9 @@ from typing import Any
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
-from cot_blueprint_refine.common import output_root, write_json
+from cot_blueprint_refine.common import append_jsonl, output_root, write_json
 
 
 def _utc_now() -> str:
@@ -309,3 +309,148 @@ class VLLMServer:
         if exc_type is not None:
             self.stop_reason = f"stage_exception:{exc_type.__name__}"
         self.stop()
+
+
+class PersistentVLLMRuntime:
+    """Own one vLLM process and attach compatible model stages to it.
+
+    The manager deliberately compares the complete effective service definition,
+    rather than only the endpoint. This prevents silently reusing a process whose
+    parsers, context window, or scheduling limits differ from the requested stage.
+    """
+
+    def __init__(self, config: DictConfig) -> None:
+        self.config = config
+        self.root = output_root(config) / "vllm"
+        self.attachments_path = self.root / "stage_attachments.jsonl"
+        self.session_path = self.root / "session.json"
+        self.server: VLLMServer | None = None
+        self.fingerprint: str | None = None
+        self.started_at: str | None = None
+        self.stopped_at: str | None = None
+        self.start_count = 0
+        self.stop_count = 0
+        self.reuse_count = 0
+        self.switch_count = 0
+        self.attached_stages: list[str] = []
+        self.closed = False
+
+    def _service_fingerprint(
+        self,
+        *,
+        client_model: str,
+        base_url: str,
+        service: DictConfig,
+    ) -> str:
+        payload = {
+            "client_model": client_model,
+            "base_url": base_url.rstrip("/"),
+            "python_bin": str(self.config.python_bin),
+            "cuda_visible_devices": str(self.config.vllm.cuda_visible_devices),
+            "service": OmegaConf.to_container(service, resolve=True),
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    @property
+    def pid(self) -> int | None:
+        if self.server is None or self.server.process is None:
+            return None
+        return self.server.process.pid
+
+    def _write_session(self, status: str) -> None:
+        write_json(
+            self.session_path,
+            {
+                "status": status,
+                "pid": self.pid,
+                "started_at": self.started_at,
+                "stopped_at": self.stopped_at,
+                "updated_at": _utc_now(),
+                "start_count": self.start_count,
+                "stop_count": self.stop_count,
+                "reuse_count": self.reuse_count,
+                "switch_count": self.switch_count,
+                "attached_stages": self.attached_stages,
+                "service_fingerprint": self.fingerprint,
+            },
+        )
+
+    def ensure(
+        self,
+        *,
+        stage: str,
+        client_model: str,
+        base_url: str,
+        service: DictConfig,
+    ) -> VLLMServer:
+        if self.closed:
+            raise RuntimeError("cannot attach a stage to a closed vLLM runtime")
+        requested = self._service_fingerprint(
+            client_model=client_model,
+            base_url=base_url,
+            service=service,
+        )
+        reused = self.server is not None and requested == self.fingerprint
+        if self.server is not None and not reused:
+            self.switch_count += 1
+            self.server.stop_reason = f"service_switch_before:{stage}"
+            self.server.stop()
+            self.stop_count += 1
+            self.server = None
+        if self.server is None:
+            self.server = VLLMServer(
+                self.config,
+                stage="experiment_397b",
+                client_model=client_model,
+                base_url=base_url,
+                service=service,
+            )
+            self.server.start()
+            self.fingerprint = requested
+            self.started_at = self.server.started_at or _utc_now()
+            self.start_count += 1
+        else:
+            self.reuse_count += 1
+            print(
+                f"[vllm-reuse] stage={stage} pid={self.pid} model={client_model}",
+                flush=True,
+            )
+        attached_at = _utc_now()
+        self.attached_stages.append(stage)
+        append_jsonl(
+            self.attachments_path,
+            {
+                "stage": stage,
+                "attached_at": attached_at,
+                "pid": self.pid,
+                "model": client_model,
+                "base_url": base_url,
+                "reused": reused,
+                "reuse_count": self.reuse_count,
+            },
+        )
+        self._write_session("running")
+        return self.server
+
+    def close(self, *, reason: str = "experiment_finished") -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if self.server is not None:
+            self.server.stop_reason = reason
+            self.server.stop()
+            self.stop_count += 1
+        self.stopped_at = _utc_now()
+        self._write_session("stopped")
+
+    def __enter__(self) -> "PersistentVLLMRuntime":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        _exc: BaseException | None,
+        _traceback: TracebackType | None,
+    ) -> None:
+        reason = "experiment_finished" if exc_type is None else f"experiment_exception:{exc_type.__name__}"
+        self.close(reason=reason)

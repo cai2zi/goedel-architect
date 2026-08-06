@@ -47,7 +47,8 @@ PIPELINE_CODE_NAME = "cot_blueprint_refine_pipeline_code.md"
 ANALYSIS_PROMPT_NAME = "cot_blueprint_refine_full_analysis_prompt.md"
 PIPELINE_TEXT_SUFFIXES = {".py", ".sh", ".yaml", ".yml", ".md"}
 COMPARISON_CSV_FIELDS = [
-    "ID", "source", "gold",
+    "ID", "source", "refine_variant", "prompt_mode", "gold",
+    "claimed_answer", "after_claimed_answer",
     "before_extracted_pred", "before_math_verify_correct",
     "before_judge_status", "before_judge_equivalent",
     "before_judge_reason", "before_judge_error", "before_judge_error_layer",
@@ -133,13 +134,14 @@ def _read_or_reconstruct_conversation(
     refinement: dict[str, Any],
     context: dict[str, Any],
     config: DictConfig,
+    variant_name: str = "blueprint",
 ) -> tuple[dict[str, Any], Path, str, bool]:
-    path = conversation_path(root, row_id)
+    path = conversation_path(root, row_id, variant_name)
     if path.exists():
         payload = json.loads(path.read_text(encoding="utf-8"))
         source = "recorded_full" if not payload.get("reconstructed") else "reconstructed_sidecar"
     else:
-        reconstruction_row = {**refinement, "ID": row_id}
+        reconstruction_row = {**refinement, "ID": row_id, "refine_variant": variant_name}
         payload = synthesize_legacy_conversation(reconstruction_row, context)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -197,6 +199,10 @@ def _response_usage(refinement: dict[str, Any]) -> tuple[int | None, int | None,
 ANALYSIS_SCHEMA = pa.schema([
     ("ID", pa.string()),
     ("source", pa.string()),
+    ("refine_variant", pa.string()),
+    ("prompt_mode", pa.string()),
+    ("blueprint_used", pa.bool_()),
+    ("source_solution_model_label", pa.string()),
     ("row_index", pa.int64()),
     ("problem", pa.string()),
     ("gold", pa.string()),
@@ -412,7 +418,7 @@ def write_full_analysis_prompt(root: Path, parquet_path: Path, code_path: Path) 
 
 你是一名擅长数学推理评测、LLM 行为分析、Lean/Mathlib 与实验审计的研究员。现提供两个附件：
 
-1. `{parquet_path.name}`：每个 eligible 样本一行的全量实验数据；包含原始题目/COT、blueprint 节点及 Lean context、RobustPA 状态、refinement 完整请求与响应对话、前后 Math-Verify 与 LLM judge 判分，以及逐样本 `transition`。
+1. `{parquet_path.name}`：每个 eligible 样本 × refinement arm 一行的全量实验数据；`refine_variant` 区分 `blueprint` 与 `cot_only`。数据包含原始题目/COT、blueprint 节点及 Lean context、RobustPA 状态、refinement 完整请求与响应对话、前后 Math-Verify 与 LLM judge 判分，以及逐样本 `transition`。
 2. `{code_path.name}`：本次 `experiments/cot_blueprint_refine` 流水线的完整代码、配置、prompt，以及实际 resolved config。
 
 请完整读取两个附件后再分析。Parquet 中以 `_json` 结尾的列是 JSON 字符串，必须解析；尤其必须读取 `conversation_json` 中的每个 event、完整 messages、reasoning/content、finish reason、normalization 与 exception。不要只依赖汇总字段。代码文件是解释分母、状态语义、截断、判分与错误处理的权威依据。
@@ -614,20 +620,330 @@ def _judge_decision(
     }
 
 
+def _transition(before_correct: bool, after_correct: bool) -> str:
+    if before_correct and after_correct:
+        return "correct_to_correct"
+    if before_correct:
+        return "correct_to_wrong"
+    if after_correct:
+        return "wrong_to_correct"
+    return "wrong_to_wrong"
+
+
+def _enabled_variant_names(config: DictConfig) -> list[str]:
+    variants = config.refine.get("variants")
+    if variants is None:
+        return ["blueprint"]
+    return [
+        str(name)
+        for name, variant in variants.items()
+        if bool(variant.get("enabled", True))
+    ]
+
+
+def _write_rows_csv(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field) for field in fields})
+
+
+def _arm_efficiency(comparisons: list[dict[str, Any]]) -> dict[str, Any]:
+    total = len(comparisons)
+    attempts = [_int_or_none(row.get("refine_attempts")) for row in comparisons]
+    latencies = [_float_or_none(row.get("refine_latency_s")) for row in comparisons]
+    prompt_tokens = [_int_or_none(row.get("usage_prompt_tokens")) for row in comparisons]
+    completion_tokens = [
+        _int_or_none(row.get("usage_completion_tokens")) for row in comparisons
+    ]
+
+    def numeric(values: list[int | float | None]) -> dict[str, Any]:
+        available = [value for value in values if value is not None]
+        return {
+            "available": len(available),
+            "missing": len(values) - len(available),
+            "total": sum(available),
+            "mean": sum(available) / len(available) if available else None,
+            "min": min(available) if available else None,
+            "max": max(available) if available else None,
+        }
+
+    return {
+        "rows": total,
+        "status_counts": dict(sorted(Counter(
+            str(row.get("refine_status") or "missing") for row in comparisons
+        ).items())),
+        "finish_reason_counts": dict(sorted(Counter(
+            str(row.get("finish_reason") or "missing") for row in comparisons
+        ).items())),
+        "attempts": numeric(attempts),
+        "retry_rows": sum((value or 0) > 1 for value in attempts),
+        "retry_attempts": sum(max(0, (value or 0) - 1) for value in attempts),
+        "latency_s": numeric(latencies),
+        "input_tokens": numeric([
+            _int_or_none(row.get("input_tokens")) for row in comparisons
+        ]),
+        "usage_prompt_tokens": numeric(prompt_tokens),
+        "usage_completion_tokens": numeric(completion_tokens),
+        "invalid_output": sum(
+            row.get("refine_status") == "invalid_output" for row in comparisons
+        ),
+        "refinement_error": sum(
+            row.get("refine_status") != "ok" for row in comparisons
+        ),
+        "answer_changed": sum(
+            str(row.get("claimed_answer") or "").strip()
+            != str(row.get("after_claimed_answer") or "").strip()
+            for row in comparisons
+        ),
+        "answer_change_rate": (
+            sum(
+                str(row.get("claimed_answer") or "").strip()
+                != str(row.get("after_claimed_answer") or "").strip()
+                for row in comparisons
+            ) / total if total else 0.0
+        ),
+        "transition_counts": dict(sorted(Counter(
+            str(row.get("transition") or "unknown") for row in comparisons
+        ).items())),
+        "wrong_to_correct_ids": sorted(
+            str(row.get("ID") or "") for row in comparisons
+            if row.get("transition") == "wrong_to_correct"
+        ),
+        "correct_to_wrong_ids": sorted(
+            str(row.get("ID") or "") for row in comparisons
+            if row.get("transition") == "correct_to_wrong"
+        ),
+    }
+
+
+def summarize_ablation(
+    paired_rows: list[dict[str, Any]],
+    comparisons_by_variant: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    """Summarize the complete paired denominator and a generation-success diagnostic."""
+    total = len(paired_rows)
+
+    def score(field: str) -> dict[str, Any]:
+        correct = sum(bool(row.get(field)) for row in paired_rows)
+        return {"correct": correct, "accuracy": correct / total if total else 0.0}
+
+    original_math = score("original_math_verify_correct")
+    original_final = score("original_correct")
+    arm_metrics: dict[str, Any] = {}
+    for variant, comparisons in comparisons_by_variant.items():
+        math_result = score(f"{variant}_math_verify_correct")
+        final_result = score(f"{variant}_correct")
+        arm_metrics[variant] = {
+            "math_verify_only": {
+                **math_result,
+                "delta_vs_original": math_result["accuracy"] - original_math["accuracy"],
+            },
+            "math_verify_or_llm_judge": {
+                **final_result,
+                "delta_vs_original": final_result["accuracy"] - original_final["accuracy"],
+            },
+            "efficiency": _arm_efficiency(comparisons),
+        }
+    if "blueprint" in arm_metrics and "cot_only" in arm_metrics:
+        arm_metrics["blueprint"]["math_verify_only"]["delta_vs_cot_only"] = (
+            arm_metrics["blueprint"]["math_verify_only"]["accuracy"]
+            - arm_metrics["cot_only"]["math_verify_only"]["accuracy"]
+        )
+        arm_metrics["blueprint"]["math_verify_or_llm_judge"]["delta_vs_cot_only"] = (
+            arm_metrics["blueprint"]["math_verify_or_llm_judge"]["accuracy"]
+            - arm_metrics["cot_only"]["math_verify_or_llm_judge"]["accuracy"]
+        )
+    outcome_counts = Counter(str(row.get("paired_outcome") or "unknown") for row in paired_rows)
+    successful = [
+        row for row in paired_rows
+        if row.get("blueprint_refine_status") == "ok"
+        and row.get("cot_only_refine_status") == "ok"
+    ]
+    return {
+        "denominator_policy": (
+            "all prepared eligible IDs; missing/error/invalid refinement remains incorrect"
+        ),
+        "total": total,
+        "original_8b": {
+            "math_verify_only": original_math,
+            "math_verify_or_llm_judge": original_final,
+        },
+        "arms": arm_metrics,
+        "paired_outcome_counts": dict(sorted(outcome_counts.items())),
+        "paired_outcome_ids": {
+            outcome: sorted(
+                str(row.get("ID") or "") for row in paired_rows
+                if row.get("paired_outcome") == outcome
+            )
+            for outcome in sorted(outcome_counts)
+        },
+        "refinement_errors": {
+            "any_count": sum(bool(row.get("any_refinement_error")) for row in paired_rows),
+            "any_ids": sorted(
+                str(row.get("ID") or "") for row in paired_rows
+                if row.get("any_refinement_error")
+            ),
+            "blueprint_ids": sorted(
+                str(row.get("ID") or "") for row in paired_rows
+                if row.get("blueprint_refinement_error")
+            ),
+            "cot_only_ids": sorted(
+                str(row.get("ID") or "") for row in paired_rows
+                if row.get("cot_only_refinement_error")
+            ),
+        },
+        "both_generated_ok_diagnostic": {
+            "total": len(successful),
+            "fraction_of_primary_denominator": len(successful) / total if total else 0.0,
+            "blueprint_correct": sum(bool(row.get("blueprint_correct")) for row in successful),
+            "cot_only_correct": sum(bool(row.get("cot_only_correct")) for row in successful),
+            "not_primary_metric": True,
+        },
+    }
+
+
+def _analysis_row_for_arm(
+    *,
+    config: DictConfig,
+    root: Path,
+    variant: str,
+    original: dict[str, Any],
+    generation: dict[str, Any],
+    context: dict[str, Any],
+    robustpa: dict[str, Any],
+    refinement: dict[str, Any],
+    comparison: dict[str, Any],
+    before: dict[str, Any],
+    after: dict[str, Any],
+    before_whole: dict[str, Any],
+    after_whole: dict[str, Any],
+    before_judge: dict[str, Any],
+    after_judge: dict[str, Any],
+) -> dict[str, Any]:
+    row_id = str(comparison["ID"])
+    conversation, conversation_file, conversation_source, conversation_complete = (
+        _read_or_reconstruct_conversation(
+            root, row_id, refinement, context, config, variant
+        )
+    )
+    events = list(conversation.get("events") or [])
+    usage_prompt, usage_completion, usage_total = _response_usage(refinement)
+    node_counts = comparison.get("node_status_counts") or {}
+    row = {field.name: None for field in ANALYSIS_SCHEMA}
+    row.update({
+        "ID": row_id,
+        "source": str(original.get("source") or ""),
+        "refine_variant": variant,
+        "prompt_mode": str(refinement.get("prompt_mode") or variant),
+        "blueprint_used": bool(refinement.get("blueprint_used", variant == "blueprint")),
+        "source_solution_model_label": str(
+            refinement.get("source_solution_model_label")
+            or config.refine.get("source_solution_model_label", "")
+        ),
+        "row_index": _int_or_none(original.get("row_index")),
+        "problem": str(original.get("problem") or ""),
+        "gold": str(original.get("gold") or ""),
+        "claimed_answer": str(comparison.get("claimed_answer") or ""),
+        "after_claimed_answer": str(comparison.get("after_claimed_answer") or ""),
+        "original_raw_cot": str(original.get("raw_cot") or ""),
+        "original_post_think_cot": str(generation.get("post_think_cot") or ""),
+        "before_math_verify_correct": bool(before.get("is_correct")),
+        "after_math_verify_correct": bool(after.get("is_correct")),
+        "before_correct": bool(comparison.get("before_correct")),
+        "after_correct": bool(comparison.get("after_correct")),
+        "transition": str(comparison.get("transition") or ""),
+        "before_parse_ok": bool(before.get("math_verify_parse_ok")),
+        "after_parse_ok": bool(after.get("math_verify_parse_ok")),
+        "before_extracted_pred_json": _json_text(before.get("extracted_pred", [])),
+        "after_extracted_pred_json": _json_text(after.get("extracted_pred", [])),
+        "before_whole_cot_math_verify_correct": bool(before_whole.get("is_correct")),
+        "after_whole_cot_math_verify_correct": bool(after_whole.get("is_correct")),
+        "before_whole_cot_parse_ok": bool(before_whole.get("math_verify_parse_ok")),
+        "after_whole_cot_parse_ok": bool(after_whole.get("math_verify_parse_ok")),
+        "before_whole_cot_extracted_pred_json": _json_text(
+            before_whole.get("extracted_pred", [])
+        ),
+        "after_whole_cot_extracted_pred_json": _json_text(
+            after_whole.get("extracted_pred", [])
+        ),
+        "judge_model": str(config.judge.model) if bool(config.judge.enabled) else "",
+        "judge_base_url": (
+            str(config.judge.openai_base_url) if bool(config.judge.enabled) else ""
+        ),
+        "blueprint_status": str(context.get("status") or "missing"),
+        "context_quality": str(context.get("context_quality") or "INFRA_ERROR"),
+        "context_error": str(context.get("error") or ""),
+        "root_proved": bool(context.get("root_proved")),
+        "robustpa_status": str(robustpa.get("status") or context.get("robustpa_status") or ""),
+        "robustpa_error": str(robustpa.get("error") or ""),
+        "checkpoint_path": str(robustpa.get("checkpoint_path") or context.get("checkpoint_path") or ""),
+        "trace_path": str(robustpa.get("trace_path") or ""),
+        "blueprint_path": str(robustpa.get("blueprint_dir") or ""),
+        "blueprint_candidate_source": str(context.get("blueprint_candidate_source") or ""),
+        "node_count": len(list(context.get("nodes") or [])),
+        "node_status_counts_json": _json_text(node_counts),
+        "blueprint_nodes_json": _json_text(context.get("nodes") or []),
+        "lean_context": str(context.get("lean_context") or ""),
+        "refine_status": str(refinement.get("status") or "missing"),
+        "refine_error": str(refinement.get("error") or ""),
+        "refine_model": str(refinement.get("model") or ""),
+        "refine_base_url": str(refinement.get("openai_base_url") or ""),
+        "refine_attempts": _int_or_none(refinement.get("attempts")),
+        "refine_latency_s": _float_or_none(refinement.get("latency_s")),
+        "finish_reason": str(refinement.get("finish_reason") or ""),
+        "think_stripped": bool(refinement.get("think_stripped")),
+        "boxed_answer_count": _int_or_none(refinement.get("boxed_answer_count")),
+        "blueprint_truncated": bool(refinement.get("blueprint_truncated")),
+        "blueprint_tokens_original": _int_or_none(refinement.get("blueprint_tokens_original")),
+        "blueprint_tokens_used": _int_or_none(refinement.get("blueprint_tokens_used")),
+        "input_tokens": _int_or_none(refinement.get("input_tokens")),
+        "effective_max_tokens": _int_or_none(refinement.get("effective_max_tokens")),
+        "usage_prompt_tokens": usage_prompt,
+        "usage_completion_tokens": usage_completion,
+        "usage_total_tokens": usage_total,
+        "refined_cot": str(refinement.get("refined_cot") or ""),
+        "raw_assistant_content": str(refinement.get("raw_content") or ""),
+        "reasoning_content": str(refinement.get("reasoning_content") or ""),
+        "prompt_messages_json": _json_text(refinement.get("prompt") or []),
+        "raw_response_json": _json_text(refinement.get("raw_response") or {}),
+        "conversation_path": str(conversation_file),
+        "conversation_source": conversation_source,
+        "conversation_complete": conversation_complete,
+        "conversation_event_count": len(events),
+        "conversation_request_count": sum(bool(event.get("request")) for event in events),
+        "conversation_exception_count": sum(bool(event.get("exception")) for event in events),
+        "conversation_json": _json_text(conversation),
+        "original_prediction_json": _json_text(original),
+        "generation_input_json": _json_text(generation),
+        "blueprint_context_json": _json_text(context),
+        "robustpa_result_json": _json_text(robustpa),
+        "refinement_result_json": _json_text(refinement),
+    })
+    for prefix, decision in (("before", before_judge), ("after", after_judge)):
+        row.update({
+            f"{prefix}_judge_status": decision["status"],
+            f"{prefix}_judge_equivalent": decision["equivalent"],
+            f"{prefix}_judge_reason": decision["reason"],
+            f"{prefix}_judge_error": decision["error"],
+            f"{prefix}_judge_error_layer": decision["error_layer"],
+            f"{prefix}_judge_request_id": decision["request_id"],
+            f"{prefix}_judge_cache_hit": decision["cache_hit"],
+            f"{prefix}_judge_response_json": _json_text(decision["raw_response"]),
+            f"{prefix}_judge_audit_json": _json_text(decision["audit"]),
+        })
+    return row
+
+
 def evaluate(config: DictConfig) -> dict[str, Any]:
+    """Evaluate all refinement variants with one baseline and one deduplicated judge pass."""
     root = output_root(config)
-    prediction_path = Path(str(config.input_predictions)).expanduser()
-    original_rows = latest_rows(prediction_path, "ID")
+    evaluation_root = root / "evaluation"
+    original_rows = latest_rows(Path(str(config.input_predictions)).expanduser(), "ID")
     original_by_id = {str(row["ID"]): row for row in original_rows}
     eligible_rows = _global_eligible(original_rows)
-    global_before_correct = sum(
-        grade_final_answer(
-            str(row.get("gold") or ""),
-            claimed_answer(str(row["post_think_cot"])),
-        )["is_correct"]
-        for row in eligible_rows
-    )
-
     generation_rows = latest_rows(root / "prepared" / "generation_inputs.jsonl", "name")
     contexts = {
         str(row.get("ID") or ""): row
@@ -637,11 +953,21 @@ def evaluate(config: DictConfig) -> dict[str, Any]:
         str(row.get("source_id") or ""): row
         for row in latest_rows(root / "robustpa" / "blueprint" / "results.jsonl", "source_id")
     }
-    refined = {
-        str(row.get("ID") or ""): row
-        for row in latest_rows(root / "refinement" / "refined_predictions.jsonl", "ID")
+    variants = _enabled_variant_names(config)
+    if not variants:
+        raise ValueError("at least one refinement variant must be enabled")
+    refined_by_variant = {
+        variant: {
+            str(row.get("ID") or ""): row
+            for row in latest_rows(
+                root / "refinement" / variant / "refined_predictions.jsonl", "ID"
+            )
+        }
+        for variant in variants
     }
-    evaluation_inputs: list[dict[str, Any]] = []
+
+    baseline: dict[str, dict[str, Any]] = {}
+    arm_inputs: dict[str, dict[str, dict[str, Any]]] = {variant: {} for variant in variants}
     judge_requests: list[dict[str, Any]] = []
     judge_enabled = bool(config.judge.enabled)
     for generation in generation_rows:
@@ -653,331 +979,276 @@ def evaluate(config: DictConfig) -> dict[str, Any]:
         before_text = str(generation.get("post_think_cot") or "")
         before_candidate = str(generation.get("claimed_answer") or claimed_answer(before_text))
         before = grade_final_answer(gold, before_candidate)
-        before_whole_cot = grade_response(gold, before_text)
-        refinement = refined.get(row_id, {})
-        after_text = str(refinement.get("refined_cot") or "") if refinement.get("status") == "ok" else ""
-        after_candidate = claimed_answer(after_text) if after_text else ""
-        after = (
-            grade_final_answer(gold, after_candidate)
-            if after_text
-            else {"is_correct": False, "math_verify_parse_ok": False, "extracted_pred": []}
-        )
-        after_whole_cot = (
-            grade_response(gold, after_text)
-            if after_text
-            else {"is_correct": False, "math_verify_parse_ok": False, "extracted_pred": []}
-        )
-        item = {
-            "row_id": row_id,
+        before_whole = grade_response(gold, before_text)
+        baseline[row_id] = {
             "original": original,
             "generation": generation,
-            "context": contexts.get(row_id, {}),
-            "robustpa": robustpa_results.get(row_id, {}),
-            "refinement": refinement,
-            "before": before,
-            "after": after,
-            "before_whole_cot": before_whole_cot,
-            "after_whole_cot": after_whole_cot,
+            "before_text": before_text,
             "before_candidate": before_candidate,
-            "after_candidate": after_candidate,
+            "before": before,
+            "before_whole": before_whole,
         }
-        evaluation_inputs.append(item)
-        if judge_enabled:
-            for side, grading, candidate in (
-                ("before", before, before_candidate),
-                ("after", after, after_candidate),
-            ):
-                if not bool(grading.get("is_correct")) and candidate:
-                    judge_requests.append({
-                        "ID": row_id,
-                        "side": side,
-                        "problem": str(original.get("problem") or ""),
-                        "gold": gold,
-                        "candidate": candidate,
-                    })
+        if judge_enabled and not bool(before.get("is_correct")) and before_candidate:
+            judge_requests.append({
+                "ID": row_id,
+                "side": "before",
+                "variant": "original_8b",
+                "problem": str(original.get("problem") or ""),
+                "gold": gold,
+                "candidate": before_candidate,
+            })
+        for variant in variants:
+            refinement = refined_by_variant[variant].get(row_id, {})
+            after_text = (
+                str(refinement.get("refined_cot") or "")
+                if refinement.get("status") == "ok" else ""
+            )
+            after_candidate = claimed_answer(after_text) if after_text else ""
+            after = (
+                grade_final_answer(gold, after_candidate)
+                if after_text else {
+                    "is_correct": False,
+                    "math_verify_parse_ok": False,
+                    "extracted_pred": [],
+                }
+            )
+            after_whole = (
+                grade_response(gold, after_text)
+                if after_text else {
+                    "is_correct": False,
+                    "math_verify_parse_ok": False,
+                    "extracted_pred": [],
+                }
+            )
+            arm_inputs[variant][row_id] = {
+                "refinement": refinement,
+                "after_text": after_text,
+                "after_candidate": after_candidate,
+                "after": after,
+                "after_whole": after_whole,
+            }
+            if judge_enabled and not bool(after.get("is_correct")) and after_candidate:
+                judge_requests.append({
+                    "ID": row_id,
+                    "side": f"after:{variant}",
+                    "variant": variant,
+                    "problem": str(original.get("problem") or ""),
+                    "gold": gold,
+                    "candidate": after_candidate,
+                })
 
-    evaluation_dir = root / "evaluation"
-    judge_path = evaluation_dir / "judge_results.jsonl"
+    judge_path = evaluation_root / "judge_results.jsonl"
     judgments = (
         asyncio.run(judge_equivalences(judge_requests, config, judge_path))
-        if judge_enabled
-        else {}
+        if judge_enabled else {}
     )
-
-    comparisons: list[dict[str, Any]] = []
-    analysis_rows: list[dict[str, Any]] = []
-    for item in evaluation_inputs:
-        row_id = item["row_id"]
-        original = item["original"]
-        generation = item["generation"]
-        context = item["context"]
-        robustpa = item["robustpa"]
-        refinement = item["refinement"]
-        before = item["before"]
-        after = item["after"]
-        before_whole_cot = item["before_whole_cot"]
-        after_whole_cot = item["after_whole_cot"]
-        before_judge = _judge_decision(
-            math_verify_correct=bool(before.get("is_correct")),
+    before_decisions: dict[str, dict[str, Any]] = {}
+    for row_id, item in baseline.items():
+        before_decisions[row_id] = _judge_decision(
+            math_verify_correct=bool(item["before"].get("is_correct")),
             candidate=item["before_candidate"],
             enabled=judge_enabled,
             result=judgments.get((row_id, "before")),
         )
-        after_judge = _judge_decision(
-            math_verify_correct=bool(after.get("is_correct")),
-            candidate=item["after_candidate"],
-            enabled=judge_enabled,
-            result=judgments.get((row_id, "after")),
+
+    comparisons_by_variant: dict[str, list[dict[str, Any]]] = {}
+    all_analysis_rows: list[dict[str, Any]] = []
+    per_variant_metrics: dict[str, Any] = {}
+    for variant in variants:
+        comparisons: list[dict[str, Any]] = []
+        variant_analysis: list[dict[str, Any]] = []
+        for row_id, base in baseline.items():
+            original = base["original"]
+            generation = base["generation"]
+            arm = arm_inputs[variant][row_id]
+            refinement = arm["refinement"]
+            context = contexts.get(row_id, {})
+            robustpa = robustpa_results.get(row_id, {})
+            before_judge = before_decisions[row_id]
+            after_judge = _judge_decision(
+                math_verify_correct=bool(arm["after"].get("is_correct")),
+                candidate=arm["after_candidate"],
+                enabled=judge_enabled,
+                result=judgments.get((row_id, f"after:{variant}")),
+            )
+            before_correct = bool(before_judge["correct"])
+            after_correct = bool(after_judge["correct"])
+            node_counts = Counter(
+                str(node.get("prompt_signal") or "")
+                for node in (context.get("nodes") or [])
+            )
+            usage_prompt, usage_completion, usage_total = _response_usage(refinement)
+            comparison = {
+                "ID": row_id,
+                "source": str(original.get("source") or ""),
+                "refine_variant": variant,
+                "prompt_mode": str(refinement.get("prompt_mode") or variant),
+                "problem": str(original.get("problem") or ""),
+                "gold": str(original.get("gold") or ""),
+                "claimed_answer": base["before_candidate"],
+                "after_claimed_answer": arm["after_candidate"],
+                "before_math_verify_correct": bool(base["before"].get("is_correct")),
+                "after_math_verify_correct": bool(arm["after"].get("is_correct")),
+                "before_correct": before_correct,
+                "after_correct": after_correct,
+                "transition": _transition(before_correct, after_correct),
+                "before_parse_ok": bool(base["before"].get("math_verify_parse_ok")),
+                "after_parse_ok": bool(arm["after"].get("math_verify_parse_ok")),
+                "before_extracted_pred": base["before"].get("extracted_pred", []),
+                "after_extracted_pred": arm["after"].get("extracted_pred", []),
+                "before_whole_cot_math_verify_correct": bool(base["before_whole"].get("is_correct")),
+                "after_whole_cot_math_verify_correct": bool(arm["after_whole"].get("is_correct")),
+                "blueprint_status": str(context.get("status") or "missing"),
+                "context_quality": str(context.get("context_quality") or "INFRA_ERROR"),
+                "root_proved": bool(context.get("root_proved")),
+                "refine_status": str(refinement.get("status") or "missing"),
+                "refine_error": str(refinement.get("error") or ""),
+                "refine_attempts": _int_or_none(refinement.get("attempts")),
+                "refine_latency_s": _float_or_none(refinement.get("latency_s")),
+                "finish_reason": str(refinement.get("finish_reason") or ""),
+                "blueprint_truncated": bool(refinement.get("blueprint_truncated")),
+                "blueprint_tokens_original": _int_or_none(refinement.get("blueprint_tokens_original")),
+                "blueprint_tokens_used": _int_or_none(refinement.get("blueprint_tokens_used")),
+                "input_tokens": _int_or_none(refinement.get("input_tokens")),
+                "usage_prompt_tokens": usage_prompt,
+                "usage_completion_tokens": usage_completion,
+                "usage_total_tokens": usage_total,
+                "refined_cot": str(refinement.get("refined_cot") or ""),
+                "node_status_counts": dict(sorted(node_counts.items())),
+            }
+            for prefix, decision in (("before", before_judge), ("after", after_judge)):
+                comparison.update({
+                    f"{prefix}_judge_status": decision["status"],
+                    f"{prefix}_judge_equivalent": decision["equivalent"],
+                    f"{prefix}_judge_reason": decision["reason"],
+                    f"{prefix}_judge_error": decision["error"],
+                    f"{prefix}_judge_error_layer": decision["error_layer"],
+                    f"{prefix}_judge_request_id": decision["request_id"],
+                    f"{prefix}_judge_cache_hit": decision["cache_hit"],
+                })
+            comparisons.append(comparison)
+            variant_analysis.append(_analysis_row_for_arm(
+                config=config,
+                root=root,
+                variant=variant,
+                original=original,
+                generation=generation,
+                context=context,
+                robustpa=robustpa,
+                refinement=refinement,
+                comparison=comparison,
+                before=base["before"],
+                after=arm["after"],
+                before_whole=base["before_whole"],
+                after_whole=arm["after_whole"],
+                before_judge=before_judge,
+                after_judge=after_judge,
+            ))
+        comparisons.sort(key=lambda row: str(row["ID"]))
+        comparisons_by_variant[variant] = comparisons
+        all_analysis_rows.extend(variant_analysis)
+        metrics = summarize_comparisons(
+            comparisons,
+            dataset_total=len(original_rows),
+            global_eligible_total=len(eligible_rows),
+            global_before_correct=sum(
+                bool(grade_final_answer(
+                    str(row.get("gold") or ""),
+                    claimed_answer(str(row.get("post_think_cot") or "")),
+                )["is_correct"])
+                for row in eligible_rows
+            ),
+            historical_raw_correct=sum(bool(row.get("is_correct")) for row in original_rows),
         )
-        before_correct = bool(before_judge["correct"])
-        after_correct = bool(after_judge["correct"])
-        transition = (
-            "correct_to_correct" if before_correct and after_correct
-            else "correct_to_wrong" if before_correct
-            else "wrong_to_correct" if after_correct
-            else "wrong_to_wrong"
-        )
-        node_counts = Counter(
-            str(node.get("prompt_signal") or "") for node in (context.get("nodes") or [])
-        )
-        comparison = {
+        metrics["refine_variant"] = variant
+        metrics["efficiency"] = _arm_efficiency(comparisons)
+        variant_dir = evaluation_root / variant
+        write_jsonl(variant_dir / "comparison.jsonl", comparisons)
+        _write_rows_csv(variant_dir / "comparison.csv", comparisons, COMPARISON_CSV_FIELDS)
+        write_json(variant_dir / "metrics.json", metrics)
+        per_variant_metrics[variant] = metrics
+
+    comparison_indexes = {
+        variant: {str(row["ID"]): row for row in rows}
+        for variant, rows in comparisons_by_variant.items()
+    }
+    paired_rows: list[dict[str, Any]] = []
+    for row_id, base in baseline.items():
+        paired: dict[str, Any] = {
             "ID": row_id,
-            "source": str(original.get("source") or ""),
-            "problem": str(original.get("problem") or ""),
-            "gold": str(original.get("gold") or ""),
-            "claimed_answer": item["before_candidate"],
-            "after_claimed_answer": item["after_candidate"],
-            "before_math_verify_correct": bool(before.get("is_correct")),
-            "after_math_verify_correct": bool(after.get("is_correct")),
-            "before_correct": before_correct,
-            "after_correct": after_correct,
-            "transition": transition,
-            "before_parse_ok": bool(before.get("math_verify_parse_ok")),
-            "after_parse_ok": bool(after.get("math_verify_parse_ok")),
-            "before_extracted_pred": before.get("extracted_pred", []),
-            "after_extracted_pred": after.get("extracted_pred", []),
-            "before_whole_cot_math_verify_correct": bool(
-                before_whole_cot.get("is_correct")
-            ),
-            "after_whole_cot_math_verify_correct": bool(
-                after_whole_cot.get("is_correct")
-            ),
-            "before_judge_status": before_judge["status"],
-            "before_judge_equivalent": before_judge["equivalent"],
-            "before_judge_reason": before_judge["reason"],
-            "before_judge_error": before_judge["error"],
-            "before_judge_error_layer": before_judge["error_layer"],
-            "before_judge_request_id": before_judge["request_id"],
-            "before_judge_cache_hit": before_judge["cache_hit"],
-            "after_judge_status": after_judge["status"],
-            "after_judge_equivalent": after_judge["equivalent"],
-            "after_judge_reason": after_judge["reason"],
-            "after_judge_error": after_judge["error"],
-            "after_judge_error_layer": after_judge["error_layer"],
-            "after_judge_request_id": after_judge["request_id"],
-            "after_judge_cache_hit": after_judge["cache_hit"],
-            "blueprint_status": str(context.get("status") or "missing"),
-            "context_quality": str(context.get("context_quality") or "INFRA_ERROR"),
-            "root_proved": bool(context.get("root_proved")),
-            "refine_status": str(refinement.get("status") or "missing"),
-            "blueprint_truncated": bool(refinement.get("blueprint_truncated")),
-            "refined_cot": str(refinement.get("refined_cot") or ""),
-            "node_status_counts": dict(sorted(node_counts.items())),
+            "source": str(base["original"].get("source") or ""),
+            "problem": str(base["original"].get("problem") or ""),
+            "gold": str(base["original"].get("gold") or ""),
+            "original_answer": base["before_candidate"],
+            "original_math_verify_correct": bool(base["before"].get("is_correct")),
+            "original_correct": bool(before_decisions[row_id]["correct"]),
         }
-        comparisons.append(comparison)
-
-        conversation, conversation_file, conversation_source, conversation_complete = (
-            _read_or_reconstruct_conversation(root, row_id, refinement, context, config)
+        for variant in variants:
+            comparison = comparison_indexes[variant][row_id]
+            paired.update({
+                f"{variant}_answer": comparison["after_claimed_answer"],
+                f"{variant}_math_verify_correct": comparison["after_math_verify_correct"],
+                f"{variant}_correct": comparison["after_correct"],
+                f"{variant}_transition": comparison["transition"],
+                f"{variant}_refine_status": comparison["refine_status"],
+                f"{variant}_refine_error": comparison["refine_error"],
+            })
+        blueprint_ok = paired.get("blueprint_refine_status") == "ok"
+        cot_only_ok = paired.get("cot_only_refine_status") == "ok"
+        blueprint_correct = bool(paired.get("blueprint_correct"))
+        cot_only_correct = bool(paired.get("cot_only_correct"))
+        outcome = (
+            "both_correct" if blueprint_correct and cot_only_correct
+            else "blueprint_only_correct" if blueprint_correct
+            else "cot_only_only_correct" if cot_only_correct
+            else "both_wrong"
         )
-        events = list(conversation.get("events") or [])
-        usage_prompt, usage_completion, usage_total = _response_usage(refinement)
-        analysis_rows.append({
-            "ID": row_id,
-            "source": str(original.get("source") or ""),
-            "row_index": _int_or_none(original.get("row_index")),
-            "problem": str(original.get("problem") or ""),
-            "gold": str(original.get("gold") or ""),
-            "claimed_answer": item["before_candidate"],
-            "after_claimed_answer": item["after_candidate"],
-            "original_raw_cot": str(original.get("raw_cot") or ""),
-            "original_post_think_cot": str(generation.get("post_think_cot") or ""),
-            "before_math_verify_correct": bool(before.get("is_correct")),
-            "after_math_verify_correct": bool(after.get("is_correct")),
-            "before_correct": before_correct,
-            "after_correct": after_correct,
-            "transition": transition,
-            "before_parse_ok": bool(before.get("math_verify_parse_ok")),
-            "after_parse_ok": bool(after.get("math_verify_parse_ok")),
-            "before_extracted_pred_json": _json_text(before.get("extracted_pred", [])),
-            "after_extracted_pred_json": _json_text(after.get("extracted_pred", [])),
-            "before_whole_cot_math_verify_correct": bool(
-                before_whole_cot.get("is_correct")
-            ),
-            "after_whole_cot_math_verify_correct": bool(
-                after_whole_cot.get("is_correct")
-            ),
-            "before_whole_cot_parse_ok": bool(
-                before_whole_cot.get("math_verify_parse_ok")
-            ),
-            "after_whole_cot_parse_ok": bool(
-                after_whole_cot.get("math_verify_parse_ok")
-            ),
-            "before_whole_cot_extracted_pred_json": _json_text(
-                before_whole_cot.get("extracted_pred", [])
-            ),
-            "after_whole_cot_extracted_pred_json": _json_text(
-                after_whole_cot.get("extracted_pred", [])
-            ),
-            "before_judge_status": before_judge["status"],
-            "before_judge_equivalent": before_judge["equivalent"],
-            "before_judge_reason": before_judge["reason"],
-            "before_judge_error": before_judge["error"],
-            "before_judge_error_layer": before_judge["error_layer"],
-            "before_judge_request_id": before_judge["request_id"],
-            "before_judge_cache_hit": before_judge["cache_hit"],
-            "before_judge_response_json": _json_text(before_judge["raw_response"]),
-            "before_judge_audit_json": _json_text(before_judge["audit"]),
-            "after_judge_status": after_judge["status"],
-            "after_judge_equivalent": after_judge["equivalent"],
-            "after_judge_reason": after_judge["reason"],
-            "after_judge_error": after_judge["error"],
-            "after_judge_error_layer": after_judge["error_layer"],
-            "after_judge_request_id": after_judge["request_id"],
-            "after_judge_cache_hit": after_judge["cache_hit"],
-            "after_judge_response_json": _json_text(after_judge["raw_response"]),
-            "after_judge_audit_json": _json_text(after_judge["audit"]),
-            "judge_model": str(config.judge.model) if judge_enabled else "",
-            "judge_base_url": str(config.judge.openai_base_url) if judge_enabled else "",
-            "blueprint_status": str(context.get("status") or "missing"),
-            "context_quality": str(context.get("context_quality") or "INFRA_ERROR"),
-            "context_error": str(context.get("error") or ""),
-            "root_proved": bool(context.get("root_proved")),
-            "robustpa_status": str(robustpa.get("status") or context.get("robustpa_status") or ""),
-            "robustpa_error": str(robustpa.get("error") or ""),
-            "checkpoint_path": str(robustpa.get("checkpoint_path") or context.get("checkpoint_path") or ""),
-            "trace_path": str(robustpa.get("trace_path") or ""),
-            "blueprint_path": str(robustpa.get("blueprint_dir") or ""),
-            "blueprint_candidate_source": str(context.get("blueprint_candidate_source") or ""),
-            "node_count": len(list(context.get("nodes") or [])),
-            "node_status_counts_json": _json_text(dict(sorted(node_counts.items()))),
-            "blueprint_nodes_json": _json_text(context.get("nodes") or []),
-            "lean_context": str(context.get("lean_context") or ""),
-            "refine_status": str(refinement.get("status") or "missing"),
-            "refine_error": str(refinement.get("error") or ""),
-            "refine_model": str(refinement.get("model") or ""),
-            "refine_base_url": str(refinement.get("openai_base_url") or ""),
-            "refine_attempts": _int_or_none(refinement.get("attempts")),
-            "refine_latency_s": _float_or_none(refinement.get("latency_s")),
-            "finish_reason": str(refinement.get("finish_reason") or ""),
-            "think_stripped": bool(refinement.get("think_stripped")),
-            "boxed_answer_count": _int_or_none(refinement.get("boxed_answer_count")),
-            "blueprint_truncated": bool(refinement.get("blueprint_truncated")),
-            "blueprint_tokens_original": _int_or_none(refinement.get("blueprint_tokens_original")),
-            "blueprint_tokens_used": _int_or_none(refinement.get("blueprint_tokens_used")),
-            "input_tokens": _int_or_none(refinement.get("input_tokens")),
-            "effective_max_tokens": _int_or_none(refinement.get("effective_max_tokens")),
-            "usage_prompt_tokens": usage_prompt,
-            "usage_completion_tokens": usage_completion,
-            "usage_total_tokens": usage_total,
-            "refined_cot": str(refinement.get("refined_cot") or ""),
-            "raw_assistant_content": str(refinement.get("raw_content") or ""),
-            "reasoning_content": str(refinement.get("reasoning_content") or ""),
-            "prompt_messages_json": _json_text(refinement.get("prompt") or []),
-            "raw_response_json": _json_text(refinement.get("raw_response") or {}),
-            "conversation_path": str(conversation_file),
-            "conversation_source": conversation_source,
-            "conversation_complete": conversation_complete,
-            "conversation_event_count": len(events),
-            "conversation_request_count": sum(bool(event.get("request")) for event in events),
-            "conversation_exception_count": sum(bool(event.get("exception")) for event in events),
-            "conversation_json": _json_text(conversation),
-            "original_prediction_json": _json_text(original),
-            "generation_input_json": _json_text(generation),
-            "blueprint_context_json": _json_text(context),
-            "robustpa_result_json": _json_text(robustpa),
-            "refinement_result_json": _json_text(refinement),
+        paired.update({
+            "both_correct": outcome == "both_correct",
+            "blueprint_only_correct": outcome == "blueprint_only_correct",
+            "cot_only_only_correct": outcome == "cot_only_only_correct",
+            "both_wrong": outcome == "both_wrong",
+            "any_refinement_error": not (blueprint_ok and cot_only_ok),
+            "blueprint_refinement_error": not blueprint_ok,
+            "cot_only_refinement_error": not cot_only_ok,
         })
-    comparisons.sort(key=lambda row: str(row["ID"]))
-    analysis_rows.sort(key=lambda row: str(row["ID"]))
+        paired["paired_outcome"] = outcome
+        paired_rows.append(paired)
+    paired_rows.sort(key=lambda row: str(row["ID"]))
+    paired_metrics = summarize_ablation(paired_rows, comparisons_by_variant)
+    ablation_dir = evaluation_root / "ablation"
+    write_jsonl(ablation_dir / "paired_comparison.jsonl", paired_rows)
+    paired_fields = list(paired_rows[0].keys()) if paired_rows else ["ID"]
+    _write_rows_csv(ablation_dir / "paired_comparison.csv", paired_rows, paired_fields)
+    write_json(ablation_dir / "metrics.json", paired_metrics)
 
-    metrics = summarize_comparisons(
-        comparisons,
-        dataset_total=len(original_rows),
-        global_eligible_total=len(eligible_rows),
-        global_before_correct=global_before_correct,
-        historical_raw_correct=sum(bool(row.get("is_correct")) for row in original_rows),
-    )
-    write_jsonl(evaluation_dir / "comparison.jsonl", comparisons)
-    evaluation_dir.mkdir(parents=True, exist_ok=True)
-    with (evaluation_dir / "comparison.csv").open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=COMPARISON_CSV_FIELDS,
-        )
-        writer.writeheader()
-        for row in comparisons:
-            writer.writerow({key: row.get(key) for key in writer.fieldnames})
-    with (evaluation_dir / "metrics_by_source.csv").open("w", encoding="utf-8", newline="") as handle:
-        fieldnames = [
-            "source", "total", "before_math_verify_correct", "before_math_verify_accuracy",
-            "after_math_verify_correct", "after_math_verify_accuracy",
-            "before_correct", "before_accuracy",
-            "after_correct", "after_accuracy", "refined_ok",
-        ]
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        for source, values in metrics["by_source"].items():
-            writer.writerow({"source": source, **values})
-
+    all_analysis_rows.sort(key=lambda row: (str(row["ID"]), str(row["refine_variant"])))
     analysis_path = root / ANALYSIS_PARQUET_NAME
-    write_analysis_parquet(analysis_path, analysis_rows)
+    write_analysis_parquet(analysis_path, all_analysis_rows)
     code_path = write_pipeline_code_snapshot(root)
     prompt_path = write_full_analysis_prompt(root, analysis_path, code_path)
-    incomplete_conversation_ids = sorted(
-        str(row["ID"]) for row in analysis_rows if not row["conversation_complete"]
-    )
-    reconstructed_conversation_ids = sorted(
-        str(row["ID"])
-        for row in analysis_rows
-        if row["conversation_source"] != "recorded_full"
-    )
-    metrics["analysis_artifacts"] = {
-        "parquet": str(analysis_path),
-        "pipeline_code_markdown": str(code_path),
-        "full_analysis_prompt": str(prompt_path),
-        "parquet_rows": len(analysis_rows),
-        "conversation_sidecar_dir": str(root / "refinement" / "conversations"),
-        "conversation_complete_count": len(analysis_rows) - len(incomplete_conversation_ids),
-        "conversation_incomplete_count": len(incomplete_conversation_ids),
-        "conversation_incomplete_ids": incomplete_conversation_ids,
-        "conversation_reconstructed_count": len(reconstructed_conversation_ids),
-        "conversation_reconstructed_ids": reconstructed_conversation_ids,
-        "judge_results_jsonl": str(judge_path) if judge_enabled else None,
+    aggregate = {
+        "variants": per_variant_metrics,
+        "ablation": paired_metrics,
+        "analysis_artifacts": {
+            "parquet": str(analysis_path),
+            "parquet_rows": len(all_analysis_rows),
+            "pipeline_code_markdown": str(code_path),
+            "full_analysis_prompt": str(prompt_path),
+            "judge_results_jsonl": str(judge_path) if judge_enabled else None,
+            "conversation_complete_count": sum(
+                bool(row.get("conversation_complete")) for row in all_analysis_rows
+            ),
+            "conversation_incomplete_ids_by_variant": sorted(
+                f"{row['refine_variant']}:{row['ID']}" for row in all_analysis_rows
+                if not row.get("conversation_complete")
+            ),
+        },
     }
-    write_json(evaluation_dir / "metrics.json", metrics)
+    write_json(evaluation_root / "metrics.json", aggregate)
     print(
-        f"[evaluate] selected={metrics['selected']['total']} "
-        f"before={metrics['selected']['before_accuracy']:.6f} "
-        f"after={metrics['selected']['after_accuracy']:.6f} "
-        f"full_after_available={metrics['full_after']['available']}",
+        f"[evaluate-ablation] rows={len(baseline)} variants={variants} "
+        f"outcomes={paired_metrics['paired_outcome_counts']}",
         flush=True,
     )
-    print(f"[evaluate-judge] {metrics['selected']['judge']}", flush=True)
-    print(
-        f"[evaluate-context] quality={metrics['selected']['context_quality_counts']} "
-        f"invalid_ids={metrics['selected']['invalid_blueprint_candidate_ids']} "
-        f"infra_ids={metrics['selected']['infra_error_ids']} "
-        f"truncated_ids={metrics['selected']['blueprint_truncated_ids']}",
-        flush=True,
-    )
-    print(
-        f"[evaluate-analysis] parquet={analysis_path} rows={len(analysis_rows)} "
-        f"conversations_complete={len(analysis_rows) - len(incomplete_conversation_ids)} "
-        f"conversations_reconstructed={len(reconstructed_conversation_ids)}",
-        flush=True,
-    )
-    print(
-        f"[evaluate-analysis] code={code_path} prompt={prompt_path}",
-        flush=True,
-    )
-    return metrics
+    return aggregate
