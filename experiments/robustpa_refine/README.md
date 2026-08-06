@@ -4,6 +4,10 @@ This experiment uses only each RobustPABench row's `informal_statement` and
 `informal_proof`. The formal statement and proof in the dataset are not passed
 to the pipeline.
 
+Both fields are persisted in the checkpoint. Every Phase-3 blueprint
+refinement prompt includes the original `informal_proof`/COT alongside the
+natural-language problem, current annotated blueprint, and prior-round trace.
+
 ## Services
 
 Kimina must expose `POST /api/check` at the configured `lean_api_url` (default
@@ -33,14 +37,16 @@ Important defaults in `configs/base.yaml`:
 ```yaml
 max_refinement_iterations: 4
 node_max_prove_turns: 8
+node_max_negation_probe_turns: 1  # 0 disables the probe
 max_tool_calls_per_turn: 3
 lean_max_inflight_snippets: 128
 lean_batch_size: 8
 ```
 
-The negation probe is fixed in code to one turn with one `lean_compile` call.
-It is not configurable. `node_timeout_s` and `llm_api_timeout_s` may be `null`
-for local long-running inference.
+The negation probe runs for at most `node_max_negation_probe_turns` Lean-guided
+turns and stops on the first successful proof. Set it to `0` to disable the
+probe. `node_timeout_s` and `llm_api_timeout_s` may be `null` for local
+long-running inference.
 
 ## Proof Protocol
 

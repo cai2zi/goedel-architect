@@ -69,6 +69,8 @@ def refine_blueprint(
     thm_name: str = "",
     max_retries: int = MAX_RETRIES,
     phase2_contract_check_concurrency: int = 1,
+    informal_statement: str = "",
+    informal_proof: str = "",
 ) -> Blueprint:
     """
     Produce a revised blueprint by feeding failure diagnostics back to the LLM.
@@ -109,6 +111,8 @@ def refine_blueprint(
             iteration=iteration, max_iterations=max_iterations,
             total_prior_rounds=total_prior_rounds,
             dropped_rounds_summary=dropped_rounds_summary,
+            informal_statement=informal_statement,
+            informal_proof=informal_proof,
         )},
     ]
 
@@ -303,6 +307,8 @@ def _build_refinement_user_prompt(
     max_iterations: int = 0,
     total_prior_rounds: int | None = None,
     dropped_rounds_summary: str = "",
+    informal_statement: str = "",
+    informal_proof: str = "",
 ) -> str:
     total_prior_rounds = total_prior_rounds if total_prior_rounds is not None else len(prior_rounds or [])
 
@@ -340,4 +346,6 @@ def _build_refinement_user_prompt(
         annotated_lean=annotated_lean,
         prior_rounds=prior_rounds_text,
         round_info=round_info,
+        informal_statement=informal_statement,
+        informal_proof=informal_proof,
     )

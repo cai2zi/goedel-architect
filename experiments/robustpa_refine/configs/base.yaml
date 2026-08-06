@@ -11,6 +11,8 @@ resume: false
 max_refinement_iterations: 4
 blueprint_max_retries: 8
 node_max_prove_turns: 8
+# Set to 0 to disable the formal-negation probe after normal proving fails.
+node_max_negation_probe_turns: 1
 max_tool_calls_per_turn: 3
 node_timeout_s: null
 llm_api_timeout_s: null

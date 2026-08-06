@@ -29,7 +29,7 @@ from pipeline import (  # noqa: E402
     run_phase2_async,
 )
 from prover import ProofSignal, ProverResult  # noqa: E402
-from refinement import _annotate_with_verdicts  # noqa: E402
+from refinement import _annotate_with_verdicts, _build_refinement_user_prompt  # noqa: E402
 
 
 LEAN = """import Mathlib
@@ -156,7 +156,7 @@ class RootClosureTest(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
-            state = CheckpointState("informal", "model")
+            state = CheckpointState("informal", "model", informal_proof="original COT")
             state.set_blueprint(self.blueprint)
             failed = solved_result(self.blueprint)
             failed.node_results["root"] = NodeResult(
@@ -165,11 +165,13 @@ class RootClosureTest(unittest.TestCase):
             )
             state.set_node_results(failed.node_results)
             state.save(path)
-            with patch("pipeline.refine_blueprint", return_value=revised):
+            with patch("pipeline.refine_blueprint", return_value=revised) as refine:
                 run_phase3(
                     checkpoint_path=path,
                     compiler=FakeCompiler(CompilerResult(True)),
                 )
+            self.assertEqual(refine.call_args.kwargs["informal_statement"], "informal")
+            self.assertEqual(refine.call_args.kwargs["informal_proof"], "original COT")
             loaded = CheckpointState.load(path)
         self.assertIn("theorem root : base = base", loaded.blueprint_lean_file)
         self.assertEqual(loaded.status, RunStatus.RUNNING)
@@ -177,7 +179,9 @@ class RootClosureTest(unittest.TestCase):
         self.assertNotIn("root", loaded.proved_cache)
 
     def test_checkpoint_round_trip_uses_new_schema(self) -> None:
-        state = CheckpointState("informal", "model", status=RunStatus.SOLVED)
+        state = CheckpointState(
+            "informal", "model", status=RunStatus.SOLVED, informal_proof="original COT",
+        )
         state.set_blueprint(self.blueprint)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
@@ -185,6 +189,18 @@ class RootClosureTest(unittest.TestCase):
             loaded = CheckpointState.load(path)
         self.assertTrue(loaded.root_proved)
         self.assertEqual(loaded.informal_statement, "informal")
+        self.assertEqual(loaded.informal_proof, "original COT")
+
+    def test_refinement_prompt_contains_original_cot(self) -> None:
+        prompt = _build_refinement_user_prompt(
+            "theorem root : True := by sorry",
+            informal_statement="Original problem statement",
+            informal_proof="Original chain of thought with final answer",
+        )
+        self.assertIn("## Original natural-language problem", prompt)
+        self.assertIn("Original problem statement", prompt)
+        self.assertIn("## Original COT / informal proof", prompt)
+        self.assertIn("Original chain of thought with final answer", prompt)
 
     def test_final_verify_success_is_only_success_state(self) -> None:
         asyncio.run(self._run_final_case(CompilerResult(True), RunStatus.SOLVED, True))

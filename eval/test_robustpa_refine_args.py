@@ -26,7 +26,7 @@ class RobustPAConfigTest(unittest.TestCase):
         )
         self.assertNotIn("lean_backend", config)
         self.assertNotIn("parallel_tool_calls", config)
-        self.assertNotIn("node_max_negation_probe_turns", config)
+        self.assertEqual(config.node_max_negation_probe_turns, 1)
         self.assertEqual(config.max_tool_calls_per_turn, 3)
 
     def test_tool_budget_must_be_positive(self) -> None:
@@ -35,6 +35,16 @@ class RobustPAConfigTest(unittest.TestCase):
         )
         config.max_tool_calls_per_turn = 0
         with self.assertRaisesRegex(ValueError, "max_tool_calls_per_turn"):
+            _validate_args(SimpleNamespace(**OmegaConf.to_container(config, resolve=False)))
+
+    def test_negation_probe_turns_may_be_disabled(self) -> None:
+        config = OmegaConf.load(
+            REPO_ROOT / "experiments/robustpa_refine/configs/base.yaml"
+        )
+        config.node_max_negation_probe_turns = 0
+        _validate_args(SimpleNamespace(**OmegaConf.to_container(config, resolve=False)))
+        config.node_max_negation_probe_turns = -1
+        with self.assertRaisesRegex(ValueError, "node_max_negation_probe_turns"):
             _validate_args(SimpleNamespace(**OmegaConf.to_container(config, resolve=False)))
 
     def test_new_successes_are_bucketed_by_refinement_count(self) -> None:

@@ -103,6 +103,14 @@ def tag_counts(text: str) -> tuple[int, int]:
     return len(THINK_OPEN_RE.findall(text)), len(THINK_CLOSE_RE.findall(text))
 
 
+def restore_implicit_think_start(text: str) -> tuple[str, bool]:
+    """Restore the Qwen3.5 think opener injected by its chat template."""
+    opens, closes = tag_counts(text)
+    if opens == 0 and closes == 1:
+        return f"<think>\n{text}", True
+    return text, False
+
+
 def validate_think_and_extract(text: str) -> tuple[str, str]:
     """Return (post-think text, rejection reason)."""
     tags = sorted(
@@ -133,7 +141,8 @@ def validate_think_and_extract(text: str) -> tuple[str, str]:
 
 
 def extract_post_think(text: str) -> tuple[str, str]:
-    return validate_think_and_extract(text)
+    normalized, _restored = restore_implicit_think_start(text)
+    return validate_think_and_extract(normalized)
 
 
 def extract_boxed_texts(text: str) -> list[str]:

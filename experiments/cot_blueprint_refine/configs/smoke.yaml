@@ -20,6 +20,21 @@ export:
 refine:
   model: Qwen3.5-397B-A17B-FP8
   openai_base_url: http://127.0.0.1:8001/v1
+  vllm:
+    model_path: /ssd/czx/models/Qwen3.5-397B-A17B-FP8
+    served_model_name: Qwen3.5-397B-A17B-FP8
+    host: 127.0.0.1
+    port: 8001
+    tensor_parallel_size: 8
+    max_model_len: 65536
+    max_num_seqs: 256
+    gpu_memory_utilization: 0.9
+    trust_remote_code: true
+    reasoning_parser: qwen3
+    extra_args: []
   context_window: 65536
   tokenizer_path: /ssd/czx/models/Qwen3.5-397B-A17B-FP8
+  concurrency: 2
+
+judge:
   concurrency: 2

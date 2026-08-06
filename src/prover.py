@@ -177,6 +177,7 @@ class GoedelProver:
         tracer=None,
         api_timeout_s: float | None = 120.0,
         max_prove_turns: int | None = None,
+        max_negation_probe_turns: int = 1,
         max_tool_calls_per_turn: int = DEFAULT_MAX_TOOL_CALLS_PER_TURN,
     ):
         if max_tool_calls_per_turn <= 0:
@@ -186,6 +187,9 @@ class GoedelProver:
         self.retrieval = retrieval or MathlibRetrieval()
         self.tracer = tracer or NullTracer()
         self.max_prove_turns = max_prove_turns or DEFAULT_NODE_MAX_PROVE_TURNS
+        if max_negation_probe_turns < 0:
+            raise ValueError("max_negation_probe_turns must be non-negative")
+        self.max_negation_probe_turns = max_negation_probe_turns
         self.max_tool_calls_per_turn = max_tool_calls_per_turn
         self._tool_cache: dict[str, _ToolOutcome] = {}
 
@@ -558,6 +562,8 @@ class GoedelProver:
         parent_lemma_decls: str,
         header: str,
     ) -> ProverResult | None:
+        if self.max_negation_probe_turns == 0:
+            return None
         try:
             negation_decl = _build_negation_node_decl(node_decl, node_name)
         except ValueError:
@@ -567,29 +573,31 @@ class GoedelProver:
             {
                 "role": "user",
                 "content": (
-                    "Try exactly once to prove this formal negation. Call lean_compile with "
+                    "Try to prove this formal negation. Call lean_compile with "
                     f"a proof body beginning with `by`.\n\n```lean\n{negation_decl}\n```"
                 ),
             },
         ]
-        response = self._chat(
-            messages, node_name, 1, "negation_probe", [LEAN_COMPILE_TOOL], "negation_probe",
-        )
-        outcome = self._process_turn(
-            response=response,
-            messages=messages,
-            compiler=compiler,
-            node_name=node_name,
-            node_decl=negation_decl,
-            parent_lemma_decls=parent_lemma_decls,
-            header=header,
-            stage="negation_probe",
-            turn=1,
-            limit=1,
-            allowed_names={"lean_compile"},
-        )
-        if outcome.solved_proof:
-            return ProverResult(ProofSignal.FORMALLY_NEGATED, outcome.solved_proof)
+        for turn in range(1, self.max_negation_probe_turns + 1):
+            response = self._chat(
+                messages, node_name, turn, "negation_probe", [LEAN_COMPILE_TOOL],
+                "negation_probe",
+            )
+            outcome = self._process_turn(
+                response=response,
+                messages=messages,
+                compiler=compiler,
+                node_name=node_name,
+                node_decl=negation_decl,
+                parent_lemma_decls=parent_lemma_decls,
+                header=header,
+                stage="negation_probe",
+                turn=turn,
+                limit=1,
+                allowed_names={"lean_compile"},
+            )
+            if outcome.solved_proof:
+                return ProverResult(ProofSignal.FORMALLY_NEGATED, outcome.solved_proof)
         return None
 
 
@@ -722,6 +730,7 @@ def prove_node(
     tracer=None,
     api_timeout_s: float | None = 120.0,
     max_prove_turns: int | None = None,
+    max_negation_probe_turns: int = 1,
     max_tool_calls_per_turn: int = DEFAULT_MAX_TOOL_CALLS_PER_TURN,
 ) -> ProverResult:
     context_parts: list[str] = []
@@ -750,6 +759,7 @@ def prove_node(
         tracer=tracer,
         api_timeout_s=api_timeout_s,
         max_prove_turns=max_prove_turns,
+        max_negation_probe_turns=max_negation_probe_turns,
         max_tool_calls_per_turn=max_tool_calls_per_turn,
     )
     return prover.prove_node(

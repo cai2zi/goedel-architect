@@ -34,6 +34,9 @@ class CheckpointState:
     refinement_history: list[str] = field(default_factory=list)
     final_lean_file: str = ""
     final_lean_errors: list[str] = field(default_factory=list)
+    # The original natural-language proof/COT is retained so every Phase-3
+    # refinement round can compare the formal blueprint against its source.
+    informal_proof: str = ""
 
     def __post_init__(self) -> None:
         self.status = RunStatus(self.status)

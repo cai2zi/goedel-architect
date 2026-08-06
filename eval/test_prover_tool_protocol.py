@@ -70,9 +70,14 @@ def response(calls: list[ToolCall], content: str = ""):
 
 
 class ProverToolProtocolTest(unittest.TestCase):
-    def make_prover(self, retrieval=None) -> GoedelProver:
+    def make_prover(self, retrieval=None, *, max_negation_probe_turns: int = 1) -> GoedelProver:
         with patch("prover.make_client", return_value=object()):
-            return GoedelProver("model", retrieval or Retrieval(), max_tool_calls_per_turn=3)
+            return GoedelProver(
+                "model",
+                retrieval or Retrieval(),
+                max_negation_probe_turns=max_negation_probe_turns,
+                max_tool_calls_per_turn=3,
+            )
 
     def prepare(self, prover, calls, limit=3, allowed=None):
         return prover._prepare_calls(
@@ -282,6 +287,33 @@ class ProverToolProtocolTest(unittest.TestCase):
         )
         self.assertIn("failed", turn.last_errors)
         self.assertIn("x : Nat\n⊢ x = x", turn.last_errors)
+
+    def test_negation_probe_can_be_disabled(self) -> None:
+        prover = self.make_prover(max_negation_probe_turns=0)
+        with patch.object(prover, "_chat") as chat:
+            result = prover._probe_negation(
+                RecordingCompiler(), "root", NODE_DECL, "", "import Mathlib",
+            )
+        self.assertIsNone(result)
+        chat.assert_not_called()
+
+    def test_negation_probe_retries_up_to_configured_limit(self) -> None:
+        prover = self.make_prover(max_negation_probe_turns=3)
+        failed = SimpleNamespace(solved_proof="")
+        solved = SimpleNamespace(solved_proof="by trivial")
+        with (
+            patch.object(prover, "_chat", return_value=object()) as chat,
+            patch.object(prover, "_process_turn", side_effect=[failed, solved]) as process,
+        ):
+            result = prover._probe_negation(
+                RecordingCompiler(), "root", NODE_DECL, "", "import Mathlib",
+            )
+        self.assertEqual(result.signal, ProofSignal.FORMALLY_NEGATED)
+        self.assertEqual(result.proof_body, "by trivial")
+        self.assertEqual(chat.call_count, 2)
+        self.assertEqual(process.call_count, 2)
+        self.assertEqual(process.call_args_list[0].kwargs["turn"], 1)
+        self.assertEqual(process.call_args_list[1].kwargs["turn"], 2)
 
 
 if __name__ == "__main__":

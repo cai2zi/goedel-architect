@@ -2,6 +2,14 @@ Revise the blueprint below. Node markers and diagnosis blocks describe the
 previous proving pass. The original natural-language problem is canonical;
 repair the Lean formalization, including the root declaration when necessary.
 
+## Original natural-language problem
+
+{{informal_statement}}
+
+## Original COT / informal proof
+
+{{informal_proof}}
+
 Produce a corrected dependency graph. Do NOT copy the markers or diagnosis blocks into your output.
 {{#if round_info}}
 

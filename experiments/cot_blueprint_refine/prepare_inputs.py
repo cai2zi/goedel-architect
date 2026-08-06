@@ -14,6 +14,7 @@ from cot_blueprint_refine.common import (
     extract_post_think,
     latest_rows,
     prepared_dir,
+    restore_implicit_think_start,
     tag_counts,
     write_json,
     write_jsonl,
@@ -78,6 +79,7 @@ def prepare(config: DictConfig) -> dict[str, Any]:
         stats["input_lines"] = sum(1 for line in handle if line.strip())
     stats["unique_rows"] = len(raw_rows)
     stats["duplicate_rows"] = stats["input_lines"] - stats["unique_rows"]
+    stats["implicit_think_start_restored"] = 0
     rejections: list[dict[str, Any]] = []
     eligible_all: list[dict[str, Any]] = []
     rejected_by_id: dict[str, str] = {}
@@ -98,6 +100,9 @@ def prepare(config: DictConfig) -> dict[str, Any]:
             else:
                 stats["length_other_think_shape"] += 1
         else:
+            _normalized_cot, restored = restore_implicit_think_start(raw_cot)
+            if restored:
+                stats["implicit_think_start_restored"] += 1
             post_think, reason = extract_post_think(raw_cot)
             if not reason:
                 answer = claimed_answer(post_think)
@@ -153,7 +158,11 @@ def prepare(config: DictConfig) -> dict[str, Any]:
     write_json(root / "preprocessing_stats.json", stats_payload)
     print("[prepare] " + " ".join(
         f"{key}={stats_payload.get(key, 0)}"
-        for key in ("unique_rows", "finish_reason_length", "length_unclosed_think", "length_balanced_think", "eligible_rows", "selected_rows")
+        for key in (
+            "unique_rows", "finish_reason_length", "length_unclosed_think",
+            "length_balanced_think", "implicit_think_start_restored",
+            "eligible_rows", "selected_rows",
+        )
     ), flush=True)
     print(f"[prepare] data_root={root / 'data'}", flush=True)
     return stats_payload

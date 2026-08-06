@@ -160,6 +160,7 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
     args.node_timeout_s = _optional_timeout(args.node_timeout_s)
     args.llm_api_timeout_s = _optional_timeout(args.llm_api_timeout_s)
     args.node_max_prove_turns = _optional_positive_int(args.node_max_prove_turns)
+    args.node_max_negation_probe_turns = int(args.node_max_negation_probe_turns)
     args.max_tool_calls_per_turn = int(args.max_tool_calls_per_turn)
     _validate_args(args)
     return args
@@ -181,6 +182,8 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"{name} must be positive")
     if args.max_refinement_iterations < 0:
         raise ValueError("max_refinement_iterations must be non-negative")
+    if args.node_max_negation_probe_turns < 0:
+        raise ValueError("node_max_negation_probe_turns must be non-negative")
     if args.node_timeout_s is not None and args.node_timeout_s <= 0:
         raise ValueError("node_timeout_s must be positive or none/null/0")
     if args.llm_api_timeout_s is not None and args.llm_api_timeout_s <= 0:
@@ -418,7 +421,7 @@ def _result_row(
         "error": error,
         "lean_runtime": runtime.metadata,
         "node_max_prove_turns": args.node_max_prove_turns,
-        "negation_probe_turns": 1,
+        "negation_probe_turns": args.node_max_negation_probe_turns,
         "max_tool_calls_per_turn": args.max_tool_calls_per_turn,
         **score,
     }
@@ -510,7 +513,11 @@ async def _run_record(
                     phase2_contract_check_concurrency=args.phase2_contract_check_concurrency,
                 ),
             )
-            state = CheckpointState(informal_statement=record.informal_statement, model=args.model)
+            state = CheckpointState(
+                informal_statement=record.informal_statement,
+                informal_proof=record.informal_proof,
+                model=args.model,
+            )
             state.set_blueprint(blueprint)
             state.save(checkpoint_path)
             path = _write_blueprint_snapshot(
@@ -559,6 +566,7 @@ async def _run_record(
                     llm_api_timeout_s=args.llm_api_timeout_s,
                     model=args.model,
                     node_max_prove_turns=args.node_max_prove_turns,
+                    node_max_negation_probe_turns=args.node_max_negation_probe_turns,
                     max_tool_calls_per_turn=args.max_tool_calls_per_turn,
                     node_executor=node_executor,
                     node_semaphore=node_sem,
@@ -956,7 +964,7 @@ async def _run_experiment(
         f"node_timeout_s={args.node_timeout_s} "
         f"llm_api_timeout_s={args.llm_api_timeout_s} "
         f"node_max_prove_turns={args.node_max_prove_turns} "
-        "negation_probe_turns=1 "
+        f"negation_probe_turns={args.node_max_negation_probe_turns} "
         f"max_tool_calls_per_turn={args.max_tool_calls_per_turn}",
         flush=True,
     )

@@ -251,6 +251,7 @@ def fit_messages_to_context(
             f"prompt remains too long after blueprint truncation: {input_tokens}>{max_input_tokens}"
         )
     return messages, {
+        "max_input_tokens": max_input_tokens,
         "blueprint_truncated": truncated,
         "blueprint_tokens_original": original_context_tokens,
         "blueprint_tokens_used": len(tokenizer.encode(context, add_special_tokens=False)),

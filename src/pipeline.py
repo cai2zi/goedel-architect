@@ -134,7 +134,11 @@ def run_phase1(
         phase2_contract_check_concurrency=phase2_contract_check_concurrency,
     )
     if checkpoint_path is not None:
-        state = CheckpointState(informal_statement=theorem_stmt, model=model)
+        state = CheckpointState(
+            informal_statement=theorem_stmt,
+            informal_proof=nl_proof or "",
+            model=model,
+        )
         state.set_blueprint(blueprint)
         state.save(checkpoint_path)
     return blueprint
@@ -150,6 +154,7 @@ async def run_phase2_async(
     llm_api_timeout_s: float | None = 120.0,
     model: str | None = None,
     node_max_prove_turns: int | None = None,
+    node_max_negation_probe_turns: int = 1,
     max_tool_calls_per_turn: int = 3,
     node_executor: Executor | None = None,
     node_semaphore: asyncio.Semaphore | None = None,
@@ -178,6 +183,7 @@ async def run_phase2_async(
         node_timeout_s=node_timeout_s,
         llm_api_timeout_s=llm_api_timeout_s,
         node_max_prove_turns=node_max_prove_turns,
+        node_max_negation_probe_turns=node_max_negation_probe_turns,
         max_tool_calls_per_turn=max_tool_calls_per_turn,
         node_executor=node_executor,
         node_semaphore=node_semaphore,
@@ -284,6 +290,8 @@ def run_phase3(
             thm_name=thm_name,
             max_retries=blueprint_max_retries or 8,
             phase2_contract_check_concurrency=phase2_contract_check_concurrency,
+            informal_statement=state.informal_statement,
+            informal_proof=state.informal_proof,
         )
     except KiminaInfrastructureError as exc:
         state.status = RunStatus.ERROR
@@ -364,10 +372,15 @@ def prove_theorem(
     node_timeout_s: float | None = 300.0,
     llm_api_timeout_s: float | None = 120.0,
     node_max_prove_turns: int | None = None,
+    node_max_negation_probe_turns: int = 1,
     max_tool_calls_per_turn: int = 3,
 ) -> ProofResult:
     tracer = tracer or NullTracer()
     state = CheckpointState.load_or_none(checkpoint_path)
+    if state is not None and nl_proof and not state.informal_proof:
+        # Backfill checkpoints written before `informal_proof` was persisted.
+        state.informal_proof = nl_proof
+        state.save(checkpoint_path)
     if state is None:
         run_phase1(
             theorem_stmt,
@@ -391,6 +404,7 @@ def prove_theorem(
             llm_api_timeout_s=llm_api_timeout_s,
             model=model,
             node_max_prove_turns=node_max_prove_turns,
+            node_max_negation_probe_turns=node_max_negation_probe_turns,
             max_tool_calls_per_turn=max_tool_calls_per_turn,
         )
         state = CheckpointState.load(checkpoint_path)

@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import fcntl
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -22,6 +23,7 @@ from cot_blueprint_refine.evaluate import evaluate  # noqa: E402
 from cot_blueprint_refine.export_blueprint_contexts import export_contexts  # noqa: E402
 from cot_blueprint_refine.prepare_inputs import DATASET_SUBSET, prepare  # noqa: E402
 from cot_blueprint_refine.run_cot_refinement import refine  # noqa: E402
+from cot_blueprint_refine.vllm_runtime import VLLMServer  # noqa: E402
 from kimina_lean_compiler import KiminaLeanCompiler  # noqa: E402
 
 
@@ -113,54 +115,59 @@ def blueprint_results_complete(config: DictConfig) -> bool:
 def run_blueprint(config: DictConfig) -> None:
     if blueprint_results_complete(config):
         return
-    preflight_model(
-        str(config.blueprint.model),
-        str(config.blueprint.openai_base_url),
-    )
-    preflight_kimina(config)
-    root = output_root(config)
-    robustpa_output_base = root / "robustpa"
     blueprint = config.blueprint
-    overrides = [
-        "exp_name=blueprint",
-        f"data_root={prepared_dir(config) / 'data'}",
-        f"output_base={robustpa_output_base}",
-        f"model={blueprint.model}",
-        f"openai_base_url={blueprint.openai_base_url}",
-        f"subset={DATASET_SUBSET}",
-        "split=null",
-        "limit=null",
-        "problem_id=null",
-        f"resume={str(bool(config.resume)).lower()}",
-        f"max_refinement_iterations={blueprint.max_refinement_iterations}",
-        f"blueprint_max_retries={blueprint.blueprint_max_retries}",
-        f"node_max_prove_turns={blueprint.node_max_prove_turns}",
-        f"max_tool_calls_per_turn={blueprint.max_tool_calls_per_turn}",
-        "node_timeout_s=null",
-        "llm_api_timeout_s=null",
-        f"phase1_concurrency={blueprint.phase1_concurrency}",
-        f"phase2_blueprint_concurrency={blueprint.phase2_blueprint_concurrency}",
-        f"phase2_node_concurrency={blueprint.phase2_node_concurrency}",
-        f"refine_concurrency={blueprint.refine_concurrency}",
-        f"phase2_contract_check_concurrency={blueprint.phase2_contract_check_concurrency}",
-        f"lean_api_url={blueprint.lean_api_url}",
-        f"lean_server_timeout={blueprint.lean_server_timeout}",
-        "lean_server_reuse=true",
-        "lean_server_debug=false",
-        f"lean_max_inflight_snippets={blueprint.lean_max_inflight_snippets}",
-        f"lean_batch_size={blueprint.lean_batch_size}",
-    ]
-    env = os.environ.copy()
-    env.setdefault("GOEDEL_OPENAI_API_KEY", "dummy")
-    env["GOEDEL_BLUEPRINT_MAX_TOKENS"] = str(int(blueprint.generation_max_tokens))
-    env["GOEDEL_PROVER_MAX_TOKENS"] = str(int(blueprint.prover_max_tokens))
-    command = [
-        str(config.python_bin),
-        str(REPO_ROOT / "experiments" / "robustpa_refine" / "run_robustpa_refine.py"),
-        *overrides,
-    ]
-    print("[blueprint] " + " ".join(command), flush=True)
-    subprocess.run(command, cwd=REPO_ROOT, env=env, check=True)
+    with VLLMServer(
+        config,
+        stage="blueprint",
+        client_model=str(blueprint.model),
+        base_url=str(blueprint.openai_base_url),
+        service=blueprint.vllm,
+    ):
+        preflight_model(str(blueprint.model), str(blueprint.openai_base_url))
+        preflight_kimina(config)
+        root = output_root(config)
+        robustpa_output_base = root / "robustpa"
+        overrides = [
+            "exp_name=blueprint",
+            f"data_root={prepared_dir(config) / 'data'}",
+            f"output_base={robustpa_output_base}",
+            f"model={blueprint.model}",
+            f"openai_base_url={blueprint.openai_base_url}",
+            f"subset={DATASET_SUBSET}",
+            "split=null",
+            "limit=null",
+            "problem_id=null",
+            f"resume={str(bool(config.resume)).lower()}",
+            f"max_refinement_iterations={blueprint.max_refinement_iterations}",
+            f"blueprint_max_retries={blueprint.blueprint_max_retries}",
+            f"node_max_prove_turns={blueprint.node_max_prove_turns}",
+            f"node_max_negation_probe_turns={blueprint.node_max_negation_probe_turns}",
+            f"max_tool_calls_per_turn={blueprint.max_tool_calls_per_turn}",
+            "node_timeout_s=null",
+            "llm_api_timeout_s=null",
+            f"phase1_concurrency={blueprint.phase1_concurrency}",
+            f"phase2_blueprint_concurrency={blueprint.phase2_blueprint_concurrency}",
+            f"phase2_node_concurrency={blueprint.phase2_node_concurrency}",
+            f"refine_concurrency={blueprint.refine_concurrency}",
+            f"phase2_contract_check_concurrency={blueprint.phase2_contract_check_concurrency}",
+            f"lean_api_url={blueprint.lean_api_url}",
+            f"lean_server_timeout={blueprint.lean_server_timeout}",
+            "lean_server_reuse=true",
+            "lean_server_debug=false",
+            f"lean_max_inflight_snippets={blueprint.lean_max_inflight_snippets}",
+            f"lean_batch_size={blueprint.lean_batch_size}",
+        ]
+        env = os.environ.copy()
+        env.setdefault("GOEDEL_OPENAI_API_KEY", "dummy")
+        env["GOEDEL_BLUEPRINT_MAX_TOKENS"] = str(int(blueprint.generation_max_tokens))
+        env["GOEDEL_PROVER_MAX_TOKENS"] = str(int(blueprint.prover_max_tokens))
+        command = [
+            str(config.python_bin),
+            str(REPO_ROOT / "experiments" / "robustpa_refine" / "run_robustpa_refine.py"),
+            *overrides,
+        ]
+        print("[blueprint] " + " ".join(command), flush=True)
+        subprocess.run(command, cwd=REPO_ROOT, env=env, check=True)
 
 
 def run_stage(stage: str, config: DictConfig) -> Any:
@@ -172,14 +179,35 @@ def run_stage(stage: str, config: DictConfig) -> Any:
         preflight_kimina(config)
         return export_contexts(config)
     if stage == "refine":
-        preflight_model(
-            str(config.refine.model),
-            str(config.refine.openai_base_url),
-            str(config.refine.api_key),
-        )
-        return asyncio.run(refine(config))
+        with VLLMServer(
+            config,
+            stage="refine",
+            client_model=str(config.refine.model),
+            base_url=str(config.refine.openai_base_url),
+            service=config.refine.vllm,
+        ):
+            preflight_model(
+                str(config.refine.model),
+                str(config.refine.openai_base_url),
+                str(config.refine.api_key),
+            )
+            return asyncio.run(refine(config))
     if stage == "evaluate":
-        return evaluate(config)
+        if not bool(config.judge.enabled):
+            return evaluate(config)
+        with VLLMServer(
+            config,
+            stage="evaluate",
+            client_model=str(config.judge.model),
+            base_url=str(config.judge.openai_base_url),
+            service=config.judge.vllm,
+        ):
+            preflight_model(
+                str(config.judge.model),
+                str(config.judge.openai_base_url),
+                str(config.judge.api_key),
+            )
+            return evaluate(config)
     raise ValueError(f"unknown stage: {stage}")
 
 
@@ -217,15 +245,26 @@ def main() -> None:
     config = load_config(args.profile, args.override)
     root = output_root(config)
     root.mkdir(parents=True, exist_ok=True)
-    with ExperimentLock(root):
-        (root / "config_resolved.yaml").write_text(
-            OmegaConf.to_yaml(config, resolve=True), encoding="utf-8"
-        )
-        stages = STAGES if args.stage == "all" else (args.stage,)
-        for stage in stages:
-            print(f"[stage-start] {stage}", flush=True)
-            run_stage(stage, config)
-            print(f"[stage-done] {stage}", flush=True)
+    previous_handlers: dict[signal.Signals, Any] = {}
+
+    def terminate(signum: int, _frame: Any) -> None:
+        raise SystemExit(128 + signum)
+
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        previous_handlers[signum] = signal.signal(signum, terminate)
+    try:
+        with ExperimentLock(root):
+            (root / "config_resolved.yaml").write_text(
+                OmegaConf.to_yaml(config, resolve=True), encoding="utf-8"
+            )
+            stages = STAGES if args.stage == "all" else (args.stage,)
+            for stage in stages:
+                print(f"[stage-start] {stage}", flush=True)
+                run_stage(stage, config)
+                print(f"[stage-done] {stage}", flush=True)
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
 
 if __name__ == "__main__":

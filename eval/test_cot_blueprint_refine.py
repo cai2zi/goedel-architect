@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import asyncio
+import signal
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -31,10 +33,19 @@ from cot_blueprint_refine.common import (  # noqa: E402
 )
 from cot_blueprint_refine.evaluate import (  # noqa: E402
     ANALYSIS_SCHEMA,
+    COMPARISON_CSV_FIELDS,
+    _judge_decision,
+    grade_final_answer,
+    grade_response,
     summarize_comparisons,
     write_analysis_parquet,
     write_full_analysis_prompt,
     write_pipeline_code_snapshot,
+)
+from cot_blueprint_refine.judge import (  # noqa: E402
+    judge_cache_key,
+    judge_equivalences,
+    parse_judge_content,
 )
 from cot_blueprint_refine.export_blueprint_contexts import (  # noqa: E402
     export_contexts,
@@ -53,6 +64,7 @@ from cot_blueprint_refine.run_cot_refinement import (  # noqa: E402
     synthesize_legacy_conversation,
 )
 from cot_blueprint_refine.run_experiment import ExperimentLock, blueprint_results_complete  # noqa: E402
+from cot_blueprint_refine.vllm_runtime import VLLMServer, validate_service_config  # noqa: E402
 
 
 class CotCleaningTest(unittest.TestCase):
@@ -65,6 +77,14 @@ class CotCleaningTest(unittest.TestCase):
         post, reason = extract_post_think("<think>unfinished")
         self.assertEqual(post, "")
         self.assertEqual(reason, "unclosed_think")
+
+    def test_restores_qwen35_implicit_think_start(self) -> None:
+        post, reason = extract_post_think("private reasoning</think>Answer \\boxed{7}")
+        self.assertEqual(reason, "")
+        self.assertEqual(post, "Answer \\boxed{7}")
+        post, reason = extract_post_think("one</think>two</think>Answer \\boxed{7}")
+        self.assertEqual(post, "")
+        self.assertEqual(reason, "unmatched_think_close")
 
     def test_nested_box_and_last_box(self) -> None:
         text = r"First \boxed{\frac{1}{2}}, finally \boxed{3}"
@@ -105,6 +125,32 @@ class CotCleaningTest(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertEqual(output, r"Steps. Final \boxed{2}")
 
+    def test_final_answer_math_verify_regressions(self) -> None:
+        cases = [
+            ("cmimc_2025/38", r"10+\frac{40\pi}{3}", "10", False),
+            ("MATH-500/test/intermediate_algebra/1566.json", "2k", "2k", True),
+            (
+                "MATH-500/test/precalculus/1281.json",
+                r"11 \sqrt{5} + 11",
+                r"11(1 + \sqrt{5})",
+                True,
+            ),
+            ("brumo_2025/18", r"20\pi", r"20\pi", True),
+        ]
+        for row_id, gold, candidate, expected in cases:
+            with self.subTest(ID=row_id):
+                result = grade_final_answer(gold, candidate)
+                self.assertEqual(result["is_correct"], expected)
+                self.assertEqual(result["scoring_mode"], "canonical_claimed_answer")
+
+        # Whole-COT any_match remains observable, but cannot rescue the wrong
+        # final answer for cmimc_2025/38.
+        whole_cot = r"An intermediate value is 10. Final: \boxed{10}."
+        self.assertTrue(grade_response(r"10+\frac{40\pi}{3}", whole_cot)["is_correct"])
+        self.assertFalse(
+            grade_final_answer(r"10+\frac{40\pi}{3}", claimed_answer(whole_cot))["is_correct"]
+        )
+
 
 class PrepareInputsTest(unittest.TestCase):
     def test_filters_length_and_does_not_put_gold_in_generation_data(self) -> None:
@@ -128,6 +174,12 @@ class PrepareInputsTest(unittest.TestCase):
                     "problem": "x", "gold": "x", "status": "ok",
                     "finish_reason": "length", "raw_cot": "<think>x</think>truncated",
                 },
+                {
+                    "ID": "qwen35/implicit", "source": "demo", "row_index": 3,
+                    "problem": "What is 2+2?", "gold": "4", "status": "ok",
+                    "finish_reason": "stop",
+                    "raw_cot": "reasoning supplied after prompt opener</think>Answer \\boxed{4}",
+                },
             ]
             input_path.write_text(
                 "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
@@ -139,15 +191,18 @@ class PrepareInputsTest(unittest.TestCase):
                 "include_ids": [],
             })
             stats = prepare(config)
-            self.assertEqual(stats["unique_rows"], 3)
+            self.assertEqual(stats["unique_rows"], 4)
             self.assertEqual(stats["finish_reason_length"], 2)
             self.assertEqual(stats["length_unclosed_think"], 1)
             self.assertEqual(stats["length_balanced_think"], 1)
-            self.assertEqual(stats["eligible_rows"], 1)
+            self.assertEqual(stats["implicit_think_start_restored"], 1)
+            self.assertEqual(stats["eligible_rows"], 2)
             parquet_path = next((root / "outputs/unit/prepared/data/qwen3_8b_math_verify").glob("*.parquet"))
-            parquet_row = pq.read_table(parquet_path).to_pylist()[0]
+            parquet_rows = pq.read_table(parquet_path).to_pylist()
+            parquet_row = parquet_rows[0]
             self.assertNotIn("gold", parquet_row)
             self.assertEqual(parquet_row["claimed_answer"], "2")
+            self.assertEqual(parquet_rows[1]["claimed_answer"], "4")
 
     def test_generation_statement_contains_claim_not_gold(self) -> None:
         row = {
@@ -328,6 +383,28 @@ class ContextBudgetTest(unittest.TestCase):
         self.assertLessEqual(metadata["input_tokens"] + 1100, 7000)
         self.assertIn("fallible reference", messages[1]["content"])
         self.assertIn("syntax error", messages[1]["content"])
+
+    def test_qwen3_refine_budget_reserves_20480_output_tokens(self) -> None:
+        row = {
+            "problem": "p", "claimed_answer": "1", "original_cot": r"\boxed{1}",
+            "lean_context": "short", "context_quality": "VERIFIED", "nodes": [],
+        }
+        config = OmegaConf.create({"refine": {
+            "tokenizer_path": "unused",
+            "context_window": 40960,
+            "context_safety_margin": 256,
+            "max_tokens": 20480,
+        }})
+        with patch(
+            "cot_blueprint_refine.run_cot_refinement._load_tokenizer",
+            return_value=self.CharacterTokenizer(),
+        ):
+            _messages, metadata = fit_messages_to_context(row, config)
+        self.assertEqual(metadata["effective_max_tokens"], 20480)
+        self.assertEqual(metadata["max_input_tokens"], 20224)
+
+        base = OmegaConf.load(REPO_ROOT / "experiments/cot_blueprint_refine/configs/base.yaml")
+        self.assertEqual(base.refine.max_tokens, 20480)
 
 
 class RefinementConversationTest(unittest.TestCase):
@@ -522,6 +599,16 @@ class ExportContextsTest(unittest.TestCase):
 
 
 class EvaluationMetricsTest(unittest.TestCase):
+    def test_comparison_csv_exposes_judge_audit_fields(self) -> None:
+        for side in ("before", "after"):
+            self.assertIn(f"{side}_extracted_pred", COMPARISON_CSV_FIELDS)
+            self.assertIn(f"{side}_math_verify_correct", COMPARISON_CSV_FIELDS)
+            self.assertIn(f"{side}_judge_status", COMPARISON_CSV_FIELDS)
+            self.assertIn(f"{side}_judge_equivalent", COMPARISON_CSV_FIELDS)
+            self.assertIn(f"{side}_judge_reason", COMPARISON_CSV_FIELDS)
+            self.assertIn(f"{side}_judge_error", COMPARISON_CSV_FIELDS)
+            self.assertIn(f"{side}_correct", COMPARISON_CSV_FIELDS)
+
     def test_full_denominators_and_transitions(self) -> None:
         comparisons = [
             {
@@ -543,10 +630,691 @@ class EvaluationMetricsTest(unittest.TestCase):
             historical_raw_correct=2,
         )
         self.assertEqual(metrics["dataset"]["historical_raw_accuracy"], 0.5)
+        self.assertEqual(
+            metrics["dataset"]["historical_baseline_scoring"],
+            "legacy_whole_cot_math_verify_any_match_diagnostic_only",
+        )
+        self.assertEqual(
+            metrics["dataset"]["current_math_verify_scoring"],
+            "canonical_claimed_answer_only",
+        )
         self.assertEqual(metrics["dataset"]["strict_post_think_before_full_accuracy"], 0.25)
         self.assertEqual(metrics["full_after"]["eligible_accuracy"], 0.5)
+        self.assertEqual(metrics["full_after"]["scoring_method"], "math_verify_or_llm_judge")
         self.assertEqual(metrics["full_after"]["full_accuracy"], 0.25)
         self.assertEqual(metrics["selected"]["node_status_counts"], {"NOT_PROVED": 1, "PROVED": 2})
+
+    def test_judge_assisted_metrics_preserve_math_verify_baseline(self) -> None:
+        comparisons = [{
+            "source": "s",
+            "before_math_verify_correct": False,
+            "after_math_verify_correct": False,
+            "before_correct": True,
+            "after_correct": False,
+            "transition": "correct_to_wrong",
+            "before_judge_status": "ok",
+            "before_judge_equivalent": True,
+            "before_judge_cache_hit": True,
+            "after_judge_status": "error",
+            "after_judge_equivalent": None,
+            "blueprint_status": "ready",
+            "refine_status": "ok",
+            "node_status_counts": {},
+        }]
+        metrics = summarize_comparisons(
+            comparisons,
+            dataset_total=2,
+            global_eligible_total=1,
+            global_before_correct=0,
+            historical_raw_correct=0,
+        )
+        self.assertEqual(metrics["selected"]["math_verify_only"]["before_correct"], 0)
+        self.assertEqual(metrics["selected"]["scoring_method"], "math_verify_or_llm_judge")
+        self.assertEqual(metrics["selected"]["before_correct"], 1)
+        self.assertEqual(metrics["selected"]["judge"]["calls"], 2)
+        self.assertEqual(metrics["selected"]["judge"]["errors"], 1)
+        self.assertEqual(metrics["selected"]["judge"]["cache_hits"], 1)
+
+
+class JudgeTest(unittest.TestCase):
+    def test_parse_and_cache_key_contract(self) -> None:
+        self.assertEqual(
+            parse_judge_content('{"equivalent":true,"reason":"same value"}'),
+            (True, "same value"),
+        )
+        with self.assertRaises(ValueError):
+            parse_judge_content('{"equivalent":"yes","reason":"bad type"}')
+        first = judge_cache_key(problem="p", gold="1/2", candidate="0.5", model="m")
+        same = judge_cache_key(problem="p", gold="1/2", candidate="0.5", model="m")
+        changed = judge_cache_key(problem="p", gold="1/2", candidate="0.50", model="m")
+        self.assertEqual(first, same)
+        self.assertNotEqual(first, changed)
+
+    def test_judge_decision_is_fallback_and_exposes_failures(self) -> None:
+        local = _judge_decision(
+            math_verify_correct=True, candidate="1", enabled=True, result=None,
+        )
+        self.assertTrue(local["correct"])
+        self.assertEqual(local["status"], "not_needed")
+        rescued = _judge_decision(
+            math_verify_correct=False,
+            candidate="0.5",
+            enabled=True,
+            result={"status": "ok", "equivalent": True, "reason": "same"},
+        )
+        self.assertTrue(rescued["correct"])
+        failed = _judge_decision(
+            math_verify_correct=False,
+            candidate="0.5",
+            enabled=True,
+            result={"status": "error", "error": "timeout"},
+        )
+        self.assertFalse(failed["correct"])
+        self.assertEqual(failed["error"], "timeout")
+        unavailable = _judge_decision(
+            math_verify_correct=False, candidate="", enabled=True, result=None,
+        )
+        self.assertEqual(unavailable["status"], "unavailable")
+
+    def test_successful_judgment_is_cached_by_content(self) -> None:
+        class FakeResponse:
+            choices = [SimpleNamespace(
+                message=SimpleNamespace(
+                    content='{"equivalent":true,"reason":"same rational"}',
+                    reasoning_content="checked",
+                    model_extra={},
+                ),
+                finish_reason="stop",
+            )]
+
+            def model_dump(self, mode="json"):
+                return {"id": "judge-1", "choices": []}
+
+        class FakeCompletions:
+            calls = 0
+
+            async def create(self, **_kwargs):
+                self.calls += 1
+                return FakeResponse()
+
+        class FakeClient:
+            completions = FakeCompletions()
+
+            def __init__(self, **_kwargs):
+                self.chat = SimpleNamespace(completions=self.completions)
+
+            async def close(self):
+                pass
+
+        config = OmegaConf.create({
+            "resume": True,
+            "judge": {
+                "model": "judge-model", "api_key": "dummy",
+                "openai_base_url": "http://localhost:8001/v1",
+                "temperature": 0, "max_tokens": 32, "timeout_s": 2,
+                "max_retries": 1, "retry_base_delay_s": 0,
+                "retry_max_delay_s": 0, "concurrency": 2,
+            },
+        })
+        request = [{
+            "ID": "one", "side": "before", "problem": "half?",
+            "gold": "1/2", "candidate": "0.5",
+        }]
+        with tempfile.TemporaryDirectory() as temporary, patch(
+            "cot_blueprint_refine.judge.AsyncOpenAI", FakeClient,
+        ):
+            path = Path(temporary) / "judge.jsonl"
+            first = asyncio.run(judge_equivalences(request, config, path))
+            second = asyncio.run(judge_equivalences(request, config, path))
+        self.assertTrue(first[("one", "before")]["equivalent"])
+        self.assertFalse(first[("one", "before")]["cache_hit"])
+        self.assertTrue(second[("one", "before")]["cache_hit"])
+        self.assertEqual(FakeClient.completions.calls, 1)
+
+    def test_judge_retries_transient_failures(self) -> None:
+        class FakeResponse:
+            choices = [SimpleNamespace(
+                message=SimpleNamespace(
+                    content='{"equivalent":false,"reason":"different"}',
+                    reasoning_content=None,
+                    model_extra={},
+                ),
+                finish_reason="stop",
+            )]
+
+            def model_dump(self, mode="json"):
+                return {"id": "judge-retry", "choices": []}
+
+        class FlakyCompletions:
+            calls = 0
+
+            async def create(self, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise TimeoutError("temporary timeout")
+                return FakeResponse()
+
+        class FakeClient:
+            completions = FlakyCompletions()
+
+            def __init__(self, **_kwargs):
+                self.chat = SimpleNamespace(completions=self.completions)
+
+            async def close(self):
+                pass
+
+        config = OmegaConf.create({
+            "resume": False,
+            "judge": {
+                "model": "judge-model", "api_key": "dummy",
+                "openai_base_url": "http://localhost:8001/v1",
+                "temperature": 0, "max_tokens": 32, "timeout_s": 2,
+                "max_retries": 2, "retry_base_delay_s": 0,
+                "retry_max_delay_s": 0, "concurrency": 1,
+            },
+        })
+        request = [{
+            "ID": "one", "side": "after", "problem": "one?",
+            "gold": "1", "candidate": "2",
+        }]
+        with tempfile.TemporaryDirectory() as temporary, patch(
+            "cot_blueprint_refine.judge.AsyncOpenAI", FakeClient,
+        ):
+            result = asyncio.run(
+                judge_equivalences(request, config, Path(temporary) / "judge.jsonl")
+            )[("one", "after")]
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(FakeClient.completions.calls, 2)
+        self.assertEqual([row["status"] for row in result["attempt_log"]], ["error", "ok"])
+        self.assertEqual(result["attempt_log"][0]["error_layer"], "api_request")
+        self.assertIsNotNone(result["attempt_log"][1]["raw_body"])
+        self.assertIsNotNone(result["attempt_log"][1]["raw_content"])
+
+    def test_judge_separates_api_and_content_json_decoding_layers(self) -> None:
+        class RawHTTPResponse:
+            text = '{"malformed transport"'
+            request_id = "req-transport"
+            status_code = 200
+
+            def parse(self):
+                raise json.JSONDecodeError("transport body", self.text, 1)
+
+        class RawCreate:
+            async def create(self, **_kwargs):
+                return RawHTTPResponse()
+
+        class TransportCompletions:
+            with_raw_response = SimpleNamespace(create=RawCreate().create)
+
+        class TransportClient:
+            completions = TransportCompletions()
+
+            def __init__(self, **_kwargs):
+                self.chat = SimpleNamespace(completions=self.completions)
+
+            async def close(self):
+                pass
+
+        class ContentResponse:
+            _request_id = "req-content"
+            choices = [SimpleNamespace(
+                message=SimpleNamespace(
+                    content='{not judge json', reasoning_content="reasoning", model_extra={},
+                ),
+                finish_reason="stop",
+            )]
+
+            def model_dump(self, mode="json"):
+                return {"id": "content-response", "choices": []}
+
+        class ContentCompletions:
+            async def create(self, **_kwargs):
+                return ContentResponse()
+
+        class ContentClient:
+            completions = ContentCompletions()
+
+            def __init__(self, **_kwargs):
+                self.chat = SimpleNamespace(completions=self.completions)
+
+            async def close(self):
+                pass
+
+        config = OmegaConf.create({
+            "resume": False,
+            "judge": {
+                "model": "judge-model", "api_key": "dummy",
+                "openai_base_url": "http://localhost:8001/v1",
+                "temperature": 0, "max_tokens": 32, "timeout_s": 2,
+                "max_retries": 1, "retry_base_delay_s": 0,
+                "retry_max_delay_s": 0, "concurrency": 1,
+            },
+        })
+        request = [{
+            "ID": "one", "side": "before", "problem": "p", "gold": "1", "candidate": "2",
+        }]
+        with tempfile.TemporaryDirectory() as temporary, patch(
+            "cot_blueprint_refine.judge.AsyncOpenAI", TransportClient,
+        ):
+            transport = asyncio.run(judge_equivalences(
+                request, config, Path(temporary) / "transport.jsonl",
+            ))[("one", "before")]
+        self.assertEqual(transport["error_layer"], "api_response_decoding")
+        self.assertEqual(transport["request_id"], "req-transport")
+        self.assertEqual(transport["http_status"], 200)
+        self.assertEqual(transport["raw_body"], RawHTTPResponse.text)
+        self.assertIsNone(transport["raw_content"])
+
+        with tempfile.TemporaryDirectory() as temporary, patch(
+            "cot_blueprint_refine.judge.AsyncOpenAI", ContentClient,
+        ):
+            content = asyncio.run(judge_equivalences(
+                request, config, Path(temporary) / "content.jsonl",
+            ))[("one", "before")]
+        self.assertEqual(content["error_layer"], "judge_content_json_decoding")
+        self.assertEqual(content["request_id"], "req-content")
+        self.assertEqual(content["raw_content"], "{not judge json")
+        self.assertIsNotNone(content["raw_body"])
+
+    def test_judge_resume_retries_only_failed_cache_key(self) -> None:
+        class FakeResponse:
+            choices = [SimpleNamespace(
+                message=SimpleNamespace(
+                    content='{"equivalent":false,"reason":"different"}',
+                    reasoning_content=None,
+                    model_extra={},
+                ),
+                finish_reason="stop",
+            )]
+
+            def model_dump(self, mode="json"):
+                return {"id": "new-response", "choices": []}
+
+        class CountingCompletions:
+            calls = 0
+
+            async def create(self, **_kwargs):
+                self.calls += 1
+                return FakeResponse()
+
+        class FakeClient:
+            completions = CountingCompletions()
+
+            def __init__(self, **_kwargs):
+                self.chat = SimpleNamespace(completions=self.completions)
+
+            async def close(self):
+                pass
+
+        config = OmegaConf.create({
+            "resume": True,
+            "judge": {
+                "model": "judge-model", "api_key": "dummy",
+                "openai_base_url": "http://localhost:8001/v1",
+                "temperature": 0, "max_tokens": 32, "timeout_s": 2,
+                "max_retries": 1, "retry_base_delay_s": 0,
+                "retry_max_delay_s": 0, "concurrency": 1,
+            },
+        })
+        requests = [
+            {"ID": "cached", "side": "before", "problem": "p1", "gold": "1", "candidate": "1"},
+            {"ID": "failed", "side": "after", "problem": "p2", "gold": "1", "candidate": "2"},
+        ]
+        cached_key = judge_cache_key(
+            problem="p1", gold="1", candidate="1", model="judge-model",
+        )
+        failed_key = judge_cache_key(
+            problem="p2", gold="1", candidate="2", model="judge-model",
+        )
+        with tempfile.TemporaryDirectory() as temporary, patch(
+            "cot_blueprint_refine.judge.AsyncOpenAI", FakeClient,
+        ):
+            path = Path(temporary) / "judge.jsonl"
+            path.write_text(
+                json.dumps({"cache_key": cached_key, "status": "ok", "equivalent": True})
+                + "\n"
+                + json.dumps({"cache_key": failed_key, "status": "error", "error": "old"})
+                + "\n",
+                encoding="utf-8",
+            )
+            results = asyncio.run(judge_equivalences(requests, config, path))
+        self.assertTrue(results[("cached", "before")]["cache_hit"])
+        self.assertFalse(results[("failed", "after")]["cache_hit"])
+        self.assertEqual(FakeClient.completions.calls, 1)
+
+    def test_failed_judgments_are_retried_on_resume(self) -> None:
+        class FailingCompletions:
+            calls = 0
+
+            async def create(self, **_kwargs):
+                self.calls += 1
+                raise RuntimeError("judge unavailable")
+
+        class FakeClient:
+            completions = FailingCompletions()
+
+            def __init__(self, **_kwargs):
+                self.chat = SimpleNamespace(completions=self.completions)
+
+            async def close(self):
+                pass
+
+        config = OmegaConf.create({
+            "resume": True,
+            "judge": {
+                "model": "judge-model", "api_key": "dummy",
+                "openai_base_url": "http://localhost:8001/v1",
+                "temperature": 0, "max_tokens": 32, "timeout_s": 2,
+                "max_retries": 1, "retry_base_delay_s": 0,
+                "retry_max_delay_s": 0, "concurrency": 1,
+            },
+        })
+        request = [{
+            "ID": "one", "side": "before", "problem": "one?",
+            "gold": "1", "candidate": "2",
+        }]
+        with tempfile.TemporaryDirectory() as temporary, patch(
+            "cot_blueprint_refine.judge.AsyncOpenAI", FakeClient,
+        ):
+            path = Path(temporary) / "judge.jsonl"
+            first = asyncio.run(judge_equivalences(request, config, path))
+            second = asyncio.run(judge_equivalences(request, config, path))
+            saved_rows = path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(first[("one", "before")]["status"], "error")
+        self.assertEqual(second[("one", "before")]["status"], "error")
+        self.assertEqual(FakeClient.completions.calls, 2)
+        self.assertEqual(len(saved_rows), 2)
+
+
+class VLLMServerTest(unittest.TestCase):
+    @staticmethod
+    def _config(root: Path, *, auto_start: bool = True, auto_destroy: bool = True):
+        model = root / "model"
+        model.mkdir(exist_ok=True)
+        return OmegaConf.create({
+            "output_base": str(root / "outputs"),
+            "exp_name": "unit",
+            "python_bin": "/env/bin/python",
+            "vllm": {
+                "auto_start": auto_start,
+                "auto_destroy": auto_destroy,
+                "startup_timeout_s": 1,
+                "shutdown_timeout_s": 1,
+                "poll_interval_s": 0,
+                "cuda_visible_devices": "0,1",
+            },
+            "service": {
+                "model_path": str(model),
+                "served_model_name": "model",
+                "host": "127.0.0.1",
+                "port": 8123,
+                "tensor_parallel_size": 2,
+                "max_model_len": 4096,
+                "max_num_seqs": 8,
+                "gpu_memory_utilization": 0.5,
+                "trust_remote_code": True,
+                "reasoning_parser": "qwen3",
+                "tool_call_parser": "qwen3_coder",
+                "enable_auto_tool_choice": True,
+                "extra_args": ["--disable-log-stats"],
+            },
+        })
+
+    def test_validates_client_endpoint_and_builds_command(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = self._config(Path(temporary))
+            validate_service_config("model", "http://localhost:8123/v1", config.service)
+            with self.assertRaisesRegex(ValueError, "port"):
+                validate_service_config("model", "http://localhost:9999/v1", config.service)
+            server = VLLMServer(
+                config, stage="refine", client_model="model",
+                base_url="http://127.0.0.1:8123/v1", service=config.service,
+            )
+            command = server.command()
+            self.assertEqual(command[:3], ["/env/bin/python", "-m", "vllm.entrypoints.openai.api_server"])
+            self.assertEqual(command[3:5], ["--model", str(Path(temporary) / "model")])
+            self.assertIn("--tensor-parallel-size", command)
+            self.assertIn("--tool-call-parser", command)
+            self.assertIn("--enable-auto-tool-choice", command)
+            self.assertIn("--disable-log-stats", command)
+
+    def test_exclusive_port_rejects_without_starting_process(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = self._config(Path(temporary))
+            server = VLLMServer(
+                config, stage="blueprint", client_model="model",
+                base_url="http://127.0.0.1:8123/v1", service=config.service,
+            )
+            with patch.object(server, "_port_is_in_use", return_value=True), patch(
+                "cot_blueprint_refine.vllm_runtime.subprocess.Popen",
+            ) as popen:
+                with self.assertRaisesRegex(RuntimeError, "exclusive port"):
+                    server.start()
+            popen.assert_not_called()
+
+    def test_ready_poll_waits_for_matching_served_model(self) -> None:
+        class RunningProcess:
+            pid = 4000
+
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = self._config(Path(temporary))
+            server = VLLMServer(
+                config, stage="blueprint", client_model="model",
+                base_url="http://127.0.0.1:8123/v1", service=config.service,
+            )
+            server.process = RunningProcess()
+            with patch.object(
+                server, "_available_models", side_effect=[set(), {"model"}],
+            ) as available, patch("cot_blueprint_refine.vllm_runtime.time.sleep"):
+                server._wait_until_ready()
+            self.assertEqual(available.call_count, 2)
+            self.assertIsNotNone(server.ready_at)
+
+    def test_exited_startup_reports_log_tail(self) -> None:
+        class ExitedProcess:
+            pid = 4001
+            returncode = 2
+
+            def poll(self):
+                return self.returncode
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = self._config(Path(temporary))
+            server = VLLMServer(
+                config, stage="blueprint", client_model="model",
+                base_url="http://127.0.0.1:8123/v1", service=config.service,
+            )
+            server.root.mkdir(parents=True, exist_ok=True)
+            server.log_path.write_text("fatal startup detail\n", encoding="utf-8")
+            server.process = ExitedProcess()
+            with self.assertRaisesRegex(RuntimeError, "fatal startup detail"):
+                server._wait_until_ready()
+
+    def test_startup_health_failure_cleans_process_group(self) -> None:
+        class FakeProcess:
+            pid = 4100
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                self.returncode = 0
+                return 0
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = self._config(Path(temporary))
+            server = VLLMServer(
+                config, stage="blueprint", client_model="model",
+                base_url="http://127.0.0.1:8123/v1", service=config.service,
+            )
+            with patch.object(server, "_port_is_in_use", return_value=False), patch.object(
+                server, "_wait_until_ready", side_effect=TimeoutError("not ready"),
+            ), patch(
+                "cot_blueprint_refine.vllm_runtime.subprocess.Popen",
+                return_value=FakeProcess(),
+            ), patch(
+                "cot_blueprint_refine.vllm_runtime.os.getpgid", return_value=4100,
+            ), patch("cot_blueprint_refine.vllm_runtime.os.killpg") as killpg:
+                with self.assertRaisesRegex(TimeoutError, "not ready"):
+                    server.start()
+            killpg.assert_called_once_with(4100, signal.SIGTERM)
+            metadata = json.loads(server.metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(metadata["status"], "startup_failed")
+
+    def test_owned_process_group_is_stopped(self) -> None:
+        class FakeProcess:
+            pid = 4321
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                self.returncode = 0
+                return 0
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = self._config(Path(temporary))
+            server = VLLMServer(
+                config, stage="evaluate", client_model="model",
+                base_url="http://127.0.0.1:8123/v1", service=config.service,
+            )
+            fake = FakeProcess()
+            with patch.object(server, "_port_is_in_use", return_value=False), patch.object(
+                server, "_wait_until_ready", side_effect=lambda: setattr(server, "ready_at", "now"),
+            ), patch(
+                "cot_blueprint_refine.vllm_runtime.subprocess.Popen", return_value=fake,
+            ) as popen, patch(
+                "cot_blueprint_refine.vllm_runtime.os.getpgid", return_value=4321,
+            ), patch("cot_blueprint_refine.vllm_runtime.os.killpg") as killpg:
+                with server:
+                    self.assertIs(server.process, fake)
+            self.assertTrue(popen.call_args.kwargs["start_new_session"])
+            self.assertTrue(popen.call_args.kwargs["env"]["PATH"].startswith("/env/bin:"))
+            killpg.assert_called_once()
+            self.assertEqual(killpg.call_args.args[0], 4321)
+            metadata = json.loads(server.metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(metadata["status"], "stopped")
+
+    def test_exception_and_interrupt_stop_owned_process_group(self) -> None:
+        class FakeProcess:
+            pid = 4500
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                self.returncode = 0
+                return 0
+
+        for exception_type in (RuntimeError, KeyboardInterrupt):
+            with self.subTest(exception_type=exception_type), tempfile.TemporaryDirectory() as temporary:
+                config = self._config(Path(temporary))
+                server = VLLMServer(
+                    config, stage="refine", client_model="model",
+                    base_url="http://127.0.0.1:8123/v1", service=config.service,
+                )
+                with patch.object(server, "_port_is_in_use", return_value=False), patch.object(
+                    server, "_wait_until_ready",
+                ), patch(
+                    "cot_blueprint_refine.vllm_runtime.subprocess.Popen",
+                    return_value=FakeProcess(),
+                ), patch(
+                    "cot_blueprint_refine.vllm_runtime.os.getpgid", return_value=4500,
+                ), patch("cot_blueprint_refine.vllm_runtime.os.killpg") as killpg:
+                    with self.assertRaises(exception_type):
+                        with server:
+                            raise exception_type("stage failed")
+                killpg.assert_called_once_with(4500, signal.SIGTERM)
+                metadata = json.loads(server.metadata_path.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    metadata["stop_reason"], f"stage_exception:{exception_type.__name__}"
+                )
+
+    def test_external_mode_never_starts_or_kills(self) -> None:
+        for auto_destroy in (False, True):
+            with self.subTest(auto_destroy=auto_destroy), tempfile.TemporaryDirectory() as temporary:
+                config = self._config(
+                    Path(temporary), auto_start=False, auto_destroy=auto_destroy,
+                )
+                server = VLLMServer(
+                    config, stage="refine", client_model="model",
+                    base_url="http://127.0.0.1:8123/v1", service=config.service,
+                )
+                with patch(
+                    "cot_blueprint_refine.vllm_runtime.subprocess.Popen",
+                ) as popen, patch(
+                    "cot_blueprint_refine.vllm_runtime.os.killpg",
+                ) as killpg:
+                    with server:
+                        pass
+                popen.assert_not_called()
+                killpg.assert_not_called()
+
+    def test_auto_destroy_false_leaves_owned_process_running(self) -> None:
+        class FakeProcess:
+            pid = 5000
+            returncode = None
+
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = self._config(Path(temporary), auto_destroy=False)
+            server = VLLMServer(
+                config, stage="refine", client_model="model",
+                base_url="http://127.0.0.1:8123/v1", service=config.service,
+            )
+            with patch.object(server, "_port_is_in_use", return_value=False), patch.object(
+                server, "_wait_until_ready",
+            ), patch(
+                "cot_blueprint_refine.vllm_runtime.subprocess.Popen",
+                return_value=FakeProcess(),
+            ), patch("cot_blueprint_refine.vllm_runtime.os.killpg") as killpg:
+                with server:
+                    pass
+            killpg.assert_not_called()
+            metadata = json.loads(server.metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(metadata["status"], "left_running")
+
+    def test_shutdown_timeout_force_kills_process_group(self) -> None:
+        class SlowProcess:
+            pid = 6000
+            returncode = None
+            waits = 0
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                self.waits += 1
+                if self.waits == 1:
+                    raise subprocess.TimeoutExpired("vllm", timeout)
+                self.returncode = -9
+                return self.returncode
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = self._config(Path(temporary))
+            server = VLLMServer(
+                config, stage="evaluate", client_model="model",
+                base_url="http://127.0.0.1:8123/v1", service=config.service,
+            )
+            server.process = SlowProcess()
+            with patch(
+                "cot_blueprint_refine.vllm_runtime.os.getpgid", return_value=6000,
+            ), patch("cot_blueprint_refine.vllm_runtime.os.killpg") as killpg:
+                server.stop()
+            self.assertEqual(
+                [call.args[1] for call in killpg.call_args_list],
+                [signal.SIGTERM, signal.SIGKILL],
+            )
+            self.assertTrue(server._forced_kill)
 
 
 class ExperimentLockTest(unittest.TestCase):
