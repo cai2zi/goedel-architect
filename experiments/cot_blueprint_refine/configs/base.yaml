@@ -53,6 +53,8 @@ blueprint:
   generation_max_tokens: 16384
   # Used by per-node proving and the negation probe.
   prover_max_tokens: 8192
+  # Only the current node is upgraded to this limit after a length finish.
+  prover_length_retry_max_tokens: 8192
   max_refinement_iterations: 4
   blueprint_max_retries: 4
   node_max_prove_turns: 4

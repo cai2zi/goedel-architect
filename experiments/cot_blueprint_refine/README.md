@@ -19,6 +19,31 @@ PYTHONPATH=src:experiments /ssd/miniconda3/envs/lean4-czx/bin/python \
   --profile smoke --stage export
 ```
 
+Composite stages keep the owned vLLM/Kimina processes alive across the sequence:
+
+```bash
+# prepare + RobustPA + export; stop before natural-language refinement
+--stage cot-to-blueprint
+
+# prepare + RobustPA + export + enabled refinement variants; no evaluation
+--stage blueprint-refine
+```
+
+To focus on source COTs whose canonical final boxed answer is wrong:
+
+```bash
+# Extract the strict math_verify subset and stop after COT -> Blueprint.
+bash experiments/cot_blueprint_refine/script/qwen3_8b_397b_cot_incorrect_blueprint.sh
+
+# Resume the same experiment and additionally run the blueprint refinement arm.
+PIPELINE_STAGE=blueprint-refine \
+  bash experiments/cot_blueprint_refine/script/qwen3_8b_397b_cot_incorrect_blueprint.sh
+```
+
+The subset extractor scores only the last post-thinking `\boxed{...}`; it does not
+use the historical whole-COT `is_correct` field. The dedicated profile disables
+the `cot_only` refinement arm and Judge.
+
 For `--stage all`, the runner starts one experiment-owned 397B vLLM service
 after `prepare`, keeps it resident through blueprint generation, export, both
 refinement arms, and the final answer-equivalence judge, then stops it once.

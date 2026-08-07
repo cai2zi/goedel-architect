@@ -35,6 +35,10 @@ def _max_tokens() -> int:
     return int(os.environ.get("GOEDEL_PROVER_MAX_TOKENS", "64000"))
 
 
+def _length_retry_max_tokens() -> int:
+    return int(os.environ.get("GOEDEL_PROVER_LENGTH_RETRY_MAX_TOKENS", str(_max_tokens())))
+
+
 LEAN_COMPILE_TOOL = {
     "type": "function",
     "function": {
@@ -194,6 +198,11 @@ class GoedelProver:
         self.max_negation_probe_turns = max_negation_probe_turns
         self.max_tool_calls_per_turn = max_tool_calls_per_turn
         self._tool_cache: dict[str, _ToolOutcome] = {}
+        self._completion_max_tokens = _max_tokens()
+        self._length_retry_max_tokens = max(
+            self._completion_max_tokens,
+            _length_retry_max_tokens(),
+        )
 
     def prove_node(
         self,
@@ -305,21 +314,53 @@ class GoedelProver:
         tools: list[dict[str, Any]],
         operation: str,
     ):
-        response = chat_completion_with_retry(
-            self.client,
-            tracer=self.tracer,
-            thm_name=node_name,
-            phase="phase2",
-            model_id=self.model_id,
-            operation=operation,
-            trace_args={"stage": stage, "turn": turn},
-            model=self.model_id,
-            messages=messages,
-            tools=tools,
-            max_completion_tokens=_max_tokens(),
-            parallel_tool_calls=len(tools) > 1,
-            tool_choice="required",
-        )
+        def request(max_tokens: int, *, adaptive_retry: bool):
+            return chat_completion_with_retry(
+                self.client,
+                tracer=self.tracer,
+                thm_name=node_name,
+                phase="phase2",
+                model_id=self.model_id,
+                operation=operation,
+                trace_args={
+                    "stage": stage,
+                    "turn": turn,
+                    "adaptive_length_retry": adaptive_retry,
+                    "max_completion_tokens": max_tokens,
+                },
+                model=self.model_id,
+                messages=messages,
+                tools=tools,
+                max_completion_tokens=max_tokens,
+                parallel_tool_calls=len(tools) > 1,
+                tool_choice="required",
+            )
+
+        requested_tokens = self._completion_max_tokens
+        response = request(requested_tokens, adaptive_retry=False)
+        choice = response.choices[0]
+        if (
+            getattr(choice, "finish_reason", None) == "length"
+            and self._length_retry_max_tokens > requested_tokens
+        ):
+            upgraded_tokens = self._length_retry_max_tokens
+            self.tracer.emit(TraceEvent(
+                kind="llm_length_retry",
+                thm_name=node_name,
+                turn=turn,
+                args={
+                    "phase": "phase2",
+                    "operation": operation,
+                    "stage": stage,
+                    "previous_max_completion_tokens": requested_tokens,
+                    "max_completion_tokens": upgraded_tokens,
+                },
+            ))
+            # A GoedelProver instance handles exactly one node. Once that node
+            # demonstrates that 4K is insufficient, retain the upgraded limit
+            # for its remaining turns without affecting any other node.
+            self._completion_max_tokens = upgraded_tokens
+            response = request(upgraded_tokens, adaptive_retry=True)
         usage = getattr(response, "usage", None)
         if usage is not None:
             self.tracer.emit(TraceEvent(

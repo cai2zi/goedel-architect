@@ -58,6 +58,9 @@ from cot_blueprint_refine.export_blueprint_contexts import (  # noqa: E402
     render_blueprint_context,
 )
 from cot_blueprint_refine.prepare_inputs import make_generation_row, prepare  # noqa: E402
+from cot_blueprint_refine.extract_original_incorrect_subset import (  # noqa: E402
+    extract_incorrect_rows,
+)
 from cot_blueprint_refine.run_cot_refinement import (  # noqa: E402
     _call_one,
     build_messages,
@@ -67,7 +70,11 @@ from cot_blueprint_refine.run_cot_refinement import (  # noqa: E402
     normalize_refined_output,
     synthesize_legacy_conversation,
 )
-from cot_blueprint_refine.run_experiment import ExperimentLock, blueprint_results_complete  # noqa: E402
+from cot_blueprint_refine.run_experiment import (  # noqa: E402
+    ExperimentLock,
+    STAGE_SEQUENCES,
+    blueprint_results_complete,
+)
 from cot_blueprint_refine.vllm_runtime import (  # noqa: E402
     PersistentVLLMRuntime,
     VLLMServer,
@@ -161,6 +168,45 @@ class CotCleaningTest(unittest.TestCase):
 
 
 class PrepareInputsTest(unittest.TestCase):
+    def test_extracts_strict_original_answer_incorrect_subset(self) -> None:
+        rows = [
+            {
+                "ID": "correct", "source": "demo", "row_index": 0,
+                "problem": "1+1", "gold": "2", "status": "ok", "finish_reason": "stop",
+                "raw_cot": r"<think>x</think>Answer \boxed{2}",
+            },
+            {
+                "ID": "incorrect", "source": "demo", "row_index": 1,
+                "problem": "1+1", "gold": "2", "status": "ok", "finish_reason": "stop",
+                "raw_cot": r"<think>x</think>Mentions 2, but final \boxed{3}",
+                "is_correct": True,
+            },
+            {
+                "ID": "length", "source": "demo", "row_index": 2,
+                "problem": "1+1", "gold": "2", "status": "ok", "finish_reason": "length",
+                "raw_cot": r"<think>x</think>Answer \boxed{3}",
+            },
+        ]
+        selected, metrics = extract_incorrect_rows(rows)
+        self.assertEqual([row["ID"] for row in selected], ["incorrect"])
+        self.assertEqual(metrics["eligible_rows"], 2)
+        self.assertEqual(metrics["incorrect_rows"], 1)
+        self.assertEqual(metrics["rejected_finish_reason_length"], 1)
+        self.assertEqual(
+            selected[0]["subset_selection"]["scoring_mode"],
+            "canonical_last_boxed_answer_math_verify",
+        )
+
+    def test_composite_stage_sequences(self) -> None:
+        self.assertEqual(
+            STAGE_SEQUENCES["cot-to-blueprint"],
+            ("prepare", "blueprint", "export"),
+        )
+        self.assertEqual(
+            STAGE_SEQUENCES["blueprint-refine"],
+            ("prepare", "blueprint", "export", "refine"),
+        )
+
     def test_filters_length_and_does_not_put_gold_in_generation_data(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -29,12 +29,25 @@ from kimina_lean_compiler import KiminaLeanCompiler  # noqa: E402
 
 
 STAGES = ("prepare", "blueprint", "export", "refine", "evaluate")
+STAGE_SEQUENCES = {
+    "all": STAGES,
+    "cot-to-blueprint": ("prepare", "blueprint", "export"),
+    "blueprint-refine": ("prepare", "blueprint", "export", "refine"),
+}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Blueprint-guided COT refinement experiment")
     parser.add_argument("--profile", default="base", help="Config profile under configs/")
-    parser.add_argument("--stage", choices=(*STAGES, "all"), default="all")
+    parser.add_argument(
+        "--stage",
+        choices=(*STAGES, *STAGE_SEQUENCES),
+        default="all",
+        help=(
+            "A single stage, all stages, cot-to-blueprint (prepare+blueprint+export), "
+            "or blueprint-refine (prepare+blueprint+export+refine)"
+        ),
+    )
     parser.add_argument("override", nargs="*", help="OmegaConf dot-list overrides")
     return parser.parse_args()
 
@@ -169,6 +182,9 @@ def run_blueprint(
     env.setdefault("GOEDEL_OPENAI_API_KEY", "dummy")
     env["GOEDEL_BLUEPRINT_MAX_TOKENS"] = str(int(blueprint.generation_max_tokens))
     env["GOEDEL_PROVER_MAX_TOKENS"] = str(int(blueprint.prover_max_tokens))
+    env["GOEDEL_PROVER_LENGTH_RETRY_MAX_TOKENS"] = str(
+        int(blueprint.get("prover_length_retry_max_tokens", blueprint.prover_max_tokens))
+    )
     command = [
         str(config.python_bin),
         str(REPO_ROOT / "experiments" / "robustpa_refine" / "run_robustpa_refine.py"),
@@ -304,7 +320,7 @@ def main() -> None:
             (root / "config_resolved.yaml").write_text(
                 OmegaConf.to_yaml(config, resolve=True), encoding="utf-8"
             )
-            stages = STAGES if args.stage == "all" else (args.stage,)
+            stages = STAGE_SEQUENCES.get(args.stage, (args.stage,))
             for stage in stages:
                 print(f"[stage-start] {stage}", flush=True)
                 run_stage(stage, config, runtime, kimina_runtime)

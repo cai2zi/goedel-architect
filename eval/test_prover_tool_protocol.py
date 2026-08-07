@@ -13,7 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from kimina_lean_compiler import CompilerResult  # noqa: E402
-from prover import GoedelProver, ProofSignal, ProverResult  # noqa: E402
+from prover import LEAN_COMPILE_TOOL, GoedelProver, ProofSignal, ProverResult  # noqa: E402
 
 
 NODE_DECL = "theorem root : True := by sorry_using []"
@@ -72,9 +72,12 @@ class RecordingTracer:
         self.events.append(event)
 
 
-def response(calls: list[ToolCall], content: str = ""):
+def response(calls: list[ToolCall], content: str = "", finish_reason: str | None = None):
     message = SimpleNamespace(tool_calls=calls, content=content)
-    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+    return SimpleNamespace(choices=[SimpleNamespace(
+        message=message,
+        finish_reason=finish_reason,
+    )])
 
 
 class ProverToolProtocolTest(unittest.TestCase):
@@ -127,6 +130,40 @@ class ProverToolProtocolTest(unittest.TestCase):
         self.assertEqual([message["role"] for message in messages], [
             "assistant", "tool", "tool", "tool",
         ])
+
+    def test_length_finish_upgrades_only_this_prover_to_eight_k(self) -> None:
+        tracer = RecordingTracer()
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "GOEDEL_PROVER_MAX_TOKENS": "4096",
+                    "GOEDEL_PROVER_LENGTH_RETRY_MAX_TOKENS": "8192",
+                },
+            ),
+            patch("prover.make_client", return_value=object()),
+        ):
+            prover = GoedelProver("model", Retrieval(), tracer=tracer)
+        truncated = response([], finish_reason="length")
+        completed = response(
+            [ToolCall("proof", "lean_compile", {"proof_body": "by trivial"})],
+            finish_reason="tool_calls",
+        )
+        with patch(
+            "prover.chat_completion_with_retry",
+            side_effect=[truncated, completed, completed],
+        ) as chat:
+            actual = prover._chat([], "root", 1, "prove", [LEAN_COMPILE_TOOL], "prove_node")
+            prover._chat([], "root", 2, "prove", [LEAN_COMPILE_TOOL], "prove_node")
+        self.assertIs(actual, completed)
+        self.assertEqual(
+            [call.kwargs["max_completion_tokens"] for call in chat.call_args_list],
+            [4096, 8192, 8192],
+        )
+        self.assertEqual(
+            len([event for event in tracer.events if event.kind == "llm_length_retry"]),
+            1,
+        )
 
     def test_same_turn_duplicates_are_removed(self) -> None:
         prover = self.make_prover()
