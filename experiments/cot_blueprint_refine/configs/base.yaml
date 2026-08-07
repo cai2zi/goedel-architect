@@ -13,17 +13,33 @@ vllm:
   poll_interval_s: 2
   cuda_visible_devices: 0,1,2,3,4,5,6,7
 
+kimina:
+  auto_start: true
+  auto_destroy: true
+  root: /ssd/czx/kimina-lean-server
+  host: 127.0.0.1
+  port: 8000
+  startup_timeout_s: 300
+  shutdown_timeout_s: 180
+  poll_interval_s: 1
+  metrics_interval_s: 5
+  max_repls: 48
+  max_repl_uses: 256
+  max_repl_mem: 64G
+  max_snippets_per_request: 8
+  project_dir: /ssd/czx/goedel-architect/goedel_lean
+  repl_path: /ssd/czx/kimina-lean-server/repl/.lake/build/bin/repl
+
 shared_vllm_397b:
   model_path: /ssd/czx/models/Qwen3.5-397B-A17B-FP8
   served_model_name: Qwen3.5-397B-A17B-FP8
   host: 127.0.0.1
   port: 8001
   tensor_parallel_size: 8
-  max_model_len: 65536
-  max_num_seqs: 1024
+  max_model_len: 40960
+  max_num_seqs: 512
   gpu_memory_utilization: 0.95
   trust_remote_code: true
-  reasoning_parser: qwen3
   tool_call_parser: qwen3_xml
   enable_auto_tool_choice: true
   extra_args: []
@@ -53,6 +69,9 @@ blueprint:
   lean_server_timeout: 600
   lean_max_inflight_snippets: 128
   lean_batch_size: 32
+  lean_global_batching: true
+  lean_parallel_batches: 6
+  lean_batch_wait_ms: 10
 
 export:
   workers: 128
@@ -64,7 +83,7 @@ refine:
   api_key: dummy
   temperature: 0.6
   max_tokens: 20480
-  context_window: 65536
+  context_window: 40960
   context_safety_margin: 256
   tokenizer_path: /ssd/czx/models/Qwen3.5-397B-A17B-FP8
   source_solution_model_label: Qwen3.5-9B
@@ -87,10 +106,10 @@ judge:
   openai_base_url: http://127.0.0.1:8001/v1
   api_key: dummy
   temperature: 0.0
-  max_tokens: 2048
+  max_tokens: 32
   concurrency: 1024
   timeout_s: 300
-  max_retries: 3
+  max_retries: 2
   retry_base_delay_s: 2.0
   retry_max_delay_s: 30.0
   vllm: ${shared_vllm_397b}

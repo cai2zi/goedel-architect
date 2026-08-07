@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import uuid
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,15 @@ class TraceEvent:
     result: str | None = None
     ok: bool | None = None
     ts: float = field(default_factory=time.time)
+    schema_version: int = 2
+    event_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    span_id: str | None = None
+    parent_span_id: str | None = None
+    batch_id: str | None = None
+    snippet_id: str | None = None
+    wall_time_ns: int = field(default_factory=time.time_ns)
+    monotonic_ns: int = field(default_factory=time.monotonic_ns)
+    duration_ms: float | None = None
 
 
 class NullTracer:

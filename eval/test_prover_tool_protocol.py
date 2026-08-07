@@ -64,17 +64,28 @@ class Retrieval:
         return []
 
 
+class RecordingTracer:
+    def __init__(self) -> None:
+        self.events = []
+
+    def emit(self, event) -> None:
+        self.events.append(event)
+
+
 def response(calls: list[ToolCall], content: str = ""):
     message = SimpleNamespace(tool_calls=calls, content=content)
     return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
 
 class ProverToolProtocolTest(unittest.TestCase):
-    def make_prover(self, retrieval=None, *, max_negation_probe_turns: int = 1) -> GoedelProver:
+    def make_prover(
+        self, retrieval=None, *, tracer=None, max_negation_probe_turns: int = 1,
+    ) -> GoedelProver:
         with patch("prover.make_client", return_value=object()):
             return GoedelProver(
                 "model",
                 retrieval or Retrieval(),
+                tracer=tracer,
                 max_negation_probe_turns=max_negation_probe_turns,
                 max_tool_calls_per_turn=3,
             )
@@ -189,6 +200,42 @@ class ProverToolProtocolTest(unittest.TestCase):
         self.assertLess(elapsed, 0.27)
         self.assertEqual([item.call.call.id for item in outcomes], ["a", "b", "c"])
         self.assertEqual(len(compiler.requests[0]), 2)
+
+    def test_parallel_tool_spans_use_each_tools_actual_duration(self) -> None:
+        tracer = RecordingTracer()
+        prover = self.make_prover(Retrieval(delay=0.1), tracer=tracer)
+        compiler = RecordingCompiler()
+        cached, _ = self.prepare(prover, [
+            ToolCall("warm", "lean_compile", {"proof_body": "by trivial"}),
+        ])
+        prover._execute_calls(cached, compiler, NODE_DECL, "", "import Mathlib")
+        tracer.events.clear()
+
+        prover._process_response(
+            response=response([
+                ToolCall("cached", "lean_compile", {"proof_body": "by trivial"}),
+                ToolCall("search", "mathlib_search", {"query": "True"}),
+            ]),
+            messages=[],
+            compiler=compiler,
+            node_name="root",
+            node_decl=NODE_DECL,
+            parent_lemma_decls="",
+            header="import Mathlib",
+            turn=1,
+            stage="prove",
+            limit=3,
+            allowed_names={"lean_compile", "mathlib_search"},
+        )
+        results = {
+            event.call_id: event for event in tracer.events if event.kind == "tool_result"
+        }
+        self.assertLess(results["cached"].duration_ms, 20)
+        self.assertGreaterEqual(results["search"].duration_ms, 80)
+        self.assertEqual(
+            {event.span_id for event in tracer.events if event.kind == "tool_call"},
+            {event.span_id for event in tracer.events if event.kind == "tool_result"},
+        )
 
     def test_step_success_does_not_solve_and_history_has_exact_pairs(self) -> None:
         prover = self.make_prover()

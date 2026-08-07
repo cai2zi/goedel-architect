@@ -24,6 +24,7 @@ from cot_blueprint_refine.export_blueprint_contexts import export_contexts  # no
 from cot_blueprint_refine.prepare_inputs import DATASET_SUBSET, prepare  # noqa: E402
 from cot_blueprint_refine.run_cot_refinement import refine  # noqa: E402
 from cot_blueprint_refine.vllm_runtime import PersistentVLLMRuntime  # noqa: E402
+from cot_blueprint_refine.kimina_runtime import PersistentKiminaRuntime  # noqa: E402
 from kimina_lean_compiler import KiminaLeanCompiler  # noqa: E402
 
 
@@ -112,7 +113,11 @@ def blueprint_results_complete(config: DictConfig) -> bool:
     return complete
 
 
-def run_blueprint(config: DictConfig, runtime: PersistentVLLMRuntime) -> None:
+def run_blueprint(
+    config: DictConfig,
+    runtime: PersistentVLLMRuntime,
+    kimina_runtime: PersistentKiminaRuntime,
+) -> None:
     if blueprint_results_complete(config):
         return
     blueprint = config.blueprint
@@ -122,6 +127,7 @@ def run_blueprint(config: DictConfig, runtime: PersistentVLLMRuntime) -> None:
         base_url=str(blueprint.openai_base_url),
         service=blueprint.vllm,
     )
+    kimina_runtime.ensure("blueprint")
     preflight_model(str(blueprint.model), str(blueprint.openai_base_url))
     preflight_kimina(config)
     root = output_root(config)
@@ -155,6 +161,9 @@ def run_blueprint(config: DictConfig, runtime: PersistentVLLMRuntime) -> None:
         "lean_server_debug=false",
         f"lean_max_inflight_snippets={blueprint.lean_max_inflight_snippets}",
         f"lean_batch_size={blueprint.lean_batch_size}",
+        f"lean_global_batching={str(bool(blueprint.lean_global_batching)).lower()}",
+        f"lean_parallel_batches={blueprint.lean_parallel_batches}",
+        f"lean_batch_wait_ms={blueprint.lean_batch_wait_ms}",
     ]
     env = os.environ.copy()
     env.setdefault("GOEDEL_OPENAI_API_KEY", "dummy")
@@ -184,14 +193,21 @@ def run_stage(
     stage: str,
     config: DictConfig,
     runtime: PersistentVLLMRuntime | None = None,
+    kimina_runtime: PersistentKiminaRuntime | None = None,
 ) -> Any:
     if runtime is None:
-        with PersistentVLLMRuntime(config) as owned_runtime:
-            return run_stage(stage, config, owned_runtime)
+        with (
+            PersistentVLLMRuntime(config) as owned_runtime,
+            PersistentKiminaRuntime(config) as owned_kimina,
+        ):
+            return run_stage(stage, config, owned_runtime, owned_kimina)
+    if kimina_runtime is None:
+        with PersistentKiminaRuntime(config) as owned_kimina:
+            return run_stage(stage, config, runtime, owned_kimina)
     if stage == "prepare":
         return prepare(config)
     if stage == "blueprint":
-        return run_blueprint(config, runtime)
+        return run_blueprint(config, runtime, kimina_runtime)
     if stage == "export":
         if runtime.server is not None:
             runtime.ensure(
@@ -200,6 +216,7 @@ def run_stage(
                 base_url=str(config.blueprint.openai_base_url),
                 service=config.blueprint.vllm,
             )
+        kimina_runtime.ensure("export")
         preflight_kimina(config)
         return export_contexts(config)
     if stage == "refine":
@@ -279,14 +296,18 @@ def main() -> None:
     for signum in (signal.SIGTERM, signal.SIGHUP):
         previous_handlers[signum] = signal.signal(signum, terminate)
     try:
-        with ExperimentLock(root), PersistentVLLMRuntime(config) as runtime:
+        with (
+            ExperimentLock(root),
+            PersistentVLLMRuntime(config) as runtime,
+            PersistentKiminaRuntime(config) as kimina_runtime,
+        ):
             (root / "config_resolved.yaml").write_text(
                 OmegaConf.to_yaml(config, resolve=True), encoding="utf-8"
             )
             stages = STAGES if args.stage == "all" else (args.stage,)
             for stage in stages:
                 print(f"[stage-start] {stage}", flush=True)
-                run_stage(stage, config, runtime)
+                run_stage(stage, config, runtime, kimina_runtime)
                 print(f"[stage-done] {stage}", flush=True)
     finally:
         for signum, handler in previous_handlers.items():

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import time
+import uuid
 from concurrent.futures import Executor
 from dataclasses import dataclass, field
 
@@ -13,7 +14,7 @@ from blueprint import Blueprint, BlueprintNode, render_solved_declaration
 from kimina_lean_compiler import KiminaLeanCompiler
 from mathlib_retrieval import MathlibRetrieval
 from prover import ProofSignal, ProverResult, prove_node
-from tracer import NullTracer
+from tracer import NullTracer, TraceEvent
 
 
 @dataclass
@@ -236,7 +237,17 @@ async def _prove_one(
     async def attempt() -> ProverResult:
         loop = asyncio.get_running_loop()
         if node_semaphore is not None:
+            wait_span_id = uuid.uuid4().hex
+            wait_started_ns = time.monotonic_ns()
+            tracer.emit(TraceEvent(
+                kind="node_semaphore_wait_start", thm_name=name, span_id=wait_span_id,
+            ))
             await node_semaphore.acquire()
+            tracer.emit(TraceEvent(
+                kind="node_semaphore_wait_end", thm_name=name, span_id=wait_span_id,
+                ok=True,
+                duration_ms=(time.monotonic_ns() - wait_started_ns) / 1_000_000,
+            ))
         future = loop.run_in_executor(
             node_executor,
             functools.partial(

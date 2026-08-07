@@ -30,6 +30,9 @@ def make_lean_runtime(args) -> LeanRuntime:
         "debug": args.lean_server_debug,
         "max_inflight_snippets": args.lean_max_inflight_snippets,
         "batch_size": args.lean_batch_size,
+        "global_batching": args.lean_global_batching,
+        "parallel_batches": args.lean_parallel_batches,
+        "batch_wait_ms": args.lean_batch_wait_ms,
     }
     compiler = KiminaLeanCompiler(
         api_url=args.lean_api_url,
@@ -39,6 +42,9 @@ def make_lean_runtime(args) -> LeanRuntime:
         debug=args.lean_server_debug,
         max_inflight_snippets=args.lean_max_inflight_snippets,
         batch_size=args.lean_batch_size,
+        global_batching=bool(args.lean_global_batching),
+        parallel_batches=int(args.lean_parallel_batches),
+        batch_wait_ms=float(args.lean_batch_wait_ms),
     )
     return LeanRuntime(compiler, metadata)
 

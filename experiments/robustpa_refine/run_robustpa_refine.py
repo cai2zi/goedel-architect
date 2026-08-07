@@ -175,6 +175,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         "phase2_contract_check_concurrency",
         "lean_max_inflight_snippets",
         "lean_batch_size",
+        "lean_parallel_batches",
         "blueprint_max_retries",
         "node_max_prove_turns",
     ):
@@ -190,6 +191,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("llm_api_timeout_s must be positive or none/null/0")
     if args.max_tool_calls_per_turn <= 0:
         raise ValueError("max_tool_calls_per_turn must be a positive integer")
+    if float(args.lean_batch_wait_ms) < 0:
+        raise ValueError("lean_batch_wait_ms must be non-negative")
 
 
 def _read_parquet_rows(path: Path) -> list[dict[str, Any]]:
@@ -961,6 +964,9 @@ async def _run_experiment(
         f"phase2_contract_check={args.phase2_contract_check_concurrency} "
         f"lean_max_inflight_snippets={args.lean_max_inflight_snippets} "
         f"lean_batch_size={args.lean_batch_size} "
+        f"lean_global_batching={args.lean_global_batching} "
+        f"lean_parallel_batches={args.lean_parallel_batches} "
+        f"lean_batch_wait_ms={args.lean_batch_wait_ms} "
         f"node_timeout_s={args.node_timeout_s} "
         f"llm_api_timeout_s={args.llm_api_timeout_s} "
         f"node_max_prove_turns={args.node_max_prove_turns} "

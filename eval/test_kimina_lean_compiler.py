@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -85,6 +86,36 @@ class ConcurrentClient:
 
 
 class KiminaLeanCompilerTest(unittest.TestCase):
+    def test_global_batcher_combines_cross_thread_singletons(self) -> None:
+        client = ConcurrentClient(delay_s=0.01)
+        compiler = KiminaLeanCompiler(
+            _client=client,
+            max_inflight_snippets=48,
+            batch_size=8,
+            global_batching=True,
+            parallel_batches=6,
+            batch_wait_ms=20,
+        )
+        try:
+            with ThreadPoolExecutor(max_workers=96) as executor:
+                results = list(executor.map(
+                    lambda index: compiler.check(
+                        f"example : {index} = {index} := by rfl"
+                    ),
+                    range(96),
+                ))
+            stats = compiler.stats()
+        finally:
+            compiler.close()
+
+        self.assertTrue(all(result.success for result in results))
+        self.assertEqual([len(payload["snippets"]) for payload in client.payloads], [8] * 12)
+        self.assertLessEqual(client.peak_snippets, 48)
+        self.assertEqual(stats["parallel_batches"], 6)
+        self.assertEqual(stats["batch_size_distribution"], {"8": 12})
+        self.assertTrue(all("micro_batch_wait_ms" in result.timings for result in results))
+        self.assertTrue(all("client_http_ms" in result.timings for result in results))
+
     def test_batch_uses_one_request_and_restores_input_order(self) -> None:
         client = FakeClient([response({
             "results": [success_item("b"), success_item("a")],
@@ -167,10 +198,14 @@ class KiminaLeanCompilerTest(unittest.TestCase):
 
     def test_http_failure_is_infrastructure_error_for_every_snippet(self) -> None:
         client = FakeClient([response({"detail": "down"}, 503)])
-        results = KiminaLeanCompiler(_client=client).check_many([
-            CompileRequest("a", request_id="a"),
-            CompileRequest("b", request_id="b"),
-        ])
+        compiler = KiminaLeanCompiler(_client=client, retry_delays_s=())
+        try:
+            results = compiler.check_many([
+                CompileRequest("a", request_id="a"),
+                CompileRequest("b", request_id="b"),
+            ])
+        finally:
+            compiler.close()
         self.assertEqual([item.failure_kind for item in results], ["infra", "infra"])
 
     def test_large_batch_is_chunked_weighted_and_ordered(self) -> None:
@@ -249,6 +284,50 @@ class KiminaLeanCompilerTest(unittest.TestCase):
         self.assertEqual(stats["http_requests"], 2)
         self.assertEqual(stats["http_429"], 1)
         self.assertEqual(stats["retries"], 1)
+
+    def test_500_is_retried_as_transient_repl_failure(self) -> None:
+        sleeps: list[float] = []
+        client = FakeClient([
+            response({"detail": "REPL exited"}, 500),
+            response({"results": [success_item("x")]}),
+        ])
+        compiler = KiminaLeanCompiler(
+            _client=client,
+            retry_delays_s=(1,),
+            retry_jitter_s=2,
+            _sleep=sleeps.append,
+            _random=lambda: 0.25,
+        )
+        try:
+            result = compiler.check_many([
+                CompileRequest("example : True := by trivial", request_id="x"),
+            ])[0]
+            stats = compiler.stats()
+        finally:
+            compiler.close()
+
+        self.assertTrue(result.success)
+        self.assertEqual(sleeps, [1.5])
+        self.assertEqual(stats["http_requests"], 2)
+        self.assertEqual(stats["http_5xx"], 1)
+        self.assertEqual(stats["retries"], 1)
+
+    def test_raw_output_hashes_code_instead_of_duplicating_it(self) -> None:
+        code = "example : True := by trivial -- unique-secret-source"
+        client = FakeClient([response({"results": [success_item("x")]})])
+        compiler = KiminaLeanCompiler(_client=client)
+        try:
+            result = compiler.check_many([
+                CompileRequest(code, request_id="x"),
+            ])[0]
+        finally:
+            compiler.close()
+
+        raw = json.loads(result.raw_output)
+        snippet = raw["request"]["snippets"][0]
+        self.assertEqual(snippet["code_chars"], len(code))
+        self.assertEqual(len(snippet["code_sha256"]), 64)
+        self.assertNotIn("unique-secret-source", result.raw_output)
 
 
 if __name__ == "__main__":

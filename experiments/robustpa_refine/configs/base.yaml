@@ -23,6 +23,9 @@ refine_concurrency: 1024
 phase2_contract_check_concurrency: 8
 lean_max_inflight_snippets: 128
 lean_batch_size: 8
+lean_global_batching: false
+lean_parallel_batches: 1
+lean_batch_wait_ms: 10
 lean_api_url: http://localhost:8000
 lean_api_key_env: KIMINA_API_KEY
 lean_server_timeout: 600

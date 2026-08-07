@@ -167,6 +167,7 @@ def _emit_lean_check_result(
             "goals": result.goals,
             "raw_output": result.raw_output,
             "failure_kind": result.failure_kind,
+            "timings": result.timings,
         },
         ok=result.success,
     ))

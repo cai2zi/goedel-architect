@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import time
 import traceback
 from datetime import datetime, timezone
@@ -15,24 +16,9 @@ from omegaconf import DictConfig
 from cot_blueprint_refine.common import EXPERIMENT_DIR, append_jsonl, read_jsonl, response_to_json
 
 
-PROMPT_VERSION = "answer-equivalence-v1"
+PROMPT_VERSION = "answer-equivalence-flag-v2"
 PROMPTS_DIR = EXPERIMENT_DIR / "prompts"
-JUDGE_RESPONSE_FORMAT = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "answer_equivalence",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "equivalent": {"type": "boolean"},
-                "reason": {"type": "string"},
-            },
-            "required": ["equivalent", "reason"],
-            "additionalProperties": False,
-        },
-    },
-}
+JUDGE_FLAG_RE = re.compile(r"\[\[JUDGE=([01])\]\]")
 
 
 def _utc_now() -> str:
@@ -79,15 +65,13 @@ def _message_parts(response: Any) -> tuple[str, str | None, str | None]:
     return content, None if reasoning is None else str(reasoning), getattr(choice, "finish_reason", None)
 
 
-def parse_judge_content(content: str) -> tuple[bool, str]:
-    payload = json.loads(content)
-    if not isinstance(payload, dict):
-        raise ValueError("judge response must be a JSON object")
-    equivalent = payload.get("equivalent")
-    reason = payload.get("reason")
-    if not isinstance(equivalent, bool) or not isinstance(reason, str):
-        raise ValueError("judge response must contain boolean equivalent and string reason")
-    return equivalent, reason.strip()
+def parse_judge_flag(content: str) -> tuple[bool, str]:
+    matches = JUDGE_FLAG_RE.findall(content)
+    if not matches:
+        raise ValueError("judge flag missing")
+    if len(matches) != 1:
+        raise ValueError("judge flag conflict or duplicate")
+    return matches[0] == "1", matches[0]
 
 
 def _error_text(exc: BaseException) -> str:
@@ -226,6 +210,7 @@ async def _judge_one(
                 "reasoning_content": None,
                 "finish_reason": None,
                 "raw_response": None,
+                "judge_flag": None,
             }
             response = None
             try:
@@ -237,7 +222,15 @@ async def _judge_one(
                         "temperature": float(config.judge.temperature),
                         "max_tokens": int(config.judge.max_tokens),
                         "timeout": float(config.judge.timeout_s),
-                        "response_format": JUDGE_RESPONSE_FORMAT,
+                        # Qwen3/3.5 otherwise spends this deliberately tiny
+                        # output budget on its hidden thinking preamble and is
+                        # truncated before emitting the machine-readable flag.
+                        # This is a chat-template control, not a structured
+                        # response format, and is supported by vLLM's OpenAI
+                        # compatible endpoint through ``extra_body``.
+                        "extra_body": {
+                            "chat_template_kwargs": {"enable_thinking": False},
+                        },
                     },
                 )
                 attempt_row.update({
@@ -283,27 +276,34 @@ async def _judge_one(
                     })
                 else:
                     try:
-                        equivalent, reason = parse_judge_content(content)
-                    except json.JSONDecodeError as exc:
-                        attempt_row.update({
-                            "status": "error",
-                            "error_layer": "judge_content_json_decoding",
-                            "error_type": type(exc).__name__,
-                            "error": _error_text(exc),
-                        })
+                        equivalent, flag = parse_judge_flag(content)
                     except Exception as exc:  # noqa: BLE001
+                        layer = (
+                            "judge_flag_missing"
+                            if "missing" in str(exc)
+                            else "judge_flag_conflict"
+                        )
                         attempt_row.update({
                             "status": "error",
-                            "error_layer": "judge_content_schema",
+                            "error_layer": layer,
                             "error_type": type(exc).__name__,
                             "error": _error_text(exc),
                         })
+                        if attempt < max_retries:
+                            messages.extend([
+                                {"role": "assistant", "content": content},
+                                {"role": "user", "content": (
+                                    "Your previous response did not contain exactly one valid decision flag. "
+                                    "Reply with exactly [[JUDGE=1]] or [[JUDGE=0]] and nothing else."
+                                )},
+                            ])
                     else:
                         attempt_row.update({
                             "status": "ok",
                             "error_layer": None,
                             "error_type": None,
                             "error": None,
+                            "judge_flag": flag,
                         })
 
             attempt_row["finished_at"] = _utc_now()
@@ -315,7 +315,8 @@ async def _judge_one(
                     **request,
                     "status": "ok",
                     "equivalent": equivalent,
-                    "reason": reason,
+                    "reason": "",
+                    "judge_flag": flag,
                     "error": "",
                     "attempts": attempt,
                     "latency_s": time.time() - start,
@@ -348,6 +349,7 @@ async def _judge_one(
         "status": "error",
         "equivalent": None,
         "reason": "",
+        "judge_flag": last_attempt.get("judge_flag"),
         "error": last_error,
         "attempts": len(attempt_log),
         "latency_s": time.time() - start,

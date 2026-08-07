@@ -48,7 +48,7 @@ from cot_blueprint_refine.evaluate import (  # noqa: E402
 from cot_blueprint_refine.judge import (  # noqa: E402
     judge_cache_key,
     judge_equivalences,
-    parse_judge_content,
+    parse_judge_flag,
 )
 from cot_blueprint_refine.export_blueprint_contexts import (  # noqa: E402
     export_contexts,
@@ -726,11 +726,15 @@ class EvaluationMetricsTest(unittest.TestCase):
 class JudgeTest(unittest.TestCase):
     def test_parse_and_cache_key_contract(self) -> None:
         self.assertEqual(
-            parse_judge_content('{"equivalent":true,"reason":"same value"}'),
-            (True, "same value"),
+            parse_judge_flag('analysis\n[[JUDGE=1]]'),
+            (True, "1"),
         )
         with self.assertRaises(ValueError):
-            parse_judge_content('{"equivalent":"yes","reason":"bad type"}')
+            parse_judge_flag('no decision')
+        with self.assertRaises(ValueError):
+            parse_judge_flag('[[JUDGE=1]] [[JUDGE=0]]')
+        with self.assertRaises(ValueError):
+            parse_judge_flag('[[JUDGE=1]] [[JUDGE=1]]')
         first = judge_cache_key(problem="p", gold="1/2", candidate="0.5", model="m")
         same = judge_cache_key(problem="p", gold="1/2", candidate="0.5", model="m")
         changed = judge_cache_key(problem="p", gold="1/2", candidate="0.50", model="m")
@@ -767,7 +771,7 @@ class JudgeTest(unittest.TestCase):
         class FakeResponse:
             choices = [SimpleNamespace(
                 message=SimpleNamespace(
-                    content='{"equivalent":true,"reason":"same rational"}',
+                    content='[[JUDGE=1]]',
                     reasoning_content="checked",
                     model_extra={},
                 ),
@@ -779,9 +783,11 @@ class JudgeTest(unittest.TestCase):
 
         class FakeCompletions:
             calls = 0
+            last_kwargs = None
 
-            async def create(self, **_kwargs):
+            async def create(self, **kwargs):
                 self.calls += 1
+                self.last_kwargs = kwargs
                 return FakeResponse()
 
         class FakeClient:
@@ -826,12 +832,18 @@ class JudgeTest(unittest.TestCase):
         self.assertTrue(second[("one", "after:blueprint")]["cache_hit"])
         self.assertTrue(second[("one", "after:cot_only")]["cache_hit"])
         self.assertEqual(FakeClient.completions.calls, 1)
+        self.assertNotIn("response_format", FakeClient.completions.last_kwargs)
+        self.assertEqual(FakeClient.completions.last_kwargs["max_tokens"], 32)
+        self.assertEqual(
+            FakeClient.completions.last_kwargs["extra_body"],
+            {"chat_template_kwargs": {"enable_thinking": False}},
+        )
 
     def test_judge_retries_transient_failures(self) -> None:
         class FakeResponse:
             choices = [SimpleNamespace(
                 message=SimpleNamespace(
-                    content='{"equivalent":false,"reason":"different"}',
+                    content='[[JUDGE=0]]',
                     reasoning_content=None,
                     model_extra={},
                 ),
@@ -887,7 +899,7 @@ class JudgeTest(unittest.TestCase):
         self.assertIsNotNone(result["attempt_log"][1]["raw_body"])
         self.assertIsNotNone(result["attempt_log"][1]["raw_content"])
 
-    def test_judge_separates_api_and_content_json_decoding_layers(self) -> None:
+    def test_judge_separates_api_and_flag_decoding_layers(self) -> None:
         class RawHTTPResponse:
             text = '{"malformed transport"'
             request_id = "req-transport"
@@ -916,7 +928,7 @@ class JudgeTest(unittest.TestCase):
             _request_id = "req-content"
             choices = [SimpleNamespace(
                 message=SimpleNamespace(
-                    content='{not judge json', reasoning_content="reasoning", model_extra={},
+                    content='no judge flag', reasoning_content="reasoning", model_extra={},
                 ),
                 finish_reason="stop",
             )]
@@ -968,16 +980,16 @@ class JudgeTest(unittest.TestCase):
             content = asyncio.run(judge_equivalences(
                 request, config, Path(temporary) / "content.jsonl",
             ))[("one", "before")]
-        self.assertEqual(content["error_layer"], "judge_content_json_decoding")
+        self.assertEqual(content["error_layer"], "judge_flag_missing")
         self.assertEqual(content["request_id"], "req-content")
-        self.assertEqual(content["raw_content"], "{not judge json")
+        self.assertEqual(content["raw_content"], "no judge flag")
         self.assertIsNotNone(content["raw_body"])
 
     def test_judge_resume_retries_only_failed_cache_key(self) -> None:
         class FakeResponse:
             choices = [SimpleNamespace(
                 message=SimpleNamespace(
-                    content='{"equivalent":false,"reason":"different"}',
+                    content='[[JUDGE=0]]',
                     reasoning_content=None,
                     model_extra={},
                 ),
@@ -1086,7 +1098,7 @@ class JudgeTest(unittest.TestCase):
 class AblationConfigurationTest(unittest.TestCase):
     def test_qwen8b_profile_uses_one_397b_service_and_two_arms(self) -> None:
         config = load_config("qwen3_8b_397b_refine_ablation", [])
-        self.assertFalse(config.resume)
+        self.assertTrue(config.resume)
         self.assertEqual(config.refine.source_solution_model_label, "Qwen3-8B")
         self.assertEqual(set(config.refine.variants), {"blueprint", "cot_only"})
         self.assertEqual(config.refine.variants.blueprint.prompt_mode, "blueprint")
@@ -1094,9 +1106,16 @@ class AblationConfigurationTest(unittest.TestCase):
         for stage in (config.blueprint, config.refine, config.judge):
             self.assertEqual(stage.model, "Qwen3.5-397B-A17B-FP8")
             self.assertEqual(stage.openai_base_url, "http://127.0.0.1:8001/v1")
-            self.assertEqual(stage.vllm.reasoning_parser, "qwen3")
+            self.assertIsNone(stage.vllm.get("reasoning_parser"))
             self.assertEqual(stage.vllm.tool_call_parser, "qwen3_xml")
             validate_service_config(str(stage.model), str(stage.openai_base_url), stage.vllm)
+        self.assertEqual(config.blueprint.phase2_node_concurrency, 512)
+        self.assertEqual(config.blueprint.lean_max_inflight_snippets, 48)
+        self.assertEqual(config.blueprint.lean_batch_size, 8)
+        self.assertEqual(config.blueprint.lean_parallel_batches, 6)
+        self.assertTrue(config.blueprint.lean_global_batching)
+        self.assertEqual(config.judge.max_tokens, 32)
+        self.assertEqual(config.judge.max_retries, 2)
         self.assertEqual(
             config.refine.tokenizer_path,
             "/ssd/czx/models/Qwen3.5-397B-A17B-FP8",

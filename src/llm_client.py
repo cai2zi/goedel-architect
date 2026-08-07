@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import random
 import time
+import uuid
 from typing import Any
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI, RateLimitError
@@ -134,9 +135,68 @@ def chat_completion_with_retry(
 ):
     max_retries, base_delay_s, max_delay_s, jitter_s = _retry_config()
     for retry_index in range(max_retries + 1):
+        span_id = uuid.uuid4().hex
+        started_ns = time.monotonic_ns()
+        if tracer is not None:
+            args = dict(trace_args or {})
+            args.update({
+                "phase": phase,
+                "model": model_id,
+                "operation": operation,
+                "retry_index": retry_index,
+            })
+            tracer.emit(TraceEvent(
+                kind="llm_request_start",
+                thm_name=thm_name,
+                span_id=span_id,
+                args=args,
+            ))
         try:
-            return client.chat.completions.create(**create_kwargs)
+            response = client.chat.completions.create(**create_kwargs)
+            if tracer is not None:
+                usage = getattr(response, "usage", None)
+                choice = response.choices[0] if getattr(response, "choices", None) else None
+                args = dict(trace_args or {})
+                args.update({
+                    "phase": phase,
+                    "model": model_id,
+                    "operation": operation,
+                    "retry_index": retry_index,
+                    "request_id": _request_id(response),
+                    "finish_reason": getattr(choice, "finish_reason", None),
+                    "prompt_tokens": getattr(usage, "prompt_tokens", 0) if usage else 0,
+                    "completion_tokens": getattr(usage, "completion_tokens", 0) if usage else 0,
+                    "total_tokens": getattr(usage, "total_tokens", 0) if usage else 0,
+                })
+                tracer.emit(TraceEvent(
+                    kind="llm_request_end",
+                    thm_name=thm_name,
+                    span_id=span_id,
+                    args=args,
+                    ok=True,
+                    duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
+                ))
+            return response
         except Exception as exc:
+            if tracer is not None:
+                args = dict(trace_args or {})
+                args.update({
+                    "phase": phase,
+                    "model": model_id,
+                    "operation": operation,
+                    "retry_index": retry_index,
+                    "request_id": _request_id(exc),
+                    "error_type": type(exc).__name__,
+                    "status_code": _status_code(exc),
+                })
+                tracer.emit(TraceEvent(
+                    kind="llm_request_end",
+                    thm_name=thm_name,
+                    span_id=span_id,
+                    args=args,
+                    ok=False,
+                    duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
+                ))
             retryable = _is_retryable_llm_error(exc)
             exhausted = retry_index >= max_retries
             if not retryable or exhausted:
@@ -175,4 +235,24 @@ def chat_completion_with_retry(
                 exhausted=False,
                 trace_args=trace_args,
             )
+            sleep_span_id = uuid.uuid4().hex
+            sleep_started_ns = time.monotonic_ns()
+            if tracer is not None:
+                tracer.emit(TraceEvent(
+                    kind="llm_retry_sleep_start",
+                    thm_name=thm_name,
+                    span_id=sleep_span_id,
+                    args={"phase": phase, "operation": operation, "retry_index": retry_index + 1,
+                          "sleep_s": wait_s},
+                ))
             time.sleep(wait_s)
+            if tracer is not None:
+                tracer.emit(TraceEvent(
+                    kind="llm_retry_sleep_end",
+                    thm_name=thm_name,
+                    span_id=sleep_span_id,
+                    args={"phase": phase, "operation": operation, "retry_index": retry_index + 1,
+                          "sleep_s": wait_s},
+                    ok=True,
+                    duration_ms=(time.monotonic_ns() - sleep_started_ns) / 1_000_000,
+                ))

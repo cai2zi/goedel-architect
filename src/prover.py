@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
@@ -151,6 +152,7 @@ class _ToolOutcome:
     proof_body: str = ""
     errors: list[str] = field(default_factory=list)
     failure_kind: str | None = None
+    timings: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -377,6 +379,7 @@ class GoedelProver:
         })
         executions = self._execute_calls(
             accepted, compiler, node_decl, parent_lemma_decls, header,
+            node_name=node_name, turn=turn, stage=stage,
         )
         turn_outcome = _TurnOutcome(had_calls=True)
         successful: list[tuple[int, str]] = []
@@ -387,17 +390,6 @@ class GoedelProver:
             messages.append({
                 "role": "tool", "tool_call_id": call.call_id, "content": outcome.output,
             })
-            self.tracer.emit(TraceEvent(
-                kind="tool_call", thm_name=node_name, turn=turn,
-                call_id=call.call_id, tool_name=call.name,
-                args={"stage": stage, "arguments": call.args, "hash": call.call_hash},
-            ))
-            self.tracer.emit(TraceEvent(
-                kind="tool_result", thm_name=node_name, turn=turn,
-                call_id=call.call_id, tool_name=call.name,
-                result=outcome.output, ok=outcome.ok,
-                args={"stage": stage, "hash": call.call_hash, "cache_hit": cache_hit},
-            ))
             if call.name == "lean_compile":
                 turn_outcome.last_proof = outcome.proof_body
                 turn_outcome.last_errors = list(outcome.errors)
@@ -491,12 +483,46 @@ class GoedelProver:
         node_decl: str,
         parent_lemma_decls: str,
         header: str,
+        *,
+        node_name: str = "",
+        turn: int = 0,
+        stage: str = "",
     ) -> list[_ExecutedCall]:
         outcomes: dict[int, tuple[_ToolOutcome, bool]] = {}
         uncached = [call for call in calls if call.call_hash not in self._tool_cache]
+
+        def start_trace(call: _AcceptedCall) -> tuple[str, int]:
+            span_id = uuid.uuid4().hex
+            started_ns = time.monotonic_ns()
+            self.tracer.emit(TraceEvent(
+                kind="tool_call", thm_name=node_name, turn=turn,
+                call_id=call.call_id, tool_name=call.name, span_id=span_id,
+                args={"stage": stage, "arguments": call.args, "hash": call.call_hash},
+            ))
+            return span_id, started_ns
+
+        def finish_trace(
+            call: _AcceptedCall,
+            outcome: _ToolOutcome,
+            cache_hit: bool,
+            span_id: str,
+            started_ns: int,
+        ) -> None:
+            self.tracer.emit(TraceEvent(
+                kind="tool_result", thm_name=node_name, turn=turn,
+                call_id=call.call_id, tool_name=call.name, span_id=span_id,
+                result=outcome.output, ok=outcome.ok,
+                args={"stage": stage, "hash": call.call_hash, "cache_hit": cache_hit,
+                      "timings": outcome.timings},
+                duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
+            ))
+
         for call in calls:
             if call.call_hash in self._tool_cache:
-                outcomes[call.index] = (self._tool_cache[call.call_hash], True)
+                span_id, started_ns = start_trace(call)
+                outcome = self._tool_cache[call.call_hash]
+                outcomes[call.index] = (outcome, True)
+                finish_trace(call, outcome, True, span_id, started_ns)
 
         compile_calls: list[_AcceptedCall] = []
         compile_requests: list[CompileRequest] = []
@@ -516,39 +542,60 @@ class GoedelProver:
                 compile_calls.append(call)
                 compile_requests.append(CompileRequest(code, request_id=call.call_hash))
             except (KeyError, ValueError) as exc:
+                span_id, started_ns = start_trace(call)
                 outcome = _ToolOutcome(
                     f"Tool protocol error: {exc}", errors=[str(exc)], failure_kind="assembly",
                 )
                 outcomes[call.index] = (outcome, False)
                 self._tool_cache[call.call_hash] = outcome
+                finish_trace(call, outcome, False, span_id, started_ns)
 
         def run_compiles() -> list[CompilerResult]:
-            return compiler.check_many(compile_requests)
+            trace_starts = {call.index: start_trace(call) for call in compile_calls}
+            try:
+                results = compiler.check_many(compile_requests)
+            except Exception as exc:  # noqa: BLE001
+                results = [
+                    CompilerResult(
+                        False,
+                        errors=[f"Lean batch execution failed: {exc}"],
+                        failure_kind="infra",
+                    )
+                    for _call in compile_calls
+                ]
+            for call, result in zip(compile_calls, results, strict=True):
+                proof = (
+                    _normalize_node_proof_body(str(call.args["proof_body"]))
+                    if call.name == "lean_compile" else ""
+                )
+                outcome = _compiler_outcome(result, proof)
+                outcomes[call.index] = (outcome, False)
+                self._tool_cache[call.call_hash] = outcome
+                finish_trace(call, outcome, False, *trace_starts[call.index])
+            return results
 
-        def run_search(call: _AcceptedCall) -> str:
-            hits = self.retrieval.search(str(call.args["query"]), int(call.args.get("k", 10)))
-            return "\n\n".join(hit.format() for hit in hits) or "No Mathlib results."
+        def run_search(call: _AcceptedCall) -> _ToolOutcome:
+            span_id, started_ns = start_trace(call)
+            try:
+                hits = self.retrieval.search(
+                    str(call.args["query"]), int(call.args.get("k", 10)),
+                )
+                output = "\n\n".join(hit.format() for hit in hits) or "No Mathlib results."
+                outcome = _ToolOutcome(output, ok=True)
+            except Exception as exc:  # noqa: BLE001
+                outcome = _ToolOutcome(f"Mathlib search failed: {exc}", failure_kind="infra")
+            outcomes[call.index] = (outcome, False)
+            self._tool_cache[call.call_hash] = outcome
+            finish_trace(call, outcome, False, span_id, started_ns)
+            return outcome
 
         with ThreadPoolExecutor(max_workers=max(1, 1 + len(search_calls))) as executor:
             compile_future = executor.submit(run_compiles) if compile_requests else None
             search_futures = {call.index: executor.submit(run_search, call) for call in search_calls}
             if compile_future is not None:
-                for call, result in zip(compile_calls, compile_future.result(), strict=True):
-                    proof = (
-                        _normalize_node_proof_body(str(call.args["proof_body"]))
-                        if call.name == "lean_compile" else ""
-                    )
-                    outcome = _compiler_outcome(result, proof)
-                    outcomes[call.index] = (outcome, False)
-                    self._tool_cache[call.call_hash] = outcome
+                compile_future.result()
             for call in search_calls:
-                try:
-                    output = search_futures[call.index].result()
-                    outcome = _ToolOutcome(output, ok=True)
-                except Exception as exc:
-                    outcome = _ToolOutcome(f"Mathlib search failed: {exc}", failure_kind="infra")
-                outcomes[call.index] = (outcome, False)
-                self._tool_cache[call.call_hash] = outcome
+                search_futures[call.index].result()
         return [
             _ExecutedCall(call, outcomes[call.index][0], outcomes[call.index][1])
             for call in calls
@@ -603,13 +650,14 @@ class GoedelProver:
 
 def _compiler_outcome(result: CompilerResult, proof_body: str) -> _ToolOutcome:
     if result.success:
-        return _ToolOutcome("Compilation SUCCESSFUL.", True, proof_body)
+        return _ToolOutcome("Compilation SUCCESSFUL.", True, proof_body, timings=result.timings)
     lines = ["Compilation FAILED.", *result.errors]
     if result.goals:
         lines.extend(["Goals:", *result.goals])
     lines.append("Fix errors and call lean_compile again.")
     return _ToolOutcome(
         "\n".join(lines), False, proof_body, result.diagnostics, result.failure_kind,
+        result.timings,
     )
 
 

@@ -168,6 +168,9 @@ def _event_summary(event: dict[str, Any], max_text: int) -> dict[str, Any]:
         "iteration": event.get("iteration"),
         "ok": event.get("ok"),
         "ts": event.get("ts"),
+        "schema_version": event.get("schema_version", 1),
+        "span_id": event.get("span_id"),
+        "duration_ms": event.get("duration_ms"),
         "args": _trim_payload(args, max_text),
         "result": _trim_payload(result, max_text),
         "short": "",
@@ -193,6 +196,23 @@ def _event_summary(event: dict[str, Any], max_text: int) -> dict[str, Any]:
             out["short"] = "ok" if event.get("ok") else _norm(errors[0] if errors else result, max_text)
         else:
             out["short"] = _norm(result, max_text)
+        if event.get("duration_ms") is not None:
+            out["short"] = f"{out['short']}; wall={float(event['duration_ms']):.1f}ms"
+        timings = (args or {}).get("timings") or {}
+        if timings:
+            out["short"] += (
+                f"; queue={float(timings.get('micro_batch_wait_ms') or 0):.1f}ms"
+                f" inflight={float(timings.get('client_inflight_wait_ms') or 0):.1f}ms"
+                f" http={float(timings.get('client_http_ms') or 0):.1f}ms"
+                f" lean={float(timings.get('lean_exec_wall_ms') or 0):.1f}ms"
+            )
+    elif kind in {"llm_request_start", "llm_retry_sleep_start"}:
+        out["short"] = json.dumps(args or {}, ensure_ascii=False, sort_keys=True)
+    elif kind in {"llm_request_end", "llm_retry_sleep_end"}:
+        out["short"] = (
+            f"ok={event.get('ok')} duration={float(event.get('duration_ms') or 0):.1f}ms; "
+            + json.dumps(args or {}, ensure_ascii=False, sort_keys=True)
+        )
     elif kind == "llm_usage":
         out["short"] = json.dumps(args or {}, ensure_ascii=False, sort_keys=True)
     elif kind == "node_finished":
@@ -252,7 +272,7 @@ def build_trace_payload(
         kind = event.get("kind")
         thm_name = str(event.get("thm_name") or "")
         turn = int(event.get("turn") or 0)
-        if kind in {"theorem_start", "llm_response", "tool_call", "tool_result", "model_text", "node_finished", "llm_usage", "llm_error"} and thm_name != unique_id:
+        if kind in {"theorem_start", "llm_response", "llm_request_start", "llm_request_end", "llm_retry_sleep_start", "llm_retry_sleep_end", "tool_call", "tool_result", "model_text", "node_finished", "llm_usage", "llm_error"} and thm_name != unique_id:
             grouped[(thm_name, turn)].append(event)
         else:
             phase_events.append(event)
