@@ -4,12 +4,14 @@ Refine the draft solution below.
 
 {{problem}}
 
-## Claimed final answer in the original response
+## UNTRUSTED ORIGINAL CLAIM — NOT A TARGET
 
 \boxed{ {{claimed_answer}} }
+
+This value is retained to audit the source reasoning faithfully. Changing it is not penalized.
 
 ## Original {{source_solution_model_label}} post-thinking solution
 
 {{original_cot}}
 
-Write a corrected, self-contained, step-by-step mathematical solution. Recheck every step and the final answer independently. Wrap the complete answer in `<final_refined_solution>...</final_refined_solution>`. Inside those markers, the last line must contain the only `\boxed{...}`.
+Write a corrected, self-contained, step-by-step mathematical solution. Recheck every step and the final answer independently. Output only `<final_refined_solution>...</final_refined_solution>` with no text outside those markers. Inside those markers, the last line must contain the only `\boxed{...}`.

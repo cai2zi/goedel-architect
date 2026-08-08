@@ -1,8 +1,14 @@
 input_predictions: /ssd/czx/czx_work/cot_blueprint_refine/subsets/qwen3_8b_original_answer_incorrect/predictions.jsonl
-exp_name: qwen3_8b_397b_cot_incorrect_blueprint
+output_base: /ssd/czx/czx_work/cot_blueprint_refine
+exp_name: qwen3_8b_397b_wrong76_claim_scope_v1
 resume: true
 include_ids: []
 python_bin: /ssd/miniconda3/envs/lean4-czx/bin/python
+
+vllm:
+  # Interactive iterations attach to the persistent tmux service.  A later
+  # production run can override this to false and regain managed lifecycle.
+  use_existing: true
 
 shared_vllm_397b:
   model_path: /ssd/czx/models/Qwen3.5-397B-A17B-FP8
@@ -11,6 +17,21 @@ shared_vllm_397b:
   max_num_seqs: 512
   gpu_memory_utilization: 0.95
   trust_remote_code: true
+
+cot_splitter:
+  mode: llm_claim_scope_v1
+  model: Qwen3.5-397B-A17B-FP8
+  openai_base_url: http://127.0.0.1:8001/v1
+  vllm: ${shared_vllm_397b}
+  temperature: 0.0
+  max_tokens: 8192
+  concurrency: 24
+  timeout_s: 600
+  max_attempts: 2
+  enable_thinking: false
+  fallback_on_error: false
+  atomizer_version: cot-atomizer-v1
+  prompt_version: claim-scope-direct-v3
 
 blueprint:
   model: Qwen3.5-397B-A17B-FP8
@@ -25,16 +46,6 @@ blueprint:
   node_max_prove_turns: 4
   node_max_negation_probe_turns: 0
   max_tool_calls_per_turn: 3
-  semantic_fidelity_enabled: true
-  semantic_require_step_ids: true
-  semantic_static_gate: true
-  semantic_minimal_ir: true
-  semantic_freeze_refinement: true
-  semantic_audit_mode: risk
-  semantic_audit_max_tokens: 1024
-  semantic_max_repair_attempts: 1
-  proof_policy: first_failed_wave
-  critical_negation_max_turns: 0
   phase1_concurrency: 512
   phase2_blueprint_concurrency: 512
   phase2_node_concurrency: 512
@@ -47,6 +58,16 @@ blueprint:
   lean_global_batching: true
   lean_parallel_batches: 6
   lean_batch_wait_ms: 10
+  semantic_fidelity_enabled: true
+  semantic_require_step_ids: true
+  semantic_static_gate: true
+  semantic_minimal_ir: true
+  semantic_freeze_refinement: true
+  semantic_audit_mode: full
+  semantic_audit_max_tokens: 2048
+  semantic_max_repair_attempts: 1
+  proof_policy: first_failed_wave
+  critical_negation_max_turns: 1
 
 export:
   workers: 128
@@ -54,10 +75,13 @@ export:
 refine:
   model: Qwen3.5-397B-A17B-FP8
   source_solution_model_label: Qwen3-8B
-  concurrency: 512
+  concurrency: 24
   vllm: ${shared_vllm_397b}
   temperature: 0.6
   max_tokens: 20480
+  concise_recovery_max_tokens: 8192
+  strict_final_envelope: false
+  timeout_s: 3600
   variants:
     blueprint:
       enabled: true
@@ -68,4 +92,3 @@ refine:
 
 judge:
   enabled: false
-  concurrency: 512

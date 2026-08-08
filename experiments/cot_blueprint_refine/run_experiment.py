@@ -22,17 +22,23 @@ from cot_blueprint_refine.common import latest_rows, load_config, output_root, p
 from cot_blueprint_refine.evaluate import evaluate  # noqa: E402
 from cot_blueprint_refine.export_blueprint_contexts import export_contexts  # noqa: E402
 from cot_blueprint_refine.prepare_inputs import DATASET_SUBSET, prepare  # noqa: E402
+from cot_blueprint_refine.run_cot_split import (  # noqa: E402
+    DETERMINISTIC_MODES,
+    LLM_MODES,
+    run_cot_split,
+)
 from cot_blueprint_refine.run_cot_refinement import refine  # noqa: E402
 from cot_blueprint_refine.vllm_runtime import PersistentVLLMRuntime  # noqa: E402
 from cot_blueprint_refine.kimina_runtime import PersistentKiminaRuntime  # noqa: E402
 from kimina_lean_compiler import KiminaLeanCompiler  # noqa: E402
 
 
-STAGES = ("prepare", "blueprint", "export", "refine", "evaluate")
+STAGES = ("prepare", "split", "blueprint", "export", "refine", "evaluate")
 STAGE_SEQUENCES = {
     "all": STAGES,
-    "cot-to-blueprint": ("prepare", "blueprint", "export"),
-    "blueprint-refine": ("prepare", "blueprint", "export", "refine"),
+    "cot-to-blueprint": ("prepare", "split", "blueprint", "export"),
+    "blueprint-refine": ("prepare", "split", "blueprint", "export", "refine"),
+    "phase1-only": ("prepare", "split", "blueprint"),
 }
 
 
@@ -44,8 +50,9 @@ def parse_args() -> argparse.Namespace:
         choices=(*STAGES, *STAGE_SEQUENCES),
         default="all",
         help=(
-            "A single stage, all stages, cot-to-blueprint (prepare+blueprint+export), "
-            "or blueprint-refine (prepare+blueprint+export+refine)"
+            "A single stage, all stages, cot-to-blueprint "
+            "(prepare+split+blueprint+export), or blueprint-refine "
+            "(prepare+split+blueprint+export+refine)"
         ),
     )
     parser.add_argument("override", nargs="*", help="OmegaConf dot-list overrides")
@@ -83,7 +90,7 @@ def preflight_model(model: str, base_url: str, api_key: str = "dummy") -> None:
 
 def _blueprint_result_is_terminal(row: dict[str, Any], *, retry_error_results: bool) -> bool:
     status = str(row.get("status") or "")
-    if bool(row.get("root_proved")) or status in {"solved", "exhausted"}:
+    if bool(row.get("root_proved")) or status in {"solved", "exhausted", "phase1_accepted"}:
         return True
     return status == "error" and not retry_error_results
 
@@ -101,13 +108,26 @@ def blueprint_results_complete(config: DictConfig) -> bool:
     retry_error_results = bool(config.blueprint.get("retry_error_results", False))
     missing_count = 0
     nonterminal_count = 0
+    manifest_mismatches: list[str] = []
     for generation in generation_rows:
         source_id = str(generation.get("name") or "")
         result = result_rows.get(source_id)
         if result is None:
             missing_count += 1
+        elif (
+            "cot_manifest_json" in result
+            and str(result.get("cot_manifest_json") or "")
+            != str(generation.get("cot_manifest_json") or "")
+        ):
+            manifest_mismatches.append(source_id)
         elif not _blueprint_result_is_terminal(result, retry_error_results=retry_error_results):
             nonterminal_count += 1
+    if manifest_mismatches:
+        preview = ", ".join(manifest_mismatches[:10])
+        raise RuntimeError(
+            "Refusing to resume RobustPA with changed COT manifests; use a new exp_name. "
+            f"mismatched={len(manifest_mismatches)} ids={preview}"
+        )
     complete = missing_count == 0 and nonterminal_count == 0
     if complete:
         print(
@@ -157,10 +177,20 @@ def run_blueprint(
         "problem_id=null",
         f"resume={str(bool(config.resume)).lower()}",
         f"max_refinement_iterations={blueprint.max_refinement_iterations}",
+        f"execution_mode={blueprint.get('execution_mode', 'full')}",
         f"blueprint_max_retries={blueprint.blueprint_max_retries}",
         f"node_max_prove_turns={blueprint.node_max_prove_turns}",
         f"node_max_negation_probe_turns={blueprint.node_max_negation_probe_turns}",
         f"max_tool_calls_per_turn={blueprint.max_tool_calls_per_turn}",
+        f"semantic_fidelity_enabled={str(bool(blueprint.get('semantic_fidelity_enabled', False))).lower()}",
+        f"semantic_require_step_ids={str(bool(blueprint.get('semantic_require_step_ids', False))).lower()}",
+        f"semantic_static_gate={str(bool(blueprint.get('semantic_static_gate', False))).lower()}",
+        f"semantic_minimal_ir={str(bool(blueprint.get('semantic_minimal_ir', False))).lower()}",
+        f"semantic_freeze_refinement={str(bool(blueprint.get('semantic_freeze_refinement', False))).lower()}",
+        f"semantic_audit_mode={blueprint.get('semantic_audit_mode', 'none')}",
+        f"semantic_max_repair_attempts={int(blueprint.get('semantic_max_repair_attempts', 1))}",
+        f"proof_policy={blueprint.get('proof_policy', 'full')}",
+        f"critical_negation_max_turns={int(blueprint.get('critical_negation_max_turns', 0))}",
         "node_timeout_s=null",
         "llm_api_timeout_s=null",
         f"phase1_concurrency={blueprint.phase1_concurrency}",
@@ -181,9 +211,39 @@ def run_blueprint(
     env = os.environ.copy()
     env.setdefault("GOEDEL_OPENAI_API_KEY", "dummy")
     env["GOEDEL_BLUEPRINT_MAX_TOKENS"] = str(int(blueprint.generation_max_tokens))
+    env["GOEDEL_PHASE1_MODEL_MAX_CONTEXT"] = str(
+        int(blueprint.get("phase1_model_max_context", blueprint.vllm.max_model_len))
+    )
+    env["GOEDEL_PHASE1_CONTEXT_SAFETY_MARGIN"] = str(
+        int(blueprint.get("phase1_context_safety_margin", 512))
+    )
+    env["GOEDEL_PHASE1_MAX_OUTPUT_CAP"] = str(
+        int(blueprint.get("phase1_max_output_cap", blueprint.generation_max_tokens))
+    )
+    env["GOEDEL_PHASE1_MIN_OUTPUT_TOKENS"] = str(
+        int(blueprint.get("phase1_min_output_tokens", 512))
+    )
+    env["GOEDEL_PHASE3_MODEL_MAX_CONTEXT"] = str(
+        int(blueprint.get("phase3_model_max_context", blueprint.vllm.max_model_len))
+    )
+    env["GOEDEL_PHASE3_CONTEXT_SAFETY_MARGIN"] = str(
+        int(blueprint.get("phase3_context_safety_margin", 512))
+    )
+    env["GOEDEL_PHASE3_MAX_OUTPUT_CAP"] = str(
+        int(blueprint.get("phase3_max_output_cap", blueprint.generation_max_tokens))
+    )
+    env["GOEDEL_PHASE3_MIN_OUTPUT_TOKENS"] = str(
+        int(blueprint.get("phase3_min_output_tokens", 512))
+    )
+    env["GOEDEL_TOKENIZER_PATH"] = str(
+        blueprint.get("tokenizer_path", blueprint.vllm.model_path)
+    )
     env["GOEDEL_PROVER_MAX_TOKENS"] = str(int(blueprint.prover_max_tokens))
     env["GOEDEL_PROVER_LENGTH_RETRY_MAX_TOKENS"] = str(
         int(blueprint.get("prover_length_retry_max_tokens", blueprint.prover_max_tokens))
+    )
+    env["GOEDEL_SEMANTIC_AUDIT_MAX_TOKENS"] = str(
+        int(blueprint.get("semantic_audit_max_tokens", 1024))
     )
     command = [
         str(config.python_bin),
@@ -222,6 +282,24 @@ def run_stage(
             return run_stage(stage, config, runtime, owned_kimina)
     if stage == "prepare":
         return prepare(config)
+    if stage == "split":
+        split_mode = str(config.cot_splitter.get("mode", "deterministic")).strip().lower()
+        if split_mode in LLM_MODES:
+            splitter = config.cot_splitter
+            runtime.ensure(
+                stage="cot_split",
+                client_model=str(splitter.model),
+                base_url=str(splitter.openai_base_url),
+                service=splitter.vllm,
+            )
+            preflight_model(
+                str(splitter.model),
+                str(splitter.openai_base_url),
+                str(splitter.get("api_key", "dummy")),
+            )
+        elif split_mode not in DETERMINISTIC_MODES:
+            raise ValueError(f"unknown cot_splitter.mode: {split_mode!r}")
+        return run_cot_split(config)
     if stage == "blueprint":
         return run_blueprint(config, runtime, kimina_runtime)
     if stage == "export":

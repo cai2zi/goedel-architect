@@ -63,8 +63,14 @@ def _status_code(exc: Exception) -> int | None:
     return getattr(exc, "status_code", None)
 
 
-def _request_id(exc: Exception) -> str:
-    return str(getattr(exc, "request_id", "") or "")
+def _request_id(value: Any) -> str:
+    """Return transport or OpenAI-compatible completion identifiers."""
+    return str(
+        getattr(value, "request_id", None)
+        or getattr(value, "_request_id", None)
+        or getattr(value, "id", None)
+        or ""
+    )
 
 
 def _is_retryable_llm_error(exc: Exception) -> bool:

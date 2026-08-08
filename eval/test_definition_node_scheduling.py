@@ -49,6 +49,23 @@ theorem root : base = 1 := by sorry_using [used]
 """
 
 
+POLICY_LEAN = """import Mathlib
+import Architect
+
+@[blueprint (statement := /-- First branch. -/) (proof := /-- Deferred. -/)]
+lemma first : True := by sorry_using []
+
+@[blueprint (statement := /-- Independent branch. -/) (proof := /-- Deferred. -/)]
+lemma second : True := by sorry_using []
+
+@[blueprint (statement := /-- Depends on the first branch. -/) (proof := /-- Deferred. -/)]
+lemma after_first : True := by sorry_using [first]
+
+@[blueprint (statement := /-- Root. -/) (proof := /-- Combine both branches. -/)]
+theorem policy_root : True := by sorry_using [after_first, second]
+"""
+
+
 class FakeCompiler:
     def __init__(self, final_result: CompilerResult) -> None:
         self.final_result = final_result
@@ -284,6 +301,89 @@ class RootClosureTest(unittest.TestCase):
         self.assertEqual(loaded.root_proved, expect_root)
         self.assertEqual(len(compiler.codes), 1)
         return loaded
+
+
+class ProofPolicyTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.blueprint = _parse_blueprint(POLICY_LEAN, "policy_root")
+
+    def _run(self, policy: str) -> tuple[list[str], OrchestratorResult]:
+        attempted: list[str] = []
+
+        async def fake_prove_one(**kwargs):
+            name = kwargs["name"]
+            attempted.append(name)
+            node = self.blueprint.node_by_name(name)
+            if name == "first":
+                return NodeResult(
+                    node,
+                    ProverResult(ProofSignal.PROOF_TOO_HARD, lean_errors=["first failed"]),
+                )
+            return NodeResult(node, ProverResult(ProofSignal.SOLVED, "by trivial"))
+
+        async def run() -> OrchestratorResult:
+            with patch("orchestrator._prove_one", side_effect=fake_prove_one):
+                return await prove_dag(
+                    self.blueprint,
+                    compiler=object(),
+                    retrieval=object(),
+                    proof_policy=policy,
+                )
+
+        return attempted, asyncio.run(run())
+
+    def test_first_failed_wave_finishes_wave_then_blocks_unrun_descendants(self) -> None:
+        attempted, result = self._run("first_failed_wave")
+
+        self.assertEqual(set(attempted), {"first", "second"})
+        self.assertEqual(result.node_results["first"].result.signal, ProofSignal.PROOF_TOO_HARD)
+        self.assertEqual(result.node_results["second"].result.signal, ProofSignal.SOLVED)
+        for name in ("after_first", "policy_root"):
+            self.assertEqual(
+                result.node_results[name].result.signal,
+                ProofSignal.BLOCKED_BY_DEPENDENCY,
+            )
+            self.assertIn(
+                "Skipped by proof_policy=first_failed_wave",
+                result.node_results[name].result.lean_errors[0],
+            )
+
+    def test_critical_path_stops_inside_wave_and_blocks_every_unrun_node(self) -> None:
+        attempted, result = self._run("critical_path")
+
+        self.assertEqual(attempted, ["first"])
+        self.assertEqual(result.node_results["first"].result.signal, ProofSignal.PROOF_TOO_HARD)
+        for name in ("second", "after_first", "policy_root"):
+            self.assertEqual(
+                result.node_results[name].result.signal,
+                ProofSignal.BLOCKED_BY_DEPENDENCY,
+            )
+            self.assertIn(
+                "Skipped by proof_policy=critical_path",
+                result.node_results[name].result.lean_errors[0],
+            )
+
+    def test_full_policy_keeps_scheduling_independent_work(self) -> None:
+        attempted, result = self._run("full")
+
+        self.assertEqual(set(attempted), {"first", "second"})
+        self.assertEqual(result.node_results["second"].result.signal, ProofSignal.SOLVED)
+        self.assertEqual(
+            result.node_results["after_first"].result.signal,
+            ProofSignal.BLOCKED_BY_DEPENDENCY,
+        )
+        self.assertEqual(
+            result.node_results["policy_root"].result.signal,
+            ProofSignal.BLOCKED_BY_DEPENDENCY,
+        )
+        self.assertIn(
+            "Unresolved dependencies",
+            result.node_results["after_first"].result.lean_errors[0],
+        )
+        self.assertNotIn(
+            "Skipped by proof_policy",
+            result.node_results["after_first"].result.lean_errors[0],
+        )
 
 
 if __name__ == "__main__":

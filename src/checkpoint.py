@@ -37,6 +37,22 @@ class CheckpointState:
     # The original natural-language proof/COT is retained so every Phase-3
     # refinement round can compare the formal blueprint against its source.
     informal_proof: str = ""
+    # Optional source semantics added for step-grounded COT experiments.  Both
+    # fields have defaults so checkpoints written before this schema continue
+    # to load unchanged.
+    cot_manifest_json: str = ""
+    claimed_answer: str = ""
+    semantic_fidelity_enabled: bool = False
+    semantic_require_step_ids: bool = False
+    semantic_static_gate: bool = False
+    semantic_minimal_ir: bool = False
+    semantic_freeze_refinement: bool = False
+    semantic_audit_mode: str = "none"
+    # Immutable iter=0 snapshot plus an append-only record of local gate
+    # decisions.  Plain dictionaries keep checkpoint JSON forward-compatible.
+    semantic_contract_snapshot: dict = field(default_factory=dict)
+    semantic_gate_results: list[dict] = field(default_factory=list)
+    semantic_status: str = ""
 
     def __post_init__(self) -> None:
         self.status = RunStatus(self.status)

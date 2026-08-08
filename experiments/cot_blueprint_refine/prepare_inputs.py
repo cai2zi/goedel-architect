@@ -19,9 +19,15 @@ from cot_blueprint_refine.common import (
     write_json,
     write_jsonl,
 )
+from cot_blueprint_refine.cot_steps import encode_steps, split_cot_steps
 
 
 DATASET_SUBSET = "qwen3_8b_math_verify"
+PARQUET_FIELDS = [
+    "name", "source", "row_index", "problem", "claimed_answer",
+    "post_think_cot", "informal_statement", "informal_proof",
+    "cot_manifest_json",
+]
 
 
 def _safe_filename(value: str) -> str:
@@ -31,6 +37,7 @@ def _safe_filename(value: str) -> str:
 
 def make_generation_row(row: dict[str, Any], post_think: str, answer: str) -> dict[str, Any]:
     problem = str(row.get("problem") or "").strip()
+    cot_manifest_json = encode_steps(split_cot_steps(post_think))
     informal_statement = (
         "Original problem:\n"
         f"{problem}\n\n"
@@ -46,7 +53,10 @@ def make_generation_row(row: dict[str, Any], post_think: str, answer: str) -> di
         "claimed_answer": answer,
         "post_think_cot": post_think,
         "informal_statement": informal_statement,
+        # Keep the source proof byte-for-byte unchanged.  The numbered step
+        # manifest travels beside it and is rendered only at prompt time.
         "informal_proof": post_think,
+        "cot_manifest_json": cot_manifest_json,
     }
 
 
@@ -62,6 +72,42 @@ def _reject_row(row: dict[str, Any], reason: str) -> dict[str, Any]:
         "think_open_count": opens,
         "think_close_count": closes,
     }
+
+
+def write_generation_artifacts(config: DictConfig, rows: list[dict[str, Any]]) -> None:
+    """Atomically keep prepared JSONL and parquet manifests in sync.
+
+    The LLM boundary stage rewrites only ``cot_manifest_json`` after every row
+    has passed exact-coverage validation.  Writing through temporary files keeps
+    a failed/interrupted split from leaving RobustPA with a mixed manifest set.
+    """
+    root = prepared_dir(config)
+    data_root = root / "data" / DATASET_SUBSET
+    data_root.mkdir(parents=True, exist_ok=True)
+
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[str(row["source"])].append({key: row[key] for key in PARQUET_FIELDS})
+
+    expected_paths: set[Path] = set()
+    temporary_paths: list[tuple[Path, Path]] = []
+    for source, source_rows in sorted(grouped.items()):
+        path = data_root / f"{_safe_filename(source)}-00000-of-00001.parquet"
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        pq.write_table(pa.Table.from_pylist(source_rows), temporary)
+        expected_paths.add(path)
+        temporary_paths.append((temporary, path))
+
+    jsonl_path = root / "generation_inputs.jsonl"
+    jsonl_temporary = jsonl_path.with_suffix(jsonl_path.suffix + ".tmp")
+    write_jsonl(jsonl_temporary, rows)
+
+    for temporary, path in temporary_paths:
+        temporary.replace(path)
+    for old_path in data_root.glob("*.parquet"):
+        if old_path not in expected_paths:
+            old_path.unlink()
+    jsonl_temporary.replace(jsonl_path)
 
 
 def prepare(config: DictConfig) -> dict[str, Any]:
@@ -133,19 +179,6 @@ def prepare(config: DictConfig) -> dict[str, Any]:
     stats["selected_requested_rows"] = len(requested_ids)
 
     root = prepared_dir(config)
-    data_root = root / "data" / DATASET_SUBSET
-    data_root.mkdir(parents=True, exist_ok=True)
-    for old_path in data_root.glob("*.parquet"):
-        old_path.unlink()
-
-    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    parquet_fields = ["name", "source", "row_index", "problem", "claimed_answer", "post_think_cot", "informal_statement", "informal_proof"]
-    for row in selected:
-        grouped[row["source"]].append({key: row[key] for key in parquet_fields})
-    for source, rows in sorted(grouped.items()):
-        path = data_root / f"{_safe_filename(source)}-00000-of-00001.parquet"
-        pq.write_table(pa.Table.from_pylist(rows), path)
-
     stats_payload = {
         **dict(sorted(stats.items())),
         "input_path": str(input_path),
@@ -153,7 +186,7 @@ def prepare(config: DictConfig) -> dict[str, Any]:
         "dataset_subset": DATASET_SUBSET,
         "requested_ids": requested_ids,
     }
-    write_jsonl(root / "generation_inputs.jsonl", selected)
+    write_generation_artifacts(config, selected)
     write_jsonl(root / "rejections.jsonl", rejections)
     write_json(root / "preprocessing_stats.json", stats_payload)
     print("[prepare] " + " ".join(

@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -25,6 +26,7 @@ from blueprint import (  # noqa: E402
     _parse_blueprint,
     generate_blueprint_from_informal,
 )
+from kimina_lean_compiler import CompilerResult  # noqa: E402
 from checkpoint import CheckpointState  # noqa: E402
 from cot_blueprint_refine.common import (  # noqa: E402
     claimed_answer,
@@ -68,6 +70,7 @@ from cot_blueprint_refine.run_cot_refinement import (  # noqa: E402
     fit_refinement_messages,
     fit_messages_to_context,
     normalize_refined_output,
+    refine,
     synthesize_legacy_conversation,
 )
 from cot_blueprint_refine.run_experiment import (  # noqa: E402
@@ -200,11 +203,15 @@ class PrepareInputsTest(unittest.TestCase):
     def test_composite_stage_sequences(self) -> None:
         self.assertEqual(
             STAGE_SEQUENCES["cot-to-blueprint"],
-            ("prepare", "blueprint", "export"),
+            ("prepare", "split", "blueprint", "export"),
         )
         self.assertEqual(
             STAGE_SEQUENCES["blueprint-refine"],
-            ("prepare", "blueprint", "export", "refine"),
+            ("prepare", "split", "blueprint", "export", "refine"),
+        )
+        self.assertEqual(
+            STAGE_SEQUENCES["phase1-only"],
+            ("prepare", "split", "blueprint"),
         )
 
     def test_filters_length_and_does_not_put_gold_in_generation_data(self) -> None:
@@ -320,6 +327,60 @@ theorem target : True := by sorry_using [checked_step]
         self.assertEqual(prompt_signal("protocol_error"), "NOT_PROVED")
         self.assertEqual(prompt_signal("solved", proved=True), "PROVED")
 
+    def test_source_step_is_exported_and_definition_is_not_called_proved(self) -> None:
+        code = """import Mathlib
+import Architect
+
+@[blueprint
+  (title := "COT_STEP:S001")
+  (statement := /-- The source value. -/)]
+def source_value : Nat := 7
+
+@[blueprint
+  (title := "COT_STEP:S002")
+  (statement := /-- The target. -/)
+  (proof := /-- Use the source value. -/)]
+theorem target : source_value = 7 := by sorry_using [source_value]
+"""
+        blueprint = _parse_blueprint(code, "target")
+        state = CheckpointState(informal_statement="test", model="model")
+        state.set_blueprint(blueprint)
+        state.node_results = {
+            "source_value": {"signal": "solved", "proof_body": "", "lean_errors": []},
+            "target": {"signal": "proof_too_hard", "proof_body": "", "lean_errors": []},
+        }
+
+        context, nodes, infra = render_blueprint_context(blueprint, state)
+
+        self.assertFalse(infra)
+        self.assertIn("COT_BLUEPRINT_SOURCE_STEP: S001", context)
+        self.assertIn("COT_BLUEPRINT_SOURCE_STEP: S002", context)
+        self.assertIn("COT_BLUEPRINT_NODE_STATUS: DEFINITION", context)
+        self.assertIn("not a proof", context)
+        self.assertNotIn("COT_BLUEPRINT_NODE_STATUS: PROVED\ndef source_value", context)
+        self.assertEqual(nodes[0]["source_step_id"], "S001")
+        self.assertEqual(nodes[0]["prompt_signal"], "DEFINITION")
+        self.assertEqual(nodes[0]["raw_signal"], "solved")
+        self.assertEqual(nodes[1]["source_step_id"], "S002")
+
+    def test_blueprint_refine_prompt_explains_definition_and_source_mapping(self) -> None:
+        messages = build_messages(
+            {
+                "problem": "Compute a value.",
+                "claimed_answer": "7",
+                "original_cot": r"The value is seven. \boxed{7}",
+                "context_quality": "VERIFIED",
+                "error": "",
+            },
+            prompt_mode="blueprint",
+            lean_context="-- COT_BLUEPRINT_NODE_STATUS: DEFINITION\ndef answer := 7",
+        )
+        system = messages[0]["content"]
+        self.assertIn("COT_BLUEPRINT_SOURCE_STEP", system)
+        self.assertIn("DEFINITION", system)
+        self.assertIn("not a theorem proof", system)
+        self.assertIn("hard-coded", system)
+
     def test_stale_proof_becomes_not_proved_and_dependent_is_blocked(self) -> None:
         blueprint = self._blueprint()
         state = CheckpointState(informal_statement="test", model="model")
@@ -396,6 +457,64 @@ class InvalidBlueprintRecoveryTest(unittest.TestCase):
                 )
         self.assertIn("wrong_name", caught.exception.last_candidate)
         self.assertEqual(caught.exception.failure_stage, "blueprint_contract")
+
+    def test_phase1_retries_keep_only_latest_lean_candidate(self) -> None:
+        def candidate(name: str) -> str:
+            return f"""import Mathlib
+import Architect
+@[blueprint (statement := /-- {name} -/) (proof := /-- gap -/)]
+theorem required_name : True := by sorry_using []
+"""
+
+        def model_response(name: str, reasoning: str, finish_reason: str):
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    content=f"{reasoning}\n```lean\n{candidate(name)}\n```",
+                    tool_calls=[],
+                ),
+                finish_reason=finish_reason,
+            )], usage=None)
+
+        responses = [
+            model_response("candidate_one", "PRIVATE_REASONING_ONE\n" * 1000, "length"),
+            model_response("candidate_two", "PRIVATE_REASONING_TWO\n" * 1000, "stop"),
+            model_response("candidate_three", "PRIVATE_REASONING_THREE", "stop"),
+        ]
+        requests = []
+
+        def call_model(_client, _model, messages, *_args, **_kwargs):
+            requests.append(deepcopy(messages))
+            return responses[len(requests) - 1]
+
+        compiler = SimpleNamespace(check_blueprint=lambda *_args: CompilerResult(
+            False,
+            errors=["synthetic Lean error"],
+            failure_kind="lean",
+        ))
+        with patch("blueprint.make_client", return_value=object()), patch(
+            "blueprint._call_blueprint_model", side_effect=call_model,
+        ):
+            with self.assertRaises(BlueprintGenerationError):
+                generate_blueprint_from_informal(
+                    "statement",
+                    "proof",
+                    "required_name",
+                    compiler=compiler,
+                    max_retries=3,
+                )
+
+        self.assertEqual([message["role"] for message in requests[1]], [
+            "system", "user", "assistant", "user",
+        ])
+        self.assertEqual(requests[0], requests[1][:2])
+        self.assertIn("candidate_one", requests[1][2]["content"])
+        self.assertNotIn("PRIVATE_REASONING_ONE", requests[1][2]["content"])
+        self.assertIn("reached its output limit", requests[1][3]["content"])
+
+        self.assertEqual(requests[0], requests[2][:2])
+        self.assertIn("candidate_two", requests[2][2]["content"])
+        self.assertNotIn("candidate_one", requests[2][2]["content"])
+        self.assertNotIn("PRIVATE_REASONING_TWO", requests[2][2]["content"])
 
 
 class ContextBudgetTest(unittest.TestCase):
@@ -499,13 +618,69 @@ class ContextBudgetTest(unittest.TestCase):
         self.assertEqual(metadata["blueprint_tokens_used"], 0)
         self.assertFalse(metadata["blueprint_truncated"])
 
+    def test_prompts_keep_but_deanchor_original_claim_and_scope_verified(self) -> None:
+        row = {
+            "problem": "Compute 1+1.",
+            "claimed_answer": "3",
+            "original_cot": r"One plus one is three. \boxed{3}",
+            "lean_context": "theorem source_copy : 1 + 1 = 3 := by sorry",
+            "context_quality": "VERIFIED",
+            "error": "",
+        }
+        messages = build_messages(row, prompt_mode="blueprint")
+        prompt = "\n".join(message["content"] for message in messages)
+        self.assertIn("UNTRUSTED ORIGINAL CLAIM — NOT A TARGET", prompt)
+        self.assertIn(row["claimed_answer"], prompt)
+        self.assertIn(row["original_cot"], prompt)
+        self.assertIn("Changing it is not penalized", prompt)
+        self.assertIn("not independent evidence", prompt)
+        self.assertIn("structural/export validation", prompt)
+        self.assertIn("does not certify semantic faithfulness", prompt)
+
 
 class RefinementConversationTest(unittest.TestCase):
+    def test_refine_disables_hidden_openai_sdk_retries(self) -> None:
+        class FakeClient:
+            init_kwargs: dict | None = None
+
+            def __init__(self, **kwargs):
+                type(self).init_kwargs = kwargs
+
+            async def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = OmegaConf.create({
+                "output_base": temporary,
+                "exp_name": "unit",
+                "resume": False,
+                "refine": {
+                    "api_key": "dummy",
+                    "openai_base_url": "http://localhost/v1",
+                    "concurrency": 1,
+                    "source_solution_model_label": "source",
+                },
+            })
+            with patch(
+                "cot_blueprint_refine.run_cot_refinement.AsyncOpenAI",
+                FakeClient,
+            ):
+                asyncio.run(refine(
+                    config,
+                    variant_name="blueprint",
+                    variant_config=OmegaConf.create({"prompt_mode": "blueprint"}),
+                ))
+        self.assertIsNotNone(FakeClient.init_kwargs)
+        self.assertEqual(FakeClient.init_kwargs["max_retries"], 0)
+
     def test_records_complete_request_response_and_normalization(self) -> None:
         class FakeResponse:
             choices = [SimpleNamespace(
                 message=SimpleNamespace(
-                    content=r"Checked steps. Final \boxed{2}",
+                    content=(
+                        r"<final_refined_solution>Checked steps. Final \boxed{2}"
+                        r"</final_refined_solution>"
+                    ),
                     reasoning_content="internal reasoning",
                     model_extra={},
                 ),
@@ -517,7 +692,10 @@ class RefinementConversationTest(unittest.TestCase):
                     "id": "response-1",
                     "choices": [{
                         "message": {
-                            "content": r"Checked steps. Final \boxed{2}",
+                            "content": (
+                                r"<final_refined_solution>Checked steps. Final \boxed{2}"
+                                r"</final_refined_solution>"
+                            ),
                             "reasoning_content": "internal reasoning",
                         },
                         "finish_reason": "stop",
@@ -564,6 +742,211 @@ class RefinementConversationTest(unittest.TestCase):
             self.assertEqual(payload["events"][0]["response"]["id"], "response-1")
             self.assertEqual(payload["events"][0]["assistant_reasoning_content"], "internal reasoning")
             self.assertEqual(payload["events"][0]["normalization"]["status"], "ok")
+            self.assertEqual(payload["events"][0]["request_mode"], "primary")
+            self.assertEqual(payload["events"][0]["request"]["max_tokens"], 100)
+            self.assertIsNone(payload["events"][0]["request"]["extra_body"])
+
+    def test_length_uses_one_concise_non_thinking_recovery_without_partial(self) -> None:
+        class FakeResponse:
+            def __init__(self, content: str, finish_reason: str):
+                self.choices = [SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=content,
+                        reasoning_content="private",
+                        model_extra={},
+                    ),
+                    finish_reason=finish_reason,
+                )]
+
+            def model_dump(self, mode="json"):
+                choice = self.choices[0]
+                return {
+                    "choices": [{
+                        "message": {"content": choice.message.content},
+                        "finish_reason": choice.finish_reason,
+                    }],
+                }
+
+        class SequencedCompletions:
+            def __init__(self):
+                self.calls: list[dict] = []
+                self.responses = [
+                    FakeResponse("HUGE_PARTIAL_SENTINEL" * 100, "length"),
+                    FakeResponse(
+                        r"<final_refined_solution>Short proof. \boxed{2}"
+                        r"</final_refined_solution>",
+                        "stop",
+                    ),
+                ]
+
+            async def create(self, **kwargs):
+                self.calls.append(kwargs)
+                return self.responses[len(self.calls) - 1]
+
+        completions = SequencedCompletions()
+        client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        with tempfile.TemporaryDirectory() as temporary:
+            config = OmegaConf.create({
+                "output_base": temporary,
+                "exp_name": "unit",
+                "refine": {
+                    "timeout_s": 3600,
+                    "max_retries": 3,
+                    "retry_max_delay_s": 0,
+                    "retry_base_delay_s": 0,
+                    "model": "model",
+                    "openai_base_url": "http://localhost/v1",
+                    "temperature": 0.6,
+                    "max_tokens": 20480,
+                    "concise_recovery_max_tokens": 8192,
+                },
+            })
+            row = {
+                "ID": "sample/recover", "source": "s", "problem": "1+1?",
+                "claimed_answer": "3", "context_quality": "VERIFIED",
+                "status": "ready", "refine_eligible": True,
+            }
+            messages = [{"role": "user", "content": "ORIGINAL_INPUT"}]
+            with patch(
+                "cot_blueprint_refine.run_cot_refinement.fit_messages_to_context",
+                return_value=(messages, {"input_tokens": 10, "effective_max_tokens": 20480}),
+            ):
+                result = asyncio.run(_call_one(client, asyncio.Semaphore(1), row, config))
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["attempts"], 2)
+            self.assertTrue(result["concise_recovery_used"])
+            self.assertEqual(completions.calls[0]["max_tokens"], 20480)
+            self.assertNotIn("extra_body", completions.calls[0])
+            self.assertEqual(completions.calls[1]["max_tokens"], 8192)
+            self.assertEqual(
+                completions.calls[1]["extra_body"],
+                {"chat_template_kwargs": {"enable_thinking": False}},
+            )
+            recovery_request = json.dumps(completions.calls[1]["messages"])
+            self.assertNotIn("HUGE_PARTIAL_SENTINEL", recovery_request)
+            self.assertIn("Output only one", recovery_request)
+
+            artifact = conversation_path(Path(temporary) / "unit", "sample/recover")
+            events = json.loads(artifact.read_text(encoding="utf-8"))["events"]
+            self.assertEqual(events[0]["status"], "recovery_scheduled")
+            self.assertEqual(events[0]["request"]["max_tokens"], 20480)
+            self.assertIsNone(events[0]["request"]["extra_body"])
+            self.assertEqual(events[1]["request_mode"], "concise_recovery")
+            self.assertEqual(events[1]["request"]["max_tokens"], 8192)
+            self.assertEqual(
+                events[1]["request"]["extra_body"],
+                {"chat_template_kwargs": {"enable_thinking": False}},
+            )
+
+    def test_missing_markers_gets_at_most_one_concise_recovery(self) -> None:
+        class FakeResponse:
+            choices = [SimpleNamespace(
+                message=SimpleNamespace(
+                    content=r"A markerless answer. \boxed{2}",
+                    reasoning_content=None,
+                    model_extra={},
+                ),
+                finish_reason="stop",
+            )]
+
+            def model_dump(self, mode="json"):
+                return {"choices": []}
+
+        class FakeCompletions:
+            calls: list[dict] = []
+
+            async def create(self, **kwargs):
+                self.calls.append(kwargs)
+                return FakeResponse()
+
+        completions = FakeCompletions()
+        client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        with tempfile.TemporaryDirectory() as temporary:
+            config = OmegaConf.create({
+                "output_base": temporary,
+                "exp_name": "unit",
+                "refine": {
+                    "timeout_s": 30, "max_retries": 3,
+                    "retry_max_delay_s": 0, "retry_base_delay_s": 0,
+                    "model": "model", "openai_base_url": "http://localhost/v1",
+                    "temperature": 0.6, "max_tokens": 20480,
+                },
+            })
+            row = {
+                "ID": "sample/bad-markers", "source": "s", "problem": "1+1?",
+                "claimed_answer": "3", "context_quality": "VERIFIED",
+                "status": "ready", "refine_eligible": True,
+            }
+            with patch(
+                "cot_blueprint_refine.run_cot_refinement.fit_messages_to_context",
+                return_value=([{"role": "user", "content": "input"}], {}),
+            ):
+                result = asyncio.run(_call_one(client, asyncio.Semaphore(1), row, config))
+        self.assertEqual(len(completions.calls), 2)
+        self.assertEqual(result["status"], "invalid_output")
+        self.assertEqual(result["error"], "missing_final_refined_solution_open")
+        self.assertTrue(result["concise_recovery_used"])
+
+    def test_lenient_envelope_extracts_complete_block_without_regeneration(self) -> None:
+        class FakeResponse:
+            choices = [SimpleNamespace(
+                message=SimpleNamespace(
+                    content=(
+                        "scratch text\n"
+                        r"<final_refined_solution>Valid proof. \boxed{2}"
+                        r"</final_refined_solution>"
+                    ),
+                    reasoning_content=None,
+                    model_extra={},
+                ),
+                finish_reason="stop",
+            )]
+
+            def model_dump(self, mode="json"):
+                return {"choices": []}
+
+        class FakeCompletions:
+            def __init__(self):
+                self.calls: list[dict] = []
+
+            async def create(self, **kwargs):
+                self.calls.append(kwargs)
+                return FakeResponse()
+
+        completions = FakeCompletions()
+        client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        with tempfile.TemporaryDirectory() as temporary:
+            config = OmegaConf.create({
+                "output_base": temporary,
+                "exp_name": "unit",
+                "refine": {
+                    "timeout_s": 30, "max_retries": 3,
+                    "retry_max_delay_s": 0, "retry_base_delay_s": 0,
+                    "model": "model", "openai_base_url": "http://localhost/v1",
+                    "temperature": 0.6, "max_tokens": 20480,
+                    "strict_final_envelope": False,
+                },
+            })
+            row = {
+                "ID": "sample/lenient", "source": "s", "problem": "1+1?",
+                "claimed_answer": "3", "context_quality": "VERIFIED",
+                "status": "ready", "refine_eligible": True,
+            }
+            with patch(
+                "cot_blueprint_refine.run_cot_refinement.fit_messages_to_context",
+                return_value=([{"role": "user", "content": "input"}], {}),
+            ):
+                result = asyncio.run(_call_one(client, asyncio.Semaphore(1), row, config))
+
+        self.assertEqual(len(completions.calls), 1)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["refined_cot"], r"Valid proof. \boxed{2}")
+        self.assertEqual(
+            result["final_envelope_warning"],
+            "content_outside_final_refined_solution",
+        )
+        self.assertFalse(result["concise_recovery_used"])
 
     def test_legacy_conversation_preserves_existing_prompt_and_response(self) -> None:
         row = {
@@ -1320,6 +1703,114 @@ class PersistentVLLMRuntimeTest(unittest.TestCase):
             ]
             self.assertEqual({row["pid"] for row in attachments}, {397})
 
+    def test_use_existing_preflights_reuses_and_never_owns_or_destroys(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = VLLMServerTest._config(Path(temporary))
+            config.vllm.use_existing = True
+            with patch.object(
+                VLLMServer, "_port_is_in_use", return_value=True,
+            ), patch.object(
+                VLLMServer, "_check_health",
+            ) as health, patch.object(
+                VLLMServer, "_available_models", return_value={"model"},
+            ) as models, patch(
+                "cot_blueprint_refine.vllm_runtime.subprocess.Popen",
+            ) as popen, patch(
+                "cot_blueprint_refine.vllm_runtime.os.killpg",
+            ) as killpg, patch.object(
+                VLLMServer, "_wait_for_port_release",
+            ) as wait_for_port_release:
+                runtime = PersistentVLLMRuntime(config)
+                for stage in ("cot-split", "blueprint"):
+                    server = runtime.ensure(
+                        stage=stage,
+                        client_model="model",
+                        base_url="http://127.0.0.1:8123/v1",
+                        service=config.service,
+                    )
+                    self.assertTrue(server.use_existing)
+                    self.assertIsNone(server.process)
+                runtime.close()
+
+            popen.assert_not_called()
+            killpg.assert_not_called()
+            wait_for_port_release.assert_not_called()
+            health.assert_called_once()
+            models.assert_called_once()
+            session = json.loads(runtime.session_path.read_text(encoding="utf-8"))
+            self.assertEqual(session["status"], "detached_existing")
+            self.assertEqual(session["ownership"], "external")
+            self.assertEqual(session["start_count"], 0)
+            self.assertEqual(session["stop_count"], 0)
+            self.assertEqual(session["external_attach_count"], 1)
+            self.assertEqual(session["reuse_count"], 1)
+            attachments = [
+                json.loads(line)
+                for line in runtime.attachments_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(attachments), 2)
+            self.assertTrue(all(row["ownership"] == "external" for row in attachments))
+            self.assertTrue(all(row["pid"] is None for row in attachments))
+            metadata = json.loads(runtime.server.metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(metadata["status"], "detached_existing")
+            self.assertIsNone(metadata["command"])
+            self.assertFalse(metadata["auto_start"])
+            self.assertFalse(metadata["auto_destroy"])
+            self.assertTrue(metadata["configured_auto_start"])
+            self.assertTrue(metadata["configured_auto_destroy"])
+            self.assertTrue(metadata["preflight"]["health_ok"])
+            self.assertTrue(metadata["preflight"]["model_ok"])
+
+    def test_use_existing_missing_service_fails_without_start_or_destroy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = VLLMServerTest._config(Path(temporary))
+            config.vllm.use_existing = True
+            runtime = PersistentVLLMRuntime(config)
+            with patch.object(
+                VLLMServer, "_port_is_in_use", return_value=False,
+            ), patch(
+                "cot_blueprint_refine.vllm_runtime.subprocess.Popen",
+            ) as popen, patch(
+                "cot_blueprint_refine.vllm_runtime.os.killpg",
+            ) as killpg:
+                with self.assertRaisesRegex(RuntimeError, "use_existing=true.*not reachable"):
+                    runtime.ensure(
+                        stage="cot-split",
+                        client_model="model",
+                        base_url="http://127.0.0.1:8123/v1",
+                        service=config.service,
+                    )
+            popen.assert_not_called()
+            killpg.assert_not_called()
+            metadata = json.loads(
+                (runtime.root / "experiment_397b.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metadata["status"], "existing_preflight_failed")
+            self.assertFalse(metadata["preflight"]["host_port_reachable"])
+
+    def test_use_existing_rejects_wrong_served_model_without_start(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = VLLMServerTest._config(Path(temporary))
+            config.vllm.use_existing = True
+            runtime = PersistentVLLMRuntime(config)
+            with patch.object(
+                VLLMServer, "_port_is_in_use", return_value=True,
+            ), patch.object(
+                VLLMServer, "_check_health",
+            ), patch.object(
+                VLLMServer, "_available_models", return_value={"other-model"},
+            ), patch(
+                "cot_blueprint_refine.vllm_runtime.subprocess.Popen",
+            ) as popen:
+                with self.assertRaisesRegex(RuntimeError, "does not serve required model"):
+                    runtime.ensure(
+                        stage="cot-split",
+                        client_model="model",
+                        base_url="http://127.0.0.1:8123/v1",
+                        service=config.service,
+                    )
+            popen.assert_not_called()
+
 
 class VLLMServerTest(unittest.TestCase):
     @staticmethod
@@ -1372,6 +1863,23 @@ class VLLMServerTest(unittest.TestCase):
             self.assertIn("--tool-call-parser", command)
             self.assertIn("--enable-auto-tool-choice", command)
             self.assertIn("--disable-log-stats", command)
+
+    def test_missing_or_false_use_existing_preserves_managed_compatibility(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = self._config(Path(temporary))
+            self.assertNotIn("use_existing", config.vllm)
+            server = VLLMServer(
+                config, stage="blueprint", client_model="model",
+                base_url="http://127.0.0.1:8123/v1", service=config.service,
+            )
+            self.assertFalse(server.use_existing)
+            config.vllm.use_existing = False
+            self.assertFalse(server.use_existing)
+
+    def test_use_existing_profile_defaults_are_explicit(self) -> None:
+        self.assertFalse(bool(load_config("base", []).vllm.use_existing))
+        profile = load_config("qwen3_8b_397b_wrong76_llm_split", [])
+        self.assertTrue(bool(profile.vllm.use_existing))
 
     def test_exclusive_port_rejects_without_starting_process(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1651,6 +2159,50 @@ class BlueprintResumeTest(unittest.TestCase):
             self.assertTrue(blueprint_results_complete(config))
             config.blueprint.retry_error_results = True
             self.assertFalse(blueprint_results_complete(config))
+
+    def test_phase1_accepted_is_a_terminal_resume_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output_root = root / "out" / "unit"
+            self._write_jsonl(output_root / "prepared" / "generation_inputs.jsonl", [
+                {"name": "accepted", "cot_manifest_json": "manifest"},
+            ])
+            self._write_jsonl(output_root / "robustpa" / "blueprint" / "results.jsonl", [
+                {
+                    "source_id": "accepted", "status": "phase1_accepted",
+                    "root_proved": False, "cot_manifest_json": "manifest",
+                },
+            ])
+            config = OmegaConf.create({
+                "output_base": str(root / "out"), "exp_name": "unit",
+                "resume": True, "blueprint": {"retry_error_results": False},
+            })
+            self.assertTrue(blueprint_results_complete(config))
+
+    def test_resume_rejects_changed_cot_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output_root = root / "out" / "unit"
+            self._write_jsonl(output_root / "prepared" / "generation_inputs.jsonl", [
+                {"name": "sample", "cot_manifest_json": "new-manifest"},
+            ])
+            self._write_jsonl(output_root / "robustpa" / "blueprint" / "results.jsonl", [
+                {
+                    "source_id": "sample",
+                    "status": "exhausted",
+                    "root_proved": False,
+                    "cot_manifest_json": "old-manifest",
+                },
+            ])
+            config = OmegaConf.create({
+                "output_base": str(root / "out"),
+                "exp_name": "unit",
+                "resume": True,
+                "blueprint": {"retry_error_results": False},
+            })
+
+            with self.assertRaisesRegex(RuntimeError, "changed COT manifests"):
+                blueprint_results_complete(config)
 
     def test_run_all_uses_stage_environment_variable(self) -> None:
         script = (REPO_ROOT / "experiments/cot_blueprint_refine/run_all.sh").read_text(

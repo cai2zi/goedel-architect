@@ -51,6 +51,12 @@ def prompt_signal(raw_signal: str, *, proved: bool = False) -> str:
 
 
 def _status_explanation(signal: str) -> str:
+    if signal == "DEFINITION":
+        return (
+            "Lean accepted this definition and its body as well-typed. This is not a proof "
+            "that the definition faithfully represents the original problem or COT step, "
+            "and it does not validate any answer or mathematical claim encoded in the body."
+        )
     if signal == "NOT_PROVED":
         return (
             "This node was not successfully proved. The corresponding solution step may be "
@@ -99,7 +105,7 @@ def render_blueprint_context(
             has_infra_error = True
 
         if node.kind == "definition":
-            signal = "PROVED"
+            signal = "DEFINITION"
             rendered = node.full_declaration().strip()
         else:
             proved = (
@@ -115,6 +121,9 @@ def render_blueprint_context(
                 rendered = node.full_declaration().strip()
 
         block = [
+            *prompt_safe_comment_lines(
+                "COT_BLUEPRINT_SOURCE_STEP", node.source_step_id or "(unmapped)",
+            ),
             *prompt_safe_comment_lines("COT_BLUEPRINT_NODE_STATEMENT", node.statement or "(none)"),
             *prompt_safe_comment_lines("COT_BLUEPRINT_NODE_PROOF_SKETCH", node.proof_sketch or "(none)"),
             f"-- COT_BLUEPRINT_NODE_STATUS: {signal}",
@@ -130,10 +139,15 @@ def render_blueprint_context(
         node_rows.append({
             "name": node.name,
             "kind": node.kind,
+            "source_step_id": node.source_step_id,
             "statement": node.statement,
             "proof_sketch": node.proof_sketch,
             "dependencies": list(node.dependencies),
-            "raw_signal": raw_signal or ("solved" if signal == "PROVED" else "pending"),
+            "raw_signal": raw_signal or (
+                "definition" if signal == "DEFINITION"
+                else "solved" if signal == "PROVED"
+                else "pending"
+            ),
             "prompt_signal": signal,
             "proof_body": proof_body,
             "lean_errors": lean_errors,

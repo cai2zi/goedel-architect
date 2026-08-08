@@ -6,6 +6,7 @@ include_ids: []
 python_bin: /ssd/miniconda3/envs/lean4-czx/bin/python
 
 vllm:
+  use_existing: false
   auto_start: true
   auto_destroy: true
   startup_timeout_s: 1800
@@ -44,13 +45,41 @@ shared_vllm_397b:
   enable_auto_tool_choice: true
   extra_args: []
 
+cot_splitter:
+  # `deterministic` preserves the historical Markdown/regex splitter.  The
+  # quality experiment overrides this with `llm_boundary_v1`.
+  mode: deterministic
+  model: ${shared_vllm_397b.served_model_name}
+  openai_base_url: http://127.0.0.1:8001/v1
+  api_key: dummy
+  vllm: ${shared_vllm_397b}
+  temperature: 0.0
+  max_tokens: 2048
+  concurrency: 24
+  timeout_s: 600
+  max_attempts: 2
+  enable_thinking: false
+  fallback_on_error: false
+  atomizer_version: cot-atomizer-v1
+  prompt_version: cot-split-boundaries-v6
+
 blueprint:
+  execution_mode: full
   model: Qwen3.5-397B-A17B-FP8
   openai_base_url: http://127.0.0.1:8001/v1
   vllm: ${shared_vllm_397b}
   retry_error_results: false
   # Shared by initial Blueprint generation and Blueprint refinement.
   generation_max_tokens: 16384
+  phase1_model_max_context: ${shared_vllm_397b.max_model_len}
+  phase1_context_safety_margin: 512
+  phase1_max_output_cap: 16384
+  phase1_min_output_tokens: 512
+  phase3_model_max_context: ${shared_vllm_397b.max_model_len}
+  phase3_context_safety_margin: 512
+  phase3_max_output_cap: 16384
+  phase3_min_output_tokens: 512
+  tokenizer_path: ${shared_vllm_397b.model_path}
   # Used by per-node proving and the negation probe.
   prover_max_tokens: 8192
   # Only the current node is upgraded to this limit after a length finish.
@@ -62,6 +91,16 @@ blueprint:
   # Set to 0 to disable the negation probe.
   node_max_negation_probe_turns: 1
   max_tool_calls_per_turn: 3
+  semantic_fidelity_enabled: false
+  semantic_require_step_ids: false
+  semantic_static_gate: false
+  semantic_minimal_ir: false
+  semantic_freeze_refinement: false
+  semantic_audit_mode: none
+  semantic_audit_max_tokens: 1024
+  semantic_max_repair_attempts: 1
+  proof_policy: full
+  critical_negation_max_turns: 0
   phase1_concurrency: 1024
   phase2_blueprint_concurrency: 1024
   phase2_node_concurrency: 4096
@@ -85,6 +124,10 @@ refine:
   api_key: dummy
   temperature: 0.6
   max_tokens: 20480
+  # When false, safely extract the last complete tagged solution and retain any
+  # extra/multiple-marker envelope defect as an audit warning instead of paying
+  # for a second full generation.
+  strict_final_envelope: true
   context_window: 40960
   context_safety_margin: 256
   tokenizer_path: /ssd/czx/models/Qwen3.5-397B-A17B-FP8

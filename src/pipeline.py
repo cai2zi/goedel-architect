@@ -8,6 +8,8 @@ from pathlib import Path
 
 from blueprint import (
     Blueprint,
+    _emit_semantic_check,
+    _enabled_semantic_issues,
     format_phase2_contract_errors,
     generate_blueprint,
     phase2_contract_errors,
@@ -23,7 +25,14 @@ from orchestrator import (
     prove_dag,
 )
 from prover import ProofSignal, ProverResult
-from refinement import refine_blueprint
+from refinement import SemanticRefinementError, refine_blueprint
+from semantic_fidelity import (
+    format_semantic_issues,
+    parse_cot_manifest,
+    semantic_snapshot_from_dict,
+    snapshot_blueprint_semantics,
+    validate_blueprint_fidelity,
+)
 from tracer import NullTracer, TraceEvent
 
 
@@ -156,6 +165,8 @@ async def run_phase2_async(
     node_max_prove_turns: int | None = None,
     node_max_negation_probe_turns: int = 1,
     max_tool_calls_per_turn: int = 3,
+    proof_policy: str = "full",
+    critical_negation_max_turns: int = 0,
     node_executor: Executor | None = None,
     node_semaphore: asyncio.Semaphore | None = None,
 ) -> OrchestratorResult:
@@ -163,6 +174,38 @@ async def run_phase2_async(
     blueprint = state.get_blueprint()
     if blueprint is None:
         raise RuntimeError(f"No blueprint in checkpoint {checkpoint_path}")
+    if state.semantic_fidelity_enabled:
+        semantic_issues = _enabled_semantic_issues(
+            validate_blueprint_fidelity(
+                blueprint,
+                parse_cot_manifest(state.cot_manifest_json),
+                claimed_answer=state.claimed_answer,
+                require_step_bindings=state.semantic_require_step_ids,
+            ),
+            require_step_ids=state.semantic_require_step_ids,
+            static_gate=state.semantic_static_gate,
+        )
+        _emit_semantic_check(
+            tracer,
+            thm_name=blueprint.target_theorem,
+            phase="phase2_checkpoint",
+            attempt=state.iteration + 1,
+            issues=semantic_issues,
+        )
+        state.semantic_gate_results.append({
+            "stage": "phase2_checkpoint",
+            "passed": not semantic_issues,
+            "issues": [issue.to_dict() for issue in semantic_issues],
+        })
+        if semantic_issues:
+            state.status = RunStatus.ERROR
+            state.semantic_status = "phase2_checkpoint_rejected"
+            state.final_lean_errors = [format_semantic_issues(semantic_issues)]
+            state.save(checkpoint_path)
+            return OrchestratorResult(
+                active_nodes=active_node_names(blueprint),
+                root_name=blueprint.target_theorem,
+            )
     contract_errors = phase2_contract_errors(blueprint)
     if contract_errors:
         raise RuntimeError(format_phase2_contract_errors(contract_errors))
@@ -185,6 +228,8 @@ async def run_phase2_async(
         node_max_prove_turns=node_max_prove_turns,
         node_max_negation_probe_turns=node_max_negation_probe_turns,
         max_tool_calls_per_turn=max_tool_calls_per_turn,
+        proof_policy=proof_policy,
+        critical_negation_max_turns=critical_negation_max_turns,
         node_executor=node_executor,
         node_semaphore=node_semaphore,
     )
@@ -266,6 +311,12 @@ def run_phase3(
     thm_name: str = "",
     blueprint_max_retries: int | None = None,
     phase2_contract_check_concurrency: int = 1,
+    semantic_fidelity_enabled: bool | None = None,
+    semantic_require_step_ids: bool | None = None,
+    semantic_static_gate: bool | None = None,
+    semantic_freeze_refinement: bool | None = None,
+    semantic_audit_mode: str | None = None,
+    semantic_max_repair_attempts: int = 1,
 ) -> Blueprint:
     state = CheckpointState.load(checkpoint_path)
     if state.status != RunStatus.RUNNING:
@@ -292,9 +343,58 @@ def run_phase3(
             phase2_contract_check_concurrency=phase2_contract_check_concurrency,
             informal_statement=state.informal_statement,
             informal_proof=state.informal_proof,
+            cot_manifest_json=state.cot_manifest_json,
+            claimed_answer=state.claimed_answer,
+            semantic_fidelity_enabled=(
+                state.semantic_fidelity_enabled
+                if semantic_fidelity_enabled is None
+                else semantic_fidelity_enabled
+            ),
+            semantic_require_step_ids=(
+                state.semantic_require_step_ids
+                if semantic_require_step_ids is None
+                else semantic_require_step_ids
+            ),
+            semantic_static_gate=(
+                state.semantic_static_gate
+                if semantic_static_gate is None
+                else semantic_static_gate
+            ),
+            semantic_freeze_refinement=(
+                state.semantic_freeze_refinement
+                if semantic_freeze_refinement is None
+                else semantic_freeze_refinement
+            ),
+            semantic_audit_mode=(
+                state.semantic_audit_mode
+                if semantic_audit_mode is None
+                else semantic_audit_mode
+            ),
+            semantic_max_repair_attempts=semantic_max_repair_attempts,
+            baseline_semantic_snapshot=(
+                semantic_snapshot_from_dict(state.semantic_contract_snapshot)
+                if state.semantic_contract_snapshot
+                else None
+            ),
         )
     except KiminaInfrastructureError as exc:
         state.status = RunStatus.ERROR
+        state.final_lean_errors = [str(exc)]
+        state.refinement_history = history
+        state.save(checkpoint_path)
+        return blueprint
+    except SemanticRefinementError as exc:
+        state.status = RunStatus.EXHAUSTED
+        state.semantic_status = "refinement_rejected"
+        state.semantic_gate_results.append({
+            "stage": "phase3_local_gate",
+            "passed": False,
+            "issues": [
+                issue.to_dict() if hasattr(issue, "to_dict") else {"message": str(issue)}
+                for issue in exc.issues
+            ],
+            "message": str(exc),
+        })
         state.final_lean_errors = [str(exc)]
         state.refinement_history = history
         state.save(checkpoint_path)
@@ -308,6 +408,9 @@ def run_phase3(
     state.proved_cache = _invalidate_stale_proofs(
         revised, state.proved_cache, state.proof_cache_keys,
     )
+    state.semantic_gate_results.extend(revised.semantic_gate_results)
+    if state.semantic_fidelity_enabled:
+        state.semantic_status = "refinement_accepted"
     state.proof_cache_keys = {
         name: key for name, key in state.proof_cache_keys.items()
         if name in state.proved_cache
@@ -374,6 +477,8 @@ def prove_theorem(
     node_max_prove_turns: int | None = None,
     node_max_negation_probe_turns: int = 1,
     max_tool_calls_per_turn: int = 3,
+    proof_policy: str = "full",
+    critical_negation_max_turns: int = 0,
 ) -> ProofResult:
     tracer = tracer or NullTracer()
     state = CheckpointState.load_or_none(checkpoint_path)
@@ -406,6 +511,8 @@ def prove_theorem(
             node_max_prove_turns=node_max_prove_turns,
             node_max_negation_probe_turns=node_max_negation_probe_turns,
             max_tool_calls_per_turn=max_tool_calls_per_turn,
+            proof_policy=proof_policy,
+            critical_negation_max_turns=critical_negation_max_turns,
         )
         state = CheckpointState.load(checkpoint_path)
         if state.status != RunStatus.RUNNING:

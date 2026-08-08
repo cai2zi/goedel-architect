@@ -79,7 +79,7 @@ def _error_text(exc: BaseException) -> str:
 
 
 def _request_id(value: Any) -> str | None:
-    for name in ("request_id", "_request_id"):
+    for name in ("request_id", "_request_id", "id"):
         request_id = getattr(value, name, None)
         if request_id:
             return str(request_id)

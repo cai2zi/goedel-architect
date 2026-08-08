@@ -13,7 +13,7 @@ import time
 import traceback
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -42,6 +42,7 @@ from robustpa_refine.runtime import (  # noqa: E402
 from mathlib_retrieval import MathlibRetrieval  # noqa: E402
 from orchestrator import active_node_names  # noqa: E402
 from pipeline import run_phase2_async, run_phase3  # noqa: E402
+from semantic_fidelity import parse_cot_manifest, snapshot_blueprint_semantics  # noqa: E402
 from tracer import JsonlTracer  # noqa: E402
 
 
@@ -111,6 +112,8 @@ class Record:
     theorem_name: str
     informal_statement: str
     informal_proof: str
+    cot_manifest_json: str
+    claimed_answer: str
 
 
 def _apply_environment(config: dict[str, Any]) -> None:
@@ -161,12 +164,16 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
     args.llm_api_timeout_s = _optional_timeout(args.llm_api_timeout_s)
     args.node_max_prove_turns = _optional_positive_int(args.node_max_prove_turns)
     args.node_max_negation_probe_turns = int(args.node_max_negation_probe_turns)
+    args.critical_negation_max_turns = int(args.critical_negation_max_turns)
     args.max_tool_calls_per_turn = int(args.max_tool_calls_per_turn)
+    args.semantic_max_repair_attempts = int(args.semantic_max_repair_attempts)
     _validate_args(args)
     return args
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    if args.execution_mode not in {"full", "phase1_only"}:
+        raise ValueError("execution_mode must be one of: full, phase1_only")
     for name in (
         "phase1_concurrency",
         "phase2_blueprint_concurrency",
@@ -185,6 +192,14 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("max_refinement_iterations must be non-negative")
     if args.node_max_negation_probe_turns < 0:
         raise ValueError("node_max_negation_probe_turns must be non-negative")
+    if args.critical_negation_max_turns < 0:
+        raise ValueError("critical_negation_max_turns must be non-negative")
+    if args.semantic_max_repair_attempts < 0:
+        raise ValueError("semantic_max_repair_attempts must be non-negative")
+    if args.semantic_audit_mode not in {"none", "risk", "full"}:
+        raise ValueError("semantic_audit_mode must be one of: none, risk, full")
+    if args.proof_policy not in {"full", "first_failed_wave", "critical_path"}:
+        raise ValueError("proof_policy must be one of: full, first_failed_wave, critical_path")
     if args.node_timeout_s is not None and args.node_timeout_s <= 0:
         raise ValueError("node_timeout_s must be positive or none/null/0")
     if args.llm_api_timeout_s is not None and args.llm_api_timeout_s <= 0:
@@ -239,6 +254,8 @@ def _make_record(subset: str, split: str, parquet_path: Path, row_index: int, ro
     unique_id = f"{subset}__{split}__{record_id}"
     informal_statement = str(row.get("informal_statement") or "")
     informal_proof = str(row.get("informal_proof") or "")
+    cot_manifest_json = str(row.get("cot_manifest_json") or "")
+    claimed_answer = str(row.get("claimed_answer") or "")
     if not informal_statement:
         raise ValueError(f"row has no informal_statement: {parquet_path}:{row_index}")
     return Record(
@@ -252,6 +269,8 @@ def _make_record(subset: str, split: str, parquet_path: Path, row_index: int, ro
         theorem_name=theorem_name,
         informal_statement=informal_statement,
         informal_proof=informal_proof,
+        cot_manifest_json=cot_manifest_json,
+        claimed_answer=claimed_answer,
     )
 
 
@@ -312,6 +331,8 @@ def _node_rows(blueprint: Blueprint | None, state: CheckpointState | None) -> li
         rows.append({
             "name": node.name,
             "kind": node.kind,
+            "title": node.title,
+            "source_step_id": node.source_step_id,
             "dependencies": list(node.dependencies),
             "signal": signal or "pending",
             "proof_body": result.get("proof_body", proved_cache.get(node.name, "")),
@@ -414,6 +435,8 @@ def _result_row(
         "row_index": record.row_index,
         "parquet_path": str(record.parquet_path),
         "theorem_name": record.theorem_name,
+        "claimed_answer": record.claimed_answer,
+        "cot_manifest_json": record.cot_manifest_json,
         "status": status,
         "phase": phase,
         "success": bool(score["root_proved"]),
@@ -426,6 +449,16 @@ def _result_row(
         "node_max_prove_turns": args.node_max_prove_turns,
         "negation_probe_turns": args.node_max_negation_probe_turns,
         "max_tool_calls_per_turn": args.max_tool_calls_per_turn,
+        "proof_policy": args.proof_policy,
+        "critical_negation_max_turns": args.critical_negation_max_turns,
+        "semantic_fidelity_enabled": bool(args.semantic_fidelity_enabled),
+        "semantic_require_step_ids": bool(args.semantic_require_step_ids),
+        "semantic_static_gate": bool(args.semantic_static_gate),
+        "semantic_minimal_ir": bool(args.semantic_minimal_ir),
+        "semantic_freeze_refinement": bool(args.semantic_freeze_refinement),
+        "semantic_audit_mode": str(args.semantic_audit_mode),
+        "semantic_status": state.semantic_status if state else "",
+        "semantic_gate_results": list(state.semantic_gate_results) if state else [],
         **score,
     }
     if traceback_text:
@@ -507,6 +540,8 @@ async def _run_record(
                     generate_blueprint_from_informal,
                     informal_statement=record.informal_statement,
                     informal_proof=record.informal_proof,
+                    cot_manifest_json=record.cot_manifest_json,
+                    claimed_answer=record.claimed_answer,
                     target_name=record.theorem_name,
                     model=args.model,
                     compiler=runtime.compiler,
@@ -514,13 +549,38 @@ async def _run_record(
                     thm_name=record.unique_id,
                     max_retries=args.blueprint_max_retries,
                     phase2_contract_check_concurrency=args.phase2_contract_check_concurrency,
+                    semantic_fidelity_enabled=args.semantic_fidelity_enabled,
+                    semantic_require_step_ids=args.semantic_require_step_ids,
+                    semantic_static_gate=args.semantic_static_gate,
+                    semantic_minimal_ir=args.semantic_minimal_ir,
+                    semantic_audit_mode=args.semantic_audit_mode,
+                    semantic_max_repair_attempts=args.semantic_max_repair_attempts,
                 ),
             )
             state = CheckpointState(
                 informal_statement=record.informal_statement,
                 informal_proof=record.informal_proof,
+                cot_manifest_json=record.cot_manifest_json,
+                claimed_answer=record.claimed_answer,
                 model=args.model,
+                semantic_fidelity_enabled=bool(args.semantic_fidelity_enabled),
+                semantic_require_step_ids=bool(args.semantic_require_step_ids),
+                semantic_static_gate=bool(args.semantic_static_gate),
+                semantic_minimal_ir=bool(args.semantic_minimal_ir),
+                semantic_freeze_refinement=bool(args.semantic_freeze_refinement),
+                semantic_audit_mode=str(args.semantic_audit_mode),
             )
+            state.semantic_gate_results = list(blueprint.semantic_gate_results)
+            state.semantic_status = (
+                "phase1_accepted" if args.semantic_fidelity_enabled else "disabled"
+            )
+            if args.semantic_fidelity_enabled:
+                state.semantic_contract_snapshot = asdict(
+                    snapshot_blueprint_semantics(
+                        blueprint,
+                        parse_cot_manifest(record.cot_manifest_json),
+                    )
+                )
             state.set_blueprint(blueprint)
             state.save(checkpoint_path)
             path = _write_blueprint_snapshot(
@@ -537,6 +597,18 @@ async def _run_record(
                 state=state,
             )
             tqdm.write(f"[phase1-done] {record.unique_id} nodes={len(blueprint.nodes)}")
+
+        if args.execution_mode == "phase1_only":
+            return _result_row(
+                record,
+                output_root,
+                status="phase1_accepted",
+                phase="phase1",
+                blueprint=blueprint,
+                state=state,
+                runtime=runtime,
+                args=args,
+            )
 
         while True:
             state = CheckpointState.load(checkpoint_path)
@@ -571,6 +643,8 @@ async def _run_record(
                     node_max_prove_turns=args.node_max_prove_turns,
                     node_max_negation_probe_turns=args.node_max_negation_probe_turns,
                     max_tool_calls_per_turn=args.max_tool_calls_per_turn,
+                    proof_policy=args.proof_policy,
+                    critical_negation_max_turns=args.critical_negation_max_turns,
                     node_executor=node_executor,
                     node_semaphore=node_sem,
                 )
@@ -637,6 +711,12 @@ async def _run_record(
                         thm_name=record.unique_id,
                         blueprint_max_retries=args.blueprint_max_retries,
                         phase2_contract_check_concurrency=args.phase2_contract_check_concurrency,
+                        semantic_fidelity_enabled=args.semantic_fidelity_enabled,
+                        semantic_require_step_ids=args.semantic_require_step_ids,
+                        semantic_static_gate=args.semantic_static_gate,
+                        semantic_freeze_refinement=args.semantic_freeze_refinement,
+                        semantic_audit_mode=args.semantic_audit_mode,
+                        semantic_max_repair_attempts=args.semantic_max_repair_attempts,
                     ),
                 )
                 state = CheckpointState.load(checkpoint_path)
@@ -708,6 +788,7 @@ def _metric_row(scope: str, rows: list[dict[str, Any]], subset: str = "", split:
         "avg_total_nodes": sum(float(row.get("total_nodes") or 0) for row in rows) / total if total else 0.0,
         "avg_proved_ratio": sum(float(row.get("proved_ratio") or 0) for row in rows) / total if total else 0.0,
         "phase1_failed": sum(1 for row in rows if row.get("status") == "error" and row.get("phase") == "phase1"),
+        "phase1_accepted": sum(1 for row in rows if row.get("status") == "phase1_accepted"),
         "refine_failed": sum(1 for row in rows if row.get("status") == "error" and row.get("phase") == "phase3"),
         "exhausted": sum(1 for row in rows if row.get("status") == "exhausted"),
         "infra_error": sum(1 for row in rows if int(row.get("infra_error_node_count") or 0) > 0),
@@ -971,7 +1052,11 @@ async def _run_experiment(
         f"llm_api_timeout_s={args.llm_api_timeout_s} "
         f"node_max_prove_turns={args.node_max_prove_turns} "
         f"negation_probe_turns={args.node_max_negation_probe_turns} "
-        f"max_tool_calls_per_turn={args.max_tool_calls_per_turn}",
+        f"max_tool_calls_per_turn={args.max_tool_calls_per_turn} "
+        f"proof_policy={args.proof_policy} "
+        f"semantic_fidelity={args.semantic_fidelity_enabled} "
+        f"semantic_static_gate={args.semantic_static_gate} "
+        f"semantic_freeze={args.semantic_freeze_refinement}",
         flush=True,
     )
 

@@ -7,6 +7,7 @@ import os
 import re
 import time
 import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
@@ -29,6 +30,7 @@ PROVER_SYSTEM_PROMPT = load("prover_system")
 PROVER_USER_TEMPLATE = load("prover_user")
 DEFAULT_NODE_MAX_PROVE_TURNS = 8
 DEFAULT_MAX_TOOL_CALLS_PER_TURN = 3
+DEFAULT_TOOL_FEEDBACK_MAX_CHARS = 8192
 
 
 def _max_tokens() -> int:
@@ -37,6 +39,114 @@ def _max_tokens() -> int:
 
 def _length_retry_max_tokens() -> int:
     return int(os.environ.get("GOEDEL_PROVER_LENGTH_RETRY_MAX_TOKENS", str(_max_tokens())))
+
+
+def _tool_feedback_max_chars() -> int:
+    return max(
+        512,
+        int(os.environ.get(
+            "GOEDEL_TOOL_FEEDBACK_MAX_CHARS",
+            str(DEFAULT_TOOL_FEEDBACK_MAX_CHARS),
+        )),
+    )
+
+
+def _stable_deduplicate_lines(text: str) -> tuple[str, int]:
+    """Collapse exact repeated lines while preserving first-seen order."""
+    lines = text.splitlines()
+    counts = Counter(lines)
+    seen: set[str] = set()
+    compacted: list[str] = []
+    removed = 0
+    for line in lines:
+        if line in seen:
+            removed += 1
+            continue
+        seen.add(line)
+        compacted.append(line)
+        repeats = counts[line] - 1
+        if repeats > 0 and line.strip():
+            compacted.append(f"[previous line repeated {repeats} additional times]")
+    return "\n".join(compacted), removed
+
+
+def _head_tail_limit(text: str, max_chars: int) -> tuple[str, bool]:
+    if len(text) <= max_chars:
+        return text, False
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    marker = (
+        "\n... [tool feedback truncated; "
+        f"original_chars={len(text)} sha256={digest}] ...\n"
+    )
+    available = max_chars - len(marker)
+    if available <= 0:
+        return marker[:max_chars], True
+    head_chars = available // 2
+    tail_chars = available - head_chars
+    return text[:head_chars] + marker + text[-tail_chars:], True
+
+
+def _tool_feedback_for_model(
+    output: str,
+    *,
+    max_chars: int | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Project full tool output into bounded model history.
+
+    The caller keeps ``output`` unchanged for trace/cache.  Only the text sent
+    back to the model is deduplicated and bounded.
+    """
+    compacted, duplicate_lines_removed = _stable_deduplicate_lines(output)
+    sent, truncated = _head_tail_limit(
+        compacted,
+        _tool_feedback_max_chars() if max_chars is None else max(512, max_chars),
+    )
+    return sent, {
+        "original_chars": len(output),
+        "deduplicated_chars": len(compacted),
+        "sent_chars": len(sent),
+        "duplicate_lines_removed": duplicate_lines_removed,
+        "truncated": truncated,
+        "full_sha256": hashlib.sha256(output.encode()).hexdigest(),
+    }
+
+
+def _stable_deduplicate_diagnostics(diagnostics: list[str]) -> list[str]:
+    counts = Counter(diagnostics)
+    seen: set[str] = set()
+    compacted: list[str] = []
+    for diagnostic in diagnostics:
+        if diagnostic in seen:
+            continue
+        seen.add(diagnostic)
+        compacted.append(diagnostic)
+        repeats = counts[diagnostic] - 1
+        if repeats > 0:
+            compacted.append(
+                f"[previous diagnostic repeated {repeats} additional times]"
+            )
+    return compacted
+
+
+def _retain_latest_assistant_turn(
+    messages: list[dict[str, Any]],
+    base_messages: tuple[dict[str, Any], ...],
+) -> None:
+    """Retain the immutable prompt and the most recent legal assistant turn."""
+    base_len = len(base_messages)
+    latest_assistant = next(
+        (
+            index
+            for index in range(len(messages) - 1, base_len - 1, -1)
+            if messages[index].get("role") == "assistant"
+        ),
+        None,
+    )
+    if latest_assistant is None:
+        messages[:] = [dict(message) for message in base_messages]
+        return
+    latest_turn = messages[latest_assistant:]
+    messages[:] = [dict(message) for message in base_messages] + latest_turn
 
 
 LEAN_COMPILE_TOOL = {
@@ -226,6 +336,7 @@ class GoedelProver:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
+        base_messages = tuple(dict(message) for message in messages)
         last_proof = ""
         last_errors: list[str] = []
         last_failure_kind: str | None = None
@@ -261,6 +372,7 @@ class GoedelProver:
                 last_proof = outcome.last_proof
                 last_errors = outcome.last_errors
                 last_failure_kind = outcome.last_failure_kind
+            _retain_latest_assistant_turn(messages, base_messages)
             if not outcome.had_calls:
                 protocol_error = True
                 if final_turn:
@@ -428,9 +540,22 @@ class GoedelProver:
             call = execution.call
             outcome = execution.outcome
             cache_hit = execution.cache_hit
+            model_output, feedback_metadata = _tool_feedback_for_model(outcome.output)
             messages.append({
-                "role": "tool", "tool_call_id": call.call_id, "content": outcome.output,
+                "role": "tool", "tool_call_id": call.call_id, "content": model_output,
             })
+            if (
+                feedback_metadata["duplicate_lines_removed"] > 0
+                or feedback_metadata["truncated"]
+            ):
+                self.tracer.emit(TraceEvent(
+                    kind="tool_feedback_compacted",
+                    thm_name=node_name,
+                    turn=turn,
+                    call_id=call.call_id,
+                    tool_name=call.name,
+                    args={"stage": stage, **feedback_metadata},
+                ))
             if call.name == "lean_compile":
                 turn_outcome.last_proof = outcome.proof_body
                 turn_outcome.last_errors = list(outcome.errors)
@@ -666,6 +791,7 @@ class GoedelProver:
                 ),
             },
         ]
+        base_messages = tuple(dict(message) for message in messages)
         for turn in range(1, self.max_negation_probe_turns + 1):
             response = self._chat(
                 messages, node_name, turn, "negation_probe", [LEAN_COMPILE_TOOL],
@@ -686,7 +812,38 @@ class GoedelProver:
             )
             if outcome.solved_proof:
                 return ProverResult(ProofSignal.FORMALLY_NEGATED, outcome.solved_proof)
+            _retain_latest_assistant_turn(messages, base_messages)
         return None
+
+    def probe_negation_only(
+        self,
+        compiler: KiminaLeanCompiler,
+        node_name: str,
+        node_decl: str,
+        parent_lemma_decls: str,
+        header: str,
+    ) -> ProverResult | None:
+        """Run only the bounded formal-negation stage for a selected node."""
+        started = time.monotonic()
+        self.tracer.emit(TraceEvent(
+            kind="critical_negation_start",
+            thm_name=node_name,
+            args={"max_turns": self.max_negation_probe_turns},
+        ))
+        result = self._probe_negation(
+            compiler, node_name, node_decl, parent_lemma_decls, header,
+        )
+        self.tracer.emit(TraceEvent(
+            kind="critical_negation_end",
+            thm_name=node_name,
+            ok=result is not None and result.signal == ProofSignal.FORMALLY_NEGATED,
+            args={
+                "max_turns": self.max_negation_probe_turns,
+                "signal": result.signal.value if result is not None else "not_proved",
+                "wall_time_s": time.monotonic() - started,
+            },
+        ))
+        return result
 
 
 def _compiler_outcome(result: CompilerResult, proof_body: str) -> _ToolOutcome:
@@ -697,7 +854,11 @@ def _compiler_outcome(result: CompilerResult, proof_body: str) -> _ToolOutcome:
         lines.extend(["Goals:", *result.goals])
     lines.append("Fix errors and call lean_compile again.")
     return _ToolOutcome(
-        "\n".join(lines), False, proof_body, result.diagnostics, result.failure_kind,
+        "\n".join(lines),
+        False,
+        proof_body,
+        _stable_deduplicate_diagnostics(result.diagnostics),
+        result.failure_kind,
         result.timings,
     )
 
@@ -853,4 +1014,33 @@ def prove_node(
     )
     return prover.prove_node(
         compiler, node_name, canonical_stmt, user_prompt, parent_lemma_decls, header,
+    )
+
+
+def probe_node_negation(
+    *,
+    node_name: str,
+    canonical_stmt: str,
+    parent_lemma_decls: str,
+    header: str,
+    compiler: KiminaLeanCompiler,
+    retrieval: MathlibRetrieval,
+    model: str = "labs-leanstral-1-5",
+    tracer=None,
+    api_timeout_s: float | None = 120.0,
+    max_negation_probe_turns: int = 1,
+    max_tool_calls_per_turn: int = DEFAULT_MAX_TOOL_CALLS_PER_TURN,
+) -> ProverResult | None:
+    """Probe one caller-selected failed node without rerunning normal proving."""
+    prover = GoedelProver(
+        model_id=model,
+        retrieval=retrieval,
+        tracer=tracer,
+        api_timeout_s=api_timeout_s,
+        max_prove_turns=1,
+        max_negation_probe_turns=max_negation_probe_turns,
+        max_tool_calls_per_turn=max_tool_calls_per_turn,
+    )
+    return prover.probe_negation_only(
+        compiler, node_name, canonical_stmt, parent_lemma_decls, header,
     )

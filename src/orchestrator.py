@@ -13,7 +13,7 @@ import networkx as nx
 from blueprint import Blueprint, BlueprintNode, render_solved_declaration
 from kimina_lean_compiler import KiminaLeanCompiler
 from mathlib_retrieval import MathlibRetrieval
-from prover import ProofSignal, ProverResult, prove_node
+from prover import ProofSignal, ProverResult, probe_node_negation, prove_node
 from tracer import NullTracer, TraceEvent
 
 
@@ -111,9 +111,17 @@ async def prove_dag(
     node_max_prove_turns: int | None = None,
     node_max_negation_probe_turns: int = 1,
     max_tool_calls_per_turn: int = 3,
+    proof_policy: str = "full",
+    critical_negation_max_turns: int = 0,
     node_executor: Executor | None = None,
     node_semaphore: asyncio.Semaphore | None = None,
 ) -> OrchestratorResult:
+    if proof_policy not in {"full", "first_failed_wave", "critical_path"}:
+        raise ValueError(
+            "proof_policy must be one of: full, first_failed_wave, critical_path"
+        )
+    if critical_negation_max_turns < 0:
+        raise ValueError("critical_negation_max_turns must be non-negative")
     active = active_node_names(blueprint)
     dag = _build_dag(blueprint, active)
     result = OrchestratorResult(active_nodes=active, root_name=blueprint.target_theorem)
@@ -142,6 +150,9 @@ async def prove_dag(
                 node, ProverResult(ProofSignal.SOLVED, body),
             )
 
+    node_position = {node.name: index for index, node in enumerate(blueprint.nodes)}
+    stop_after_failure = False
+    critical_negation_used = False
     for generation in nx.topological_generations(dag):
         candidates = [
             name for name in generation
@@ -166,11 +177,84 @@ async def prove_dag(
                 )
             else:
                 wave.append(name)
+        wave.sort(key=lambda name: node_position.get(name, len(node_position)))
         if not wave:
             continue
-        tasks = [
-            _prove_one(
-                name=name,
+        if proof_policy == "critical_path":
+            # Preserve COT/blueprint order and stop at the first genuine gap.
+            # This is intentionally sequential: launching later sibling nodes
+            # speculatively would defeat the cost-saving policy.
+            wave_results = []
+            for name in wave:
+                node_result = await _prove_one(
+                    name=name,
+                    blueprint=blueprint,
+                    proof_bodies=proof_bodies,
+                    compiler=compiler,
+                    retrieval=retrieval,
+                    model=model,
+                    tracer=tracer,
+                    node_timeout_s=node_timeout_s,
+                    llm_api_timeout_s=llm_api_timeout_s,
+                    node_max_prove_turns=node_max_prove_turns,
+                    node_max_negation_probe_turns=node_max_negation_probe_turns,
+                    max_tool_calls_per_turn=max_tool_calls_per_turn,
+                    node_executor=node_executor,
+                    node_semaphore=node_semaphore,
+                )
+                wave_results.append(node_result)
+                if node_result.result.signal != ProofSignal.SOLVED:
+                    stop_after_failure = True
+                    break
+        else:
+            tasks = [
+                _prove_one(
+                    name=name,
+                    blueprint=blueprint,
+                    proof_bodies=proof_bodies,
+                    compiler=compiler,
+                    retrieval=retrieval,
+                    model=model,
+                    tracer=tracer,
+                    node_timeout_s=node_timeout_s,
+                    llm_api_timeout_s=llm_api_timeout_s,
+                    node_max_prove_turns=node_max_prove_turns,
+                    node_max_negation_probe_turns=node_max_negation_probe_turns,
+                    max_tool_calls_per_turn=max_tool_calls_per_turn,
+                    node_executor=node_executor,
+                    node_semaphore=node_semaphore,
+                )
+                for name in wave
+            ]
+            wave_results = await asyncio.gather(*tasks)
+        for node_result in wave_results:
+            name = node_result.node.name
+            result.node_results[name] = node_result
+            if node_result.result.signal == ProofSignal.SOLVED:
+                proof_bodies[name] = node_result.result.proof_body
+                available.add(name)
+            elif proof_policy == "first_failed_wave":
+                stop_after_failure = True
+        failed_this_wave = [
+            node_result
+            for node_result in wave_results
+            if node_result.result.signal not in {
+                ProofSignal.SOLVED,
+                ProofSignal.INFRA_ERROR,
+            }
+        ]
+        if (
+            failed_this_wave
+            and critical_negation_max_turns > 0
+            and not critical_negation_used
+        ):
+            selected = min(
+                failed_this_wave,
+                key=lambda item: node_position.get(item.node.name, len(node_position)),
+            )
+            critical_negation_used = True
+            negated = await _probe_one_negation(
+                name=selected.node.name,
                 blueprint=blueprint,
                 proof_bodies=proof_bodies,
                 compiler=compiler,
@@ -179,22 +263,110 @@ async def prove_dag(
                 tracer=tracer,
                 node_timeout_s=node_timeout_s,
                 llm_api_timeout_s=llm_api_timeout_s,
-                node_max_prove_turns=node_max_prove_turns,
-                node_max_negation_probe_turns=node_max_negation_probe_turns,
+                max_negation_probe_turns=critical_negation_max_turns,
                 max_tool_calls_per_turn=max_tool_calls_per_turn,
                 node_executor=node_executor,
                 node_semaphore=node_semaphore,
             )
-            for name in wave
-        ]
-        wave_results = await asyncio.gather(*tasks)
-        for node_result in wave_results:
-            name = node_result.node.name
-            result.node_results[name] = node_result
-            if node_result.result.signal == ProofSignal.SOLVED:
-                proof_bodies[name] = node_result.result.proof_body
-                available.add(name)
+            if negated is not None:
+                result.node_results[selected.node.name] = NodeResult(
+                    selected.node, negated,
+                )
+        if stop_after_failure:
+            tracer.emit(TraceEvent(
+                kind="proof_policy_stop",
+                thm_name=blueprint.target_theorem,
+                args={"proof_policy": proof_policy, "generation": list(generation)},
+            ))
+            break
+
+    if stop_after_failure:
+        # Make skipped work explicit.  Downstream consumers must not confuse a
+        # cost-policy skip with a failed Lean proof attempt.
+        for node in blueprint.dependency_order():
+            if (
+                node.name in active
+                and node.kind != "definition"
+                and node.name not in result.node_results
+            ):
+                result.node_results[node.name] = NodeResult(
+                    node,
+                    ProverResult(
+                        ProofSignal.BLOCKED_BY_DEPENDENCY,
+                        lean_errors=[
+                            f"Skipped by proof_policy={proof_policy} after the earliest failed step"
+                        ],
+                    ),
+                )
     return result
+
+
+async def _probe_one_negation(
+    *,
+    name: str,
+    blueprint: Blueprint,
+    proof_bodies: dict[str, str],
+    compiler: KiminaLeanCompiler,
+    retrieval: MathlibRetrieval,
+    model: str,
+    tracer,
+    node_timeout_s: float | None,
+    llm_api_timeout_s: float | None,
+    max_negation_probe_turns: int,
+    max_tool_calls_per_turn: int,
+    node_executor: Executor | None,
+    node_semaphore: asyncio.Semaphore | None,
+) -> ProverResult | None:
+    """Run the one globally selected negation probe without normal re-proving."""
+    node = blueprint.node_by_name(name)
+    assert node is not None
+    ancestor_deps = _transitive_deps(node, blueprint)
+    definitions = [
+        definition.full_declaration()
+        for definition in blueprint.nodes if definition.kind == "definition"
+    ]
+    ordered_parents = [
+        candidate for candidate in blueprint.dependency_order()
+        if candidate.kind != "definition"
+        and candidate.name in ancestor_deps
+        and candidate.name in proof_bodies
+    ]
+    parent_lemma_decls = "\n\n".join(definitions + [
+        render_solved_declaration(parent, proof_bodies[parent.name])
+        for parent in ordered_parents
+    ])
+
+    loop = asyncio.get_running_loop()
+    acquired = False
+    if node_semaphore is not None:
+        await node_semaphore.acquire()
+        acquired = True
+    try:
+        future = loop.run_in_executor(
+            node_executor,
+            functools.partial(
+                probe_node_negation,
+                node_name=name,
+                canonical_stmt=node.lean_declaration,
+                parent_lemma_decls=parent_lemma_decls,
+                header=blueprint.phase2_header,
+                compiler=compiler,
+                retrieval=retrieval,
+                model=model,
+                tracer=tracer,
+                api_timeout_s=llm_api_timeout_s,
+                max_negation_probe_turns=max_negation_probe_turns,
+                max_tool_calls_per_turn=max_tool_calls_per_turn,
+            ),
+        )
+        if node_timeout_s is None:
+            return await future
+        return await asyncio.wait_for(asyncio.shield(future), timeout=node_timeout_s)
+    except asyncio.TimeoutError:
+        return None
+    finally:
+        if acquired:
+            node_semaphore.release()
 
 
 async def _prove_one(

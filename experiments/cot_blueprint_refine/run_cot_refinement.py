@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import json
 import re
 import time
@@ -34,6 +35,17 @@ FINAL_CLOSE_RE = re.compile(r"</final_refined_solution\s*>", re.IGNORECASE)
 CONTEXT_QUALITIES = {"VERIFIED", "INVALID_BLUEPRINT_CANDIDATE", "INFRA_ERROR"}
 INFRA_ERROR = "INFRA_ERROR"
 CONVERSATION_SCHEMA_VERSION = 2
+DEFAULT_CONCISE_RECOVERY_MAX_TOKENS = 8192
+CONCISE_RECOVERY_INSTRUCTION = """\
+A prior generation attempt (omitted here rather than replaying its long partial output) could not
+be accepted because: {reason}.
+
+Return the complete corrected solution again, concisely. Output only one
+`<final_refined_solution>...</final_refined_solution>` block. Do not output scratch work,
+commentary, `<think>` tags, or any text outside that block. End the content inside the block
+with exactly one `\\boxed{{...}}`. Recheck the answer; the original claimed answer is not a
+target and changing it is not penalized.
+"""
 
 
 def _utc_now() -> str:
@@ -141,8 +153,9 @@ def _context_guidance(quality: str) -> str:
             "text below is reference only; independently verify the original solution."
         )
     return (
-        "This blueprint context passed the export validation. Interpret each node according to its "
-        "COT_BLUEPRINT_NODE_STATUS comment."
+        "This blueprint context passed structural and export validation only. That status does "
+        "not certify semantic faithfulness, mathematical truth, or the original claimed answer. "
+        "Interpret each node according to its COT_BLUEPRINT_NODE_STATUS comment."
     )
 
 
@@ -422,6 +435,38 @@ def normalize_refined_output(content: str, finish_reason: str | None) -> tuple[s
     return content, "", think_stripped, raw_box_count
 
 
+def _final_marker_contract_error(content: str) -> str:
+    """Validate the strict response envelope without changing the legacy normalizer API."""
+    final_opens = list(FINAL_OPEN_RE.finditer(content))
+    final_closes = list(FINAL_CLOSE_RE.finditer(content))
+    if not final_opens:
+        return "missing_final_refined_solution_open"
+    if not final_closes:
+        return "missing_final_refined_solution_close"
+    if len(final_opens) != 1 or len(final_closes) != 1:
+        return "multiple_final_refined_solution_markers"
+    final_open = final_opens[0]
+    final_close = final_closes[0]
+    if final_close.start() < final_open.end():
+        return "misordered_final_refined_solution_markers"
+    if content[:final_open.start()].strip() or content[final_close.end():].strip():
+        return "content_outside_final_refined_solution"
+    return ""
+
+
+def _concise_recovery_messages(
+    messages: list[dict[str, str]],
+    reason: str,
+) -> list[dict[str, str]]:
+    """Build recovery input from the original prompt, never from the large partial output."""
+    recovery_messages = deepcopy(messages)
+    recovery_messages.append({
+        "role": "user",
+        "content": CONCISE_RECOVERY_INSTRUCTION.format(reason=reason).strip(),
+    })
+    return recovery_messages
+
+
 async def _call_one(
     client: AsyncOpenAI,
     semaphore: asyncio.Semaphore,
@@ -478,16 +523,37 @@ async def _call_one(
             "conversation_path": artifact_path,
         }
 
-    timeout_s = config.refine.timeout_s
+    timeout_s = config.refine.get("timeout_s")
+    max_attempts = int(config.refine.max_retries)
+    primary_max_tokens = int(config.refine.max_tokens)
+    concise_recovery_max_tokens = min(
+        primary_max_tokens,
+        int(config.refine.get(
+            "concise_recovery_max_tokens",
+            DEFAULT_CONCISE_RECOVERY_MAX_TOKENS,
+        )),
+    )
     start = time.time()
     last_error = ""
     fit_metadata: dict[str, Any] = {}
     extra_safety_tokens = 0
+    concise_recovery_used = False
+    next_recovery_reason: str | None = None
     async with semaphore:
-        for attempt in range(1, int(config.refine.max_retries) + 1):
+        for attempt in range(1, max_attempts + 1):
+            recovery_reason = next_recovery_reason
+            next_recovery_reason = None
+            is_concise_recovery = recovery_reason is not None
+            if is_concise_recovery:
+                concise_recovery_used = True
             attempt_start = time.time()
             event: dict[str, Any] = {
                 "attempt": attempt,
+                "request_mode": (
+                    "concise_recovery" if is_concise_recovery else "primary"
+                ),
+                "concise_recovery": is_concise_recovery,
+                "recovery_reason": recovery_reason,
                 "status": "preparing_request",
                 "started_at": _utc_now(),
                 "finished_at": None,
@@ -519,12 +585,26 @@ async def _call_one(
                         source_solution_model_label=source_solution_model_label,
                         extra_safety_tokens=extra_safety_tokens,
                     )
+                if is_concise_recovery:
+                    messages = _concise_recovery_messages(messages, str(recovery_reason))
+                request_max_tokens = (
+                    concise_recovery_max_tokens
+                    if is_concise_recovery
+                    else primary_max_tokens
+                )
+                extra_body: dict[str, Any] | None = None
+                if is_concise_recovery:
+                    extra_body = {
+                        "chat_template_kwargs": {"enable_thinking": False},
+                    }
                 kwargs: dict[str, Any] = {
                     "model": str(config.refine.model),
                     "messages": messages,
                     "temperature": float(config.refine.temperature),
-                    "max_tokens": int(config.refine.max_tokens),
+                    "max_tokens": request_max_tokens,
                 }
+                if extra_body is not None:
+                    kwargs["extra_body"] = extra_body
                 if timeout_s is not None:
                     kwargs["timeout"] = float(timeout_s)
                 event["fit_metadata"] = dict(fit_metadata)
@@ -533,7 +613,8 @@ async def _call_one(
                     "model": str(config.refine.model),
                     "messages": messages,
                     "temperature": float(config.refine.temperature),
-                    "max_tokens": int(config.refine.max_tokens),
+                    "max_tokens": request_max_tokens,
+                    "extra_body": deepcopy(extra_body),
                     "timeout_s": None if timeout_s is None else float(timeout_s),
                 }
                 event["status"] = "request_started"
@@ -543,12 +624,20 @@ async def _call_one(
                 refined_cot, output_error, think_stripped, box_count = normalize_refined_output(
                     content, finish_reason,
                 )
+                marker_error = _final_marker_contract_error(content)
+                strict_final_envelope = bool(
+                    config.refine.get("strict_final_envelope", True)
+                )
+                if finish_reason != "length" and marker_error and strict_final_envelope:
+                    refined_cot = ""
+                    output_error = marker_error
                 status = "ok" if not output_error else "invalid_output"
+                response_json = _response_json(response)
                 event.update({
                     "status": status,
                     "finished_at": _utc_now(),
                     "latency_s": time.time() - attempt_start,
-                    "response": _response_json(response),
+                    "response": response_json,
                     "assistant_content": content,
                     "assistant_reasoning_content": reasoning,
                     "finish_reason": finish_reason,
@@ -558,8 +647,29 @@ async def _call_one(
                         "refined_cot": refined_cot,
                         "think_stripped": think_stripped,
                         "boxed_answer_count": box_count,
+                        "final_envelope_warning": (
+                            marker_error if marker_error and not strict_final_envelope else None
+                        ),
                     },
                 })
+                should_recover = (
+                    not is_concise_recovery
+                    and not concise_recovery_used
+                    and attempt < max_attempts
+                    and (
+                        finish_reason == "length"
+                        or (strict_final_envelope and bool(marker_error))
+                        or output_error == "unclosed_final_refined_solution"
+                    )
+                )
+                if should_recover:
+                    next_recovery_reason = output_error or marker_error or "invalid_output"
+                    event["status"] = "recovery_scheduled"
+                    event["recovery_scheduled"] = True
+                    event["recovery_reason"] = next_recovery_reason
+                    event["retry_delay_s"] = 0.0
+                    _persist_conversation(root, conversation)
+                    continue
                 artifact_path = _persist_conversation(root, conversation)
                 return {
                     **base,
@@ -569,12 +679,18 @@ async def _call_one(
                     "refined_cot": refined_cot,
                     "raw_content": content,
                     "reasoning_content": reasoning,
-                    "raw_response": _response_json(response),
+                    "raw_response": response_json,
                     "finish_reason": finish_reason,
                     "think_stripped": think_stripped,
                     "boxed_answer_count": box_count,
+                    "final_envelope_warning": (
+                        marker_error if marker_error and not strict_final_envelope else None
+                    ),
                     "prompt": messages,
                     "attempts": attempt,
+                    "request_max_tokens": request_max_tokens,
+                    "request_extra_body": deepcopy(extra_body),
+                    "concise_recovery_used": concise_recovery_used,
                     "latency_s": time.time() - start,
                     "model": str(config.refine.model),
                     "openai_base_url": str(config.refine.openai_base_url),
@@ -598,7 +714,7 @@ async def _call_one(
                 })
                 if "maximum context length" in last_error.lower():
                     extra_safety_tokens += 512
-                if attempt >= int(config.refine.max_retries):
+                if attempt >= max_attempts:
                     _persist_conversation(root, conversation)
                     break
                 delay = min(
@@ -615,7 +731,8 @@ async def _call_one(
         "status": "error",
         "error": last_error,
         "refined_cot": "",
-        "attempts": int(config.refine.max_retries),
+        "attempts": max_attempts,
+        "concise_recovery_used": concise_recovery_used,
         "latency_s": time.time() - start,
         "model": str(config.refine.model),
         "openai_base_url": str(config.refine.openai_base_url),
@@ -654,6 +771,9 @@ async def refine(
     client = AsyncOpenAI(
         api_key=str(config.refine.api_key),
         base_url=str(config.refine.openai_base_url).rstrip("/"),
+        # The outer loop owns the complete retry budget and trace. Hidden SDK
+        # retries otherwise multiply a configured request timeout.
+        max_retries=0,
     )
     semaphore = asyncio.Semaphore(int(config.refine.concurrency))
     tasks = [

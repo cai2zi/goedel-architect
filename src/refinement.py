@@ -5,7 +5,10 @@ Takes failed node diagnostics and produces a revised @[blueprint]-annotated Lean
 """
 from __future__ import annotations
 
+import os
 import re
+from functools import lru_cache
+from typing import Any
 
 from llm_client import make_client
 
@@ -13,15 +16,28 @@ from blueprint import (
     Blueprint,
     _call_blueprint_model,
     _emit_lean_check_result,
+    _emit_semantic_check,
+    _enabled_semantic_issues,
     _extract_lean_code,
     _max_tokens as _blueprint_max_tokens,
     _parse_blueprint,
     _reasoning_kwargs,
+    _render_step_grounded_proof,
+    _set_latest_blueprint_retry,
     format_phase2_contract_errors,
     phase2_contract_errors,
     phase2_standalone_contract_errors,
 )
 from kimina_lean_compiler import KiminaInfrastructureError, KiminaLeanCompiler
+from semantic_audit import SemanticAuditFormatError, run_semantic_audit
+from semantic_fidelity import (
+    check_semantic_freeze,
+    format_semantic_issues,
+    parse_cot_manifest,
+    semantic_audit_risk_reasons,
+    snapshot_blueprint_semantics,
+    validate_blueprint_fidelity,
+)
 from orchestrator import OrchestratorResult
 from goedel_prompts import load, render
 from prover import ProofSignal
@@ -29,7 +45,78 @@ from prover import ProofSignal
 REFINEMENT_SYSTEM_PROMPT = load("refinement_system")
 REFINEMENT_USER_TEMPLATE = load("refinement_user")
 
+
+_SEMANTIC_REFINEMENT_SYSTEM_SUFFIX = r"""
+
+## Semantic-fidelity refinement mode
+
+The COT-claim-to-mathematics translation is immutable in this mode. A failed
+Lean proof is evidence about the corresponding source step; it is not
+permission to repair the source solution. Preserve every source claim,
+number, relation, quantifier, negation, object, and claimed final answer even
+when it is false.
+
+Every node must retain exactly one native `(title := "COT_CLAIM:CNNN")` binding
+(legacy manifests may still use `COT_STEP:SNNN.CNNN`).
+Do not delete a source claim, move the root away from the final claim,
+replace a proposition with `True`/a reflexive equality/an unconstrained
+existential, introduce an answer as an assumption, or hide an asserted step in
+an executable definition. You may fix Lean types, casts, library names,
+dependency edges and proof sketches, or split one step into multiple nodes
+bound to the same source claim. Leave a genuinely unsupported claim as an
+explicit `sorry_using [...]` gap.
+"""
+
 MAX_RETRIES = 8
+
+
+class SemanticRefinementError(RuntimeError):
+    """A revised candidate exceeded the bounded semantic-repair budget."""
+
+    def __init__(self, message: str, *, issues: list | None = None) -> None:
+        super().__init__(message)
+        self.issues = list(issues or [])
+
+
+@lru_cache(maxsize=2)
+def _load_phase3_tokenizer(path: str):
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+
+
+def _phase3_message_token_count(messages: list[dict[str, str]], tokenizer: Any) -> int:
+    encoded = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+    )
+    return len(encoded)
+
+
+def phase3_request_max_tokens(messages: list[dict[str, str]]) -> int:
+    """Fit each refinement response into the actual remaining context window."""
+    configured_cap = int(
+        os.environ.get("GOEDEL_PHASE3_MAX_OUTPUT_CAP", str(_blueprint_max_tokens()))
+    )
+    context = int(os.environ.get("GOEDEL_PHASE3_MODEL_MAX_CONTEXT", "0"))
+    tokenizer_path = os.environ.get("GOEDEL_TOKENIZER_PATH", "").strip()
+    if context <= 0 or not tokenizer_path:
+        return configured_cap
+    margin = int(os.environ.get("GOEDEL_PHASE3_CONTEXT_SAFETY_MARGIN", "512"))
+    minimum = int(os.environ.get("GOEDEL_PHASE3_MIN_OUTPUT_TOKENS", "512"))
+    prompt_tokens = _phase3_message_token_count(
+        messages,
+        _load_phase3_tokenizer(tokenizer_path),
+    )
+    available = context - prompt_tokens - margin
+    if available < minimum:
+        raise SemanticRefinementError(
+            "insufficient_context: Phase-3 prompt leaves "
+            f"{available} output tokens (prompt={prompt_tokens}, context={context}, "
+            f"margin={margin}, minimum={minimum})"
+        )
+    return min(configured_cap, available)
 
 # Cap how many earlier rounds are replayed into the refinement prompt. Full
 # history is still kept in the checkpoint (round-count messaging stays
@@ -71,6 +158,15 @@ def refine_blueprint(
     phase2_contract_check_concurrency: int = 1,
     informal_statement: str = "",
     informal_proof: str = "",
+    cot_manifest_json: str = "",
+    claimed_answer: str = "",
+    semantic_fidelity_enabled: bool = False,
+    semantic_require_step_ids: bool = False,
+    semantic_static_gate: bool = False,
+    semantic_freeze_refinement: bool = False,
+    semantic_audit_mode: str = "none",
+    semantic_max_repair_attempts: int = 1,
+    baseline_semantic_snapshot: Any = None,
 ) -> Blueprint:
     """
     Produce a revised blueprint by feeding failure diagnostics back to the LLM.
@@ -88,7 +184,23 @@ def refine_blueprint(
         change strategy or accept a node as an unresolved gap, rather than
         cosmetically re-decomposing the same stuck problem every round.
     """
+    if semantic_max_repair_attempts < 0:
+        raise ValueError("semantic_max_repair_attempts must be non-negative")
+    if semantic_audit_mode not in {"none", "risk", "full"}:
+        raise ValueError("semantic_audit_mode must be one of: none, risk, full")
+    if semantic_audit_mode != "none" and not semantic_fidelity_enabled:
+        raise ValueError("semantic audit requires semantic_fidelity_enabled=true")
     client = make_client(model)
+    semantic_manifest = (
+        parse_cot_manifest(cot_manifest_json) if semantic_fidelity_enabled else None
+    )
+    baseline_semantics = baseline_semantic_snapshot
+    if (
+        baseline_semantics is None
+        and semantic_fidelity_enabled
+        and semantic_freeze_refinement
+    ):
+        baseline_semantics = snapshot_blueprint_semantics(blueprint, semantic_manifest)
 
     annotated_lean = _annotate_with_verdicts(blueprint, orch_result)
     if history is not None:
@@ -104,30 +216,102 @@ def refine_blueprint(
         prior_rounds = []
         dropped_rounds_summary = ""
 
+    prompt_proof = informal_proof
+    if semantic_fidelity_enabled and cot_manifest_json:
+        prompt_proof = _render_step_grounded_proof(cot_manifest_json, include_ir=True)
     messages = [
-        {"role": "system", "content": REFINEMENT_SYSTEM_PROMPT},
+        {
+            "role": "system",
+            "content": REFINEMENT_SYSTEM_PROMPT
+            + (_SEMANTIC_REFINEMENT_SYSTEM_SUFFIX if semantic_fidelity_enabled else ""),
+        },
         {"role": "user", "content": _build_refinement_user_prompt(
             annotated_lean, prior_rounds=prior_rounds,
             iteration=iteration, max_iterations=max_iterations,
             total_prior_rounds=total_prior_rounds,
             dropped_rounds_summary=dropped_rounds_summary,
             informal_statement=informal_statement,
-            informal_proof=informal_proof,
+            informal_proof=prompt_proof,
+        ) + (
+            "\n\nThe immutable claimed final answer is: " + claimed_answer
+            if semantic_fidelity_enabled else ""
         )},
     ]
+    base_messages = tuple(dict(message) for message in messages)
 
     last_error_feedback = ""
+    # Keep deterministic/freeze repairs independent from semantic-audit
+    # repairs so the first audit after a successful local repair can feed one
+    # bounded correction turn back to the model.
+    local_semantic_repair_count = 0
+    audit_semantic_repair_count = 0
     for attempt in range(max_retries):
+        request_max_tokens = phase3_request_max_tokens(messages)
         response = _call_blueprint_model(
             client,
             model,
             messages,
             _reasoning_kwargs(model),
-            _blueprint_max_tokens(),
+            request_max_tokens,
             tracer=tracer, thm_name=thm_name, phase="phase3",
         )
         content = response.choices[0].message.content
         lean_code = _extract_lean_code(content)
+
+        semantic_issues = []
+        if semantic_fidelity_enabled:
+            candidate = _parse_blueprint(lean_code, blueprint.target_theorem)
+            if candidate.nodes:
+                semantic_issues = _enabled_semantic_issues(
+                    validate_blueprint_fidelity(
+                        candidate,
+                        semantic_manifest,
+                        claimed_answer=claimed_answer,
+                        require_step_bindings=semantic_require_step_ids,
+                    ),
+                    require_step_ids=semantic_require_step_ids,
+                    static_gate=semantic_static_gate,
+                )
+                if semantic_freeze_refinement and baseline_semantics is not None:
+                    semantic_issues.extend(
+                        check_semantic_freeze(
+                            baseline_semantics,
+                            candidate,
+                            semantic_manifest,
+                        )
+                    )
+                _emit_semantic_check(
+                    tracer,
+                    thm_name=thm_name,
+                    phase="phase3",
+                    attempt=attempt + 1,
+                    issues=semantic_issues,
+                )
+                if semantic_issues:
+                    local_semantic_repair_count += 1
+                    last_error_feedback = (
+                        "The local semantic-fidelity/freeze gate rejected the revision "
+                        "before Lean execution:\n\n"
+                        f"{format_semantic_issues(semantic_issues)}"
+                    )
+                    if local_semantic_repair_count > semantic_max_repair_attempts:
+                        raise SemanticRefinementError(
+                            last_error_feedback,
+                            issues=semantic_issues,
+                        )
+                    feedback = (
+                        f"{last_error_feedback}\n\nUndo every semantic change. "
+                        "Only repair the Lean encoding, dependency edges, or proof sketches; "
+                        "keep false/unsupported COT claims as explicit gaps."
+                    )
+                    _set_latest_blueprint_retry(
+                        messages,
+                        base_messages,
+                        lean_code,
+                        feedback,
+                        finish_reason=getattr(response.choices[0], "finish_reason", None),
+                    )
+                    continue
 
         result = compiler.check_blueprint(lean_code, blueprint.target_theorem)
         _emit_lean_check_result(
@@ -145,6 +329,13 @@ def refine_blueprint(
         if result.success:
             parsed = _parse_blueprint(lean_code, blueprint.target_theorem)
             if parsed.nodes:
+                if semantic_fidelity_enabled:
+                    parsed.semantic_gate_results.append({
+                        "stage": "phase3_local_gate",
+                        "passed": True,
+                        "issues": [],
+                        "freeze": semantic_freeze_refinement,
+                    })
                 contract_errors = phase2_contract_errors(parsed)
                 if not contract_errors:
                     contract_errors = phase2_standalone_contract_errors(
@@ -162,33 +353,114 @@ def refine_blueprint(
                         "check_blueprint OK but phase2 contract FAILED",
                         flush=True,
                     )
-                    messages.append({"role": "assistant", "content": content})
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            f"{last_error_feedback}\n\n"
-                            "Fix the Phase 2 standalone contract and re-emit the whole "
-                            "blueprint. Avoid ambient declarations such as `variable`, "
-                            "`section`, `namespace`, `axiom`, and `partial def`; make "
-                            "parameters explicit and emit helper definitions as "
-                            "`@[blueprint]` definition nodes."
-                        ),
-                    })
+                    feedback = (
+                        f"{last_error_feedback}\n\n"
+                        "Fix the Phase 2 standalone contract and re-emit the whole "
+                        "blueprint. Avoid ambient declarations such as `variable`, "
+                        "`section`, `namespace`, `axiom`, and `partial def`; make "
+                        "parameters explicit and emit helper definitions as "
+                        "`@[blueprint]` definition nodes."
+                    )
+                    _set_latest_blueprint_retry(
+                        messages,
+                        base_messages,
+                        lean_code,
+                        feedback,
+                        finish_reason=getattr(response.choices[0], "finish_reason", None),
+                    )
                     continue
+                audit_risk_reasons = (
+                    semantic_audit_risk_reasons(
+                        parsed,
+                        semantic_manifest,
+                        claimed_answer=claimed_answer,
+                    )
+                    if semantic_audit_mode == "risk"
+                    else []
+                )
+                should_audit = (
+                    semantic_audit_mode == "full"
+                    or (semantic_audit_mode == "risk" and bool(audit_risk_reasons))
+                )
+                if semantic_audit_mode == "risk" and not should_audit:
+                    parsed.semantic_gate_results.append({
+                        "stage": "phase3_semantic_audit",
+                        "passed": True,
+                        "mode": "risk",
+                        "routed": False,
+                        "risk_reasons": [],
+                    })
+                if should_audit:
+                    try:
+                        audit = run_semantic_audit(
+                            model,
+                            prompt_proof,
+                            parsed.lean_file,
+                            mode=semantic_audit_mode,
+                            informal_statement=informal_statement,
+                            claimed_answer=claimed_answer,
+                            client=client,
+                            tracer=tracer,
+                            thm_name=thm_name,
+                            phase="phase3_semantic_audit",
+                        )
+                        audit_feedback = audit.diagnostics
+                        audit_passed = audit.passed
+                    except SemanticAuditFormatError as exc:
+                        audit_feedback = f"Audit response format invalid: {exc.reason}"
+                        audit_passed = False
+                    if not audit_passed:
+                        audit_semantic_repair_count += 1
+                        last_error_feedback = (
+                            "The semantic-fidelity audit rejected the revised blueprint:\n\n"
+                            f"{audit_feedback}"
+                        )
+                        if audit_semantic_repair_count > semantic_max_repair_attempts:
+                            raise SemanticRefinementError(last_error_feedback)
+                        feedback = (
+                            f"{last_error_feedback}\n\nRepair only the formal encoding. "
+                            "Restore every original COT claim and source-step binding; "
+                            "do not make the mathematics easier."
+                        )
+                        _set_latest_blueprint_retry(
+                            messages,
+                            base_messages,
+                            lean_code,
+                            feedback,
+                            finish_reason=getattr(response.choices[0], "finish_reason", None),
+                        )
+                        continue
+                    parsed.semantic_audit_result = {
+                        "passed": audit.passed,
+                        "flag": audit.flag,
+                        "diagnostics": audit.diagnostics,
+                        "request_id": audit.request_id,
+                        "mode": audit.mode,
+                        "routed": True,
+                        "risk_reasons": audit_risk_reasons,
+                        "total_tokens": audit.total_tokens,
+                    }
+                    parsed.semantic_gate_results.append({
+                        "stage": "phase3_semantic_audit",
+                        **parsed.semantic_audit_result,
+                    })
                 print(f"  [refine] attempt {attempt + 1}/{max_retries}: check_blueprint OK", flush=True)
                 return parsed
             # Compiles, but has zero @[blueprint]-annotated declarations - an
             # A zero-node response cannot contain the required root proof node.
             print(f"  [refine] attempt {attempt + 1}/{max_retries}: check_blueprint OK but zero nodes, retrying", flush=True)
-            messages.append({"role": "assistant", "content": content})
-            messages.append({
-                "role": "user",
-                "content": (
-                    f"The file compiled, but contains no `@[blueprint ...]`-annotated "
-                    f"declarations (attempt {attempt + 1}/{max_retries}). Re-emit the "
-                    "blueprint with proper annotations."
-                ),
-            })
+            feedback = (
+                f"The file compiled, but contains no `@[blueprint ...]`-annotated "
+                f"declarations (attempt {attempt + 1}/{max_retries}). Re-emit the "
+                "blueprint with proper annotations."
+            )
+            _set_latest_blueprint_retry(
+                messages,
+                base_messages,
+                lean_code,
+                feedback,
+                finish_reason=getattr(response.choices[0], "finish_reason", None),
+            )
             continue
 
         # Feed compile errors back for next attempt
@@ -196,15 +468,18 @@ def refine_blueprint(
         last_error_feedback = error_feedback
         print(f"  [refine] attempt {attempt + 1}/{max_retries}: check_blueprint FAILED - "
               f"{error_feedback[:300]!r}", flush=True)
-        messages.append({"role": "assistant", "content": content})
-        messages.append({
-            "role": "user",
-            "content": (
-                f"lean_compile reported errors (attempt {attempt + 1}/{max_retries}):\n\n"
-                f"{error_feedback}\n\n"
-                "Fix the issues and call lean_compile again."
-            ),
-        })
+        feedback = (
+            f"lean_compile reported errors (attempt {attempt + 1}/{max_retries}):\n\n"
+            f"{error_feedback}\n\n"
+            "Fix the issues and call lean_compile again."
+        )
+        _set_latest_blueprint_retry(
+            messages,
+            base_messages,
+            lean_code,
+            feedback,
+            finish_reason=getattr(response.choices[0], "finish_reason", None),
+        )
 
     raise RuntimeError(
         f"Refinement failed after {max_retries} attempts. "

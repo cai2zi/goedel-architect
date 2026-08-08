@@ -8,12 +8,26 @@ split: null
 limit: null
 problem_id: null
 resume: false
+# full runs Phase 1/2/3; phase1_only stops after a validated Blueprint.
+execution_mode: full
 max_refinement_iterations: 4
 blueprint_max_retries: 8
 node_max_prove_turns: 8
 # Set to 0 to disable the formal-negation probe after normal proving fails.
 node_max_negation_probe_turns: 1
 max_tool_calls_per_turn: 3
+# Semantic-fidelity features are opt-in so generic RobustPA callers preserve
+# their historical behavior.
+semantic_fidelity_enabled: false
+semantic_require_step_ids: false
+semantic_static_gate: false
+semantic_minimal_ir: false
+semantic_freeze_refinement: false
+semantic_audit_mode: none
+semantic_max_repair_attempts: 1
+# full | first_failed_wave | critical_path
+proof_policy: full
+critical_negation_max_turns: 0
 node_timeout_s: null
 llm_api_timeout_s: null
 phase1_concurrency: 1024
@@ -34,6 +48,7 @@ lean_server_debug: false
 environment:
   GOEDEL_BLUEPRINT_MAX_TOKENS: "8192"
   GOEDEL_PROVER_MAX_TOKENS: "4096"
+  GOEDEL_SEMANTIC_AUDIT_MAX_TOKENS: "1024"
   GOEDEL_LLM_MAX_RETRIES: "6"
   GOEDEL_LLM_RETRY_BASE_DELAY_S: "2"
   GOEDEL_LLM_RETRY_MAX_DELAY_S: "60"

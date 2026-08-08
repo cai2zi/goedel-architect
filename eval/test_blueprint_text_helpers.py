@@ -34,6 +34,49 @@ lemma mod7_2003_eq_1 :
 
 
 class BlueprintTextHelpersTest(unittest.TestCase):
+    def test_parser_extracts_native_title_and_cot_source_step_id(self) -> None:
+        lean_code = """@[blueprint
+  (title := "COT_STEP:S004.part_a")
+  (statement := /-- A source-grounded step. -/)
+  (proof := /-- Deferred. -/)]
+theorem root : True := by
+  sorry_using []
+"""
+
+        node = _parse_blueprint(lean_code, "root").nodes[0]
+
+        self.assertEqual(node.title, "COT_STEP:S004.part_a")
+        self.assertEqual(node.source_step_id, "S004.part_a")
+
+    def test_malformed_cot_title_is_preserved_but_not_accepted_as_step_id(self) -> None:
+        lean_code = """@[blueprint
+  (title := "COT_STEP:step-four")
+  (statement := /-- An invalid source binding. -/)
+  (proof := /-- Deferred. -/)]
+theorem root : True := by
+  sorry_using []
+"""
+
+        node = _parse_blueprint(lean_code, "root").nodes[0]
+
+        self.assertEqual(node.title, "COT_STEP:step-four")
+        self.assertEqual(node.source_step_id, "")
+
+    def test_cache_key_changes_when_only_source_step_binding_changes(self) -> None:
+        template = """@[blueprint
+  (title := "COT_STEP:{step_id}")
+  (statement := /-- The same claim. -/)
+  (proof := /-- Deferred. -/)]
+theorem root : True := by
+  sorry_using []
+"""
+        first = _parse_blueprint(template.format(step_id="S001"), "root").nodes[0]
+        second = _parse_blueprint(template.format(step_id="S002"), "root").nodes[0]
+
+        self.assertEqual(first.signature(), second.signature())
+        self.assertEqual(first.dependencies, second.dependencies)
+        self.assertNotEqual(first.cache_key(), second.cache_key())
+
     def test_standalone_contract_forwards_batch_concurrency(self) -> None:
         declarations = []
         for index in range(17):

@@ -4,6 +4,7 @@ import json
 import sys
 import time
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -371,6 +372,107 @@ class ProverToolProtocolTest(unittest.TestCase):
         )
         self.assertIn("failed", turn.last_errors)
         self.assertIn("x : Nat\n⊢ x = x", turn.last_errors)
+
+    def test_repeated_tool_diagnostics_are_compacted_only_for_model_history(self) -> None:
+        tracer = RecordingTracer()
+        prover = self.make_prover(tracer=tracer)
+        repeated = '{"severity":"error","data":"No goals to be solved"}'
+        middle = "M" * 4000
+        tail = '{"severity":"error","data":"Unknown constant at tail"}'
+        compiler = RecordingCompiler([
+            CompilerResult(
+                False,
+                errors=[repeated] * 729 + [middle, tail],
+                failure_kind="lean",
+            ),
+        ])
+        messages = []
+        with patch.dict("os.environ", {"GOEDEL_TOOL_FEEDBACK_MAX_CHARS": "512"}):
+            turn = prover._process_response(
+                response=response([
+                    ToolCall("compile", "lean_compile", {"proof_body": "by omega"}),
+                ]),
+                messages=messages,
+                compiler=compiler,
+                node_name="root",
+                node_decl=NODE_DECL,
+                parent_lemma_decls="",
+                header="import Mathlib",
+                turn=2,
+                stage="prove",
+                limit=1,
+                allowed_names={"lean_compile"},
+            )
+
+        model_feedback = messages[-1]["content"]
+        self.assertLessEqual(len(model_feedback), 512)
+        self.assertEqual(model_feedback.count(repeated), 1)
+        self.assertIn("previous line repeated 728 additional times", model_feedback)
+        self.assertIn("tool feedback truncated", model_feedback)
+        self.assertIn("Unknown constant at tail", model_feedback)
+
+        full_trace = next(event for event in tracer.events if event.kind == "tool_result")
+        self.assertEqual(full_trace.result.count(repeated), 729)
+        self.assertGreater(len(full_trace.result), len(model_feedback))
+        compacted = next(
+            event for event in tracer.events if event.kind == "tool_feedback_compacted"
+        )
+        self.assertEqual(compacted.args["duplicate_lines_removed"], 728)
+        self.assertTrue(compacted.args["truncated"])
+        self.assertEqual(turn.last_errors.count(repeated), 1)
+        self.assertIn(
+            "[previous diagnostic repeated 728 additional times]",
+            turn.last_errors,
+        )
+
+    def test_prover_history_rolls_to_latest_legal_tool_pair(self) -> None:
+        class SequentialCompiler:
+            def __init__(self):
+                self.results = [
+                    CompilerResult(False, errors=["first failure"], failure_kind="lean"),
+                    CompilerResult(False, errors=["second failure"], failure_kind="lean"),
+                    CompilerResult(True),
+                ]
+
+            def check_many(self, requests):
+                self.assert_single(requests)
+                return [self.results.pop(0)]
+
+            @staticmethod
+            def assert_single(requests):
+                if len(requests) != 1:
+                    raise AssertionError("expected one request")
+
+        prover = self.make_prover(max_negation_probe_turns=0)
+        prover.max_prove_turns = 3
+        model_responses = [
+            response([ToolCall("turn-1", "lean_compile", {"proof_body": "by omega"})]),
+            response([ToolCall("turn-2", "lean_compile", {"proof_body": "by simp"})]),
+            response([ToolCall("turn-3", "lean_compile", {"proof_body": "by trivial"})]),
+        ]
+        requests = []
+
+        def chat(messages, *_args, **_kwargs):
+            requests.append(deepcopy(messages))
+            return model_responses[len(requests) - 1]
+
+        with patch.object(prover, "_chat", side_effect=chat):
+            result = prover.prove_node(
+                SequentialCompiler(),
+                "root",
+                NODE_DECL,
+                "Prove the node.",
+                "",
+                "import Mathlib",
+            )
+
+        self.assertEqual(result.signal, ProofSignal.SOLVED)
+        self.assertEqual([message["role"] for message in requests[2]], [
+            "system", "user", "assistant", "tool",
+        ])
+        self.assertEqual(requests[2][2]["tool_calls"][0]["id"], "turn-2")
+        self.assertEqual(requests[2][3]["tool_call_id"], "turn-2")
+        self.assertNotIn("turn-1", json.dumps(requests[2]))
 
     def test_negation_probe_can_be_disabled(self) -> None:
         prover = self.make_prover(max_negation_probe_turns=0)

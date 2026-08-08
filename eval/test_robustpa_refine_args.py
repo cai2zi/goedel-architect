@@ -47,6 +47,16 @@ class RobustPAConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "node_max_negation_probe_turns"):
             _validate_args(SimpleNamespace(**OmegaConf.to_container(config, resolve=False)))
 
+    def test_execution_mode_is_validated(self) -> None:
+        config = OmegaConf.load(
+            REPO_ROOT / "experiments/robustpa_refine/configs/base.yaml"
+        )
+        config.execution_mode = "phase1_only"
+        _validate_args(SimpleNamespace(**OmegaConf.to_container(config, resolve=False)))
+        config.execution_mode = "unknown"
+        with self.assertRaisesRegex(ValueError, "execution_mode"):
+            _validate_args(SimpleNamespace(**OmegaConf.to_container(config, resolve=False)))
+
     def test_new_successes_are_bucketed_by_refinement_count(self) -> None:
         rows = [
             {"iterations": 0, "root_proved": True},

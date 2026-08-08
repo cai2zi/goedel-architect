@@ -1,0 +1,46 @@
+{
+  "cases": [
+    {
+      "case_id": "faithful_explicit_gap_aime_2025_15",
+      "name": "aime_2025/15",
+      "input_path": "/ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong76_semantic/sentinel_v3/E6/prepared/generation_inputs.jsonl",
+      "blueprint_path": "/ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong76_semantic/sentinel_v3/E6/robustpa/blueprint/blueprints/qwen3_8b_math_verify/aime_2025/robustpa_aime_2025_15/phase1_failed_last.lean",
+      "expected": "PASS",
+      "repeat": 3,
+      "mode": "full",
+      "include_ir": true,
+      "max_tokens": 1024
+    },
+    {
+      "case_id": "missing_total_bridge_aime_2025_15",
+      "name": "aime_2025/15",
+      "input_path": "/ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong76_semantic/sentinel_v4/E6/prepared/generation_inputs.jsonl",
+      "blueprint_path": "/ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong76_semantic/sentinel_v4/E6/robustpa/blueprint/blueprints/qwen3_8b_math_verify/aime_2025/robustpa_aime_2025_15/phase1_failed_last.lean",
+      "expected": "FAIL",
+      "repeat": 3,
+      "mode": "full",
+      "include_ir": true,
+      "max_tokens": 1024
+    },
+    {
+      "case_id": "vacuous_object_shell_aime_2024_88",
+      "name": "aime_2024/88",
+      "input_path": "/ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong76_semantic/sentinel_v4/E6/prepared/generation_inputs.jsonl",
+      "blueprint_path": "/ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong76_semantic/sentinel_v4/E6/robustpa/blueprint/blueprints/qwen3_8b_math_verify/aime_2024/robustpa_aime_2024_88/phase1_failed_last.lean",
+      "expected": "FAIL",
+      "mode": "full",
+      "include_ir": true,
+      "max_tokens": 1024
+    },
+    {
+      "case_id": "vacuous_geometry_shell_and_root",
+      "name": "MATH-500/test/geometry/434.json",
+      "input_path": "/ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong76_semantic/sentinel_v4/E6/prepared/generation_inputs.jsonl",
+      "blueprint_path": "/ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong76_semantic/sentinel_v4/E6/robustpa/blueprint/blueprints/qwen3_8b_math_verify/MATH_500/robustpa_MATH_500_test_geometry_434_json/phase1_failed_last.lean",
+      "expected": "FAIL",
+      "mode": "full",
+      "include_ir": true,
+      "max_tokens": 1024
+    }
+  ]
+}
