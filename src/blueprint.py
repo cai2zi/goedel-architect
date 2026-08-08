@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 from pathlib import Path
 
 from blueprint_text import (
@@ -41,7 +42,6 @@ from semantic_fidelity import (
 )
 from goedel_prompts import load, render
 from tracer import TraceEvent
-from cot_blueprint_refine.claim_scope_manifest import decode_claim_scope_manifest
 
 
 def _reasoning_kwargs(model: str) -> dict:
@@ -58,42 +58,36 @@ ROBUSTPA_BLUEPRINT_USER_TEMPLATE = load("robustpa_blueprint_user")
 
 _SEMANTIC_BLUEPRINT_SYSTEM_SUFFIX = r"""
 
-## Immutable COT Claim/Scope translation contract
+## Immutable formal Step translation contract
 
-For this request the informal proof is divided into immutable source claims and shared scopes.
-Translate every supplied claim, including a wrong
-or unsupported claim; never delete, weaken, repair, or replace it merely to
-make Lean accept the graph.
+The COT is partitioned losslessly into `COT_STEP` blocks. A Step is one
+formalization unit, not necessarily one Lean declaration. Translate every
+Step collectively and preserve wrong, contradictory, or unsupported reasoning
+exactly. Never solve, repair, weaken, omit, or reorder the source COT.
 
-Every `@[blueprint]` node, including definitions, MUST contain exactly one
-native LeanArchitect title binding naming one supplied claim, of this form:
+Every `@[blueprint]` node, including definitions, MUST have exactly one native
+LeanArchitect title naming its source Step:
 
-    (title := "COT_CLAIM:C002")
+    (title := "COT_STEP:S003")
 
-Use only one of the supplied `COT_CLAIM` identifiers. A claim may have several
-nodes, but a node has one primary source claim. The root theorem must bind to a
-final supplied claim, and every supplied `COT_CLAIM` must occur on the root's
-dependency closure. `[COT_CONTEXT]` is narration/layout only and gets no node.
-Claim order records provenance, not a forced dependency chain: infer the
-actual logical dependencies from the COT and never invent edges merely to
-make claim numbers monotone.
-For legacy manifests, Step identifiers record provenance, not a forced
-chronology; the same dependency rule applies.
+One Step MAY map to several connected Definitions/Lemmas/Theorems; this is the
+normal way to express its objects, conditions, intermediate facts, and result.
+Each supplied Step must map to at least one node. Every node must be in the
+root theorem's transitive semantic dependency closure. The root must map to
+the final Step. Infer real dependencies from the mathematics; never add a
+direct root edge merely to make a disconnected node reachable.
 
-`COT_SCOPE` blocks are exact source prefixes, section labels, or case
-conditions shared by the listed `applies_to` claims.  Read a scope and each
-target claim as one semantic unit.  The scope does not receive its own theorem
-node, but every mathematical object, qualifier, quantifier, definition,
-assertion, or branch condition in it MUST appear in the target proposition or
-its faithful dependencies.  Do not blindly turn every scope into a new
-hypothesis: preserve whether the source presents it as setup, notation,
-derived content, or a case assumption.  In particular, never translate a case
-body while dropping the condition printed in its `COT_SCOPE` block.
-An inclusive compact range such as `C002..C006` means every consecutively
-numbered claim from `C002` through `C006`.
+The dependency graph is extracted ONLY from identifiers inside
+`sorry_using [...]`. Merely mentioning a declaration in a type, theorem
+hypothesis, comment, or definition body does not create a graph edge. Thus
+each definition must be consumed by a genuinely downstream proof node's
+`sorry_using` list, and every non-root proof node must be consumed along a real
+chain ending at the root. Before emitting, mechanically trace every node
+forward to the root. The binding includes the colon: `COT_STEP:S003`, never
+`COT_STEP S003`.
 
 Do not encode an asserted or derived step as an executable definition.  Do not
-replace a claim with `True`, a reflexive equality, an unconstrained existential
+replace a Step with `True`, a reflexive equality, an unconstrained existential
 witness, a constant `Prop := True`/`Bool := true`, or a nullary definition that
 hard-codes the claimed answer.  If a source step is false or has a gap, keep
 its actual proposition as a lemma with `sorry_using [...]`; proving or
@@ -123,7 +117,7 @@ preferable to `True`, comments standing in for constraints, arbitrary concrete
 coordinates, or unrelated existential witnesses.  Instantiate coordinates
 only when the source COT itself does so.
 
-Coverage is clause-level, not merely paragraph-level.  If a source step counts
+Coverage is clause-level, not merely Step-level. If a source Step counts
 a restricted family and then asserts that the original problem's total `N`
 equals that count `K`, define the original `N` once and emit the exact bridge
 `lemma cot_total_jump : N = K := by sorry_using [...]`.  Do not replace it by
@@ -134,15 +128,15 @@ mathematical clause in each numbered step against a formal type or definition
 body; prose in `statement`/`proof` fields does not satisfy this check.
 
 Do not merge distinct clauses by strengthening one of them. For example, a
-source claim `3^7 ∣ x^3 ↔ 27 ∣ x` about one variable and a separate claim
+source clause `3^7 ∣ x^3 ↔ 27 ∣ x` about one variable and a separate clause
 `(27 ∣ a ∧ 27 ∣ b ∧ 27 ∣ c) → 3^7 ∣ a^3+b^3+c^3` require two propositions.
 The stronger aggregate statement
 `3^7 ∣ a^3+b^3+c^3 ↔ (27 ∣ a ∧ 27 ∣ b ∧ 27 ∣ c)` is not a faithful substitute
 because it drops the single-variable claim and invents an aggregate converse.
 
-Before emitting Lean, perform an internal step-by-step coverage check.  For
-every computation, derived claim, verification, or conclusion step, include a
-Lemma/Theorem anchor whose proposition states the source claim itself; helper
+Before emitting Lean, perform an internal Step-by-Step coverage check. For
+every computation, derived assertion, verification, or conclusion, include a
+Lemma/Theorem anchor whose proposition states the source assertion itself; helper
 Definitions do not replace that anchor.  Reserve Definitions for objects,
 functions, sets, and notation actually introduced by the source.  A quantity
 computed by the COT must be expressed as an equality proposition, not merely
@@ -157,225 +151,19 @@ asserting that an unrelated witness with the answer value exists.
 """
 
 
-def _decode_manifest_rows(value: str) -> list[dict] | dict:
-    if not value:
-        return []
-    try:
-        rows = json.loads(value)
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Invalid cot_manifest_json: {exc}") from exc
-    if isinstance(rows, list):
-        return [dict(row) for row in rows]
-    if isinstance(rows, dict):
-        return dict(rows)
-    raise ValueError("cot_manifest_json must contain a JSON list or object")
-
-
-def _compact_scope_targets(values: list[str]) -> str:
-    if len(values) < 2:
-        return values[0] if values else "none"
-    compact_claims = [re.fullmatch(r"C(\d{3,})", value) for value in values]
-    if all(compact_claims):
-        ordinals = [int(match.group(1)) for match in compact_claims if match is not None]
-        if ordinals == list(range(ordinals[0], ordinals[0] + len(ordinals))):
-            return f"{values[0]}..C{ordinals[-1]:03d}"
-    parsed = [re.fullmatch(r"(S\d{3})\.C(\d{3,})", value) for value in values]
-    if all(parsed):
-        step_ids = [match.group(1) for match in parsed if match is not None]
-        ordinals = [int(match.group(2)) for match in parsed if match is not None]
-        if (
-            len(set(step_ids)) == 1
-            and ordinals == list(range(ordinals[0], ordinals[0] + len(ordinals)))
-        ):
-            return f"{values[0]}..C{ordinals[-1]:03d}"
-    return ",".join(values)
-
-
-def _render_claim_scope_proof(manifest_value: dict) -> str:
-    manifest = decode_claim_scope_manifest(manifest_value)
-    source = str(manifest["source_text"])
-    semantic = sorted([
-        (int(claim["source_start"]), int(claim["source_end"]), "claim", claim)
-        for claim in manifest["claims"]
-    ] + [
-        (int(scope["source_start"]), int(scope["source_end"]), "scope", scope)
-        for scope in manifest["scopes"]
-    ])
-    blocks: list[str] = []
-    cursor = 0
-    for start, end, kind, row in semantic:
-        if cursor < start:
-            blocks.append(f"[COT_CONTEXT]\n{source[cursor:start]}\n[/COT_CONTEXT]")
-        if kind == "claim":
-            claim_id = str(row["claim_id"])
-            scope_ids = ",".join(str(value) for value in row.get("scope_ids", [])) or "none"
-            blocks.append(
-                f"[COT_CLAIM {claim_id} scopes={scope_ids}]\n"
-                f"{source[start:end]}\n[/COT_CLAIM {claim_id}]"
-            )
-        else:
-            scope_id = str(row["scope_id"])
-            targets = _compact_scope_targets([
-                str(value) for value in row["applies_to_claim_ids"]
-            ])
-            blocks.append(
-                f"[COT_SCOPE {scope_id} type={row['scope_type']} applies_to={targets}]\n"
-                f"{source[start:end]}\n[/COT_SCOPE {scope_id}]"
-            )
-        cursor = end
-    if cursor < len(source):
-        blocks.append(f"[COT_CONTEXT]\n{source[cursor:]}\n[/COT_CONTEXT]")
-    return "\n\n".join(blocks)
+def _decode_manifest_rows(value: str) -> dict:
+    from cot_blueprint_refine.formal_steps import decode_formal_step_manifest
+    return decode_formal_step_manifest(value)
 
 
 def _render_step_grounded_proof(cot_manifest_json: str, *, include_ir: bool) -> str:
-    decoded = _decode_manifest_rows(cot_manifest_json)
-    if isinstance(decoded, dict):
-        return _render_claim_scope_proof(decoded)
-    blocks: list[str] = []
-    for row in decoded:
-        step_id = str(row.get("step_id") or "")
-        role = str(row.get("role") or "derived_claim")
-        dependencies = ",".join(str(item) for item in (row.get("depends_on") or [])) or "none"
-        requires_formalization = bool(row.get("requires_formalization", True))
-        stored_claims = [
-            dict(claim) for claim in (row.get("claims") or [])
-            if isinstance(claim, dict)
-        ]
-        claim_ids_by_hash: dict[str, list[str]] = {}
-        for claim in stored_claims:
-            claim_hash = str(claim.get("source_sha256") or "")
-            claim_id = str(claim.get("claim_id") or "")
-            if claim_hash and claim_id:
-                claim_ids_by_hash.setdefault(claim_hash, []).append(claim_id)
-        claim_hash_uses: Counter[str] = Counter()
-        metadata = (
-            f"role={role} depends_on={dependencies} "
-            f"requires_formalization={str(requires_formalization).lower()} "
-            f"claim_count={len(stored_claims)}"
-        )
-        if include_ir:
-            numbers = ",".join(str(item) for item in (row.get("numbers") or [])) or "none"
-            relations = ",".join(str(item) for item in (row.get("relations") or [])) or "none"
-            metadata += f" numbers={numbers} relations={relations}"
-        source_text = str(row.get("source_text") or "")
-        explicit_segments = row.get("segments")
-        if explicit_segments is not None:
-            if not isinstance(explicit_segments, list) or not explicit_segments:
-                raise ValueError(f"COT step {step_id} has invalid explicit segments")
-            stored_by_id = {
-                str(claim.get("claim_id") or ""): claim
-                for claim in stored_claims
-                if claim.get("claim_id")
-            }
-            cursor = 0
-            seen_segment_claims: set[str] = set()
-            rendered_parts: list[str] = []
-            for segment_index, raw_segment in enumerate(explicit_segments, start=1):
-                if not isinstance(raw_segment, dict):
-                    raise ValueError(
-                        f"COT step {step_id} segment {segment_index} is not an object"
-                    )
-                start = int(raw_segment.get("source_start", -1))
-                end = int(raw_segment.get("source_end", -1))
-                if start != cursor or end <= start or end > len(source_text):
-                    raise ValueError(
-                        f"COT step {step_id} segments do not exactly cover source text "
-                        f"at segment {segment_index}: expected_start={cursor} start={start} end={end}"
-                    )
-                segment_text = source_text[start:end]
-                kind = str(raw_segment.get("kind") or "")
-                if kind == "context":
-                    scope_id = str(raw_segment.get("scope_id") or "")
-                    if scope_id:
-                        scope_type = str(raw_segment.get("scope_type") or "context")
-                        target_ids = [
-                            str(value)
-                            for value in (raw_segment.get("applies_to_claim_ids") or [])
-                        ]
-                        applies_to = _compact_scope_targets(target_ids)
-                        rendered_parts.append(
-                            f"[COT_SCOPE {scope_id} type={scope_type} "
-                            f"applies_to={applies_to}]\n{segment_text}\n"
-                            "[/COT_SCOPE]"
-                        )
-                    else:
-                        rendered_parts.append(f"[COT_CONTEXT {step_id}] {segment_text}")
-                elif kind == "claim":
-                    claim_id = str(raw_segment.get("claim_id") or "")
-                    claim = stored_by_id.get(claim_id)
-                    if claim is None or claim_id in seen_segment_claims:
-                        raise ValueError(
-                            f"COT step {step_id} has invalid segment claim id {claim_id!r}"
-                        )
-                    if str(claim.get("source_text") or "") != segment_text:
-                        raise ValueError(
-                            f"COT step {step_id} segment text mismatch for {claim_id}"
-                        )
-                    seen_segment_claims.add(claim_id)
-                    rendered_parts.append(
-                        f"[COT_CLAIM {claim_id}]\n{segment_text}\n[/COT_CLAIM {claim_id}]"
-                    )
-                else:
-                    raise ValueError(
-                        f"COT step {step_id} segment {segment_index} has invalid kind {kind!r}"
-                    )
-                cursor = end
-            if cursor != len(source_text):
-                raise ValueError(
-                    f"COT step {step_id} explicit segments leave source text uncovered"
-                )
-            if seen_segment_claims != set(stored_by_id):
-                missing = sorted(set(stored_by_id) - seen_segment_claims)
-                raise ValueError(
-                    f"COT step {step_id} explicit segments omit claims: {missing}"
-                )
-            rendered_source = "\n\n".join(rendered_parts)
-            blocks.append(
-                f"[COT_STEP {step_id} {metadata}]\n"
-                f"{rendered_source}\n"
-                f"[/COT_STEP {step_id}]"
-            )
-            continue
-        paragraphs = [
-            paragraph.strip()
-            for paragraph in re.split(r"\n\s*\n+", source_text)
-            if paragraph.strip()
-        ] or [source_text]
-        claim_index = 0
-        rendered_parts: list[str] = []
-        for paragraph in paragraphs:
-            if not requires_formalization:
-                rendered_parts.append(f"[COT_CONTEXT {step_id}] {paragraph}")
-                continue
-            if stored_claims:
-                paragraph_hash = hashlib.sha256(paragraph.encode("utf-8")).hexdigest()
-                candidates = claim_ids_by_hash.get(paragraph_hash, [])
-                use_index = claim_hash_uses[paragraph_hash]
-                claim_id = candidates[use_index] if use_index < len(candidates) else ""
-                claim_hash_uses[paragraph_hash] += 1
-                if not claim_id:
-                    rendered_parts.append(f"[COT_CONTEXT {step_id}] {paragraph}")
-                    continue
-                rendered_parts.append(
-                    f"[COT_CLAIM {claim_id}]\n{paragraph}\n[/COT_CLAIM {claim_id}]"
-                )
-                continue
-            if re.fullmatch(r"\s*#{1,6}\s+[^\n]+", paragraph):
-                rendered_parts.append(f"[COT_CONTEXT {step_id}] {paragraph}")
-                continue
-            claim_index += 1
-            rendered_parts.append(
-                f"[COT_CLAIM {step_id}.C{claim_index:03d}]\n{paragraph}\n"
-                f"[/COT_CLAIM {step_id}.C{claim_index:03d}]"
-            )
-        rendered_source = "\n\n".join(rendered_parts)
-        blocks.append(
-            f"[COT_STEP {step_id} {metadata}]\n"
-            f"{rendered_source}\n"
-            f"[/COT_STEP {step_id}]"
-        )
-    return "\n\n".join(blocks)
+    from cot_blueprint_refine.formal_steps import decode_formal_step_manifest
+    del include_ir
+    manifest = decode_formal_step_manifest(cot_manifest_json)
+    return "\n\n".join(
+        f"[COT_STEP {step['step_id']}]\n{step['source_text']}\n[/COT_STEP {step['step_id']}]"
+        for step in manifest["steps"]
+    )
 
 
 def _enabled_semantic_issues(
@@ -435,6 +223,7 @@ class BlueprintGenerationError(RuntimeError):
         attempt: int = 0,
         finish_reason: str | None = None,
         failure_stage: str = "model_output",
+        candidate_history: list[str] | None = None,
     ) -> None:
         super().__init__(message)
         self.last_candidate = last_candidate
@@ -442,13 +231,25 @@ class BlueprintGenerationError(RuntimeError):
         self.attempt = attempt
         self.finish_reason = finish_reason
         self.failure_stage = failure_stage
+        self.candidate_history = list(candidate_history or [])
 
 
 @lru_cache(maxsize=2)
-def _load_phase1_tokenizer(path: str):
+def _load_phase1_tokenizer_unlocked(path: str):
     from transformers import AutoTokenizer
 
     return AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+
+
+_PHASE1_TOKENIZER_LOAD_LOCK = threading.Lock()
+
+
+def _load_phase1_tokenizer(path: str):
+    # Hugging Face's lazy module imports are not safe when many Phase-1 worker
+    # threads perform the first import concurrently.  Serialize only cache
+    # misses/reads; tokenization itself remains concurrent.
+    with _PHASE1_TOKENIZER_LOAD_LOCK:
+        return _load_phase1_tokenizer_unlocked(path)
 
 
 def phase1_request_max_tokens(messages: list[dict[str, str]]) -> int:
@@ -617,24 +418,25 @@ def _semantic_repair_guidance(issues: list[SemanticIssue]) -> str:
     """Give bounded, issue-specific guidance without adding another LLM call."""
     codes = {issue.code for issue in issues}
     guidance: list[str] = []
-    if codes.intersection({"STEP_MAPPING_ABSENT", "CLAIM_MAPPING_ABSENT"}):
+    if "STEP_MAPPING_ABSENT" in codes:
         guidance.append(
-            "Create a substantive formal node for every listed absent source step/claim, "
-            "using its exact `COT_CLAIM:CNNN` (or legacy `COT_STEP:SNNN.CNNN`) title, and then "
+            "Create one or more substantive formal nodes for every absent source Step, "
+            "using its exact `COT_STEP:SNNN` title, and then "
             "include it in a downstream `sorry_using` chain to the root; never replace "
             "the missing translation with `True`, a reflexive equality, or a placeholder."
         )
     if codes.intersection({
-        "MISSING_STEP_MAPPING", "MALFORMED_STEP_MAPPING", "MISSING_CLAIM_MAPPING",
+        "MISSING_STEP_MAPPING", "MALFORMED_STEP_MAPPING",
     }):
         guidance.append(
             "Repair each listed node's provenance title so it names exactly the source "
-            "claim that its existing formal declaration translates."
+            "Step that its existing formal declaration translates."
         )
-    if codes.intersection({"STEP_NOT_ROOT_REACHABLE", "CLAIM_NOT_ROOT_REACHABLE"}):
+    if codes.intersection({"STEP_NOT_ROOT_REACHABLE", "NODE_NOT_ROOT_REACHABLE"}):
         guidance.append(
             "The corresponding formal nodes already exist: preserve their declarations "
-            "and connect them to the root through downstream `sorry_using` dependencies."
+            "and build mathematically faithful downstream dependencies to the root. Do not "
+            "attach unrelated nodes directly to the root merely to satisfy reachability."
         )
     if any(code.startswith("VACUOUS_") for code in codes):
         guidance.append(
@@ -653,7 +455,7 @@ def _semantic_repair_guidance(issues: list[SemanticIssue]) -> str:
         )
     if not guidance:
         guidance.append(
-            "Fix every listed issue while preserving all existing substantive source claims."
+            "Fix every listed issue while preserving every substantive source Step clause."
         )
     return "\n".join(f"- {item}" for item in guidance)
 
@@ -773,6 +575,7 @@ class Blueprint:
     phase2_header: str = MATHLIB_HEADER
     semantic_gate_results: list[dict] = field(default_factory=list)
     semantic_audit_result: dict = field(default_factory=dict)
+    candidate_history: list[str] = field(default_factory=list, repr=False)
 
     def node_by_name(self, name: str) -> BlueprintNode | None:
         return next((n for n in self.nodes if n.name == name), None)
@@ -955,124 +758,6 @@ def phase2_contract_errors(blueprint: Blueprint) -> list[str]:
 
 def phase2_contract_error_counts(errors: list[str]) -> dict[str, int]:
     return dict(Counter(error.split(":", 1)[0] for error in errors))
-
-
-_REACHABILITY_ONLY_ISSUES = {
-    "CLAIM_NOT_ROOT_REACHABLE",
-    "STEP_NOT_ROOT_REACHABLE",
-}
-
-
-def _repair_root_reachability_only(
-    blueprint: Blueprint,
-    issues: list[SemanticIssue],
-) -> tuple[str, list[str]] | None:
-    """Connect already-formalized source claims to the root without an LLM.
-
-    This repair is deliberately narrow: it is available only when *every*
-    enabled semantic issue says that an existing claim/step node is outside
-    the root dependency closure.  It changes only the root theorem's
-    ``sorry_using`` metadata; declarations and propositions remain byte-for-
-    byte identical.  Candidates which also contain a vacuous, malformed, or
-    missing translation must go through the normal semantic repair path.
-
-    Every existing node mapped to a missing source ID is connected.  A single
-    claim may legitimately require several formal nodes, so choosing one
-    representative would risk making the other translated clauses dead code.
-    """
-    if not issues or any(
-        issue.code not in _REACHABILITY_ONLY_ISSUES
-        or issue.category != "binding"
-        for issue in issues
-    ):
-        return None
-
-    root = blueprint.node_by_name(blueprint.target_theorem)
-    if root is None or root.kind not in {"lemma", "theorem"}:
-        return None
-    if len(blueprint.nodes_by_name()) != len(blueprint.nodes):
-        return None
-    root_decl = root.lean_declaration
-    current_root_decl = extract_current_node_decl(root_decl)
-    proof_matches = list(BLUEPRINT_PROOF_RE.finditer(current_root_decl))
-    if (
-        len(proof_matches) != 1
-        or root_decl.count(current_root_decl) != 1
-        or blueprint.lean_file.count(root_decl) != 1
-    ):
-        return None
-
-    missing_ids = list(dict.fromkeys(issue.step_id for issue in issues if issue.step_id))
-    if len(missing_ids) != len({issue.step_id for issue in issues}):
-        return None
-
-    def node_covers(node: BlueprintNode, source_id: str) -> bool:
-        if source_id.count("."):
-            return node.source_step_id == source_id
-        return node.source_step_id.split(".", 1)[0] == source_id
-
-    selected = [
-        node.name
-        for node in blueprint.nodes
-        if node.name != root.name
-        and any(node_covers(node, source_id) for source_id in missing_ids)
-    ]
-    for source_id in missing_ids:
-        if not any(
-            node_covers(node, source_id)
-            for node in blueprint.nodes
-            if node.name != root.name
-        ):
-            return None
-
-    dependencies = list(dict.fromkeys([*root.dependencies, *selected]))
-    proof_match = proof_matches[0]
-    replacement = f":= by sorry_using [{', '.join(dependencies)}]"
-    repaired_current_decl = (
-        current_root_decl[:proof_match.start()]
-        + replacement
-        + current_root_decl[proof_match.end():]
-    )
-    repaired_root = root_decl.replace(current_root_decl, repaired_current_decl, 1)
-    repaired_code = blueprint.lean_file.replace(root_decl, repaired_root, 1)
-    if repaired_code == blueprint.lean_file:
-        return None
-
-    try:
-        repaired_blueprint = _parse_blueprint(repaired_code, blueprint.target_theorem)
-        repaired_blueprint.dependency_order()
-    except (ValueError, RuntimeError):
-        return None
-    if [node.name for node in repaired_blueprint.nodes] != [
-        node.name for node in blueprint.nodes
-    ]:
-        return None
-    for before, after in zip(blueprint.nodes, repaired_blueprint.nodes, strict=True):
-        if (
-            before.kind,
-            before.title,
-            before.source_step_id,
-            before.statement,
-            before.proof_sketch,
-        ) != (
-            after.kind,
-            after.title,
-            after.source_step_id,
-            after.statement,
-            after.proof_sketch,
-        ):
-            return None
-        if before.kind == "definition":
-            if before.full_declaration() != after.full_declaration():
-                return None
-        elif before.signature() != after.signature():
-            return None
-        expected_dependencies = (
-            dependencies if before.name == root.name else before.dependencies
-        )
-        if after.dependencies != expected_dependencies:
-            return None
-    return repaired_code, selected
 
 
 def format_phase2_contract_errors(errors: list[str], limit: int = 12) -> str:
@@ -1282,9 +967,9 @@ def generate_blueprint_from_informal(
     local_semantic_repair_count = 0
     audit_semantic_repair_count = 0
     observed_semantic_issues: list[str] = []
+    candidate_history: list[str] = []
     for attempt in range(max_retries):
         semantic_check_issues: list[SemanticIssue] = []
-        deterministic_graph_repair_nodes: list[str] = []
         generation_kwargs = _reasoning_kwargs(model)
         if attempt > 0:
             # Repair turns should apply the supplied diagnostics, not spend a
@@ -1308,6 +993,7 @@ def generate_blueprint_from_informal(
         choice = response.choices[0]
         lean_code = _extract_lean_code(choice.message.content)
         last_candidate = lean_code
+        candidate_history.append(lean_code)
         last_finish_reason = getattr(choice, "finish_reason", None)
         emitted_target = _extract_target_name(lean_code, "")
         if emitted_target != target_name:
@@ -1352,49 +1038,6 @@ def generate_blueprint_from_informal(
                     attempt=attempt + 1,
                     issues=semantic_check_issues,
                 )
-                graph_repair = _repair_root_reachability_only(
-                    candidate,
-                    semantic_check_issues,
-                )
-                if semantic_check_issues and graph_repair is not None:
-                    repaired_code, repaired_nodes = graph_repair
-                    repaired_candidate = _parse_blueprint(repaired_code, target_name)
-                    repaired_issues = _enabled_semantic_issues(
-                        validate_blueprint_fidelity(
-                            repaired_candidate,
-                            semantic_manifest,
-                            claimed_answer=claimed_answer,
-                            require_step_bindings=semantic_require_step_ids,
-                        ),
-                        require_step_ids=semantic_require_step_ids,
-                        static_gate=semantic_static_gate,
-                    )
-                    if not repaired_issues:
-                        lean_code = repaired_code
-                        last_candidate = repaired_code
-                        candidate = repaired_candidate
-                        semantic_check_issues = []
-                        deterministic_graph_repair_nodes = repaired_nodes
-                        if tracer is not None:
-                            tracer.emit(TraceEvent(
-                                kind="blueprint_graph_repair",
-                                thm_name=thm_name,
-                                ok=True,
-                                args={
-                                    "phase": "phase1",
-                                    "attempt": attempt + 1,
-                                    "root": target_name,
-                                    "added_dependencies": repaired_nodes,
-                                    "changed_formal_declarations": False,
-                                },
-                            ))
-                        _emit_semantic_check(
-                            tracer,
-                            thm_name=thm_name,
-                            phase="phase1_graph_repair",
-                            attempt=attempt + 1,
-                            issues=[],
-                        )
                 if semantic_check_issues:
                     for issue in semantic_check_issues:
                         issue_key = ":".join(
@@ -1402,39 +1045,6 @@ def generate_blueprint_from_informal(
                         )
                         if issue_key not in observed_semantic_issues:
                             observed_semantic_issues.append(issue_key)
-                    local_semantic_repair_count += 1
-                    last_error_feedback = (
-                        "The local semantic-fidelity gate rejected this candidate "
-                        "before Lean execution:\n\n"
-                        f"{format_semantic_issues(semantic_check_issues)}"
-                    )
-                    last_diagnostics = [last_error_feedback]
-                    last_failure_stage = "semantic_gate"
-                    if local_semantic_repair_count > semantic_max_repair_attempts:
-                        raise BlueprintGenerationError(
-                            last_error_feedback,
-                            last_candidate=last_candidate,
-                            diagnostics=last_diagnostics,
-                            attempt=attempt + 1,
-                            finish_reason=last_finish_reason,
-                            failure_stage=last_failure_stage,
-                        )
-                    feedback = (
-                        f"{last_error_feedback}\n\nCorrect the translation contract and "
-                        "re-emit the entire file. Preserve the source COT exactly; a false "
-                        "step must remain a proposition and explicit proof gap.\n\n"
-                        f"Issue-specific repair rules:\n{_semantic_repair_guidance(semantic_check_issues)}\n\n"
-                        "Previously observed issues that must not regress: "
-                        f"{', '.join(observed_semantic_issues)}"
-                    )
-                    _set_latest_blueprint_retry(
-                        messages,
-                        base_messages,
-                        lean_code,
-                        feedback,
-                        finish_reason=last_finish_reason,
-                    )
-                    continue
 
         result = compiler.check_blueprint(lean_code, target_name)
         _emit_lean_check_result(
@@ -1449,6 +1059,51 @@ def generate_blueprint_from_informal(
             raise KiminaInfrastructureError(
                 "\n".join(result.diagnostics) or result.raw_output[-2000:]
             )
+        if semantic_check_issues:
+            # The repair budget is deliberately one turn.  Compile the same
+            # rejected candidate as well so that this single turn receives
+            # both semantic and Lean diagnostics instead of discovering Lean
+            # errors only after it has spent its sole repair on graph shape.
+            local_semantic_repair_count += 1
+            semantic_feedback = format_semantic_issues(semantic_check_issues)
+            lean_feedback = ""
+            if not result.success:
+                lean_feedback = (
+                    "\n\nThe same candidate also failed Lean compilation:\n\n"
+                    + ("\n".join(result.diagnostics) or result.raw_output[-2000:])
+                )
+            last_error_feedback = (
+                "The local semantic-fidelity gate rejected this candidate:\n\n"
+                f"{semantic_feedback}{lean_feedback}"
+            )
+            last_diagnostics = [last_error_feedback]
+            last_failure_stage = "semantic_gate"
+            if local_semantic_repair_count > semantic_max_repair_attempts:
+                raise BlueprintGenerationError(
+                    last_error_feedback,
+                    last_candidate=last_candidate,
+                    diagnostics=last_diagnostics,
+                    attempt=attempt + 1,
+                    finish_reason=last_finish_reason,
+                    failure_stage=last_failure_stage,
+                    candidate_history=candidate_history,
+                )
+            feedback = (
+                f"{last_error_feedback}\n\nCorrect all listed translation and Lean "
+                "errors in one pass and re-emit the entire file. Preserve the source COT "
+                "exactly; a false step must remain a proposition and explicit proof gap.\n\n"
+                f"Issue-specific repair rules:\n{_semantic_repair_guidance(semantic_check_issues)}\n\n"
+                "Previously observed issues that must not regress: "
+                f"{', '.join(observed_semantic_issues)}"
+            )
+            _set_latest_blueprint_retry(
+                messages,
+                base_messages,
+                lean_code,
+                feedback,
+                finish_reason=last_finish_reason,
+            )
+            continue
         if result.success:
             try:
                 parsed = _parse_blueprint(lean_code, target_name)
@@ -1472,14 +1127,6 @@ def generate_blueprint_from_informal(
                         "require_step_ids": semantic_require_step_ids,
                         "static_gate": semantic_static_gate,
                     })
-                    if deterministic_graph_repair_nodes:
-                        parsed.semantic_gate_results.append({
-                            "stage": "phase1_graph_repair",
-                            "passed": True,
-                            "root": target_name,
-                            "added_dependencies": deterministic_graph_repair_nodes,
-                            "changed_formal_declarations": False,
-                        })
                 contract_errors = phase2_contract_errors(parsed)
                 if not contract_errors:
                     contract_errors = phase2_standalone_contract_errors(
@@ -1532,6 +1179,7 @@ def generate_blueprint_from_informal(
                             )
                             audit_passed = False
                         if audit_passed:
+                            parsed.candidate_history = list(candidate_history)
                             parsed.semantic_audit_result = asdict(audit)
                             parsed.semantic_gate_results.append({
                                 "stage": "phase1_semantic_audit",
@@ -1559,10 +1207,11 @@ def generate_blueprint_from_informal(
                                 attempt=attempt + 1,
                                 finish_reason=last_finish_reason,
                                 failure_stage=last_failure_stage,
+                                candidate_history=candidate_history,
                             )
                         feedback = (
                             f"{last_error_feedback}\n\nRepair only the Lean translation. "
-                            "Do not repair, weaken, or omit the original COT claims. "
+                            "Do not repair, weaken, or omit any original COT Step clause. "
                             "Re-emit the complete blueprint with the same step bindings."
                         )
                         _set_latest_blueprint_retry(
@@ -1573,6 +1222,7 @@ def generate_blueprint_from_informal(
                             finish_reason=last_finish_reason,
                         )
                         continue
+                    parsed.candidate_history = list(candidate_history)
                     return parsed
                 last_error_feedback = (
                     "The file compiled, but the blueprint is not usable by Phase 2:\n\n"
@@ -1608,6 +1258,7 @@ def generate_blueprint_from_informal(
         attempt=max_retries,
         finish_reason=last_finish_reason,
         failure_stage=last_failure_stage,
+        candidate_history=candidate_history,
     )
 
 
@@ -1678,13 +1329,8 @@ def _parse_blueprint(lean_code: str, target_theorem: str) -> Blueprint:
         statement = _extract_attr(attrs_block, "statement")
         proof_sketch = _extract_attr(attrs_block, "proof")
         title = _extract_string_attr(attrs_block, "title")
-        source_match = re.fullmatch(
-            r"(?:COT_STEP:(S\d{3}(?:\.[A-Za-z0-9_-]+)?)|COT_CLAIM:(C\d{3,}))",
-            title.strip(),
-        )
-        source_step_id = (
-            (source_match.group(1) or source_match.group(2)) if source_match else ""
-        )
+        source_match = re.fullmatch(r"COT_STEP:(S\d{3,})", title.strip())
+        source_step_id = source_match.group(1) if source_match else ""
 
         # Extract sorry_using [...] dependencies
         dep_match = re.search(r"sorry_using\s*\[([^\]]*)\]", rest)

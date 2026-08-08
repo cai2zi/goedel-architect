@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from functools import lru_cache
 from typing import Any
 
@@ -50,20 +51,20 @@ _SEMANTIC_REFINEMENT_SYSTEM_SUFFIX = r"""
 
 ## Semantic-fidelity refinement mode
 
-The COT-claim-to-mathematics translation is immutable in this mode. A failed
+The COT-Step-to-mathematics translation is immutable in this mode. A failed
 Lean proof is evidence about the corresponding source step; it is not
-permission to repair the source solution. Preserve every source claim,
+permission to repair the source solution. Preserve every source Step clause,
 number, relation, quantifier, negation, object, and claimed final answer even
 when it is false.
 
-Every node must retain exactly one native `(title := "COT_CLAIM:CNNN")` binding
-(legacy manifests may still use `COT_STEP:SNNN.CNNN`).
-Do not delete a source claim, move the root away from the final claim,
+Every node must retain exactly one native `(title := "COT_STEP:SNNN")` binding.
+Several connected nodes may map to the same Step. Do not delete a source Step,
+move the root away from the final Step,
 replace a proposition with `True`/a reflexive equality/an unconstrained
 existential, introduce an answer as an assumption, or hide an asserted step in
 an executable definition. You may fix Lean types, casts, library names,
 dependency edges and proof sketches, or split one step into multiple nodes
-bound to the same source claim. Leave a genuinely unsupported claim as an
+bound to the same source Step. Leave a genuinely unsupported assertion as an
 explicit `sorry_using [...]` gap.
 """
 
@@ -79,10 +80,18 @@ class SemanticRefinementError(RuntimeError):
 
 
 @lru_cache(maxsize=2)
-def _load_phase3_tokenizer(path: str):
+def _load_phase3_tokenizer_unlocked(path: str):
     from transformers import AutoTokenizer
 
     return AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+
+
+_PHASE3_TOKENIZER_LOAD_LOCK = threading.Lock()
+
+
+def _load_phase3_tokenizer(path: str):
+    with _PHASE3_TOKENIZER_LOAD_LOCK:
+        return _load_phase3_tokenizer_unlocked(path)
 
 
 def _phase3_message_token_count(messages: list[dict[str, str]], tokenizer: Any) -> int:
@@ -302,7 +311,7 @@ def refine_blueprint(
                     feedback = (
                         f"{last_error_feedback}\n\nUndo every semantic change. "
                         "Only repair the Lean encoding, dependency edges, or proof sketches; "
-                        "keep false/unsupported COT claims as explicit gaps."
+                        "keep false/unsupported COT Step assertions as explicit gaps."
                     )
                     _set_latest_blueprint_retry(
                         messages,
@@ -419,7 +428,7 @@ def refine_blueprint(
                             raise SemanticRefinementError(last_error_feedback)
                         feedback = (
                             f"{last_error_feedback}\n\nRepair only the formal encoding. "
-                            "Restore every original COT claim and source-step binding; "
+                            "Restore every original COT Step and Step binding; "
                             "do not make the mathematics easier."
                         )
                         _set_latest_blueprint_retry(

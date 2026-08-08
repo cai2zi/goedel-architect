@@ -22,11 +22,7 @@ from cot_blueprint_refine.common import latest_rows, load_config, output_root, p
 from cot_blueprint_refine.evaluate import evaluate  # noqa: E402
 from cot_blueprint_refine.export_blueprint_contexts import export_contexts  # noqa: E402
 from cot_blueprint_refine.prepare_inputs import DATASET_SUBSET, prepare  # noqa: E402
-from cot_blueprint_refine.run_cot_split import (  # noqa: E402
-    DETERMINISTIC_MODES,
-    LLM_MODES,
-    run_cot_split,
-)
+from cot_blueprint_refine.run_cot_split import run_cot_split  # noqa: E402
 from cot_blueprint_refine.run_cot_refinement import refine  # noqa: E402
 from cot_blueprint_refine.vllm_runtime import PersistentVLLMRuntime  # noqa: E402
 from cot_blueprint_refine.kimina_runtime import PersistentKiminaRuntime  # noqa: E402
@@ -176,6 +172,7 @@ def run_blueprint(
         "limit=null",
         "problem_id=null",
         f"resume={str(bool(config.resume)).lower()}",
+        f"retry_error_results={str(bool(blueprint.get('retry_error_results', False))).lower()}",
         f"max_refinement_iterations={blueprint.max_refinement_iterations}",
         f"execution_mode={blueprint.get('execution_mode', 'full')}",
         f"blueprint_max_retries={blueprint.blueprint_max_retries}",
@@ -283,22 +280,18 @@ def run_stage(
     if stage == "prepare":
         return prepare(config)
     if stage == "split":
-        split_mode = str(config.cot_splitter.get("mode", "deterministic")).strip().lower()
-        if split_mode in LLM_MODES:
-            splitter = config.cot_splitter
-            runtime.ensure(
-                stage="cot_split",
-                client_model=str(splitter.model),
-                base_url=str(splitter.openai_base_url),
-                service=splitter.vllm,
-            )
-            preflight_model(
-                str(splitter.model),
-                str(splitter.openai_base_url),
-                str(splitter.get("api_key", "dummy")),
-            )
-        elif split_mode not in DETERMINISTIC_MODES:
-            raise ValueError(f"unknown cot_splitter.mode: {split_mode!r}")
+        splitter = config.step_splitter
+        runtime.ensure(
+            stage="formal_step_split",
+            client_model=str(splitter.model),
+            base_url=str(splitter.openai_base_url),
+            service=splitter.vllm,
+        )
+        preflight_model(
+            str(splitter.model),
+            str(splitter.openai_base_url),
+            str(splitter.get("api_key", "dummy")),
+        )
         return run_cot_split(config)
     if stage == "blueprint":
         return run_blueprint(config, runtime, kimina_runtime)

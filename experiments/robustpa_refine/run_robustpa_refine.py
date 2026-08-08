@@ -154,6 +154,7 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
     args.limit = getattr(args, "limit", None)
     args.problem_id = getattr(args, "problem_id", None)
     args.resume = bool(getattr(args, "resume", False))
+    args.retry_error_results = bool(getattr(args, "retry_error_results", False))
     if not args.exp_name:
         args.exp_name = default_exp_name(args.model, args.split, args.subset)
     if args.openai_base_url:
@@ -315,6 +316,17 @@ def _write_blueprint_snapshot(
     path = blueprint_dir / f"round_{iteration:02d}_{label}.lean"
     path.write_text(blueprint.lean_file, encoding="utf-8")
     return path
+
+
+def _write_phase1_candidates(blueprint_dir: Path, candidates: list[str]) -> list[str]:
+    """Persist the immutable initial candidate and its single repair separately."""
+    blueprint_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[str] = []
+    for index, candidate in enumerate(candidates):
+        path = blueprint_dir / f"phase1_iter{index}.lean"
+        path.write_text(candidate.rstrip() + "\n", encoding="utf-8")
+        paths.append(str(path))
+    return paths
 
 
 def _node_rows(blueprint: Blueprint | None, state: CheckpointState | None) -> list[dict[str, Any]]:
@@ -557,6 +569,7 @@ async def _run_record(
                     semantic_max_repair_attempts=args.semantic_max_repair_attempts,
                 ),
             )
+            _write_phase1_candidates(blueprint_dir, blueprint.candidate_history)
             state = CheckpointState(
                 informal_statement=record.informal_statement,
                 informal_proof=record.informal_proof,
@@ -755,6 +768,9 @@ async def _run_record(
         )
         if isinstance(exc, BlueprintGenerationError) and exc.last_candidate.strip():
             blueprint_dir.mkdir(parents=True, exist_ok=True)
+            candidate_paths = _write_phase1_candidates(
+                blueprint_dir, exc.candidate_history or [exc.last_candidate]
+            )
             candidate_path = blueprint_dir / "phase1_failed_last.lean"
             diagnostics_path = blueprint_dir / "phase1_failed_last.json"
             candidate_path.write_text(exc.last_candidate.rstrip() + "\n", encoding="utf-8")
@@ -768,6 +784,7 @@ async def _run_record(
                 "failed_blueprint_candidate_path": str(candidate_path),
                 "failed_blueprint_diagnostics_path": str(diagnostics_path),
                 "failed_blueprint_failure_stage": exc.failure_stage,
+                "phase1_candidate_paths": candidate_paths,
             })
         return row
     finally:
@@ -998,7 +1015,11 @@ def _write_metrics(
 def _should_skip_existing(row: dict[str, Any] | None, args: argparse.Namespace) -> bool:
     if not args.resume or row is None:
         return False
-    return row.get("root_proved") is True or row.get("status") == "exhausted"
+    if row.get("root_proved") is True or row.get("status") in {
+        "exhausted", "phase1_accepted",
+    }:
+        return True
+    return row.get("status") == "error" and not args.retry_error_results
 
 
 async def _run_experiment(

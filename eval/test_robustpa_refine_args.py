@@ -15,6 +15,7 @@ sys.path.insert(0, str(REPO_ROOT / "experiments"))
 from robustpa_refine.run_robustpa_refine import (  # noqa: E402
     _format_new_success_by_refinement_iteration,
     _new_success_by_refinement_iteration,
+    _should_skip_existing,
     _validate_args,
 )
 
@@ -56,6 +57,17 @@ class RobustPAConfigTest(unittest.TestCase):
         config.execution_mode = "unknown"
         with self.assertRaisesRegex(ValueError, "execution_mode"):
             _validate_args(SimpleNamespace(**OmegaConf.to_container(config, resolve=False)))
+
+    def test_resume_treats_terminal_phase1_results_and_errors_as_complete(self) -> None:
+        args = SimpleNamespace(resume=True, retry_error_results=False)
+        self.assertTrue(_should_skip_existing({"status": "phase1_accepted"}, args))
+        self.assertTrue(_should_skip_existing({"status": "exhausted"}, args))
+        self.assertTrue(_should_skip_existing({"status": "error"}, args))
+        self.assertTrue(_should_skip_existing({"root_proved": True}, args))
+        self.assertFalse(_should_skip_existing(None, args))
+
+        args.retry_error_results = True
+        self.assertFalse(_should_skip_existing({"status": "error"}, args))
 
     def test_new_successes_are_bucketed_by_refinement_count(self) -> None:
         rows = [

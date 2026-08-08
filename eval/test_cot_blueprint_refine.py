@@ -1878,7 +1878,7 @@ class VLLMServerTest(unittest.TestCase):
 
     def test_use_existing_profile_defaults_are_explicit(self) -> None:
         self.assertFalse(bool(load_config("base", []).vllm.use_existing))
-        profile = load_config("qwen3_8b_397b_wrong76_llm_split", [])
+        profile = load_config("qwen3_8b_397b_wrong46_step_v1_phase1_only", [])
         self.assertTrue(bool(profile.vllm.use_existing))
 
     def test_exclusive_port_rejects_without_starting_process(self) -> None:

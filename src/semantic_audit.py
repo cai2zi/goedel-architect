@@ -18,9 +18,9 @@ from tracer import TraceEvent
 
 AuditMode = Literal["risk", "full"]
 SEMANTIC_AUDIT_FLAG_RE = re.compile(r"\[\[SEMANTIC_AUDIT=(PASS|FAIL)\]\]")
-_COT_CLAIM_ID_RE = re.compile(r"\[COT_CLAIM\s+((?:S\d{3}\.)?C\d{3,})(?:\s+[^\]]*)?\]")
-_CLAIMS_LINE_RE = re.compile(r"\[\[CLAIMS=([^\]]*)\]\]")
-_CLAIM_ENTRY_RE = re.compile(r"((?:S\d{3}\.)?C\d{3,}):(OK|MISSING|MISMATCH)")
+_COT_STEP_ID_RE = re.compile(r"\[COT_STEP\s+(S\d{3,})\]")
+_STEPS_LINE_RE = re.compile(r"\[\[STEPS=([^\]]*)\]\]")
+_STEP_ENTRY_RE = re.compile(r"(S\d{3,}):(OK|MISSING|MISMATCH)")
 _BLUEPRINT_PROSE_FIELD_RE = re.compile(
     r"\((?:statement|proof)\s*:=\s*"
     r"(?:/--.*?-/|\"(?:\\.|[^\"\\])*\")\)\s*",
@@ -37,17 +37,18 @@ SYSTEM_PROMPT = """You are a proposition-coverage auditor, not a proof judge.
 Compare the original problem, claimed answer, numbered source COT, and the
 formal-only Lean view. Use this mechanical decision procedure:
 
-1. Inventory every mathematical proposition explicitly asserted by each
-   `[COT_CLAIM ...]`, including false, contradictory, and unsupported claims.
-   `[COT_CONTEXT ...]` is narration-only and requires no Lean proposition.
-2. Find a Lean proposition or definition body that states each claim about the
+1. For every `[COT_STEP ...]`, inventory all mathematical clauses it asserts,
+   including false, contradictory, and unsupported clauses. A Step may map to
+   several Lean declarations which must be judged collectively.
+2. Find Lean propositions or definition bodies that jointly state each Step about the
    same objects, bindings, assumptions, quantifiers, relations, constants,
    branches, and polarity.
 3. Check that the root asks the original problem's question about the same
    object and preserves the COT's claimed final answer.
 4. PASS exactly when this proposition inventory is covered without a
    substantive replacement, omission, weakening, strengthening, or silent
-   correction. Mathematical truth and provability are irrelevant.
+   correction. Mathematical truth and provability are irrelevant. Headings,
+   lead-ins, and method narration inside a Step need no separate declaration.
 
 The Lean view intentionally removes prose, proof bodies, and dependency lists;
 every displayed `by sorry` means "this source proposition is unproved here".
@@ -107,13 +108,13 @@ The FIRST LINE must be exactly one marker:
 [[SEMANTIC_AUDIT=FAIL]]
 
 The SECOND LINE must be exactly one compact inventory containing every supplied
-claim ID once, in source order, with status OK, MISSING, or MISMATCH:
-`[[CLAIMS=S001.C001:OK,S002.C001:MISSING]]`.
+Step ID once, in source order, with status OK, MISSING, or MISMATCH:
+`[[STEPS=S001:OK,S002:MISSING]]`.
 
 PASS is legal only when every status is OK. FAIL requires at least one MISSING
 or MISMATCH. For FAIL, output at most two diagnostic lines after the inventory,
 each `S004.C002: ...` and at most 45 words. Each line must cite one explicit
-source claim and its mismatching Lean signature. Do not duplicate a root cause.
+source Step and its mismatching Lean signature. Do not duplicate a root cause.
 Do not output chain-of-thought, proof critique, a rewritten proof, or discussion.
 Decide before emitting the first token, never revise the inventory afterward,
 and stop after the permitted diagnostic lines. Emit exactly one decision marker
@@ -125,7 +126,7 @@ class ParsedSemanticAudit:
     passed: bool
     flag: Literal["PASS", "FAIL"]
     diagnostics: str
-    claim_statuses: tuple[tuple[str, str], ...] = ()
+    step_statuses: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -143,7 +144,7 @@ class SemanticAuditResult:
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
-    claim_statuses: tuple[tuple[str, str], ...] = ()
+    step_statuses: tuple[tuple[str, str], ...] = ()
 
 
 class SemanticAuditFormatError(ValueError):
@@ -214,7 +215,7 @@ and answer-bearing nodes refer to the exact object asked for in the original
 problem and preserve the source COT's claimed answer. Remember that an
 incorrect source solution must still PASS when it is translated faithfully;
 do not repair or re-grade it. Emit the unique decision marker as the first
-line and the complete compact claim inventory as the second line, before any
+line and the complete compact Step inventory as the second line, before any
 concise diagnostics."""
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -222,14 +223,14 @@ concise diagnostics."""
     ]
 
 
-def _claim_ids(numbered_cot: str) -> tuple[str, ...]:
-    return tuple(dict.fromkeys(_COT_CLAIM_ID_RE.findall(numbered_cot)))
+def _step_ids(numbered_cot: str) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(_COT_STEP_ID_RE.findall(numbered_cot)))
 
 
 def parse_semantic_audit(
     content: str,
     *,
-    expected_claim_ids: tuple[str, ...] = (),
+    expected_step_ids: tuple[str, ...] = (),
 ) -> ParsedSemanticAudit:
     matches = list(SEMANTIC_AUDIT_FLAG_RE.finditer(content))
     markers = tuple(match.group(1) for match in matches)
@@ -253,57 +254,57 @@ def parse_semantic_audit(
             "flag is not the first line", raw_content=content, markers=markers,
         )
     flag = match.group(1)
-    claim_statuses: tuple[tuple[str, str], ...] = ()
+    step_statuses: tuple[tuple[str, str], ...] = ()
     diagnostic_lines = lines[1:]
-    if expected_claim_ids:
-        if len(lines) < 2 or _CLAIMS_LINE_RE.fullmatch(lines[1].strip()) is None:
+    if expected_step_ids:
+        if len(lines) < 2 or _STEPS_LINE_RE.fullmatch(lines[1].strip()) is None:
             raise SemanticAuditFormatError(
-                "complete claim inventory is not the second line",
+                "complete Step inventory is not the second line",
                 raw_content=content,
                 markers=markers,
             )
-        inventory = _CLAIMS_LINE_RE.fullmatch(lines[1].strip())
+        inventory = _STEPS_LINE_RE.fullmatch(lines[1].strip())
         assert inventory is not None
         payload = inventory.group(1)
         entries = payload.split(",") if payload else []
         parsed_entries: list[tuple[str, str]] = []
         for entry in entries:
-            entry_match = _CLAIM_ENTRY_RE.fullmatch(entry.strip())
+            entry_match = _STEP_ENTRY_RE.fullmatch(entry.strip())
             if entry_match is None:
                 raise SemanticAuditFormatError(
-                    "malformed claim inventory entry",
+                    "malformed Step inventory entry",
                     raw_content=content,
                     markers=markers,
                 )
             parsed_entries.append((entry_match.group(1), entry_match.group(2)))
-        actual_ids = tuple(claim_id for claim_id, _status in parsed_entries)
-        if actual_ids != expected_claim_ids:
+        actual_ids = tuple(step_id for step_id, _status in parsed_entries)
+        if actual_ids != expected_step_ids:
             raise SemanticAuditFormatError(
-                "claim inventory is incomplete, duplicated, or out of source order",
+                "Step inventory is incomplete, duplicated, or out of source order",
                 raw_content=content,
                 markers=markers,
             )
-        statuses = tuple(status for _claim_id, status in parsed_entries)
+        statuses = tuple(status for _step_id, status in parsed_entries)
         if flag == "PASS" and any(status != "OK" for status in statuses):
             raise SemanticAuditFormatError(
-                "PASS contains a non-OK claim status",
+                "PASS contains a non-OK Step status",
                 raw_content=content,
                 markers=markers,
             )
         if flag == "FAIL" and all(status == "OK" for status in statuses):
             raise SemanticAuditFormatError(
-                "FAIL contains no missing or mismatched claim",
+                "FAIL contains no missing or mismatched Step",
                 raw_content=content,
                 markers=markers,
             )
-        claim_statuses = tuple(parsed_entries)
+        step_statuses = tuple(parsed_entries)
         diagnostic_lines = lines[2:]
     diagnostics = "\n".join(diagnostic_lines).strip()
     return ParsedSemanticAudit(
         passed=flag == "PASS",
         flag=flag,
         diagnostics=diagnostics,
-        claim_statuses=claim_statuses,
+        step_statuses=step_statuses,
     )
 
 
@@ -369,7 +370,7 @@ def run_semantic_audit(
         informal_statement=informal_statement,
         claimed_answer=claimed_answer,
     )
-    expected_claim_ids = _claim_ids(numbered_cot)
+    expected_step_ids = _step_ids(numbered_cot)
     token_budget = _max_tokens() if max_tokens is None else int(max_tokens)
     if token_budget <= 0:
         raise ValueError("max_tokens must be positive")
@@ -385,7 +386,7 @@ def run_semantic_audit(
             "mode": mode,
             "informal_statement_chars": len(informal_statement),
             "claimed_answer_chars": len(claimed_answer),
-            "claim_count": len(expected_claim_ids),
+            "step_count": len(expected_step_ids),
         },
         model=model,
         messages=messages,
@@ -434,12 +435,12 @@ def run_semantic_audit(
             raw_content=content,
             markers=tuple(match.group(1) for match in SEMANTIC_AUDIT_FLAG_RE.finditer(content)),
         )
-    parsed = parse_semantic_audit(content, expected_claim_ids=expected_claim_ids)
+    parsed = parse_semantic_audit(content, expected_step_ids=expected_step_ids)
     return SemanticAuditResult(
         passed=parsed.passed,
         flag=parsed.flag,
         diagnostics=parsed.diagnostics,
-        claim_statuses=parsed.claim_statuses,
+        step_statuses=parsed.step_statuses,
         raw_content=content,
         reasoning_content=reasoning,
         model=model,

@@ -25,15 +25,6 @@ _SIMPLE_NUMBER_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
 _DECL_HEAD_RE = re.compile(
     r"^\s*(?:noncomputable\s+)?(?:def|abbrev|lemma|theorem)\s+[^\s({:\[]+"
 )
-_CLAIM_BEARING_ROLES = {
-    "derived_claim",
-    "verification",
-    "conclusion",
-    "final",
-    "final_claim",
-}
-
-
 @dataclass(frozen=True)
 class CotStep:
     step_id: str
@@ -44,7 +35,6 @@ class CotStep:
     numbers: tuple[str, ...] = ()
     relations: tuple[str, ...] = ()
     requires_formalization: bool = True
-    claim_ids: tuple[str, ...] = ()
 
     @property
     def base_id(self) -> str:
@@ -112,85 +102,23 @@ class SemanticSnapshot:
 
 
 def parse_cot_manifest(value: Any) -> CotManifest:
-    """Parse a JSON/list manifest while preserving its declared order."""
+    """Parse the sole lossless formal-Step manifest."""
     if isinstance(value, CotManifest):
         return value
-    if value in (None, ""):
-        return CotManifest()
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"invalid COT manifest JSON: {exc}") from exc
-    if isinstance(value, dict):
-        # The production representation has no Step layer.  Reuse the legacy
-        # internal contract machinery by projecting each persisted Claim to a
-        # claim-bearing unit; this projection is never serialized or shown to
-        # the Blueprint model.
-        from cot_blueprint_refine.claim_scope_manifest import decode_claim_scope_manifest
+    from cot_blueprint_refine.formal_steps import decode_formal_step_manifest
 
-        minimal = decode_claim_scope_manifest(value)
-        raw_claims = list(minimal["claims"])
-        projected = tuple(CotStep(
-            step_id=str(claim["claim_id"]),
-            source_text=str(claim["source_text"]),
-            source_sha256=str(claim["source_sha256"]),
-            role="conclusion" if index == len(raw_claims) else "derived_claim",
+    manifest = decode_formal_step_manifest(value)
+    raw_steps = list(manifest["steps"])
+    return CotManifest(tuple(
+        CotStep(
+            step_id=str(step["step_id"]),
+            source_text=str(step["source_text"]),
+            source_sha256=str(step["source_sha256"]),
+            role="conclusion" if index == len(raw_steps) else "derived_claim",
             requires_formalization=True,
-            claim_ids=(str(claim["claim_id"]),),
-        ) for index, claim in enumerate(raw_claims, start=1))
-        return CotManifest(projected)
-    if not isinstance(value, list):
-        raise ValueError("COT manifest must be a list or Claim/Scope object")
-    steps: list[CotStep] = []
-    seen: set[str] = set()
-    seen_claims: set[str] = set()
-    for index, raw in enumerate(value, start=1):
-        if not isinstance(raw, dict):
-            raise ValueError(f"COT manifest item {index} is not an object")
-        step_id = str(raw.get("step_id") or "")
-        if not _STEP_ID_RE.fullmatch(step_id):
-            raise ValueError(f"invalid COT step id at item {index}: {step_id!r}")
-        if "." in step_id:
-            raise ValueError(f"source manifest step ids must be base ids: {step_id!r}")
-        if step_id in seen:
-            raise ValueError(f"duplicate COT step id: {step_id}")
-        seen.add(step_id)
-        source_text = str(raw.get("source_text") or "")
-        source_sha256 = str(raw.get("source_sha256") or "")
-        if source_sha256 and source_text:
-            actual = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
-            if actual != source_sha256:
-                raise ValueError(f"source hash mismatch for {step_id}")
-        claim_ids: list[str] = []
-        for claim_index, claim in enumerate(raw.get("claims") or [], start=1):
-            if not isinstance(claim, dict):
-                raise ValueError(f"COT claim {step_id}/{claim_index} is not an object")
-            claim_id = str(claim.get("claim_id") or "")
-            if not _STEP_ID_RE.fullmatch(claim_id) or not claim_id.startswith(f"{step_id}."):
-                raise ValueError(f"invalid COT claim id: {claim_id!r}")
-            if claim_id in seen_claims:
-                raise ValueError(f"duplicate COT claim id: {claim_id}")
-            claim_text = str(claim.get("source_text") or "")
-            claim_hash = str(claim.get("source_sha256") or "")
-            if claim_hash and claim_text:
-                actual_claim_hash = hashlib.sha256(claim_text.encode("utf-8")).hexdigest()
-                if actual_claim_hash != claim_hash:
-                    raise ValueError(f"source hash mismatch for {claim_id}")
-            seen_claims.add(claim_id)
-            claim_ids.append(claim_id)
-        steps.append(CotStep(
-            step_id=step_id,
-            source_text=source_text,
-            source_sha256=source_sha256,
-            role=str(raw.get("role") or "derived_claim"),
-            depends_on=tuple(str(item) for item in (raw.get("depends_on") or [])),
-            numbers=tuple(str(item) for item in (raw.get("numbers") or [])),
-            relations=tuple(str(item) for item in (raw.get("relations") or [])),
-            requires_formalization=bool(raw.get("requires_formalization", True)),
-            claim_ids=tuple(claim_ids),
-        ))
-    return CotManifest(tuple(steps))
+        )
+        for index, step in enumerate(raw_steps, start=1)
+    ))
 
 
 def _base_step_id(value: str) -> str:
@@ -627,9 +555,6 @@ def validate_blueprint_fidelity(
     contract = parse_cot_manifest(manifest)
     issues: list[SemanticIssue] = []
     valid_ids = contract.by_id
-    valid_claim_ids = {
-        claim_id for step in contract.steps for claim_id in step.claim_ids
-    }
     root = blueprint.node_by_name(blueprint.target_theorem)
 
     if require_step_bindings and not contract.steps:
@@ -644,7 +569,7 @@ def validate_blueprint_fidelity(
         if require_step_bindings and title_count != 1:
             issues.append(_issue(
                 "MISSING_STEP_MAPPING" if title_count == 0 else "MULTIPLE_STEP_MAPPINGS",
-                f"Node must have exactly one source-claim title; found {title_count}.",
+                f"Node must have exactly one source-Step title; found {title_count}.",
                 node=node,
                 category="binding",
             ))
@@ -652,7 +577,7 @@ def validate_blueprint_fidelity(
         if require_step_bindings and not node.source_step_id:
             issues.append(_issue(
                 "MALFORMED_STEP_MAPPING",
-                "Node title must be exactly COT_CLAIM:CNNN (legacy COT_STEP is also accepted).",
+                "Node title must be exactly COT_STEP:SNNN.",
                 node=node,
                 category="binding",
             ))
@@ -662,14 +587,7 @@ def validate_blueprint_fidelity(
             if base_id not in valid_ids:
                 issues.append(_issue(
                     "UNKNOWN_STEP_MAPPING",
-                    f"Node refers to source claim/unit {base_id}, which is not in the manifest.",
-                    node=node,
-                    category="binding",
-                ))
-            elif valid_claim_ids and node.source_step_id not in valid_claim_ids:
-                issues.append(_issue(
-                    "MISSING_CLAIM_MAPPING",
-                    "Node title must identify one supplied COT claim.",
+                    f"Node refers to source Step {base_id}, which is not in the manifest.",
                     node=node,
                     category="binding",
                 ))
@@ -684,7 +602,7 @@ def validate_blueprint_fidelity(
         if _base_step_id(root.source_step_id) != contract.final_step_id:
             issues.append(_issue(
                 "ROOT_NOT_FINAL_STEP",
-                f"Root must map to final source claim/unit {contract.final_step_id}.",
+                f"Root must map to final source Step {contract.final_step_id}.",
                 node=root,
                 category="binding",
             ))
@@ -701,37 +619,9 @@ def validate_blueprint_fidelity(
         for node in blueprint.nodes
         if node.source_step_id
     }
-    reachable_claims = {
-        node.source_step_id
-        for node in blueprint.nodes
-        if node.name in reachable and node.source_step_id in valid_claim_ids
-    }
-    mapped_claims = {
-        node.source_step_id
-        for node in blueprint.nodes
-        if node.source_step_id in valid_claim_ids
-    }
     if require_step_bindings:
         for step in contract.steps:
             if not step.requires_formalization:
-                continue
-            if step.claim_ids:
-                for claim_id in step.claim_ids:
-                    if claim_id not in mapped_claims:
-                        issues.append(SemanticIssue(
-                            "CLAIM_MAPPING_ABSENT",
-                            "No node in the blueprint maps to this source claim.",
-                            step_id=claim_id,
-                            category="binding",
-                        ))
-                    elif claim_id not in reachable_claims:
-                        issues.append(SemanticIssue(
-                            "CLAIM_NOT_ROOT_REACHABLE",
-                            "A node maps to this source claim, but it is not in the root "
-                            "dependency closure.",
-                            step_id=claim_id,
-                            category="binding",
-                        ))
                 continue
             if step.step_id not in mapped_steps:
                 issues.append(SemanticIssue(
@@ -743,9 +633,18 @@ def validate_blueprint_fidelity(
             elif step.step_id not in reachable_steps:
                 issues.append(SemanticIssue(
                     "STEP_NOT_ROOT_REACHABLE",
-                    "A node maps to this source step, but it is not in the root "
+                    "A node maps to this source Step, but no mapped node is in the root "
                     "dependency closure.",
                     step_id=step.step_id,
+                    category="binding",
+                ))
+        for node in blueprint.nodes:
+            if node.name not in reachable:
+                issues.append(_issue(
+                    "NODE_NOT_ROOT_REACHABLE",
+                    "Every Blueprint node must be in the root's transitive semantic "
+                    "dependency closure.",
+                    node=node,
                     category="binding",
                 ))
 
@@ -814,24 +713,9 @@ def validate_blueprint_fidelity(
                     "A mathematical assertion is represented by a constant Bool definition.",
                     node=node,
                 ))
-            source_step = valid_ids.get(_base_step_id(node.source_step_id))
-            simple_answer = _simple_claimed_answer(claimed_answer)
-            if (
-                source_step is not None
-                and source_step.role in _CLAIM_BEARING_ROLES
-                and simple_answer
-                and _is_nullary_definition_prefix(prefix)
-                and normalized_body == _normalize_expr(simple_answer)
-            ):
-                issues.append(_issue(
-                    "HARDCODED_CLAIMED_ANSWER_DEFINITION",
-                    "A claim-bearing source step was replaced by a nullary definition "
-                    "whose entire value is the claimed answer.",
-                    node=node,
-                ))
-            # A setup/object/computation definition can legitimately equal the
-            # final numeric answer.  More complex answer-bearing expressions
-            # remain audit-routing risks below instead of hard failures.
+            # A Step may legitimately introduce an object whose value happens
+            # to equal the final answer. Answer-bearing definitions are routed
+            # through the full semantic audit instead of rejected locally.
 
     root_conclusion = _node_conclusion(root)
     if _is_reflexive(root_conclusion):

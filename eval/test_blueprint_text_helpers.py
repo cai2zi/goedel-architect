@@ -36,7 +36,7 @@ lemma mod7_2003_eq_1 :
 class BlueprintTextHelpersTest(unittest.TestCase):
     def test_parser_extracts_native_title_and_cot_source_step_id(self) -> None:
         lean_code = """@[blueprint
-  (title := "COT_STEP:S004.part_a")
+  (title := "COT_STEP:S004")
   (statement := /-- A source-grounded step. -/)
   (proof := /-- Deferred. -/)]
 theorem root : True := by
@@ -45,8 +45,8 @@ theorem root : True := by
 
         node = _parse_blueprint(lean_code, "root").nodes[0]
 
-        self.assertEqual(node.title, "COT_STEP:S004.part_a")
-        self.assertEqual(node.source_step_id, "S004.part_a")
+        self.assertEqual(node.title, "COT_STEP:S004")
+        self.assertEqual(node.source_step_id, "S004")
 
     def test_malformed_cot_title_is_preserved_but_not_accepted_as_step_id(self) -> None:
         lean_code = """@[blueprint

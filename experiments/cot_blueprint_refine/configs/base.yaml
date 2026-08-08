@@ -45,23 +45,22 @@ shared_vllm_397b:
   enable_auto_tool_choice: true
   extra_args: []
 
-cot_splitter:
-  # `deterministic` preserves the historical Markdown/regex splitter.  The
-  # quality experiment overrides this with `llm_boundary_v1`.
-  mode: deterministic
+step_splitter:
   model: ${shared_vllm_397b.served_model_name}
   openai_base_url: http://127.0.0.1:8001/v1
   api_key: dummy
   vllm: ${shared_vllm_397b}
+  tokenizer_path: ${shared_vllm_397b.model_path}
   temperature: 0.0
   max_tokens: 2048
   concurrency: 24
   timeout_s: 600
   max_attempts: 2
   enable_thinking: false
-  fallback_on_error: false
-  atomizer_version: cot-atomizer-v1
-  prompt_version: cot-split-boundaries-v6
+  target_tokens_per_step: 100
+  min_target_steps: 5
+  max_target_steps: 16
+  prompt_version: formal-step-boundary-v1
 
 blueprint:
   execution_mode: full

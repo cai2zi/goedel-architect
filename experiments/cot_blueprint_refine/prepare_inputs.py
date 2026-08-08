@@ -19,7 +19,10 @@ from cot_blueprint_refine.common import (
     write_json,
     write_jsonl,
 )
-from cot_blueprint_refine.cot_steps import encode_steps, split_cot_steps
+from cot_blueprint_refine.formal_steps import (
+    encode_formal_step_manifest,
+    make_formal_step_manifest,
+)
 
 
 DATASET_SUBSET = "qwen3_8b_math_verify"
@@ -37,7 +40,11 @@ def _safe_filename(value: str) -> str:
 
 def make_generation_row(row: dict[str, Any], post_think: str, answer: str) -> dict[str, Any]:
     problem = str(row.get("problem") or "").strip()
-    cot_manifest_json = encode_steps(split_cot_steps(post_think))
+    # Prepare installs a one-Step exact placeholder. The mandatory split stage
+    # replaces it atomically with the 397B formalization-aware partition.
+    cot_manifest_json = encode_formal_step_manifest(
+        make_formal_step_manifest(post_think, [(0, len(post_think))])
+    )
     informal_statement = (
         "Original problem:\n"
         f"{problem}\n\n"

@@ -8,6 +8,9 @@ split: null
 limit: null
 problem_id: null
 resume: false
+# When false, resume treats an existing terminal error as complete.  Set true
+# only for an intentional retry of failed records.
+retry_error_results: false
 # full runs Phase 1/2/3; phase1_only stops after a validated Blueprint.
 execution_mode: full
 max_refinement_iterations: 4
