@@ -13,7 +13,10 @@ import json
 import os
 import re
 import threading
+import time
+import uuid
 from pathlib import Path
+from typing import Any
 
 from blueprint_text import (
     BLUEPRINT_DECL_KW as _BLUEPRINT_DECL_KW,
@@ -32,6 +35,7 @@ from kimina_lean_compiler import (
     MATHLIB_HEADER,
 )
 from llm_client import chat_completion_with_retry, make_client
+from mathlib_retrieval import MathlibRetrieval
 from semantic_audit import SemanticAuditFormatError, run_semantic_audit
 from semantic_fidelity import (
     SemanticIssue,
@@ -73,17 +77,19 @@ LeanArchitect title naming its source Step:
 One Step MAY map to several connected Definitions/Lemmas/Theorems; this is the
 normal way to express its objects, conditions, intermediate facts, and result.
 Each supplied Step must map to at least one node. Every node must be in the
-root theorem's transitive semantic dependency closure. The root must map to
-the final Step. Infer real dependencies from the mathematics; never add a
-direct root edge merely to make a disconnected node reachable.
+root theorem's transitive semantic dependency closure when it genuinely
+supports the final conclusion. The root must map to the final Step. A faithful
+but abandoned, erroneous, or diagnostic branch may remain outside the root
+closure and will be reported as a warning. Infer real dependencies from the
+mathematics; never add a fake edge merely to silence that warning.
 
 The dependency graph is extracted ONLY from identifiers inside
 `sorry_using [...]`. Merely mentioning a declaration in a type, theorem
 hypothesis, comment, or definition body does not create a graph edge. Thus
 each definition must be consumed by a genuinely downstream proof node's
-`sorry_using` list, and every non-root proof node must be consumed along a real
-chain ending at the root. Before emitting, mechanically trace every node
-forward to the root. The binding includes the colon: `COT_STEP:S003`, never
+`sorry_using` list. Before emitting, trace every node that supports the final
+answer forward to the root, while leaving genuinely non-final branches
+independent. The binding includes the colon: `COT_STEP:S003`, never
 `COT_STEP S003`.
 
 Do not encode an asserted or derived step as an executable definition.  Do not
@@ -92,6 +98,13 @@ witness, a constant `Prop := True`/`Bool := true`, or a nullary definition that
 hard-codes the claimed answer.  If a source step is false or has a gap, keep
 its actual proposition as a lemma with `sorry_using [...]`; proving or
 diagnosing that lemma belongs to the later phase.
+
+The following are invalid semantic evasions, even when Lean accepts them:
+`def P : Prop := True`, `lemma p : P → True`, `lemma p : x = x`, and
+`lemma p : ∃ x, x = answer`. Preserve object binding, inference direction,
+and real dependencies. If Mathlib lacks a convenient concrete encoding, use a
+typed abstract relation over the same source objects rather than a `True`
+shell.
 
 Only the formal Lean type and definition body count as semantic coverage.
 Comments, docstrings, and natural-language `statement` fields do not encode a
@@ -148,7 +161,61 @@ coordinates, adding inconsistent assumptions, or replacing a determined
 quantity by `∃ (x : T), x = c`.  In particular, the root must state the answer
 about the modeled object under the original conditions, rather than only
 asserting that an unrelated witness with the answer value exists.
+
+The root theorem itself must perform the COT's final inference. Do not create
+a non-root lemma/theorem with the same complete proposition as the root merely
+because the COT repeats or emphasizes its final answer. A final verbal answer
+restatement contributes no extra Blueprint node; depend directly on the last
+substantive premises and give their conclusion to the root.
 """
+
+
+_WHOLE_COT_SEMANTIC_BLUEPRINT_SYSTEM_SUFFIX = r"""
+
+## Whole-COT faithful translation contract
+
+The informal proof is supplied as one uninterrupted COT. Translate its
+mathematical reasoning faithfully without inventing numbered source-Step
+bindings or `COT_STEP` titles. Preserve wrong, contradictory, unsupported, or
+abandoned reasoning instead of silently solving, repairing, weakening, or
+replacing it.
+
+The absence of source-Step bindings is not permission to omit difficult
+content. Every substantive computation, asserted intermediate result, case
+condition, filtering constraint, and final inference in the COT must be
+represented by the formal type or body of one or more Blueprint nodes. Purely
+verbal transitions and final-answer restatements need no separate node.
+
+Do not encode an asserted or derived proposition as an executable definition.
+Never replace mathematical content with `True`, a proposition ending in
+`→ True`, a conjunction/disjunction containing a `True` placeholder, a
+reflexive equality, an unconstrained existential witness, a constant
+`Prop := True`/`Bool := true`, or a nullary definition that hard-codes the
+claimed answer. If a claim is false or unsupported, state that exact claim as
+a lemma with `sorry_using [...]`; proving or diagnosing it belongs to the
+later phase.
+
+Only formal Lean types and definition bodies count as semantic coverage.
+Comments, docstrings, and natural-language `statement` or `proof` fields do
+not encode constraints. Preserve source objects, assumptions, quantifiers,
+polarity, inference direction, and dependencies. Reuse the same formal
+objects through the graph rather than introducing disconnected quantities
+with similar names.
+
+When a Mathlib-native encoding is disproportionately elaborate, use a typed
+abstract relational model over the same source objects. Do not use `True`,
+arbitrary coordinates, additional assumptions, or unrelated witnesses as an
+escape hatch. A derived equation must be a conclusion from its actual source
+dependencies, not a fresh premise assumed by the node meant to derive it.
+
+Keep every claimed quantity tied to the original problem object and givens.
+The root must state the claimed answer about that modeled object. It must
+perform the COT's final inference directly; do not create a non-root node with
+the same complete proposition merely because the COT repeats its answer.
+"""
+
+
+SEMANTIC_SOURCE_MODES = {"step_grounded", "whole_cot"}
 
 
 def _decode_manifest_rows(value: str) -> dict:
@@ -187,17 +254,23 @@ def _emit_semantic_check(
     phase: str,
     attempt: int,
     issues: list[SemanticIssue],
+    turn: int | None = None,
 ) -> None:
     if tracer is None:
         return
+    blocking_count = sum(issue.severity == "error" for issue in issues)
+    warning_count = sum(issue.severity == "warning" for issue in issues)
     tracer.emit(TraceEvent(
         kind="blueprint_semantic_check",
         thm_name=thm_name,
-        ok=not issues,
+        ok=blocking_count == 0,
         args={
             "phase": phase,
             "attempt": attempt,
+            "turn": turn,
             "issue_count": len(issues),
+            "blocking_count": blocking_count,
+            "warning_count": warning_count,
             "issues": [issue.to_dict() for issue in issues],
         },
     ))
@@ -261,11 +334,23 @@ def phase1_request_max_tokens(messages: list[dict[str, str]]) -> int:
         return cap
     margin = int(os.environ.get("GOEDEL_PHASE1_CONTEXT_SAFETY_MARGIN", "512"))
     minimum = int(os.environ.get("GOEDEL_PHASE1_MIN_OUTPUT_TOKENS", "512"))
-    encoded = _load_phase1_tokenizer(tokenizer_path).apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=True,
-    )
+    tokenizer = _load_phase1_tokenizer(tokenizer_path)
+    try:
+        encoded = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+    except (TypeError, ValueError):
+        # Hugging Face templates and OpenAI disagree on tool-call argument
+        # representation (mapping vs JSON string).  Budgeting must never make
+        # a valid OpenAI tool history fail.  Raw JSON tokenization is a stable
+        # conservative fallback; the configured safety margin absorbs chat
+        # framing overhead.
+        serialized = json.dumps(
+            messages, ensure_ascii=False, sort_keys=True, default=str,
+        )
+        encoded = tokenizer.encode(serialized, add_special_tokens=False)
     prompt_tokens = len(encoded)
     available = context - prompt_tokens - margin
     if available < minimum:
@@ -306,17 +391,29 @@ def _emit_usage(tracer, thm_name: str, phase: str, model: str, response) -> None
 
 
 def _tool_calls_payload(message) -> list[dict]:
-    return [
-        {
+    payload = []
+    for tc in message.tool_calls or []:
+        arguments = tc.function.arguments
+        if tc.function.name == "lean_compile":
+            try:
+                decoded = json.loads(arguments or "{}")
+                lean_code = decoded.get("lean_code") if isinstance(decoded, dict) else None
+            except json.JSONDecodeError:
+                lean_code = None
+            if isinstance(lean_code, str):
+                arguments = json.dumps({
+                    "lean_code_sha256": hashlib.sha256(lean_code.encode()).hexdigest(),
+                    "lean_code_chars": len(lean_code),
+                }, sort_keys=True)
+        payload.append({
             "id": tc.id,
             "type": getattr(tc, "type", "function"),
             "function": {
                 "name": tc.function.name,
-                "arguments": tc.function.arguments,
+                "arguments": arguments,
             },
-        }
-        for tc in message.tool_calls or []
-    ]
+        })
+    return payload
 
 
 def _emit_llm_response(
@@ -356,6 +453,7 @@ def _emit_lean_check_result(
     attempt: int,
     target: str,
     result: CompilerResult,
+    source_contexts: list[dict[str, Any]] | None = None,
 ) -> None:
     if tracer is None:
         return
@@ -372,9 +470,72 @@ def _emit_lean_check_result(
             "raw_output": result.raw_output,
             "failure_kind": result.failure_kind,
             "timings": result.timings,
+            "source_contexts": source_contexts or [],
         },
         ok=result.success,
     ))
+
+
+def _diagnostic_line(value: Any) -> int | None:
+    payload = value
+    if isinstance(value, str):
+        try:
+            payload = json.loads(value)
+        except json.JSONDecodeError:
+            match = re.search(r"(?:line\s+|:)(\d+)(?::\d+)?", value, re.I)
+            return int(match.group(1)) if match else None
+    if not isinstance(payload, dict):
+        return None
+    for key in ("pos", "startPos", "start", "position"):
+        position = payload.get(key)
+        if isinstance(position, dict) and isinstance(position.get("line"), int):
+            return int(position["line"])
+    return int(payload["line"]) if isinstance(payload.get("line"), int) else None
+
+
+def _lean_source_contexts(
+    result: CompilerResult,
+    blueprint: Blueprint,
+    manifest,
+) -> list[dict[str, Any]]:
+    if manifest is None:
+        return []
+    contexts: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    # Warnings (especially one `declaration uses sorry` per Blueprint node)
+    # are not repair targets and can multiply one source Step dozens of times.
+    for diagnostic in result.errors:
+        line = _diagnostic_line(diagnostic)
+        if line is None:
+            continue
+        node = next((
+            item for item in blueprint.nodes
+            if item.lean_start_line <= line <= item.lean_end_line
+        ), None)
+        if node is None or not node.source_step_id:
+            continue
+        step = manifest.by_id.get(node.source_step_id.split(".", 1)[0])
+        if step is None or (line, node.name) in seen:
+            continue
+        seen.add((line, node.name))
+        contexts.append({
+            "lean_line": line, "node_name": node.name, "step_id": step.step_id,
+            "source_start": step.source_start, "source_end": step.source_end,
+            "source_text": step.source_text, "source_sha256": step.source_sha256,
+        })
+    return contexts
+
+
+def _format_lean_source_contexts(contexts: list[dict[str, Any]]) -> str:
+    if not contexts:
+        return ""
+    lines = ["\nLean diagnostics mapped to source Steps (look up the Step text in the COT above):"]
+    for item in contexts:
+        lines.append(
+            f"- line {item['lean_line']} / {item['node_name']} / {item['step_id']} "
+            f"[{item['source_start']}:{item['source_end']}]"
+        )
+    return "\n".join(lines)
 
 
 def _set_latest_blueprint_retry(
@@ -418,7 +579,7 @@ def _semantic_repair_guidance(issues: list[SemanticIssue]) -> str:
     """Give bounded, issue-specific guidance without adding another LLM call."""
     codes = {issue.code for issue in issues}
     guidance: list[str] = []
-    if "STEP_MAPPING_ABSENT" in codes:
+    if "stepMappingAbsent" in codes:
         guidance.append(
             "Create one or more substantive formal nodes for every absent source Step, "
             "using its exact `COT_STEP:SNNN` title, and then "
@@ -426,32 +587,42 @@ def _semantic_repair_guidance(issues: list[SemanticIssue]) -> str:
             "the missing translation with `True`, a reflexive equality, or a placeholder."
         )
     if codes.intersection({
-        "MISSING_STEP_MAPPING", "MALFORMED_STEP_MAPPING",
+        "missingStepMapping", "malformedStepMapping",
     }):
         guidance.append(
             "Repair each listed node's provenance title so it names exactly the source "
             "Step that its existing formal declaration translates."
         )
-    if codes.intersection({"STEP_NOT_ROOT_REACHABLE", "NODE_NOT_ROOT_REACHABLE"}):
+    if codes.intersection({"stepNotRootReachable", "nodeNotRootReachable"}):
         guidance.append(
             "The corresponding formal nodes already exist: preserve their declarations "
             "and build mathematically faithful downstream dependencies to the root. Do not "
             "attach unrelated nodes directly to the root merely to satisfy reachability."
         )
-    if any(code.startswith("VACUOUS_") for code in codes):
+    if any(code.startswith("vacuous") for code in codes):
         guidance.append(
             "Replace every vacuous type/body with the exact source proposition over the "
             "same shared objects, then connect that substantive node to the root."
         )
-    if any(code.startswith("UNCONSTRAINED_EXISTS") for code in codes):
+    if any(code.startswith("unconstrainedExists") for code in codes):
         guidance.append(
             "Model the original constrained object and givens explicitly; the root must "
             "answer the original question, not merely choose a closed witness."
         )
-    if "ROOT_MISSING_CLAIMED_ANSWER" in codes:
+    if "rootMissingClaimedAnswer" in codes:
         guidance.append(
             "Keep the original COT's claimed answer literally in the root proposition "
             "about the original modeled object."
+        )
+    if "duplicateRootConclusion" in codes:
+        guidance.append(
+            "Remove the duplicated non-root answer proposition. Let the root perform the "
+            "final inference directly from the last substantive premises."
+        )
+    if codes.intersection({"claimedAnswerInDefinition", "claimedAnswerInPropDefinition"}):
+        guidance.append(
+            "Do not hard-code the claimed answer in a non-root definition. Model the "
+            "source object and state the COT's asserted equality as a proof node."
         )
     if not guidance:
         guidance.append(
@@ -494,6 +665,280 @@ def _call_blueprint_model(
     return response
 
 
+_PHASE1_LEAN_COMPILE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "lean_compile",
+        "description": "Compile and structurally validate one complete Lean Blueprint file.",
+        "parameters": {
+            "type": "object",
+            "properties": {"lean_code": {"type": "string"}},
+            "required": ["lean_code"],
+            "additionalProperties": False,
+        },
+    },
+}
+_PHASE1_MATHLIB_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "mathlib_search",
+        "description": "Search Mathlib for existing names and exact theorem/type signatures.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "k": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+@dataclass
+class _Phase1ToolSessionResult:
+    lean_code: str = ""
+    successful_lean_code: str = ""
+    finish_reason: str | None = None
+    turns: int = 0
+
+
+def _phase1_tool_output(
+    result: CompilerResult,
+    semantic_issues: list[SemanticIssue] | None = None,
+    lean_source_contexts: list[dict[str, Any]] | None = None,
+) -> tuple[str, bool]:
+    """Combine Lean and deterministic semantic validation for one tool call."""
+    issues = list(semantic_issues or [])
+    errors = [issue for issue in issues if issue.severity == "error"]
+    sections: list[str] = []
+    if result.success:
+        sections.append("Lean compilation and structural validation SUCCESSFUL.")
+    else:
+        diagnostics = "\n".join(result.diagnostics) or result.raw_output[-8000:]
+        sections.append(
+            "Lean compilation or structural validation FAILED.\n"
+            f"{diagnostics}{_format_lean_source_contexts(lean_source_contexts or [])}"
+        )
+    if issues:
+        semantic_status = "FAILED" if errors else "PASSED WITH WARNINGS"
+        sections.append(
+            f"Deterministic semantic-fidelity validation {semantic_status}.\n"
+            f"{format_semantic_issues(issues)}"
+        )
+    if errors:
+        sections.append(
+            "Issue-specific repair rules:\n"
+            f"{_semantic_repair_guidance(errors)}\n\n"
+            "Repair every blocking issue and call lean_compile with the complete file again. "
+            "Use each Step ID to look up its source text in the COT already present above."
+        )
+    return "\n\n".join(sections), result.success and not errors
+
+
+def _run_phase1_tool_session(
+    client,
+    model: str,
+    base_messages: tuple[dict[str, Any], ...],
+    *,
+    compiler: KiminaLeanCompiler,
+    target_name: str,
+    retrieval: MathlibRetrieval,
+    tracer,
+    thm_name: str,
+    attempt: int,
+    max_tool_turns: int,
+    max_tool_calls_per_turn: int,
+    mathlib_search_max_calls: int,
+    tool_cache: dict[str, tuple[str, bool]],
+    search_state: dict[str, int],
+    semantic_manifest=None,
+    claimed_answer: str = "",
+    semantic_fidelity_enabled: bool = False,
+    semantic_require_step_ids: bool = False,
+    semantic_static_gate: bool = False,
+) -> _Phase1ToolSessionResult:
+    """Run one bounded Phase-1 tool conversation with compact rolling history."""
+    messages = [dict(message) for message in base_messages]
+    result = _Phase1ToolSessionResult()
+    for turn in range(1, max_tool_turns + 1):
+        final_turn = turn == max_tool_turns
+        tools = [_PHASE1_LEAN_COMPILE_TOOL] if final_turn else [
+            _PHASE1_LEAN_COMPILE_TOOL, _PHASE1_MATHLIB_SEARCH_TOOL,
+        ]
+        response = chat_completion_with_retry(
+            client,
+            tracer=tracer,
+            thm_name=thm_name,
+            phase="phase1",
+            model_id=model,
+            operation="blueprint_tool_final" if final_turn else "blueprint_tool",
+            trace_args={"attempt": attempt, "turn": turn, "final_turn": final_turn},
+            model=model,
+            messages=messages,
+            tools=tools,
+            tool_choice="required",
+            parallel_tool_calls=not final_turn,
+            max_completion_tokens=phase1_request_max_tokens(messages),
+            **_reasoning_kwargs(model),
+        )
+        _emit_usage(tracer, thm_name, "phase1", model, response)
+        _emit_llm_response(
+            tracer, thm_name=thm_name, phase="phase1", model=model,
+            response=response, attempt=attempt, turn=turn,
+        )
+        choice = response.choices[0]
+        result.finish_reason = getattr(choice, "finish_reason", None)
+        result.turns = turn
+        message = choice.message
+        selected: list[tuple[Any, str, dict[str, Any], str]] = []
+        dropped: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        compile_count = 0
+        for index, call in enumerate(message.tool_calls or []):
+            name = str(call.function.name)
+            try:
+                args = json.loads(call.function.arguments or "{}")
+                if not isinstance(args, dict):
+                    raise ValueError("arguments must be an object")
+            except (json.JSONDecodeError, ValueError) as exc:
+                dropped.append({"index": index, "reason": "invalidArguments", "detail": str(exc)})
+                continue
+            call_hash = hashlib.sha256(json.dumps(
+                {"name": name, "args": args}, sort_keys=True,
+                ensure_ascii=False, separators=(",", ":"),
+            ).encode()).hexdigest()
+            reason = ""
+            if name not in {"lean_compile", "mathlib_search"}:
+                reason = "notAllowed"
+            elif final_turn and name != "lean_compile":
+                reason = "notAllowedOnFinalTurn"
+            elif call_hash in seen:
+                reason = "duplicateInTurn"
+            elif len(selected) >= max_tool_calls_per_turn:
+                reason = "overTurnLimit"
+            elif name == "lean_compile" and compile_count >= 1:
+                reason = "compileLimit"
+            elif name == "lean_compile" and not isinstance(args.get("lean_code"), str):
+                reason = "invalidArguments"
+            elif name == "mathlib_search" and not str(args.get("query") or "").strip():
+                reason = "invalidArguments"
+            elif name == "mathlib_search" and search_state["count"] >= mathlib_search_max_calls:
+                reason = "searchBudgetExhausted"
+            if reason:
+                dropped.append({"index": index, "name": name, "reason": reason, "hash": call_hash})
+                continue
+            seen.add(call_hash)
+            compile_count += int(name == "lean_compile")
+            if name == "mathlib_search":
+                search_state["count"] += 1
+            selected.append((call, name, args, call_hash))
+        if tracer is not None and dropped:
+            tracer.emit(TraceEvent(
+                kind="tool_calls_dropped", thm_name=thm_name, turn=turn,
+                args={"phase": "phase1", "attempt": attempt, "calls": dropped},
+            ))
+
+        assistant_payload = {
+            "role": "assistant", "content": message.content or "",
+            "tool_calls": [call.model_dump() for call, _name, _args, _hash in selected],
+        }
+        tool_messages: list[dict[str, Any]] = []
+        for call, name, args, call_hash in selected:
+            span_id = uuid.uuid4().hex
+            started_ns = time.monotonic_ns()
+            if tracer is not None:
+                trace_arguments = args
+                if name == "lean_compile":
+                    lean_code = str(args.get("lean_code") or "")
+                    trace_arguments = {
+                        "lean_code_sha256": hashlib.sha256(lean_code.encode()).hexdigest(),
+                        "lean_code_chars": len(lean_code),
+                    }
+                tracer.emit(TraceEvent(
+                    kind="tool_call", thm_name=thm_name, turn=turn,
+                    call_id=call.id, tool_name=name, span_id=span_id,
+                    args={"phase": "phase1", "attempt": attempt,
+                          "arguments": trace_arguments, "hash": call_hash},
+                ))
+            semantic_issues: list[SemanticIssue] = []
+            parsed_candidate: Blueprint | None = None
+            if name == "lean_compile" and semantic_fidelity_enabled:
+                lean_code = str(args["lean_code"])
+                parsed_candidate = _parse_blueprint(lean_code, target_name)
+                if parsed_candidate.nodes:
+                    semantic_issues = _enabled_semantic_issues(
+                        validate_blueprint_fidelity(
+                            parsed_candidate,
+                            semantic_manifest,
+                            claimed_answer=claimed_answer,
+                            require_step_bindings=semantic_require_step_ids,
+                        ),
+                        require_step_ids=semantic_require_step_ids,
+                        static_gate=semantic_static_gate,
+                    )
+                    _emit_semantic_check(
+                        tracer,
+                        thm_name=thm_name,
+                        phase="phase1Tool",
+                        attempt=attempt,
+                        turn=turn,
+                        issues=semantic_issues,
+                    )
+
+            cache_hit = call_hash in tool_cache
+            if cache_hit:
+                output, ok = tool_cache[call_hash]
+            elif name == "lean_compile":
+                lean_code = str(args["lean_code"])
+                result.lean_code = lean_code
+                compile_result = compiler.check_blueprint(lean_code, target_name)
+                if compile_result.failure_kind == "infra":
+                    raise KiminaInfrastructureError(
+                        "\n".join(compile_result.diagnostics) or compile_result.raw_output[-2000:]
+                    )
+                lean_contexts = _lean_source_contexts(
+                    compile_result,
+                    parsed_candidate or _parse_blueprint(lean_code, target_name),
+                    semantic_manifest,
+                )
+                output, ok = _phase1_tool_output(
+                    compile_result,
+                    semantic_issues,
+                    lean_contexts,
+                )
+                tool_cache[call_hash] = (output, ok)
+            else:
+                hits = retrieval.search(str(args["query"]), min(10, int(args.get("k", 5))))
+                output = "\n\n".join(hit.format() for hit in hits) or "No Mathlib results."
+                ok = True
+                tool_cache[call_hash] = (output, ok)
+            if name == "lean_compile":
+                result.lean_code = str(args["lean_code"])
+                if ok:
+                    result.successful_lean_code = result.lean_code
+            if tracer is not None:
+                tracer.emit(TraceEvent(
+                    kind="tool_result", thm_name=thm_name, turn=turn,
+                    call_id=call.id, tool_name=name, span_id=span_id,
+                    result=output, ok=ok,
+                    args={"phase": "phase1", "attempt": attempt,
+                          "hash": call_hash, "cache_hit": cache_hit},
+                    duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
+                ))
+            tool_messages.append({
+                "role": "tool", "tool_call_id": call.id, "content": output,
+            })
+        if result.successful_lean_code:
+            return result
+        # Keep only the immutable prompt and the latest complete tool exchange.
+        messages = [dict(item) for item in base_messages]
+        if selected:
+            messages.extend([assistant_payload, *tool_messages])
+    return result
+
+
 @dataclass
 class BlueprintNode:
     name: str
@@ -509,6 +954,8 @@ class BlueprintNode:
     # custom Lean attribute.
     title: str = ""
     source_step_id: str = ""
+    lean_start_line: int = 0
+    lean_end_line: int = 0
 
     def signature(self) -> str:  # 针对单个 node，提取为类似 theorem l1 (n : ℕ) : n + 0 = n
         """Strip the @[blueprint ...] attribute and sorry_using proof body,
@@ -899,7 +1346,10 @@ def generate_blueprint_from_informal(
     semantic_static_gate: bool = False,
     semantic_minimal_ir: bool = False,
     semantic_audit_mode: str = "none",
-    semantic_max_repair_attempts: int = 1,
+    semantic_source_mode: str = "step_grounded",
+    phase1_max_tool_turns: int = 3,
+    phase1_max_tool_calls_per_turn: int = 3,
+    phase1_mathlib_search_max_calls: int = 3,
 ) -> Blueprint:
     """Generate and strictly validate a blueprint from informal text only.
 
@@ -908,10 +1358,16 @@ def generate_blueprint_from_informal(
     but the theorem identifier is fixed by target_name so downstream
     checkpointing, validation, and scoring remain stable.
     """
-    if semantic_max_repair_attempts < 0:
-        raise ValueError("semantic_max_repair_attempts must be non-negative")
+    if phase1_max_tool_turns <= 0 or phase1_max_tool_calls_per_turn <= 0:
+        raise ValueError("Phase-1 tool turn/call limits must be positive")
+    if phase1_mathlib_search_max_calls < 0:
+        raise ValueError("Phase-1 search limit must be non-negative")
     if semantic_audit_mode not in {"none", "risk", "full"}:
         raise ValueError("semantic_audit_mode must be one of: none, risk, full")
+    if semantic_source_mode not in SEMANTIC_SOURCE_MODES:
+        raise ValueError(
+            "semantic_source_mode must be one of: step_grounded, whole_cot"
+        )
     if (
         semantic_require_step_ids
         or semantic_static_gate
@@ -919,6 +1375,10 @@ def generate_blueprint_from_informal(
         or semantic_audit_mode != "none"
     ) and not semantic_fidelity_enabled:
         raise ValueError("semantic subfeatures require semantic_fidelity_enabled=true")
+    if semantic_source_mode == "whole_cot" and not semantic_fidelity_enabled:
+        raise ValueError("whole_cot semantic source mode requires semantic fidelity")
+    if semantic_source_mode == "whole_cot" and semantic_require_step_ids:
+        raise ValueError("whole_cot semantic source mode cannot require Step IDs")
     manifest_rows = _decode_manifest_rows(cot_manifest_json) if semantic_fidelity_enabled else []
     semantic_manifest = (
         parse_cot_manifest(manifest_rows) if semantic_fidelity_enabled else None
@@ -926,10 +1386,18 @@ def generate_blueprint_from_informal(
     if semantic_fidelity_enabled and not manifest_rows:
         raise ValueError("semantic_fidelity_enabled requires a non-empty cot_manifest_json")
     prompt_proof = informal_proof or ""
-    if semantic_fidelity_enabled:
+    if semantic_fidelity_enabled and semantic_source_mode == "step_grounded":
         prompt_proof = _render_step_grounded_proof(
             cot_manifest_json,
             include_ir=semantic_minimal_ir,
+        )
+
+    semantic_system_suffix = ""
+    if semantic_fidelity_enabled:
+        semantic_system_suffix = (
+            _SEMANTIC_BLUEPRINT_SYSTEM_SUFFIX
+            if semantic_source_mode == "step_grounded"
+            else _WHOLE_COT_SEMANTIC_BLUEPRINT_SYSTEM_SUFFIX
         )
 
     client = make_client(model)
@@ -937,7 +1405,7 @@ def generate_blueprint_from_informal(
         {
             "role": "system",
             "content": ROBUSTPA_BLUEPRINT_SYSTEM_PROMPT
-            + (_SEMANTIC_BLUEPRINT_SYSTEM_SUFFIX if semantic_fidelity_enabled else ""),
+            + semantic_system_suffix,
         },
         {
             "role": "user",
@@ -960,41 +1428,34 @@ def generate_blueprint_from_informal(
     last_diagnostics: list[str] = []
     last_finish_reason: str | None = None
     last_failure_stage = "model_output"
-    # Local deterministic failures and model-audit failures are different
-    # repair opportunities.  Sharing one counter meant that a candidate which
-    # fixed a static issue could be rejected immediately by its first audit,
-    # without ever receiving the audit's actionable feedback.
-    local_semantic_repair_count = 0
-    audit_semantic_repair_count = 0
     observed_semantic_issues: list[str] = []
     candidate_history: list[str] = []
+    tool_cache: dict[str, tuple[str, bool]] = {}
+    search_state = {"count": 0}
+    retrieval = MathlibRetrieval()
     for attempt in range(max_retries):
         semantic_check_issues: list[SemanticIssue] = []
-        generation_kwargs = _reasoning_kwargs(model)
-        if attempt > 0:
-            # Repair turns should apply the supplied diagnostics, not spend a
-            # second long completion re-solving or debating the source COT.
-            generation_kwargs["temperature"] = 0
-            if "qwen" in model.lower():
-                generation_kwargs["extra_body"] = {
-                    "chat_template_kwargs": {"enable_thinking": False},
-                }
-        response = _call_blueprint_model(
-            client,
-            model,
-            messages,
-            reasoning_kwargs=generation_kwargs,
-            max_tokens=phase1_request_max_tokens(messages),
-            tracer=tracer,
-            thm_name=thm_name,
-            phase="phase1",
+        semantic_check_errors: list[SemanticIssue] = []
+        candidate: Blueprint | None = None
+        session = _run_phase1_tool_session(
+            client, model, tuple(dict(message) for message in messages),
+            compiler=compiler, target_name=target_name, retrieval=retrieval,
+            tracer=tracer, thm_name=thm_name,
             attempt=attempt + 1,
+            max_tool_turns=phase1_max_tool_turns,
+            max_tool_calls_per_turn=phase1_max_tool_calls_per_turn,
+            mathlib_search_max_calls=phase1_mathlib_search_max_calls,
+            tool_cache=tool_cache, search_state=search_state,
+            semantic_manifest=semantic_manifest,
+            claimed_answer=claimed_answer,
+            semantic_fidelity_enabled=semantic_fidelity_enabled,
+            semantic_require_step_ids=semantic_require_step_ids,
+            semantic_static_gate=semantic_static_gate,
         )
-        choice = response.choices[0]
-        lean_code = _extract_lean_code(choice.message.content)
+        lean_code = session.successful_lean_code or session.lean_code
         last_candidate = lean_code
         candidate_history.append(lean_code)
-        last_finish_reason = getattr(choice, "finish_reason", None)
+        last_finish_reason = session.finish_reason
         emitted_target = _extract_target_name(lean_code, "")
         if emitted_target != target_name:
             last_error_feedback = (
@@ -1031,6 +1492,10 @@ def generate_blueprint_from_informal(
                     require_step_ids=semantic_require_step_ids,
                     static_gate=semantic_static_gate,
                 )
+                semantic_check_errors = [
+                    issue for issue in semantic_check_issues
+                    if issue.severity == "error"
+                ]
                 _emit_semantic_check(
                     tracer,
                     thm_name=thm_name,
@@ -1038,8 +1503,8 @@ def generate_blueprint_from_informal(
                     attempt=attempt + 1,
                     issues=semantic_check_issues,
                 )
-                if semantic_check_issues:
-                    for issue in semantic_check_issues:
+                if semantic_check_errors:
+                    for issue in semantic_check_errors:
                         issue_key = ":".join(
                             part for part in (issue.code, issue.step_id, issue.node_name) if part
                         )
@@ -1047,6 +1512,11 @@ def generate_blueprint_from_informal(
                             observed_semantic_issues.append(issue_key)
 
         result = compiler.check_blueprint(lean_code, target_name)
+        if candidate is None:
+            candidate = _parse_blueprint(lean_code, target_name)
+        lean_source_contexts = _lean_source_contexts(
+            result, candidate, semantic_manifest,
+        )
         _emit_lean_check_result(
             tracer,
             thm_name=thm_name,
@@ -1054,23 +1524,24 @@ def generate_blueprint_from_informal(
             attempt=attempt + 1,
             target=target_name,
             result=result,
+            source_contexts=lean_source_contexts,
         )
         if result.failure_kind == "infra":
             raise KiminaInfrastructureError(
                 "\n".join(result.diagnostics) or result.raw_output[-2000:]
             )
-        if semantic_check_issues:
+        if semantic_check_errors:
             # The repair budget is deliberately one turn.  Compile the same
             # rejected candidate as well so that this single turn receives
             # both semantic and Lean diagnostics instead of discovering Lean
             # errors only after it has spent its sole repair on graph shape.
-            local_semantic_repair_count += 1
-            semantic_feedback = format_semantic_issues(semantic_check_issues)
+            semantic_feedback = format_semantic_issues(semantic_check_errors)
             lean_feedback = ""
             if not result.success:
                 lean_feedback = (
                     "\n\nThe same candidate also failed Lean compilation:\n\n"
                     + ("\n".join(result.diagnostics) or result.raw_output[-2000:])
+                    + _format_lean_source_contexts(lean_source_contexts)
                 )
             last_error_feedback = (
                 "The local semantic-fidelity gate rejected this candidate:\n\n"
@@ -1078,21 +1549,11 @@ def generate_blueprint_from_informal(
             )
             last_diagnostics = [last_error_feedback]
             last_failure_stage = "semantic_gate"
-            if local_semantic_repair_count > semantic_max_repair_attempts:
-                raise BlueprintGenerationError(
-                    last_error_feedback,
-                    last_candidate=last_candidate,
-                    diagnostics=last_diagnostics,
-                    attempt=attempt + 1,
-                    finish_reason=last_finish_reason,
-                    failure_stage=last_failure_stage,
-                    candidate_history=candidate_history,
-                )
             feedback = (
                 f"{last_error_feedback}\n\nCorrect all listed translation and Lean "
                 "errors in one pass and re-emit the entire file. Preserve the source COT "
                 "exactly; a false step must remain a proposition and explicit proof gap.\n\n"
-                f"Issue-specific repair rules:\n{_semantic_repair_guidance(semantic_check_issues)}\n\n"
+                f"Issue-specific repair rules:\n{_semantic_repair_guidance(semantic_check_errors)}\n\n"
                 "Previously observed issues that must not regress: "
                 f"{', '.join(observed_semantic_issues)}"
             )
@@ -1123,7 +1584,10 @@ def generate_blueprint_from_informal(
                     parsed.semantic_gate_results.append({
                         "stage": "phase1_local_gate",
                         "passed": True,
-                        "issues": [],
+                        "issues": [issue.to_dict() for issue in semantic_check_issues],
+                        "warning_count": sum(
+                            issue.severity == "warning" for issue in semantic_check_issues
+                        ),
                         "require_step_ids": semantic_require_step_ids,
                         "static_gate": semantic_static_gate,
                     })
@@ -1192,23 +1656,12 @@ def generate_blueprint_from_informal(
                                 "total_tokens": audit.total_tokens,
                             })
                             return parsed
-                        audit_semantic_repair_count += 1
                         last_error_feedback = (
                             "The semantic-fidelity audit rejected this candidate:\n\n"
                             f"{audit_feedback}"
                         )
                         last_diagnostics = [last_error_feedback]
                         last_failure_stage = "semantic_audit"
-                        if audit_semantic_repair_count > semantic_max_repair_attempts:
-                            raise BlueprintGenerationError(
-                                last_error_feedback,
-                                last_candidate=last_candidate,
-                                diagnostics=last_diagnostics,
-                                attempt=attempt + 1,
-                                finish_reason=last_finish_reason,
-                                failure_stage=last_failure_stage,
-                                candidate_history=candidate_history,
-                            )
                         feedback = (
                             f"{last_error_feedback}\n\nRepair only the Lean translation. "
                             "Do not repair, weaken, or omit any original COT Step clause. "
@@ -1230,7 +1683,10 @@ def generate_blueprint_from_informal(
                 )
                 last_failure_stage = "blueprint_contract"
         else:
-            last_error_feedback = "\n".join(result.diagnostics) or result.raw_output[-2000:]
+            last_error_feedback = (
+                ("\n".join(result.diagnostics) or result.raw_output[-2000:])
+                + _format_lean_source_contexts(lean_source_contexts)
+            )
             last_failure_stage = "lean_check"
         last_diagnostics = list(result.diagnostics) or [last_error_feedback]
 
@@ -1345,6 +1801,8 @@ def _parse_blueprint(lean_code: str, target_theorem: str) -> Blueprint:
             lean_declaration=m.group(0),
             title=title,
             source_step_id=source_step_id,
+            lean_start_line=lean_code.count("\n", 0, m.start()) + 1,
+            lean_end_line=lean_code.count("\n", 0, m.end()) + 1,
         ))
 
     return Blueprint(

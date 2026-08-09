@@ -48,6 +48,7 @@ class CheckpointState:
     semantic_minimal_ir: bool = False
     semantic_freeze_refinement: bool = False
     semantic_audit_mode: str = "none"
+    semantic_source_mode: str = "step_grounded"
     # Immutable iter=0 snapshot plus an append-only record of local gate
     # decisions.  Plain dictionaries keep checkpoint JSON forward-compatible.
     semantic_contract_snapshot: dict = field(default_factory=dict)

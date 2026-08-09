@@ -47,9 +47,15 @@ Emit each node of your decomposition directly as a `@[blueprint ...]`-annotated 
 - Header commands may only be `import`, `open`, `open scoped`, and `set_option`. Prefer fully-qualified names such as `Real.sin` and `Set.Icc` when practical.
 
 ## Tool use
+Use `mathlib_search` to look up existing Mathlib constants, theorem names, and
+their exact types when that avoids inventing an API or weakening a claim.
+Search results are library facts, not local Blueprint graph nodes: never put a
+Mathlib theorem in `sorry_using [...]`. Only locally declared annotated nodes
+belong in that dependency list. Avoid repeating an identical search query.
+
 Use `lean_compile` to verify the skeleton. Before Lean is invoked, the tool runs structural pre-checks on the raw code; any failure is returned as a `Safeguard rejected` response, and the file is never sent to Lean. The pre-checks reject: unbalanced `/- ... -/` block comments; a missing main theorem; forbidden constructs (`axiom`, `native_decide`, `partial def`, `variable`, `section`, `noncomputable section`, `namespace`, `structure`, `instance`, `inductive`, `class`, `notation`, `macro`, `syntax`, `local notation`); missing `import Mathlib` or `import Architect`; a Lemma or Theorem without an `@[blueprint]` attribute; a Lemma/Theorem body that is bare `sorry` or a real proof -- every body must be exactly `:= by sorry_using [...]`, since proofs belong to the next stage and bare `sorry` breaks dependency tracking.
 
-If the pre-checks pass, the code is compiled by Lean. After Lean returns no errors, a post-compile graph-validity check runs against the parsed `@[blueprint]` declarations: every node must have a non-empty `(statement := /-- ... -/)` field; every Lemma and the Theorem must have a non-empty `(proof := /-- ... -/)` field; every name in `sorry_using [...]` must resolve to a declared `@[blueprint]` node, with no self-loops; the `sorry_using` graph must be acyclic; exactly one main Theorem must exist with the target name; and every node must be reachable, in reverse, from the main Theorem (no isolated/dead nodes).
+If the pre-checks pass, the code is compiled by Lean. After Lean returns no errors, a post-compile graph-validity check runs against the parsed `@[blueprint]` declarations: every node must have a non-empty `(statement := /-- ... -/)` field; every Lemma and the Theorem must have a non-empty `(proof := /-- ... -/)` field; every name in `sorry_using [...]` must resolve to a declared `@[blueprint]` node, with no self-loops; the `sorry_using` graph must be acyclic; and exactly one main Theorem must exist with the target name. Nodes outside the root dependency closure are retained and reported as semantic warnings; never invent a dependency edge solely to silence such a warning.
 
 If any gate fails, fix the reported issue and call `lean_compile` again. Sorries from `sorry_using` are expected and do not count as errors. Iterate until `lean_compile` reports `Compilation SUCCESSFUL. Validation SUCCESSFUL.`
 

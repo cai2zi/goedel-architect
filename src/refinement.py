@@ -174,7 +174,6 @@ def refine_blueprint(
     semantic_static_gate: bool = False,
     semantic_freeze_refinement: bool = False,
     semantic_audit_mode: str = "none",
-    semantic_max_repair_attempts: int = 1,
     baseline_semantic_snapshot: Any = None,
 ) -> Blueprint:
     """
@@ -193,8 +192,6 @@ def refine_blueprint(
         change strategy or accept a node as an unresolved gap, rather than
         cosmetically re-decomposing the same stuck problem every round.
     """
-    if semantic_max_repair_attempts < 0:
-        raise ValueError("semantic_max_repair_attempts must be non-negative")
     if semantic_audit_mode not in {"none", "risk", "full"}:
         raise ValueError("semantic_audit_mode must be one of: none, risk, full")
     if semantic_audit_mode != "none" and not semantic_fidelity_enabled:
@@ -249,11 +246,6 @@ def refine_blueprint(
     base_messages = tuple(dict(message) for message in messages)
 
     last_error_feedback = ""
-    # Keep deterministic/freeze repairs independent from semantic-audit
-    # repairs so the first audit after a successful local repair can feed one
-    # bounded correction turn back to the model.
-    local_semantic_repair_count = 0
-    audit_semantic_repair_count = 0
     for attempt in range(max_retries):
         request_max_tokens = phase3_request_max_tokens(messages)
         response = _call_blueprint_model(
@@ -268,6 +260,7 @@ def refine_blueprint(
         lean_code = _extract_lean_code(content)
 
         semantic_issues = []
+        semantic_errors = []
         if semantic_fidelity_enabled:
             candidate = _parse_blueprint(lean_code, blueprint.target_theorem)
             if candidate.nodes:
@@ -289,6 +282,9 @@ def refine_blueprint(
                             semantic_manifest,
                         )
                     )
+                semantic_errors = [
+                    issue for issue in semantic_issues if issue.severity == "error"
+                ]
                 _emit_semantic_check(
                     tracer,
                     thm_name=thm_name,
@@ -296,18 +292,12 @@ def refine_blueprint(
                     attempt=attempt + 1,
                     issues=semantic_issues,
                 )
-                if semantic_issues:
-                    local_semantic_repair_count += 1
+                if semantic_errors:
                     last_error_feedback = (
                         "The local semantic-fidelity/freeze gate rejected the revision "
                         "before Lean execution:\n\n"
-                        f"{format_semantic_issues(semantic_issues)}"
+                        f"{format_semantic_issues(semantic_errors)}"
                     )
-                    if local_semantic_repair_count > semantic_max_repair_attempts:
-                        raise SemanticRefinementError(
-                            last_error_feedback,
-                            issues=semantic_issues,
-                        )
                     feedback = (
                         f"{last_error_feedback}\n\nUndo every semantic change. "
                         "Only repair the Lean encoding, dependency edges, or proof sketches; "
@@ -342,7 +332,10 @@ def refine_blueprint(
                     parsed.semantic_gate_results.append({
                         "stage": "phase3_local_gate",
                         "passed": True,
-                        "issues": [],
+                        "issues": [issue.to_dict() for issue in semantic_issues],
+                        "warning_count": sum(
+                            issue.severity == "warning" for issue in semantic_issues
+                        ),
                         "freeze": semantic_freeze_refinement,
                     })
                 contract_errors = phase2_contract_errors(parsed)
@@ -419,13 +412,10 @@ def refine_blueprint(
                         audit_feedback = f"Audit response format invalid: {exc.reason}"
                         audit_passed = False
                     if not audit_passed:
-                        audit_semantic_repair_count += 1
                         last_error_feedback = (
                             "The semantic-fidelity audit rejected the revised blueprint:\n\n"
                             f"{audit_feedback}"
                         )
-                        if audit_semantic_repair_count > semantic_max_repair_attempts:
-                            raise SemanticRefinementError(last_error_feedback)
                         feedback = (
                             f"{last_error_feedback}\n\nRepair only the formal encoding. "
                             "Restore every original COT Step and Step binding; "

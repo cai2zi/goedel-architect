@@ -28,6 +28,8 @@ _DECL_HEAD_RE = re.compile(
 @dataclass(frozen=True)
 class CotStep:
     step_id: str
+    source_start: int = 0
+    source_end: int = 0
     source_text: str = ""
     source_sha256: str = ""
     role: str = "derived_claim"
@@ -70,15 +72,29 @@ class SemanticIssue:
     message: str
     node_name: str = ""
     step_id: str = ""
-    category: str = "static"
+    category: str = "semanticDegeneration"
+    source_start: int | None = None
+    source_end: int | None = None
+    source_text: str = ""
+    source_sha256: str = ""
+    severity: str = "error"
 
-    def to_dict(self) -> dict[str, str]:
+    def __post_init__(self) -> None:
+        if self.severity not in {"error", "warning"}:
+            raise ValueError("SemanticIssue severity must be error or warning")
+
+    def to_dict(self) -> dict[str, Any]:
         return {
             "code": self.code,
             "message": self.message,
             "node_name": self.node_name,
             "step_id": self.step_id,
             "category": self.category,
+            "source_start": self.source_start,
+            "source_end": self.source_end,
+            "source_text": self.source_text,
+            "source_sha256": self.source_sha256,
+            "severity": self.severity,
         }
 
 
@@ -112,6 +128,8 @@ def parse_cot_manifest(value: Any) -> CotManifest:
     return CotManifest(tuple(
         CotStep(
             step_id=str(step["step_id"]),
+            source_start=int(step["source_start"]),
+            source_end=int(step["source_end"]),
             source_text=str(step["source_text"]),
             source_sha256=str(step["source_sha256"]),
             role="conclusion" if index == len(raw_steps) else "derived_claim",
@@ -533,15 +551,91 @@ def _issue(
     *,
     node: BlueprintNode | None = None,
     step_id: str = "",
-    category: str = "static",
+    category: str = "semanticDegeneration",
+    contract: CotManifest | None = None,
+    severity: str = "error",
 ) -> SemanticIssue:
+    resolved_step_id = step_id or (node.source_step_id if node is not None else "")
+    source_step = (
+        contract.by_id.get(_base_step_id(resolved_step_id))
+        if contract is not None and resolved_step_id else None
+    )
     return SemanticIssue(
         code=code,
         message=message,
         node_name=node.name if node is not None else "",
-        step_id=step_id or (node.source_step_id if node is not None else ""),
+        step_id=resolved_step_id,
         category=category,
+        source_start=source_step.source_start if source_step is not None else None,
+        source_end=source_step.source_end if source_step is not None else None,
+        source_text=source_step.source_text if source_step is not None else "",
+        source_sha256=source_step.source_sha256 if source_step is not None else "",
+        severity=severity,
     )
+
+
+def _issue_for_step(
+    code: str,
+    message: str,
+    step: CotStep,
+    *,
+    category: str = "binding",
+    severity: str = "error",
+) -> SemanticIssue:
+    return SemanticIssue(
+        code, message, step_id=step.step_id, category=category,
+        source_start=step.source_start, source_end=step.source_end,
+        source_text=step.source_text, source_sha256=step.source_sha256,
+        severity=severity,
+    )
+
+
+def _normalized_proposition(node: BlueprintNode) -> str:
+    """Normalize the complete proposition while retaining all binders/hypotheses."""
+    signature = _strip_lean_comments(node.signature())
+    head = _DECL_HEAD_RE.match(signature)
+    return _normalize_expr(signature[head.end():] if head else signature)
+
+
+def _closed_claimed_answer(value: str) -> str:
+    """Return a conservative normalized closed answer literal, or empty."""
+    answer = _simple_claimed_answer(value)
+    if answer:
+        return _normalize_expr(answer)
+    stripped = _strip_outer_parens(value.strip())
+    if re.fullmatch(r'"(?:\\.|[^"\\])*"', stripped):
+        return _normalize_expr(stripped)
+    return ""
+
+
+def _definition_hardcodes_answer(node: BlueprintNode, claimed_answer: str) -> bool:
+    prefix, body = _definition_parts(node)
+    answer = _closed_claimed_answer(claimed_answer)
+    if not answer or not body:
+        return False
+    normalized_body = _normalize_expr(body)
+    if normalized_body == answer:
+        return True
+    # A function that ignores every declared binder and returns the literal is
+    # equally hard-coded.  This deliberately accepts only the whole RHS.
+    head = _DECL_HEAD_RE.match(prefix)
+    remainder = prefix[head.end():] if head else ""
+    binder_names = re.findall(r"[({]\s*([A-Za-z_][A-Za-z0-9_']*)", remainder)
+    return bool(binder_names) and normalized_body == answer
+
+
+def _prop_definition_hardcodes_answer(node: BlueprintNode, claimed_answer: str) -> bool:
+    prefix, body = _definition_parts(node)
+    answer = _closed_claimed_answer(claimed_answer)
+    if not answer or not re.search(r":\s*Prop\s*$", prefix):
+        return False
+    if not _is_nullary_definition_prefix(prefix):
+        return False
+    equality = _top_level_equality(_strip_outer_parens(body))
+    if equality is None:
+        return False
+    left, right = equality
+    return _normalize_expr(left) == answer or _normalize_expr(right) == answer
 
 
 def validate_blueprint_fidelity(
@@ -559,7 +653,7 @@ def validate_blueprint_fidelity(
 
     if require_step_bindings and not contract.steps:
         issues.append(SemanticIssue(
-            "EMPTY_COT_MANIFEST",
+            "emptyCotManifest",
             "Claim bindings were required but the source COT manifest is empty.",
             category="binding",
         ))
@@ -568,43 +662,47 @@ def validate_blueprint_fidelity(
         title_count = len(re.findall(r"\(title\s*:=", node.lean_declaration))
         if require_step_bindings and title_count != 1:
             issues.append(_issue(
-                "MISSING_STEP_MAPPING" if title_count == 0 else "MULTIPLE_STEP_MAPPINGS",
+                "missingStepMapping" if title_count == 0 else "multipleStepMappings",
                 f"Node must have exactly one source-Step title; found {title_count}.",
                 node=node,
                 category="binding",
+                contract=contract,
             ))
             continue
         if require_step_bindings and not node.source_step_id:
             issues.append(_issue(
-                "MALFORMED_STEP_MAPPING",
+                "malformedStepMapping",
                 "Node title must be exactly COT_STEP:SNNN.",
                 node=node,
                 category="binding",
+                contract=contract,
             ))
             continue
         if node.source_step_id:
             base_id = _base_step_id(node.source_step_id)
             if base_id not in valid_ids:
                 issues.append(_issue(
-                    "UNKNOWN_STEP_MAPPING",
+                    "unknownStepMapping",
                     f"Node refers to source Step {base_id}, which is not in the manifest.",
                     node=node,
                     category="binding",
+                    contract=contract,
                 ))
 
     if root is None:
         issues.append(SemanticIssue(
-            "MISSING_ROOT", "The target theorem is not a blueprint node.", category="binding",
+            "missingRoot", "The target theorem is not a blueprint node.", category="binding",
         ))
         return issues
 
     if require_step_bindings and contract.final_step_id:
         if _base_step_id(root.source_step_id) != contract.final_step_id:
             issues.append(_issue(
-                "ROOT_NOT_FINAL_STEP",
+                "rootNotFinalStep",
                 f"Root must map to final source Step {contract.final_step_id}.",
                 node=root,
                 category="binding",
+                contract=contract,
             ))
 
     reachable = _root_reachable_names(blueprint)
@@ -624,28 +722,31 @@ def validate_blueprint_fidelity(
             if not step.requires_formalization:
                 continue
             if step.step_id not in mapped_steps:
-                issues.append(SemanticIssue(
-                    "STEP_MAPPING_ABSENT",
+                issues.append(_issue_for_step(
+                    "stepMappingAbsent",
                     "No node in the blueprint maps to this source step.",
-                    step_id=step.step_id,
+                    step,
                     category="binding",
                 ))
             elif step.step_id not in reachable_steps:
-                issues.append(SemanticIssue(
-                    "STEP_NOT_ROOT_REACHABLE",
+                issues.append(_issue_for_step(
+                    "stepNotRootReachable",
                     "A node maps to this source Step, but no mapped node is in the root "
                     "dependency closure.",
-                    step_id=step.step_id,
+                    step,
                     category="binding",
+                    severity="warning",
                 ))
         for node in blueprint.nodes:
             if node.name not in reachable:
                 issues.append(_issue(
-                    "NODE_NOT_ROOT_REACHABLE",
+                    "nodeNotRootReachable",
                     "Every Blueprint node must be in the root's transitive semantic "
                     "dependency closure.",
                     node=node,
                     category="binding",
+                    contract=contract,
+                    severity="warning",
                 ))
 
     # High-confidence anti-degeneration checks operate on parsed declarations,
@@ -656,86 +757,121 @@ def validate_blueprint_fidelity(
             normalized_conclusion = _normalize_expr(conclusion)
             if normalized_conclusion == "True":
                 issues.append(_issue(
-                    "VACUOUS_TRUE_ROOT" if node.name == blueprint.target_theorem else "VACUOUS_TRUE_STEP",
+                    "vacuousTrueRoot" if node.name == blueprint.target_theorem else "vacuousTrueStep",
                     "A source assertion was replaced by the proposition True.",
                     node=node,
+                    contract=contract,
                 ))
             elif normalized_conclusion == "Prop":
                 issues.append(_issue(
-                    "VACUOUS_PROP_ROOT" if node.name == blueprint.target_theorem else "VACUOUS_PROP_STEP",
+                    "vacuousPropRoot" if node.name == blueprint.target_theorem else "vacuousPropStep",
                     "A source assertion was replaced by an unspecified Prop shell.",
                     node=node,
+                    contract=contract,
                 ))
             elif _contains_true_shell(conclusion):
                 issues.append(_issue(
-                    "VACUOUS_TRUE_SHELL_ROOT"
+                    "vacuousTrueShellRoot"
                     if node.name == blueprint.target_theorem
-                    else "VACUOUS_TRUE_SHELL_STEP",
+                    else "vacuousTrueShellStep",
                     "A source assertion contains a literal True arm in place of a constraint.",
                     node=node,
+                    contract=contract,
                 ))
             if node.name != blueprint.target_theorem and _is_reflexive(conclusion):
                 issues.append(_issue(
-                    "REFLEXIVE_STEP",
+                    "reflexiveStep",
                     "A source assertion was replaced by a reflexive equality.",
                     node=node,
+                    contract=contract,
                 ))
             if node.name != blueprint.target_theorem and _is_unconstrained_exists(conclusion):
                 issues.append(_issue(
-                    "UNCONSTRAINED_EXISTS_STEP",
+                    "unconstrainedExistsStep",
                     "A source assertion only chooses an unconstrained closed witness.",
                     node=node,
+                    contract=contract,
                 ))
         else:
             prefix, body = _definition_parts(node)
             normalized_body = _normalize_expr(body)
             if re.search(r":\s*Prop\s*$", prefix) and normalized_body == "True":
                 issues.append(_issue(
-                    "VACUOUS_PROP_DEFINITION",
+                    "vacuousPropDefinition",
                     "A Prop definition is hard-coded to True.",
                     node=node,
+                    contract=contract,
                 ))
             elif re.search(r":\s*Prop\s*$", prefix) and _contains_true_shell(body):
                 issues.append(_issue(
-                    "VACUOUS_TRUE_SHELL_DEFINITION",
+                    "vacuousTrueShellDefinition",
                     "A Prop definition contains a literal True arm in place of a constraint.",
                     node=node,
+                    contract=contract,
                 ))
             if re.search(r":\s*Prop\s*$", prefix) and _is_unconstrained_exists(body):
                 issues.append(_issue(
-                    "UNCONSTRAINED_EXISTS_DEFINITION",
+                    "unconstrainedExistsDefinition",
                     "A Prop definition only introduces unconstrained witnesses.",
                     node=node,
+                    contract=contract,
                 ))
             if re.search(r":\s*Bool\s*$", prefix) and normalized_body in {"true", "false"}:
                 issues.append(_issue(
-                    "VACUOUS_BOOL_DEFINITION",
+                    "vacuousBoolDefinition",
                     "A mathematical assertion is represented by a constant Bool definition.",
                     node=node,
+                    contract=contract,
                 ))
-            # A Step may legitimately introduce an object whose value happens
-            # to equal the final answer. Answer-bearing definitions are routed
-            # through the full semantic audit instead of rejected locally.
+            if node.name != blueprint.target_theorem and claimed_answer:
+                if _prop_definition_hardcodes_answer(node, claimed_answer):
+                    issues.append(_issue(
+                        "claimedAnswerInPropDefinition",
+                        "A nullary Prop definition hard-codes the claimed answer.",
+                        node=node, category="answerGrounding", contract=contract,
+                    ))
+                elif _definition_hardcodes_answer(node, claimed_answer):
+                    issues.append(_issue(
+                        "claimedAnswerInDefinition",
+                        "A non-root definition is exactly the claimed answer literal.",
+                        node=node, category="answerGrounding", contract=contract,
+                    ))
+
+    root_proposition = _normalized_proposition(root)
+    for node in blueprint.nodes:
+        if (
+            node.name != root.name
+            and node.kind in {"lemma", "theorem"}
+            and _normalized_proposition(node) == root_proposition
+        ):
+            issues.append(_issue(
+                "duplicateRootConclusion",
+                "A non-root proof node duplicates the complete root proposition.",
+                node=node, category="answerGrounding", contract=contract,
+            ))
 
     root_conclusion = _node_conclusion(root)
     if _is_reflexive(root_conclusion):
         issues.append(_issue(
-            "REFLEXIVE_ROOT",
+            "reflexiveRoot",
             "The root is a reflexive equality and no longer states the source problem.",
             node=root,
+            contract=contract,
         ))
     if _is_unconstrained_exists(root_conclusion):
         issues.append(_issue(
-            "UNCONSTRAINED_EXISTS_ROOT",
+            "unconstrainedExistsRoot",
             "The root only chooses a closed witness and imposes no source-problem constraint.",
             node=root,
+            contract=contract,
         ))
     if claimed_answer and not _contains_answer(root_conclusion, claimed_answer):
         issues.append(_issue(
-            "ROOT_MISSING_CLAIMED_ANSWER",
+            "rootMissingClaimedAnswer",
             "The root does not retain the simple claimed final answer.",
             node=root,
-            category="grounding",
+            category="answerGrounding",
+            contract=contract,
         ))
     proof_ancestors = {
         name for name in reachable - {root.name}
@@ -745,10 +881,11 @@ def validate_blueprint_fidelity(
     substantive_steps = [step for step in contract.steps if step.requires_formalization]
     if substantive_steps and len(substantive_steps) > 1 and not proof_ancestors:
         issues.append(_issue(
-            "ROOT_NOT_GROUNDED",
+            "rootNotGrounded",
             "The root has no proof-step ancestor from the multi-step source COT.",
             node=root,
-            category="grounding",
+            category="answerGrounding",
+            contract=contract,
         ))
     return issues
 
@@ -929,26 +1066,26 @@ def check_semantic_freeze(
     revised_snapshot = snapshot_blueprint_semantics(revised, manifest)
     if revised.target_theorem != baseline.root_name:
         issues.append(SemanticIssue(
-            "ROOT_NAME_DRIFT",
+            "rootNameDrift",
             f"Root changed from {baseline.root_name} to {revised.target_theorem}.",
             node_name=revised.target_theorem,
-            category="drift",
+            category="semanticDrift",
         ))
     if revised_snapshot.root_signature != baseline.root_signature:
         issues.append(SemanticIssue(
-            "ROOT_SIGNATURE_DRIFT",
+            "rootSignatureDrift",
             "The refinement changed the root binders, assumptions, or conclusion.",
             node_name=revised.target_theorem,
             step_id=revised_snapshot.root_step_id,
-            category="drift",
+            category="semanticDrift",
         ))
     if _base_step_id(revised_snapshot.root_step_id) != _base_step_id(baseline.root_step_id):
         issues.append(SemanticIssue(
-            "ROOT_STEP_BINDING_DRIFT",
+            "rootStepBindingDrift",
             "The refinement moved the root to a different source step.",
             node_name=revised.target_theorem,
             step_id=revised_snapshot.root_step_id,
-            category="drift",
+            category="semanticDrift",
         ))
 
     revised_shapes = {
@@ -961,26 +1098,55 @@ def check_semantic_freeze(
                 available.remove(shape)
             else:
                 issues.append(SemanticIssue(
-                    "STEP_SEMANTIC_DRIFT",
+                    "stepSemanticDrift",
                     "An iter-0 declaration was removed or its mathematical type/body changed.",
                     step_id=step_id,
-                    category="drift",
+                    category="semanticDrift",
                 ))
                 break
     return issues
 
 
-def format_semantic_issues(issues: Iterable[SemanticIssue], limit: int = 20) -> str:
+def format_semantic_issues(issues: Iterable[SemanticIssue]) -> str:
+    """Render complete, compact repair feedback without repeating COT text.
+
+    The immutable Phase-1 prompt already contains every source Step verbatim.
+    Repeating ``source_text`` once per issue wastes context and used to crowd
+    later issues out behind a fixed 20-item limit.  Group by severity,
+    category, and code instead: explain each distinct problem once, then list
+    every affected Step/node location so the model can look it up in the base
+    prompt.  Full source spans and excerpts remain available in structured
+    trace/checkpoint issue dictionaries.
+    """
     values = list(issues)
-    shown = values[:limit]
+    if not values:
+        return ""
+
     lines: list[str] = []
-    for issue in shown:
-        location = "/".join(
-            value for value in (issue.step_id, issue.node_name) if value
-        )
-        lines.append(
-            f"- {issue.code}{f' [{location}]' if location else ''}: {issue.message}"
-        )
-    if len(values) > limit:
-        lines.append(f"... and {len(values) - limit} more")
+    for severity, heading in (("error", "Blocking errors"), ("warning", "Warnings")):
+        severity_issues = [issue for issue in values if issue.severity == severity]
+        if not severity_issues:
+            continue
+        lines.append(f"{heading} ({len(severity_issues)}):")
+        categories = dict.fromkeys(issue.category for issue in severity_issues)
+        for category in categories:
+            category_issues = [
+                issue for issue in severity_issues if issue.category == category
+            ]
+            lines.append(f"  {category}:")
+            codes = dict.fromkeys(issue.code for issue in category_issues)
+            for code in codes:
+                code_issues = [issue for issue in category_issues if issue.code == code]
+                messages = list(dict.fromkeys(
+                    issue.message.strip() for issue in code_issues if issue.message.strip()
+                ))
+                lines.append(f"  - {code} ({len(code_issues)})")
+                for message in messages:
+                    lines.append(f"    Meaning: {message}")
+                locations = list(dict.fromkeys(
+                    "/".join(value for value in (issue.step_id, issue.node_name) if value)
+                    or "<global>"
+                    for issue in code_issues
+                ))
+                lines.append(f"    Affected: {', '.join(locations)}")
     return "\n".join(lines)

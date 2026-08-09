@@ -32,7 +32,6 @@ blueprint:
   semantic_freeze_refinement: true
   semantic_audit_mode: risk
   semantic_audit_max_tokens: 1024
-  semantic_max_repair_attempts: 1
   proof_policy: first_failed_wave
   critical_negation_max_turns: 0
   phase1_concurrency: 512

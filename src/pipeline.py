@@ -192,15 +192,21 @@ async def run_phase2_async(
             attempt=state.iteration + 1,
             issues=semantic_issues,
         )
+        semantic_errors = [
+            issue for issue in semantic_issues if issue.severity == "error"
+        ]
         state.semantic_gate_results.append({
             "stage": "phase2_checkpoint",
-            "passed": not semantic_issues,
+            "passed": not semantic_errors,
             "issues": [issue.to_dict() for issue in semantic_issues],
+            "warning_count": sum(
+                issue.severity == "warning" for issue in semantic_issues
+            ),
         })
-        if semantic_issues:
+        if semantic_errors:
             state.status = RunStatus.ERROR
             state.semantic_status = "phase2_checkpoint_rejected"
-            state.final_lean_errors = [format_semantic_issues(semantic_issues)]
+            state.final_lean_errors = [format_semantic_issues(semantic_errors)]
             state.save(checkpoint_path)
             return OrchestratorResult(
                 active_nodes=active_node_names(blueprint),
@@ -316,7 +322,6 @@ def run_phase3(
     semantic_static_gate: bool | None = None,
     semantic_freeze_refinement: bool | None = None,
     semantic_audit_mode: str | None = None,
-    semantic_max_repair_attempts: int = 1,
 ) -> Blueprint:
     state = CheckpointState.load(checkpoint_path)
     if state.status != RunStatus.RUNNING:
@@ -370,7 +375,6 @@ def run_phase3(
                 if semantic_audit_mode is None
                 else semantic_audit_mode
             ),
-            semantic_max_repair_attempts=semantic_max_repair_attempts,
             baseline_semantic_snapshot=(
                 semantic_snapshot_from_dict(state.semantic_contract_snapshot)
                 if state.semantic_contract_snapshot

@@ -13,6 +13,7 @@ from cot_blueprint_refine.formal_step_splitter import (  # noqa: E402
     FormalStepSplitterConfig,
     build_split_messages,
     make_boundary_anchors,
+    merge_nonsemantic_spans,
     parse_boundaries,
     spans_from_boundaries,
 )
@@ -85,6 +86,35 @@ class FormalStepsTest(unittest.TestCase):
         self.assertIn("soft prior", prompt)
         self.assertIn("not a quota", prompt)
         self.assertNotIn("COT_CLAIM", prompt)
+
+    def test_postprocess_merges_format_only_span_losslessly(self) -> None:
+        source = "Compute x = 7.\n$$\nTherefore x is known.\n"
+        first_end = source.index("$$")
+        format_end = first_end + 3
+        spans, formatting, wrappers = merge_nonsemantic_spans(
+            source, [(0, first_end), (first_end, format_end), (format_end, len(source))],
+        )
+        self.assertEqual(formatting, 1)
+        self.assertEqual(wrappers, 0)
+        self.assertEqual("".join(source[a:b] for a, b in spans), source)
+
+    def test_postprocess_merges_repeated_boxed_final_answer(self) -> None:
+        source = "Solving gives x = 115.\nTherefore, the final answer is $\\boxed{115}$.\n"
+        boundary = source.index("Therefore")
+        spans, formatting, wrappers = merge_nonsemantic_spans(
+            source, [(0, boundary), (boundary, len(source))],
+        )
+        self.assertEqual((formatting, wrappers), (0, 1))
+        self.assertEqual(spans, [(0, len(source))])
+
+    def test_postprocess_keeps_new_final_inference(self) -> None:
+        source = "We know x + y = 5.\nTherefore, the final answer is $\\boxed{5}$.\n"
+        boundary = source.index("Therefore")
+        spans, _formatting, wrappers = merge_nonsemantic_spans(
+            source, [(0, boundary), (boundary, len(source))],
+        )
+        self.assertEqual(wrappers, 0)
+        self.assertEqual(len(spans), 2)
 
 
 if __name__ == "__main__":

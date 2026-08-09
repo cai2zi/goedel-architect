@@ -167,7 +167,9 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
     args.node_max_negation_probe_turns = int(args.node_max_negation_probe_turns)
     args.critical_negation_max_turns = int(args.critical_negation_max_turns)
     args.max_tool_calls_per_turn = int(args.max_tool_calls_per_turn)
-    args.semantic_max_repair_attempts = int(args.semantic_max_repair_attempts)
+    args.phase1_max_tool_turns = int(args.phase1_max_tool_turns)
+    args.phase1_max_tool_calls_per_turn = int(args.phase1_max_tool_calls_per_turn)
+    args.phase1_mathlib_search_max_calls = int(args.phase1_mathlib_search_max_calls)
     _validate_args(args)
     return args
 
@@ -186,19 +188,27 @@ def _validate_args(args: argparse.Namespace) -> None:
         "lean_parallel_batches",
         "blueprint_max_retries",
         "node_max_prove_turns",
+        "phase1_max_tool_turns",
+        "phase1_max_tool_calls_per_turn",
     ):
         if getattr(args, name) <= 0:
             raise ValueError(f"{name} must be positive")
     if args.max_refinement_iterations < 0:
         raise ValueError("max_refinement_iterations must be non-negative")
+    if args.phase1_mathlib_search_max_calls < 0:
+        raise ValueError("Phase-1 search limit must be non-negative")
     if args.node_max_negation_probe_turns < 0:
         raise ValueError("node_max_negation_probe_turns must be non-negative")
     if args.critical_negation_max_turns < 0:
         raise ValueError("critical_negation_max_turns must be non-negative")
-    if args.semantic_max_repair_attempts < 0:
-        raise ValueError("semantic_max_repair_attempts must be non-negative")
     if args.semantic_audit_mode not in {"none", "risk", "full"}:
         raise ValueError("semantic_audit_mode must be one of: none, risk, full")
+    if args.semantic_source_mode not in {"step_grounded", "whole_cot"}:
+        raise ValueError("semantic_source_mode must be one of: step_grounded, whole_cot")
+    if args.semantic_source_mode == "whole_cot" and not args.semantic_fidelity_enabled:
+        raise ValueError("whole_cot semantic source mode requires semantic fidelity")
+    if args.semantic_source_mode == "whole_cot" and args.semantic_require_step_ids:
+        raise ValueError("whole_cot semantic source mode cannot require Step IDs")
     if args.proof_policy not in {"full", "first_failed_wave", "critical_path"}:
         raise ValueError("proof_policy must be one of: full, first_failed_wave, critical_path")
     if args.node_timeout_s is not None and args.node_timeout_s <= 0:
@@ -438,6 +448,16 @@ def _result_row(
 ) -> dict[str, Any]:
     checkpoint_path, trace_path, blueprint_dir = _record_paths(output_root, record)
     score = _score_state(blueprint, state)
+    semantic_gate_results = list(state.semantic_gate_results) if state else []
+    semantic_warnings = [
+        issue
+        for gate in semantic_gate_results
+        if isinstance(gate, dict) and gate.get("passed") is True
+        for issue in (gate.get("issues") or [])
+        if isinstance(issue, dict) and issue.get("severity") == "warning"
+        and issue.get("code")
+    ]
+    semantic_warning_codes = sorted({str(issue["code"]) for issue in semantic_warnings})
     row = {
         "id": record.unique_id,
         "record_id": record.record_id,
@@ -469,8 +489,11 @@ def _result_row(
         "semantic_minimal_ir": bool(args.semantic_minimal_ir),
         "semantic_freeze_refinement": bool(args.semantic_freeze_refinement),
         "semantic_audit_mode": str(args.semantic_audit_mode),
+        "semantic_source_mode": str(args.semantic_source_mode),
         "semantic_status": state.semantic_status if state else "",
-        "semantic_gate_results": list(state.semantic_gate_results) if state else [],
+        "semantic_gate_results": semantic_gate_results,
+        "semantic_warning_codes": semantic_warning_codes,
+        "semantic_warning_count": len(semantic_warnings),
         **score,
     }
     if traceback_text:
@@ -566,7 +589,10 @@ async def _run_record(
                     semantic_static_gate=args.semantic_static_gate,
                     semantic_minimal_ir=args.semantic_minimal_ir,
                     semantic_audit_mode=args.semantic_audit_mode,
-                    semantic_max_repair_attempts=args.semantic_max_repair_attempts,
+                    semantic_source_mode=args.semantic_source_mode,
+                    phase1_max_tool_turns=args.phase1_max_tool_turns,
+                    phase1_max_tool_calls_per_turn=args.phase1_max_tool_calls_per_turn,
+                    phase1_mathlib_search_max_calls=args.phase1_mathlib_search_max_calls,
                 ),
             )
             _write_phase1_candidates(blueprint_dir, blueprint.candidate_history)
@@ -582,6 +608,7 @@ async def _run_record(
                 semantic_minimal_ir=bool(args.semantic_minimal_ir),
                 semantic_freeze_refinement=bool(args.semantic_freeze_refinement),
                 semantic_audit_mode=str(args.semantic_audit_mode),
+                semantic_source_mode=str(args.semantic_source_mode),
             )
             state.semantic_gate_results = list(blueprint.semantic_gate_results)
             state.semantic_status = (
@@ -729,7 +756,6 @@ async def _run_record(
                         semantic_static_gate=args.semantic_static_gate,
                         semantic_freeze_refinement=args.semantic_freeze_refinement,
                         semantic_audit_mode=args.semantic_audit_mode,
-                        semantic_max_repair_attempts=args.semantic_max_repair_attempts,
                     ),
                 )
                 state = CheckpointState.load(checkpoint_path)
@@ -794,6 +820,7 @@ async def _run_record(
 def _metric_row(scope: str, rows: list[dict[str, Any]], subset: str = "", split: str = "") -> dict[str, Any]:
     total = len(rows)
     root = sum(1 for row in rows if row.get("root_proved"))
+    phase1_accepted_rows = [row for row in rows if row.get("status") == "phase1_accepted"]
     return {
         "scope": scope,
         "subset": subset,
@@ -806,6 +833,12 @@ def _metric_row(scope: str, rows: list[dict[str, Any]], subset: str = "", split:
         "avg_proved_ratio": sum(float(row.get("proved_ratio") or 0) for row in rows) / total if total else 0.0,
         "phase1_failed": sum(1 for row in rows if row.get("status") == "error" and row.get("phase") == "phase1"),
         "phase1_accepted": sum(1 for row in rows if row.get("status") == "phase1_accepted"),
+        "phase1_accepted_with_warnings": sum(
+            1 for row in phase1_accepted_rows if row.get("semantic_warning_codes")
+        ),
+        "phase1_accepted_without_warnings": sum(
+            1 for row in phase1_accepted_rows if not row.get("semantic_warning_codes")
+        ),
         "refine_failed": sum(1 for row in rows if row.get("status") == "error" and row.get("phase") == "phase3"),
         "exhausted": sum(1 for row in rows if row.get("status") == "exhausted"),
         "infra_error": sum(1 for row in rows if int(row.get("infra_error_node_count") or 0) > 0),
@@ -1076,6 +1109,7 @@ async def _run_experiment(
         f"max_tool_calls_per_turn={args.max_tool_calls_per_turn} "
         f"proof_policy={args.proof_policy} "
         f"semantic_fidelity={args.semantic_fidelity_enabled} "
+        f"semantic_source_mode={args.semantic_source_mode} "
         f"semantic_static_gate={args.semantic_static_gate} "
         f"semantic_freeze={args.semantic_freeze_refinement}",
         flush=True,

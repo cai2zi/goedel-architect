@@ -63,6 +63,10 @@ from cot_blueprint_refine.prepare_inputs import make_generation_row, prepare  # 
 from cot_blueprint_refine.extract_original_incorrect_subset import (  # noqa: E402
     extract_incorrect_rows,
 )
+from cot_blueprint_refine.formal_steps import (  # noqa: E402
+    encode_formal_step_manifest,
+    make_formal_step_manifest,
+)
 from cot_blueprint_refine.run_cot_refinement import (  # noqa: E402
     _call_one,
     build_messages,
@@ -441,14 +445,13 @@ class InvalidBlueprintRecoveryTest(unittest.TestCase):
             self.assertIn("theorem traced", candidate)
 
     def test_generation_error_carries_last_invalid_candidate(self) -> None:
-        response = SimpleNamespace(choices=[SimpleNamespace(
-            message=SimpleNamespace(
-                content="```lean\nimport Mathlib\ntheorem wrong_name : True := by trivial\n```",
-            ),
+        session = SimpleNamespace(
+            successful_lean_code="",
+            lean_code="import Mathlib\ntheorem wrong_name : True := by trivial",
             finish_reason="stop",
-        )])
+        )
         with patch("blueprint.make_client", return_value=object()), patch(
-            "blueprint._call_blueprint_model", return_value=response,
+            "blueprint._run_phase1_tool_session", return_value=session,
         ):
             with self.assertRaises(BlueprintGenerationError) as caught:
                 generate_blueprint_from_informal(
@@ -458,6 +461,56 @@ class InvalidBlueprintRecoveryTest(unittest.TestCase):
         self.assertIn("wrong_name", caught.exception.last_candidate)
         self.assertEqual(caught.exception.failure_stage, "blueprint_contract")
 
+    def test_whole_cot_mode_hides_step_grounding_from_generation_prompt(self) -> None:
+        source_cot = "First derive x = 2. Therefore the answer is 2."
+        manifest = encode_formal_step_manifest(
+            make_formal_step_manifest(source_cot, [(0, 19), (19, len(source_cot))])
+        )
+        captured = []
+
+        def run_session(_client, _model, messages, **kwargs):
+            captured.append((deepcopy(list(messages)), kwargs))
+            return SimpleNamespace(
+                successful_lean_code="",
+                lean_code="import Mathlib\ntheorem wrong_name : True := by trivial",
+                finish_reason="stop",
+            )
+
+        with patch("blueprint.make_client", return_value=object()), patch(
+            "blueprint._run_phase1_tool_session", side_effect=run_session,
+        ):
+            with self.assertRaises(BlueprintGenerationError):
+                generate_blueprint_from_informal(
+                    "Find x.", source_cot, "required_name",
+                    compiler=SimpleNamespace(), max_retries=1,
+                    cot_manifest_json=manifest, claimed_answer="2",
+                    semantic_fidelity_enabled=True,
+                    semantic_source_mode="whole_cot",
+                    semantic_require_step_ids=False,
+                    semantic_static_gate=True,
+                )
+
+        messages, kwargs = captured[0]
+        self.assertIn(source_cot, messages[1]["content"])
+        self.assertNotIn("[COT_STEP", messages[1]["content"])
+        self.assertIn("Whole-COT faithful translation contract", messages[0]["content"])
+        self.assertNotIn("Immutable formal Step translation contract", messages[0]["content"])
+        self.assertFalse(kwargs["semantic_require_step_ids"])
+
+    def test_whole_cot_mode_rejects_step_binding_requirement(self) -> None:
+        source_cot = "Therefore the answer is 2."
+        manifest = encode_formal_step_manifest(
+            make_formal_step_manifest(source_cot, [(0, len(source_cot))])
+        )
+        with self.assertRaisesRegex(ValueError, "cannot require Step IDs"):
+            generate_blueprint_from_informal(
+                "Find x.", source_cot, "required_name",
+                compiler=SimpleNamespace(), cot_manifest_json=manifest,
+                semantic_fidelity_enabled=True,
+                semantic_source_mode="whole_cot",
+                semantic_require_step_ids=True,
+            )
+
     def test_phase1_retries_keep_only_latest_lean_candidate(self) -> None:
         def candidate(name: str) -> str:
             return f"""import Mathlib
@@ -466,25 +519,17 @@ import Architect
 theorem required_name : True := by sorry_using []
 """
 
-        def model_response(name: str, reasoning: str, finish_reason: str):
-            return SimpleNamespace(choices=[SimpleNamespace(
-                message=SimpleNamespace(
-                    content=f"{reasoning}\n```lean\n{candidate(name)}\n```",
-                    tool_calls=[],
-                ),
-                finish_reason=finish_reason,
-            )], usage=None)
-
-        responses = [
-            model_response("candidate_one", "PRIVATE_REASONING_ONE\n" * 1000, "length"),
-            model_response("candidate_two", "PRIVATE_REASONING_TWO\n" * 1000, "stop"),
-            model_response("candidate_three", "PRIVATE_REASONING_THREE", "stop"),
+        sessions = [
+            SimpleNamespace(successful_lean_code="", lean_code=candidate("candidate_one"),
+                            finish_reason="length"),
+            SimpleNamespace(successful_lean_code="", lean_code=candidate("candidate_two"),
+                            finish_reason="stop"),
         ]
         requests = []
 
-        def call_model(_client, _model, messages, *_args, **_kwargs):
-            requests.append(deepcopy(messages))
-            return responses[len(requests) - 1]
+        def run_session(_client, _model, messages, **_kwargs):
+            requests.append(deepcopy(list(messages)))
+            return sessions[len(requests) - 1]
 
         compiler = SimpleNamespace(check_blueprint=lambda *_args: CompilerResult(
             False,
@@ -492,7 +537,7 @@ theorem required_name : True := by sorry_using []
             failure_kind="lean",
         ))
         with patch("blueprint.make_client", return_value=object()), patch(
-            "blueprint._call_blueprint_model", side_effect=call_model,
+            "blueprint._run_phase1_tool_session", side_effect=run_session,
         ):
             with self.assertRaises(BlueprintGenerationError):
                 generate_blueprint_from_informal(
@@ -500,7 +545,7 @@ theorem required_name : True := by sorry_using []
                     "proof",
                     "required_name",
                     compiler=compiler,
-                    max_retries=3,
+                    max_retries=2,
                 )
 
         self.assertEqual([message["role"] for message in requests[1]], [
@@ -511,10 +556,7 @@ theorem required_name : True := by sorry_using []
         self.assertNotIn("PRIVATE_REASONING_ONE", requests[1][2]["content"])
         self.assertIn("reached its output limit", requests[1][3]["content"])
 
-        self.assertEqual(requests[0], requests[2][:2])
-        self.assertIn("candidate_two", requests[2][2]["content"])
-        self.assertNotIn("candidate_one", requests[2][2]["content"])
-        self.assertNotIn("PRIVATE_REASONING_TWO", requests[2][2]["content"])
+        self.assertEqual(len(requests), 2)
 
 
 class ContextBudgetTest(unittest.TestCase):
@@ -1525,6 +1567,36 @@ class JudgeTest(unittest.TestCase):
 
 
 class AblationConfigurationTest(unittest.TestCase):
+    def test_wrong46_vacuity_profiles_share_subset_and_isolate_treatments(self) -> None:
+        whole = load_config("qwen3_8b_397b_wrong46_whole_cot_phase1_tools", [])
+        repair = load_config(
+            "qwen3_8b_397b_wrong46_step_v2_phase1_tools_repair4", []
+        )
+        self.assertEqual(list(whole.include_ids), list(repair.include_ids))
+        self.assertEqual(len(whole.include_ids), 46)
+        self.assertEqual(whole.blueprint.semantic_source_mode, "whole_cot")
+        self.assertFalse(whole.blueprint.semantic_require_step_ids)
+        self.assertEqual(whole.blueprint.blueprint_max_retries, 2)
+        self.assertEqual(repair.blueprint.semantic_source_mode, "step_grounded")
+        self.assertTrue(repair.blueprint.semantic_require_step_ids)
+        self.assertEqual(repair.blueprint.blueprint_max_retries, 4)
+        self.assertTrue(whole.blueprint.semantic_static_gate)
+        self.assertTrue(repair.blueprint.semantic_static_gate)
+
+    def test_wrong76_vacuity_profiles_select_all_eligible_records(self) -> None:
+        whole = load_config("qwen3_8b_397b_wrong76_whole_cot_phase1_tools", [])
+        repair = load_config(
+            "qwen3_8b_397b_wrong76_step_v2_phase1_tools_repair4", []
+        )
+        self.assertEqual(list(whole.include_ids), [])
+        self.assertEqual(list(repair.include_ids), [])
+        self.assertEqual(whole.blueprint.phase1_concurrency, 76)
+        self.assertEqual(repair.blueprint.phase1_concurrency, 76)
+        self.assertEqual(whole.blueprint.semantic_source_mode, "whole_cot")
+        self.assertEqual(repair.blueprint.semantic_source_mode, "step_grounded")
+        self.assertEqual(whole.blueprint.blueprint_max_retries, 2)
+        self.assertEqual(repair.blueprint.blueprint_max_retries, 4)
+
     def test_qwen8b_profile_uses_one_397b_service_and_two_arms(self) -> None:
         config = load_config("qwen3_8b_397b_refine_ablation", [])
         self.assertTrue(config.resume)

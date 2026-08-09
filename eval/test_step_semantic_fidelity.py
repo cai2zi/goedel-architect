@@ -13,7 +13,11 @@ from cot_blueprint_refine.formal_steps import (  # noqa: E402
     make_formal_step_manifest,
 )
 from semantic_audit import parse_semantic_audit  # noqa: E402
-from semantic_fidelity import validate_blueprint_fidelity  # noqa: E402
+from semantic_fidelity import (  # noqa: E402
+    SemanticIssue,
+    format_semantic_issues,
+    validate_blueprint_fidelity,
+)
 
 
 def manifest() -> str:
@@ -36,11 +40,11 @@ class StepSemanticFidelityTest(unittest.TestCase):
         code = '''import Mathlib
 import Architect
 @[blueprint (title := "COT_STEP:S001") (statement := /-- object -/)]
-def x : Nat := 1
+def x : Nat := 2
 @[blueprint (title := "COT_STEP:S001") (statement := /-- value -/)]
-lemma x_value : x = 1 := by sorry_using [x]
+lemma x_value : x = 2 := by sorry_using [x]
 @[blueprint (title := "COT_STEP:S002") (statement := /-- result -/)]
-theorem root : x = 1 := by sorry_using [x_value]
+theorem root : x - 1 = 1 := by sorry_using [x_value]
 '''
         issues = validate_blueprint_fidelity(
             _parse_blueprint(code, target), manifest(), claimed_answer="1",
@@ -48,20 +52,24 @@ theorem root : x = 1 := by sorry_using [x_value]
         )
         self.assertEqual(issues, [])
 
-    def test_every_node_must_reach_root_and_no_auto_repair(self) -> None:
+    def test_unreachable_node_and_step_are_warnings(self) -> None:
         code = '''import Mathlib
 import Architect
 @[blueprint (title := "COT_STEP:S001") (statement := /-- orphan -/)]
-lemma orphan : (1:Nat) = 1 := by sorry_using []
+lemma orphan : (2:Nat) > 1 := by sorry_using []
+@[blueprint (title := "COT_STEP:S002") (statement := /-- support -/)]
+lemma support : (1:Nat) < 2 := by sorry_using []
 @[blueprint (title := "COT_STEP:S002") (statement := /-- result -/)]
-theorem root : (1:Nat) = 1 := by sorry_using []
+theorem root : (1 + 0:Nat) = 1 := by sorry_using [support]
 '''
-        codes = {issue.code for issue in validate_blueprint_fidelity(
+        issues = validate_blueprint_fidelity(
             _parse_blueprint(code, "root"), manifest(), claimed_answer="1",
             require_step_bindings=True,
-        )}
-        self.assertIn("NODE_NOT_ROOT_REACHABLE", codes)
-        self.assertIn("STEP_NOT_ROOT_REACHABLE", codes)
+        )
+        codes = {issue.code for issue in issues}
+        self.assertIn("nodeNotRootReachable", codes)
+        self.assertIn("stepNotRootReachable", codes)
+        self.assertTrue(all(issue.severity == "warning" for issue in issues))
 
     def test_prop_true_is_rejected(self) -> None:
         code = '''import Mathlib
@@ -75,7 +83,42 @@ theorem root : (1:Nat) = 1 := by sorry_using [fake]
             _parse_blueprint(code, "root"), manifest(), claimed_answer="1",
             require_step_bindings=True,
         )}
-        self.assertIn("VACUOUS_PROP_DEFINITION", codes)
+        self.assertIn("vacuousPropDefinition", codes)
+        issue = next(issue for issue in validate_blueprint_fidelity(
+            _parse_blueprint(code, "root"), manifest(), claimed_answer="1",
+            require_step_bindings=True,
+        ) if issue.code == "vacuousPropDefinition")
+        self.assertEqual((issue.source_start, issue.source_end), (0, 14))
+        self.assertEqual(issue.category, "semanticDegeneration")
+
+    def test_duplicate_root_conclusion_is_rejected(self) -> None:
+        code = '''import Mathlib
+import Architect
+@[blueprint (title := "COT_STEP:S001") (statement := /-- early answer -/)]
+lemma early : (1:Nat) = 1 := by sorry_using []
+@[blueprint (title := "COT_STEP:S002") (statement := /-- result -/)]
+theorem root : (1:Nat) = 1 := by sorry_using [early]
+'''
+        issues = validate_blueprint_fidelity(
+            _parse_blueprint(code, "root"), manifest(), claimed_answer="1",
+            require_step_bindings=True,
+        )
+        issue = next(item for item in issues if item.code == "duplicateRootConclusion")
+        self.assertEqual(issue.category, "answerGrounding")
+
+    def test_claimed_answer_definition_is_rejected(self) -> None:
+        code = '''import Mathlib
+import Architect
+@[blueprint (title := "COT_STEP:S001") (statement := /-- hard coded -/)]
+def answer : Nat := 1
+@[blueprint (title := "COT_STEP:S002") (statement := /-- result -/)]
+theorem root : answer = 1 := by sorry_using [answer]
+'''
+        codes = {issue.code for issue in validate_blueprint_fidelity(
+            _parse_blueprint(code, "root"), manifest(), claimed_answer="1",
+            require_step_bindings=True,
+        )}
+        self.assertIn("claimedAnswerInDefinition", codes)
 
     def test_semantic_audit_requires_complete_step_inventory(self) -> None:
         parsed = parse_semantic_audit(
@@ -84,6 +127,19 @@ theorem root : (1:Nat) = 1 := by sorry_using [fake]
         )
         self.assertTrue(parsed.passed)
         self.assertEqual(parsed.step_statuses, (("S001", "OK"), ("S002", "OK")))
+
+    def test_semantic_feedback_groups_all_locations_without_source_excerpts(self) -> None:
+        issues = [SemanticIssue(
+            "vacuousTrueStep", "A substantive Step was translated as True.",
+            node_name=f"node_{index}", step_id=f"S{index:03d}",
+            source_text=f"UNIQUE SOURCE EXCERPT {index}",
+        ) for index in range(1, 26)]
+        rendered = format_semantic_issues(issues)
+        self.assertIn("vacuousTrueStep (25)", rendered)
+        self.assertIn("S001/node_1", rendered)
+        self.assertIn("S025/node_25", rendered)
+        self.assertNotIn("UNIQUE SOURCE EXCERPT", rendered)
+        self.assertNotIn("more", rendered)
 
 
 if __name__ == "__main__":
