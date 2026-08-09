@@ -40,7 +40,12 @@ def response(*calls: FakeCall):
 
 class Phase1ToolProtocolTest(unittest.TestCase):
     def test_last_turn_requires_compile_and_returns_exact_tool_candidate(self) -> None:
-        code = "import Mathlib\nimport Architect\ntheorem root : True := by trivial"
+        code = '''import Mathlib
+import Architect
+def PendingBlueprintClaim (_nodeId : String) : Prop := True
+@[blueprint (statement := /-- root -/) (proof := /-- root -/)]
+theorem root : True := by sorry_using []
+'''
         requests = []
 
         def complete(_client, **kwargs):
@@ -66,7 +71,12 @@ class Phase1ToolProtocolTest(unittest.TestCase):
         ])
 
     def test_search_budget_is_shared_and_latest_exchange_is_bounded(self) -> None:
-        code = "import Mathlib\nimport Architect\ntheorem root : True := by trivial"
+        code = '''import Mathlib
+import Architect
+def PendingBlueprintClaim (_nodeId : String) : Prop := True
+@[blueprint (statement := /-- root -/) (proof := /-- root -/)]
+theorem root : True := by sorry_using []
+'''
         responses = [
             response(FakeCall("s1", "mathlib_search", {"query": "Nat addition", "k": 3})),
             response(FakeCall("c1", "lean_compile", {"lean_code": code})),
@@ -96,21 +106,16 @@ class Phase1ToolProtocolTest(unittest.TestCase):
             "system", "user", "assistant", "tool",
         ])
 
-    def test_semantic_error_continues_tool_loop_after_lean_success(self) -> None:
+    def test_repairable_semantic_error_is_deferred_to_phase1b(self) -> None:
         bad = '''import Mathlib
 import Architect
-@[blueprint (title := "COT_STEP:S001")]
+def PendingBlueprintClaim (_nodeId : String) : Prop := True
+@[blueprint (title := "COT_STEP:S001")
+  (statement := /-- The final answer is represented by a true proposition. -/)
+  (proof := /-- This deliberately exercises the semantic rejection path. -/)]
 theorem root : True := by sorry_using []
 '''
-        good = '''import Mathlib
-import Architect
-@[blueprint (title := "COT_STEP:S001")]
-theorem root : (2 : Nat) - 1 = 1 := by sorry_using []
-'''
-        responses = [
-            response(FakeCall("bad", "lean_compile", {"lean_code": bad})),
-            response(FakeCall("good", "lean_compile", {"lean_code": good})),
-        ]
+        responses = [response(FakeCall("bad", "lean_compile", {"lean_code": bad}))]
         messages_seen = []
 
         def complete(_client, **kwargs):
@@ -137,20 +142,68 @@ theorem root : (2 : Nat) - 1 = 1 := by sorry_using []
                 semantic_static_gate=True,
             )
 
+        self.assertEqual(result.successful_lean_code, bad)
+        self.assertEqual(len(messages_seen), 1)
+
+    def test_immutable_binding_error_continues_phase1a_tool_loop(self) -> None:
+        bad = '''import Mathlib
+import Architect
+def PendingBlueprintClaim (_nodeId : String) : Prop := True
+@[blueprint (title := "COT_STEP:S999")
+  (statement := /-- An incorrectly bound final claim. -/)
+  (proof := /-- Preserve the claim. -/)]
+theorem root : (2 : Nat) - 1 = 1 := by sorry_using []
+'''
+        good = '''import Mathlib
+import Architect
+def PendingBlueprintClaim (_nodeId : String) : Prop := True
+@[blueprint (title := "COT_STEP:S001")
+  (statement := /-- Subtracting one from two gives one. -/)
+  (proof := /-- Evaluate the subtraction. -/)]
+theorem root : (2 : Nat) - 1 = 1 := by sorry_using []
+'''
+        responses = [
+            response(FakeCall("bad", "lean_compile", {"lean_code": bad})),
+            response(FakeCall("good", "lean_compile", {"lean_code": good})),
+        ]
+        messages_seen = []
+
+        def complete(_client, **kwargs):
+            messages_seen.append(kwargs["messages"])
+            return responses[len(messages_seen) - 1]
+
+        source_text = "Therefore the answer is one."
+        semantic_manifest = CotManifest((CotStep(
+            "S001", 0, len(source_text), source_text, "hash", role="conclusion",
+        ),))
+        with patch("blueprint.chat_completion_with_retry", side_effect=complete):
+            result = _run_phase1_tool_session(
+                object(), "model", ({"role": "system", "content": "s"},),
+                compiler=SimpleNamespace(check_blueprint=lambda *_args: CompilerResult(True)),
+                target_name="root", retrieval=SimpleNamespace(search=lambda *_args: []),
+                tracer=None, thm_name="sample", attempt=1, max_tool_turns=2,
+                max_tool_calls_per_turn=3, mathlib_search_max_calls=3,
+                tool_cache={}, search_state={"count": 0},
+                semantic_manifest=semantic_manifest, claimed_answer="1",
+                semantic_fidelity_enabled=True, semantic_require_step_ids=True,
+                semantic_static_gate=True,
+            )
         self.assertEqual(result.successful_lean_code, good)
         self.assertEqual(len(messages_seen), 2)
-        first_tool_feedback = messages_seen[1][-1]["content"]
-        self.assertIn("semantic-fidelity validation FAILED", first_tool_feedback)
-        self.assertIn("vacuousTrueRoot", first_tool_feedback)
-        self.assertIn("S001/root", first_tool_feedback)
-        self.assertNotIn(source_text, first_tool_feedback)
+        self.assertIn("semantic-fidelity validation FAILED", messages_seen[1][-1]["content"])
+        self.assertIn("unknownStepMapping", messages_seen[1][-1]["content"])
 
     def test_semantic_warning_does_not_block_success(self) -> None:
         code = '''import Mathlib
 import Architect
-@[blueprint (title := "COT_STEP:S001")]
+def PendingBlueprintClaim (_nodeId : String) : Prop := True
+@[blueprint (title := "COT_STEP:S001")
+  (statement := /-- Binds: none. Assumes: none. Claims: two is greater than one. Use: none. -/)
+  (proof := /-- Derive: arithmetic. -/)]
 lemma orphan : (2 : Nat) > 1 := by sorry_using []
-@[blueprint (title := "COT_STEP:S001")]
+@[blueprint (title := "COT_STEP:S001")
+  (statement := /-- Subtracting one from two gives the claimed answer one. -/)
+  (proof := /-- Evaluate the subtraction. -/)]
 theorem root : (2 : Nat) - 1 = 1 := by sorry_using []
 '''
         source_text = "Therefore the answer is one."

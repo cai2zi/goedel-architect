@@ -380,21 +380,6 @@ def _definition_parts(node: BlueprintNode) -> tuple[str, str]:
     return declaration[:assignment].strip(), declaration[assignment + 2:].strip()
 
 
-def _is_nullary_definition_prefix(prefix: str) -> bool:
-    """Return whether a definition head declares no explicit parameters.
-
-    This intentionally recognizes only the unambiguous generated forms
-    ``def name := ...`` and ``def name : Type := ...``.  Parenthesized,
-    implicit, instance, or bare binders make the result false; a conservative
-    false negative is preferable to rejecting a computed function.
-    """
-    head = _DECL_HEAD_RE.match(prefix)
-    if head is None:
-        return False
-    remainder = prefix[head.end():].strip()
-    return not remainder or remainder.startswith(":")
-
-
 def _top_level_equality(text: str) -> tuple[str, str] | None:
     positions = _scan_top_level(text, "=")
     valid = []
@@ -597,53 +582,13 @@ def _normalized_proposition(node: BlueprintNode) -> str:
     return _normalize_expr(signature[head.end():] if head else signature)
 
 
-def _closed_claimed_answer(value: str) -> str:
-    """Return a conservative normalized closed answer literal, or empty."""
-    answer = _simple_claimed_answer(value)
-    if answer:
-        return _normalize_expr(answer)
-    stripped = _strip_outer_parens(value.strip())
-    if re.fullmatch(r'"(?:\\.|[^"\\])*"', stripped):
-        return _normalize_expr(stripped)
-    return ""
-
-
-def _definition_hardcodes_answer(node: BlueprintNode, claimed_answer: str) -> bool:
-    prefix, body = _definition_parts(node)
-    answer = _closed_claimed_answer(claimed_answer)
-    if not answer or not body:
-        return False
-    normalized_body = _normalize_expr(body)
-    if normalized_body == answer:
-        return True
-    # A function that ignores every declared binder and returns the literal is
-    # equally hard-coded.  This deliberately accepts only the whole RHS.
-    head = _DECL_HEAD_RE.match(prefix)
-    remainder = prefix[head.end():] if head else ""
-    binder_names = re.findall(r"[({]\s*([A-Za-z_][A-Za-z0-9_']*)", remainder)
-    return bool(binder_names) and normalized_body == answer
-
-
-def _prop_definition_hardcodes_answer(node: BlueprintNode, claimed_answer: str) -> bool:
-    prefix, body = _definition_parts(node)
-    answer = _closed_claimed_answer(claimed_answer)
-    if not answer or not re.search(r":\s*Prop\s*$", prefix):
-        return False
-    if not _is_nullary_definition_prefix(prefix):
-        return False
-    equality = _top_level_equality(_strip_outer_parens(body))
-    if equality is None:
-        return False
-    left, right = equality
-    return _normalize_expr(left) == answer or _normalize_expr(right) == answer
-
-
 def validate_blueprint_fidelity(
     blueprint: Blueprint,
     manifest: CotManifest | Any = None,
     *,
     claimed_answer: str = "",
     require_step_bindings: bool = False,
+    allow_pending_claims: bool = False,
 ) -> list[SemanticIssue]:
     """Return deterministic provenance and high-confidence degeneration issues."""
     contract = parse_cot_manifest(manifest)
@@ -755,7 +700,37 @@ def validate_blueprint_fidelity(
         if node.kind in {"lemma", "theorem"}:
             conclusion = _node_conclusion(node)
             normalized_conclusion = _normalize_expr(conclusion)
-            if normalized_conclusion == "True":
+            pending_match = re.fullmatch(
+                r'PendingBlueprintClaim"((?:\\.|[^"\\])*)"',
+                normalized_conclusion,
+            )
+            if "PendingBlueprintClaim" in normalized_conclusion:
+                pending_name = ""
+                if pending_match:
+                    try:
+                        pending_name = str(json.loads(f'"{pending_match.group(1)}"'))
+                    except json.JSONDecodeError:
+                        pending_name = ""
+                if (
+                    pending_match is None
+                    or pending_name != node.name
+                    or node.name == blueprint.target_theorem
+                ):
+                    issues.append(_issue(
+                        "malformedPendingClaim",
+                        "PendingBlueprintClaim must be the complete conclusion of a non-root "
+                        "proof node and its string must equal that declaration's name.",
+                        node=node,
+                        contract=contract,
+                    ))
+                elif not allow_pending_claims:
+                    issues.append(_issue(
+                        "unresolvedPendingClaim",
+                        "The Phase-1A placeholder has not been replaced by a concrete proposition.",
+                        node=node,
+                        contract=contract,
+                    ))
+            elif normalized_conclusion == "True":
                 issues.append(_issue(
                     "vacuousTrueRoot" if node.name == blueprint.target_theorem else "vacuousTrueStep",
                     "A source assertion was replaced by the proposition True.",
@@ -795,7 +770,14 @@ def validate_blueprint_fidelity(
         else:
             prefix, body = _definition_parts(node)
             normalized_body = _normalize_expr(body)
-            if re.search(r":\s*Prop\s*$", prefix) and normalized_body == "True":
+            if "PendingBlueprintClaim" in node.lean_declaration:
+                issues.append(_issue(
+                    "malformedPendingClaim",
+                    "Definitions may not use the Phase-1A pending-claim placeholder.",
+                    node=node,
+                    contract=contract,
+                ))
+            elif re.search(r":\s*Prop\s*$", prefix) and normalized_body == "True":
                 issues.append(_issue(
                     "vacuousPropDefinition",
                     "A Prop definition is hard-coded to True.",
@@ -823,20 +805,6 @@ def validate_blueprint_fidelity(
                     node=node,
                     contract=contract,
                 ))
-            if node.name != blueprint.target_theorem and claimed_answer:
-                if _prop_definition_hardcodes_answer(node, claimed_answer):
-                    issues.append(_issue(
-                        "claimedAnswerInPropDefinition",
-                        "A nullary Prop definition hard-codes the claimed answer.",
-                        node=node, category="answerGrounding", contract=contract,
-                    ))
-                elif _definition_hardcodes_answer(node, claimed_answer):
-                    issues.append(_issue(
-                        "claimedAnswerInDefinition",
-                        "A non-root definition is exactly the claimed answer literal.",
-                        node=node, category="answerGrounding", contract=contract,
-                    ))
-
     root_proposition = _normalized_proposition(root)
     for node in blueprint.nodes:
         if (

@@ -247,6 +247,28 @@ def _enabled_semantic_issues(
     return []
 
 
+_PHASE1A_IMMUTABLE_SEMANTIC_CODES = {
+    "emptyCotManifest",
+    "missingRoot",
+    "missingStepMapping",
+    "multipleStepMappings",
+    "malformedStepMapping",
+    "unknownStepMapping",
+    "rootNotFinalStep",
+}
+
+
+def _phase1a_blocking_semantic_issues(
+    issues: list[SemanticIssue],
+) -> list[SemanticIssue]:
+    """Keep only errors that an editable Phase-1B DAG must not inherit."""
+    return [
+        issue for issue in issues
+        if issue.severity == "error"
+        and issue.code in _PHASE1A_IMMUTABLE_SEMANTIC_CODES
+    ]
+
+
 def _emit_semantic_check(
     tracer,
     *,
@@ -255,10 +277,13 @@ def _emit_semantic_check(
     attempt: int,
     issues: list[SemanticIssue],
     turn: int | None = None,
+    blocking_issues: list[SemanticIssue] | None = None,
 ) -> None:
     if tracer is None:
         return
-    blocking_count = sum(issue.severity == "error" for issue in issues)
+    all_errors = [issue for issue in issues if issue.severity == "error"]
+    effective_blocking = all_errors if blocking_issues is None else blocking_issues
+    blocking_count = len(effective_blocking)
     warning_count = sum(issue.severity == "warning" for issue in issues)
     tracer.emit(TraceEvent(
         kind="blueprint_semantic_check",
@@ -269,7 +294,9 @@ def _emit_semantic_check(
             "attempt": attempt,
             "turn": turn,
             "issue_count": len(issues),
+            "error_count": len(all_errors),
             "blocking_count": blocking_count,
+            "deferred_error_count": len(all_errors) - blocking_count,
             "warning_count": warning_count,
             "issues": [issue.to_dict() for issue in issues],
         },
@@ -297,6 +324,9 @@ class BlueprintGenerationError(RuntimeError):
         finish_reason: str | None = None,
         failure_stage: str = "model_output",
         candidate_history: list[str] | None = None,
+        candidate_labels: list[str] | None = None,
+        validation_details: dict[str, Any] | None = None,
+        node_edit_rounds: list[dict[str, Any]] | None = None,
     ) -> None:
         super().__init__(message)
         self.last_candidate = last_candidate
@@ -305,6 +335,9 @@ class BlueprintGenerationError(RuntimeError):
         self.finish_reason = finish_reason
         self.failure_stage = failure_stage
         self.candidate_history = list(candidate_history or [])
+        self.candidate_labels = list(candidate_labels or [])
+        self.validation_details = dict(validation_details or {})
+        self.node_edit_rounds = list(node_edit_rounds or [])
 
 
 @lru_cache(maxsize=2)
@@ -619,10 +652,11 @@ def _semantic_repair_guidance(issues: list[SemanticIssue]) -> str:
             "Remove the duplicated non-root answer proposition. Let the root perform the "
             "final inference directly from the last substantive premises."
         )
-    if codes.intersection({"claimedAnswerInDefinition", "claimedAnswerInPropDefinition"}):
+    if codes.intersection({"reflexiveStep", "reflexiveRoot"}):
         guidance.append(
-            "Do not hard-code the claimed answer in a non-root definition. Model the "
-            "source object and state the COT's asserted equality as a proof node."
+            "A reflexive equality such as `c = c` does not encode the source inference. "
+            "Bind the source quantity/event/function and state that modeled expression "
+            "equals the claimed value; do not merely rewrite the claimed value twice."
         )
     if not guidance:
         guidance.append(
@@ -695,6 +729,124 @@ _PHASE1_MATHLIB_SEARCH_TOOL = {
     },
 }
 
+_PHASE1_EDIT_NODE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "editBlueprintNode",
+        "description": (
+            "Add, replace, or delete exactly one @[blueprint] declaration in the current "
+            "Lean file. Replacing a node may change its kind, COT_STEP binding, statement, "
+            "and sorry_using dependencies. Issue parallel calls for every independently "
+            "repairable node named by the diagnostics."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["add", "replace", "delete"]},
+                "node_name": {"type": "string"},
+                "expected_node_hash": {"type": "string"},
+                "replacement": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+            "required": [
+                "action", "node_name", "expected_node_hash", "replacement", "reason",
+            ],
+            "additionalProperties": False,
+        },
+    },
+}
+
+_PENDING_HELPER = 'def PendingBlueprintClaim (_nodeId : String) : Prop := True'
+_PENDING_HELPER_RE = re.compile(
+    r"(?m)^\s*def\s+PendingBlueprintClaim\s*\(_nodeId\s*:\s*String\)\s*"
+    r":\s*Prop\s*:=\s*True\s*$"
+)
+
+_PHASE1A_SKELETON_SUFFIX = r"""
+
+## Phase 1A: compilable Blueprint skeleton
+
+Emit a complete Lean Blueprint skeleton. Immediately after the imports emit
+this exact unannotated helper declaration once:
+
+    def PendingBlueprintClaim (_nodeId : String) : Prop := True
+
+This helper is the one deliberate exception to the earlier rule against plain
+top-level helper declarations. Do not annotate it with `@[blueprint]`.
+
+Every Definition must already have a real, non-vacuous body. A non-root
+Lemma/Theorem may either state its concrete Lean proposition immediately or,
+when that proposition is not yet reliable, temporarily use exactly
+`PendingBlueprintClaim "declaration_name"` as its complete conclusion. Its
+proof body must still be `by sorry_using [...]` with the real DAG dependencies.
+The root theorem must state the concrete source conclusion and claimed answer;
+the root may never be pending.
+
+For every node, write a concise, non-empty natural-language `statement` that
+identifies the source objects, relevant assumptions, and exact intended
+mathematical content. For every Lemma/Theorem, also write a concise, non-empty
+natural-language `proof` explaining the inference from its declared parents.
+No fixed prose headings are required. Put typed variables and assumptions in
+Lean binders as far as possible. A typical non-root proof node is:
+
+    @[blueprint (title := "COT_STEP:S003")
+      (statement := /-- For `x : Nat` satisfying `h : P x`, state the exact
+        mathematical conclusion represented by this source step. -/)
+      (proof := /-- Obtain the conclusion from `parent_node` while preserving
+        the source inference direction. -/)]
+    lemma node_name (x : Nat) (h : P x) :
+        PendingBlueprintClaim "node_name" := by
+      sorry_using [parent_node]
+
+The prose describes the intended interface. Phase 1B edits individual nodes and
+may add/delete nodes or repair source-Step titles and dependencies, but a useful
+initial DAG reduces later edits. Before calling `lean_compile`, check that every node has a
+meaningful statement and every proof node has a meaningful proof sketch. A
+node that already has a faithful, type-correct concrete proposition does not
+need to remain pending.
+"""
+
+_PHASE1B_SYSTEM_PROMPT = r"""
+You are completing an editable Lean Blueprint skeleton. You receive the original
+problem, its immutable COT Steps, the latest complete Lean file, and the latest
+deterministic semantic, Lean, and Phase-2 standalone diagnostics.
+
+You may act only by calling `editBlueprintNode`. One call adds, replaces, or
+deletes one `@[blueprint]` declaration. In a single response, call the tool once
+for EVERY independently repairable listed node, in parallel, up to the supplied
+call budget. Do not stop after repairing only the first pending/error node.
+
+For each edit:
+- use `add` to cover a missing COT Step or introduce a shared formal object;
+- use `replace` to repair a declaration, change a non-root declaration kind,
+  change its Step binding, or add/remove dependencies in `sorry_using [...]`;
+- use `delete` only for a redundant node, and ensure another substantive node
+  still covers its source Step;
+- use the current hash for replace/delete and an empty hash for add;
+- use an empty replacement for delete and one complete `@[blueprint]`
+  declaration for add/replace;
+- never delete, rename, or change the kind of the root theorem;
+- Phase 1B changes declarations, never proves them: for every Lemma/Theorem,
+  the ENTIRE proof body must remain exactly `:= by sorry_using [...]` with the
+  intended dependency list. Never emit `simp`, `norm_num`, `rw`, `exact`,
+  `apply`, `aesop`, or any other Lean tactic before or after `sorry_using`;
+- emit exactly one complete `@[blueprint]` declaration and no imports/helpers;
+- replace `PendingBlueprintClaim` with the concrete Lean proposition described
+  by the node's natural-language statement and proof sketch;
+- preserve source objects, assumptions, inference direction, and wrong or
+  unsupported COT claims faithfully;
+- never use True, an unspecified Prop, a reflexive equality, or an unconstrained
+  witness;
+- a source-given object may be a definition, but a COT-derived assertion must
+  remain a lemma/theorem so a later proof failure can diagnose that COT Step;
+- every symbol needed by a Phase-2 node must come from an explicit binder, a
+  Blueprint definition, or a transitive `sorry_using` dependency. Never rely
+  on ambient `variable`, `section`, `namespace`, `axiom`, or `partial def` state.
+
+The runner applies the valid node edits atomically and then compiles the complete file.
+Do not return a whole Blueprint as prose or code.
+"""
+
 
 @dataclass
 class _Phase1ToolSessionResult:
@@ -708,10 +860,18 @@ def _phase1_tool_output(
     result: CompilerResult,
     semantic_issues: list[SemanticIssue] | None = None,
     lean_source_contexts: list[dict[str, Any]] | None = None,
+    contract_errors: list[str] | None = None,
+    blocking_semantic_issues: list[SemanticIssue] | None = None,
 ) -> tuple[str, bool]:
     """Combine Lean and deterministic semantic validation for one tool call."""
     issues = list(semantic_issues or [])
     errors = [issue for issue in issues if issue.severity == "error"]
+    blocking_errors = (
+        list(blocking_semantic_issues)
+        if blocking_semantic_issues is not None
+        else errors
+    )
+    structural_errors = list(contract_errors or [])
     sections: list[str] = []
     if result.success:
         sections.append("Lean compilation and structural validation SUCCESSFUL.")
@@ -722,19 +882,39 @@ def _phase1_tool_output(
             f"{diagnostics}{_format_lean_source_contexts(lean_source_contexts or [])}"
         )
     if issues:
-        semantic_status = "FAILED" if errors else "PASSED WITH WARNINGS"
+        semantic_status = (
+            "FAILED"
+            if blocking_errors
+            else "PASSED WITH DEFERRED NODE REPAIRS"
+            if errors
+            else "PASSED WITH WARNINGS"
+        )
         sections.append(
             f"Deterministic semantic-fidelity validation {semantic_status}.\n"
             f"{format_semantic_issues(issues)}"
         )
-    if errors:
+        if errors and not blocking_errors:
+            sections.append(
+                "These content-level semantic errors are attached to replaceable nodes "
+                "and will be repaired in Phase 1B; do not regenerate the complete Blueprint "
+                "solely for these diagnostics."
+            )
+    if structural_errors:
+        sections.append(
+            "Phase 1A skeleton contract FAILED.\n"
+            + format_phase2_contract_errors(structural_errors, limit=100)
+        )
+    if blocking_errors:
         sections.append(
             "Issue-specific repair rules:\n"
-            f"{_semantic_repair_guidance(errors)}\n\n"
+            f"{_semantic_repair_guidance(blocking_errors)}\n\n"
             "Repair every blocking issue and call lean_compile with the complete file again. "
             "Use each Step ID to look up its source text in the COT already present above."
         )
-    return "\n\n".join(sections), result.success and not errors
+    return (
+        "\n\n".join(sections),
+        result.success and not blocking_errors and not structural_errors,
+    )
 
 
 def _run_phase1_tool_session(
@@ -758,6 +938,8 @@ def _run_phase1_tool_session(
     semantic_fidelity_enabled: bool = False,
     semantic_require_step_ids: bool = False,
     semantic_static_gate: bool = False,
+    allow_pending_claims: bool = False,
+    trace_phase: str = "phase1A",
 ) -> _Phase1ToolSessionResult:
     """Run one bounded Phase-1 tool conversation with compact rolling history."""
     messages = [dict(message) for message in base_messages]
@@ -771,7 +953,7 @@ def _run_phase1_tool_session(
             client,
             tracer=tracer,
             thm_name=thm_name,
-            phase="phase1",
+            phase=trace_phase,
             model_id=model,
             operation="blueprint_tool_final" if final_turn else "blueprint_tool",
             trace_args={"attempt": attempt, "turn": turn, "final_turn": final_turn},
@@ -783,9 +965,9 @@ def _run_phase1_tool_session(
             max_completion_tokens=phase1_request_max_tokens(messages),
             **_reasoning_kwargs(model),
         )
-        _emit_usage(tracer, thm_name, "phase1", model, response)
+        _emit_usage(tracer, thm_name, trace_phase, model, response)
         _emit_llm_response(
-            tracer, thm_name=thm_name, phase="phase1", model=model,
+            tracer, thm_name=thm_name, phase=trace_phase, model=model,
             response=response, attempt=attempt, turn=turn,
         )
         choice = response.choices[0]
@@ -837,7 +1019,7 @@ def _run_phase1_tool_session(
         if tracer is not None and dropped:
             tracer.emit(TraceEvent(
                 kind="tool_calls_dropped", thm_name=thm_name, turn=turn,
-                args={"phase": "phase1", "attempt": attempt, "calls": dropped},
+                args={"phase": trace_phase, "attempt": attempt, "calls": dropped},
             ))
 
         assistant_payload = {
@@ -859,32 +1041,49 @@ def _run_phase1_tool_session(
                 tracer.emit(TraceEvent(
                     kind="tool_call", thm_name=thm_name, turn=turn,
                     call_id=call.id, tool_name=name, span_id=span_id,
-                    args={"phase": "phase1", "attempt": attempt,
+                    args={"phase": trace_phase, "attempt": attempt,
                           "arguments": trace_arguments, "hash": call_hash},
                 ))
             semantic_issues: list[SemanticIssue] = []
+            phase1a_blocking_semantic_issues: list[SemanticIssue] | None = None
+            phase1a_contract_issues: list[str] = []
             parsed_candidate: Blueprint | None = None
-            if name == "lean_compile" and semantic_fidelity_enabled:
+            if name == "lean_compile":
                 lean_code = str(args["lean_code"])
                 parsed_candidate = _parse_blueprint(lean_code, target_name)
-                if parsed_candidate.nodes:
+                if trace_phase == "phase1A":
+                    phase1a_contract_issues = [
+                        *_phase1a_contract_errors(parsed_candidate),
+                        *phase2_contract_errors(parsed_candidate),
+                    ]
+                    if not parsed_candidate.nodes:
+                        phase1a_contract_issues.append(
+                            "no_blueprint_nodes: no annotated declarations were parsed."
+                        )
+                if semantic_fidelity_enabled and parsed_candidate.nodes:
                     semantic_issues = _enabled_semantic_issues(
                         validate_blueprint_fidelity(
                             parsed_candidate,
                             semantic_manifest,
                             claimed_answer=claimed_answer,
                             require_step_bindings=semantic_require_step_ids,
+                            allow_pending_claims=allow_pending_claims,
                         ),
                         require_step_ids=semantic_require_step_ids,
                         static_gate=semantic_static_gate,
                     )
+                    if trace_phase == "phase1A":
+                        phase1a_blocking_semantic_issues = (
+                            _phase1a_blocking_semantic_issues(semantic_issues)
+                        )
                     _emit_semantic_check(
                         tracer,
                         thm_name=thm_name,
-                        phase="phase1Tool",
+                        phase=trace_phase,
                         attempt=attempt,
                         turn=turn,
                         issues=semantic_issues,
+                        blocking_issues=phase1a_blocking_semantic_issues,
                     )
 
             cache_hit = call_hash in tool_cache
@@ -907,6 +1106,8 @@ def _run_phase1_tool_session(
                     compile_result,
                     semantic_issues,
                     lean_contexts,
+                    phase1a_contract_issues,
+                    phase1a_blocking_semantic_issues,
                 )
                 tool_cache[call_hash] = (output, ok)
             else:
@@ -923,7 +1124,7 @@ def _run_phase1_tool_session(
                     kind="tool_result", thm_name=thm_name, turn=turn,
                     call_id=call.id, tool_name=name, span_id=span_id,
                     result=output, ok=ok,
-                    args={"phase": "phase1", "attempt": attempt,
+                    args={"phase": trace_phase, "attempt": attempt,
                           "hash": call_hash, "cache_hit": cache_hit},
                     duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
                 ))
@@ -1023,6 +1224,9 @@ class Blueprint:
     semantic_gate_results: list[dict] = field(default_factory=list)
     semantic_audit_result: dict = field(default_factory=dict)
     candidate_history: list[str] = field(default_factory=list, repr=False)
+    candidate_labels: list[str] = field(default_factory=list, repr=False)
+    phase1b_validation: dict = field(default_factory=dict, repr=False)
+    phase1b_edit_history: list[dict] = field(default_factory=list, repr=False)
 
     def node_by_name(self, name: str) -> BlueprintNode | None:
         return next((n for n in self.nodes if n.name == name), None)
@@ -1117,65 +1321,299 @@ def _transitive_node_deps(node: BlueprintNode, blueprint: Blueprint) -> set[str]
     return seen
 
 
-def _phase2_preflight_file(blueprint: Blueprint, node: BlueprintNode) -> str:
-    parts = [blueprint.phase2_header.rstrip()]
-    parts.extend(
-        definition.full_declaration()
+@dataclass(frozen=True)
+class _Phase2PreflightCase:
+    node_name: str
+    lean_code: str
+    code_hash: str
+    line_ranges: tuple[tuple[int, int, str], ...]
+
+
+@dataclass(frozen=True)
+class Phase2StandaloneIssue:
+    code: str
+    node_name: str
+    error_kind: str
+    identifiers: tuple[str, ...]
+    diagnostic: str
+    preflight_hash: str
+    origin_declaration: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "code": self.code,
+            "nodeName": self.node_name,
+            "errorKind": self.error_kind,
+            "identifiers": list(self.identifiers),
+            "diagnostic": self.diagnostic,
+            "preflightHash": self.preflight_hash,
+            "originDeclaration": self.origin_declaration,
+        }
+
+
+@dataclass(frozen=True)
+class Phase2StandaloneReport:
+    issues: tuple[Phase2StandaloneIssue, ...]
+    checked_node_count: int
+    cached_node_count: int
+    skipped_pending_node_count: int
+    duration_ms: float
+    not_run_reason: str = ""
+
+    @property
+    def failed_nodes(self) -> list[str]:
+        return [issue.node_name for issue in self.issues]
+
+
+def _phase2_preflight_case(blueprint: Blueprint, node: BlueprintNode) -> _Phase2PreflightCase:
+    entries: list[tuple[str, str]] = [("<phase2Header>", blueprint.phase2_header.rstrip())]
+    entries.extend(
+        (definition.name, definition.full_declaration())
         for definition in blueprint.nodes
         if definition.kind == "definition" and definition.name != node.name
     )
     ancestor_deps = _transitive_node_deps(node, blueprint)
-    parts.extend(
-        dep_node.full_declaration()
+    entries.extend(
+        (dep_node.name, dep_node.full_declaration())
         for dep_node in blueprint.dependency_order()
         if dep_node.kind != "definition"
         and dep_node.name in ancestor_deps
     )
-    parts.append(node.full_declaration())
-    return "\n\n".join(part.strip() for part in parts if part.strip()) + "\n"
+    entries.append((node.name, node.full_declaration()))
+
+    rendered = ""
+    ranges: list[tuple[int, int, str]] = []
+    for origin, raw_text in entries:
+        text = raw_text.strip()
+        if not text:
+            continue
+        if rendered:
+            rendered += "\n\n"
+        start_line = rendered.count("\n") + 1
+        rendered += text
+        end_line = rendered.count("\n") + 1
+        ranges.append((start_line, end_line, origin))
+    rendered += "\n"
+    return _Phase2PreflightCase(
+        node_name=node.name,
+        lean_code=rendered,
+        code_hash=hashlib.sha256(rendered.encode()).hexdigest(),
+        line_ranges=tuple(ranges),
+    )
+
+
+def _phase2_preflight_file(blueprint: Blueprint, node: BlueprintNode) -> str:
+    return _phase2_preflight_case(blueprint, node).lean_code
+
+
+def _standalone_error_kind(message: str) -> str:
+    if re.search(r"Unknown identifier", message, re.I):
+        return "unknownIdentifier"
+    if re.search(r"Unknown constant", message, re.I):
+        return "unknownConstant"
+    if re.search(r"(?:application )?type mismatch|Invalid field notation", message, re.I):
+        return "typeMismatch"
+    if re.search(r"failed to synthesize", message, re.I):
+        return "synthesisFailure"
+    if re.search(r"unexpected token|unexpected end", message, re.I):
+        return "syntaxError"
+    return "leanCompileError"
+
+
+def _standalone_identifiers(message: str) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(re.findall(
+        r"Unknown (?:identifier|constant) `([^`]+)`", message,
+    )))
+
+
+def _preflight_origin(case: _Phase2PreflightCase, result: CompilerResult) -> str:
+    for diagnostic in result.errors:
+        line = _diagnostic_line(diagnostic)
+        if line is None:
+            continue
+        for start, end, origin in case.line_ranges:
+            if start <= line <= end:
+                return origin
+    return ""
+
+
+def _emit_standalone_report(
+    tracer,
+    *,
+    thm_name: str,
+    round_index: int,
+    report: Phase2StandaloneReport,
+) -> None:
+    if tracer is None:
+        return
+    error_counts = dict(Counter(issue.error_kind for issue in report.issues))
+    tracer.emit(TraceEvent(
+        kind="phase2StandaloneCheckEnd",
+        thm_name=thm_name,
+        turn=round_index,
+        args={
+            "phase": "phase1B",
+            "round": round_index,
+            "checkedNodeCount": report.checked_node_count,
+            "cachedNodeCount": report.cached_node_count,
+            "skippedPendingNodeCount": report.skipped_pending_node_count,
+            "failedNodeCount": len(report.issues),
+            "errorCounts": error_counts,
+            "failedNodes": report.failed_nodes,
+            "notRunReason": report.not_run_reason,
+        },
+        ok=not report.issues and not report.not_run_reason,
+        duration_ms=report.duration_ms,
+    ))
+
+
+def phase2_standalone_contract_report(
+    blueprint: Blueprint,
+    compiler: KiminaLeanCompiler,
+    *,
+    concurrency: int = 1,
+    skip_pending: bool = False,
+    cache: dict[str, CompilerResult] | None = None,
+    tracer=None,
+    thm_name: str = "",
+    round_index: int = 0,
+) -> Phase2StandaloneReport:
+    """Compile proof nodes exactly as Phase 2 will assemble them."""
+    if concurrency <= 0:
+        raise ValueError("concurrency must be positive")
+    started_ns = time.monotonic_ns()
+    proof_nodes = [node for node in blueprint.nodes if node.kind in {"lemma", "theorem"}]
+    skipped = [
+        node for node in proof_nodes
+        if skip_pending and "PendingBlueprintClaim" in node.lean_declaration
+    ]
+    checked_nodes = [node for node in proof_nodes if node not in skipped]
+    cases = [_phase2_preflight_case(blueprint, node) for node in checked_nodes]
+    result_cache = cache if cache is not None else {}
+    uncached = [case for case in cases if case.code_hash not in result_cache]
+
+    if tracer is not None:
+        tracer.emit(TraceEvent(
+            kind="phase2StandaloneCheckStart",
+            thm_name=thm_name,
+            turn=round_index,
+            args={
+                "phase": "phase1B", "round": round_index,
+                "checkedNodeCount": len(cases),
+                "cachedNodeCount": len(cases) - len(uncached),
+                "skippedPendingNodeCount": len(skipped),
+            },
+        ))
+
+    if uncached:
+        results = compiler.check_many(
+            [
+                CompileRequest(
+                    case.lean_code,
+                    allow_sorry=True,
+                    request_id=f"phase2-contract-{round_index}-{index}-{case.node_name}",
+                )
+                for index, case in enumerate(uncached)
+            ],
+            batch_concurrency=concurrency,
+        )
+        for case, result in zip(uncached, results, strict=True):
+            result_cache[case.code_hash] = result
+
+    issues: list[Phase2StandaloneIssue] = []
+    cached_count = len(cases) - len(uncached)
+    for case in cases:
+        result = result_cache[case.code_hash]
+        if result.failure_kind == "infra":
+            message = "\n".join(result.diagnostics) or result.raw_output[-2000:]
+            raise KiminaInfrastructureError(message)
+        if result.success:
+            issue = None
+        else:
+            message = "\n".join(result.diagnostics) or result.raw_output[-4000:]
+            issue = Phase2StandaloneIssue(
+                code="phase2StandaloneFailed",
+                node_name=case.node_name,
+                error_kind=_standalone_error_kind(message),
+                identifiers=_standalone_identifiers(message),
+                diagnostic=message[-4000:],
+                preflight_hash=case.code_hash,
+                origin_declaration=_preflight_origin(case, result),
+            )
+            issues.append(issue)
+        if tracer is not None:
+            tracer.emit(TraceEvent(
+                kind="phase2StandaloneNodeResult",
+                thm_name=thm_name,
+                turn=round_index,
+                args={
+                    "phase": "phase1B", "round": round_index,
+                    "nodeName": case.node_name,
+                    "preflightHash": case.code_hash,
+                    "cacheHit": case.code_hash not in {item.code_hash for item in uncached},
+                    "issue": issue.to_dict() if issue is not None else None,
+                },
+                ok=issue is None,
+            ))
+
+    report = Phase2StandaloneReport(
+        issues=tuple(issues),
+        checked_node_count=len(cases),
+        cached_node_count=cached_count,
+        skipped_pending_node_count=len(skipped),
+        duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
+    )
+    _emit_standalone_report(
+        tracer, thm_name=thm_name, round_index=round_index, report=report,
+    )
+    return report
 
 
 def phase2_standalone_contract_errors(
     blueprint: Blueprint,
     compiler: KiminaLeanCompiler,
     *,
-    limit: int = 12,
+    limit: int = 0,
     concurrency: int = 1,
 ) -> list[str]:
     """Compile proof nodes as Phase 2 would see them before accepting a blueprint."""
-    if concurrency <= 0:
-        raise ValueError("concurrency must be positive")
-
-    nodes = [
-        node for node in blueprint.nodes
-        if node.kind in {"lemma", "theorem"}
-    ]
-    results = compiler.check_many(
-        [
-            CompileRequest(
-                _phase2_preflight_file(blueprint, node),
-                allow_sorry=True,
-                request_id=f"phase2-contract-{index}-{node.name}",
-            )
-            for index, node in enumerate(nodes)
-        ],
-        batch_concurrency=concurrency,
+    report = phase2_standalone_contract_report(
+        blueprint, compiler, concurrency=concurrency,
     )
-    errors: list[str] = []
-    for node, result in zip(nodes, results, strict=True):
-        if result.failure_kind == "infra":
-            message = "\n".join(result.diagnostics) or result.raw_output[-2000:]
-            raise KiminaInfrastructureError(message)
-        if result.success:
-            continue
-        message = "\n".join(result.diagnostics) or result.raw_output[-2000:]
-        errors.append(
-            f"phase2_standalone_failed: node `{node.name}` does not compile when "
-            f"assembled as a standalone Phase 2 goal.\n{message}"
-        )
+    errors = [
+        f"phase2StandaloneFailed: node `{issue.node_name}` does not compile when "
+        f"assembled as a standalone Phase 2 goal; errorKind={issue.error_kind}; "
+        f"identifiers={list(issue.identifiers)}; origin={issue.origin_declaration or '<unknown>'}.\n"
+        f"{issue.diagnostic}"
+        for issue in report.issues
+    ]
     if limit:
         errors = errors[:limit]
     return errors
+
+
+def format_phase2_standalone_issues(
+    issues: list[Phase2StandaloneIssue] | tuple[Phase2StandaloneIssue, ...],
+) -> str:
+    """Group repeated standalone failures without dropping affected nodes."""
+    groups: dict[tuple[str, tuple[str, ...]], list[Phase2StandaloneIssue]] = {}
+    for issue in issues:
+        key = (issue.error_kind, issue.identifiers)
+        groups.setdefault(key, []).append(issue)
+    sections: list[str] = []
+    for (error_kind, identifiers), grouped in groups.items():
+        nodes = ", ".join(item.node_name for item in grouped)
+        origins = ", ".join(dict.fromkeys(
+            item.origin_declaration or "<unknown>" for item in grouped
+        ))
+        representative = grouped[0].diagnostic
+        sections.append(
+            f"- {error_kind}: identifiers={list(identifiers) or ['<none>']} "
+            f"origins={origins}\n"
+            f"  Affected nodes: {nodes}\n"
+            f"  Representative diagnostic: {representative}"
+        )
+    return "\n".join(sections)
 
 
 def phase2_contract_errors(blueprint: Blueprint) -> list[str]:
@@ -1328,6 +1766,765 @@ def generate_blueprint(
     )
 
 
+def _node_hash(node: BlueprintNode) -> str:
+    return hashlib.sha256(node.lean_declaration.strip().encode()).hexdigest()
+
+
+def _pending_helper_errors(lean_code: str) -> list[str]:
+    matches = list(_PENDING_HELPER_RE.finditer(lean_code))
+    named = len(re.findall(r"\bdef\s+PendingBlueprintClaim\b", lean_code))
+    errors: list[str] = []
+    if len(matches) != 1 or named != 1:
+        errors.append(
+            "pending_helper_contract: emit exactly one unannotated canonical declaration "
+            f"`{_PENDING_HELPER}`; canonical={len(matches)} named={named}."
+        )
+    if any("@[blueprint" in lean_code[max(0, match.start() - 200):match.start()]
+           and lean_code.rfind("@[blueprint", 0, match.start())
+           > lean_code.rfind("\n\n", 0, match.start()) for match in matches):
+        errors.append("pending_helper_annotated: PendingBlueprintClaim must not be a Blueprint node.")
+    return errors
+
+
+def _phase1a_contract_errors(blueprint: Blueprint) -> list[str]:
+    errors = _pending_helper_errors(blueprint.lean_file)
+    for node in blueprint.nodes:
+        if not node.statement.strip():
+            errors.append(
+                f"missing_statement_metadata: node `{node.name}` must have a non-empty "
+                "`statement := /-- ... -/` annotation."
+            )
+        if node.kind not in {"lemma", "theorem"}:
+            continue
+        if not node.proof_sketch.strip():
+            errors.append(
+                f"missing_proof_metadata: proof node `{node.name}` must have a non-empty "
+                "`proof := /-- ... -/` annotation."
+            )
+        if node.name == blueprint.target_theorem and "PendingBlueprintClaim" in node.signature():
+            errors.append("pending_root: the root theorem must have a concrete proposition.")
+    return errors
+
+
+def _strip_pending_helper(lean_code: str) -> str:
+    return _PENDING_HELPER_RE.sub("", lean_code, count=1).replace("\n\n\n", "\n\n").strip() + "\n"
+
+
+@dataclass(frozen=True)
+class _BlueprintNodeEdit:
+    action: str
+    node_name: str
+    replacement: str = ""
+    revised_node: BlueprintNode | None = None
+
+
+def _validate_phase1b_proof_body(node: BlueprintNode) -> str:
+    if node.kind not in {"lemma", "theorem"}:
+        return ""
+    declaration = strip_blueprint_attr(node.lean_declaration).strip()
+    proof_matches = list(BLUEPRINT_PROOF_RE.finditer(declaration))
+    if len(proof_matches) != 1 or declaration[proof_matches[0].end():].strip():
+        return "proofBodyMustBeSorryUsingOnly"
+    return ""
+
+
+def _validate_node_edit(
+    current: Blueprint,
+    *,
+    action: str,
+    node_name: str,
+    expected_hash: str,
+    replacement: str,
+) -> tuple[_BlueprintNodeEdit | None, str]:
+    if action not in {"add", "replace", "delete"}:
+        return None, "unknownAction"
+    node = current.node_by_name(node_name)
+    if action == "add":
+        if node is not None:
+            return None, "nodeAlreadyExists"
+        if expected_hash:
+            return None, "addExpectedHashMustBeEmpty"
+    else:
+        if node is None:
+            return None, "unknownNode"
+        if expected_hash != _node_hash(node):
+            return None, "staleNodeHash"
+        if node.name == current.target_theorem and action == "delete":
+            return None, "rootMutationNotAllowed"
+
+    if action == "delete":
+        if replacement.strip():
+            return None, "deleteReplacementMustBeEmpty"
+        return _BlueprintNodeEdit(action, node_name), ""
+
+    replacement = _extract_lean_code(replacement).strip()
+    if not replacement or re.search(r"(?m)^\s*(?:import|namespace|end)\b", replacement):
+        return None, "replacementMustBeOneDeclaration"
+    if action == "replace" and node is not None and replacement == node.lean_declaration.strip():
+        return None, "identicalReplacement"
+    parsed = _parse_blueprint(replacement, current.target_theorem)
+    if len(parsed.nodes) != 1:
+        return None, "replacementMustBeOneBlueprintNode"
+    revised = parsed.nodes[0]
+    if revised.name != node_name:
+        return None, "nodeNameMismatch"
+    if revised.name == current.target_theorem:
+        if action != "replace" or node is None:
+            return None, "rootMutationNotAllowed"
+        if revised.kind != "theorem" or revised.title != node.title:
+            return None, "rootMutationNotAllowed"
+    if not revised.statement.strip():
+        return None, "missingStatementMetadata"
+    if revised.kind in {"lemma", "theorem"} and not revised.proof_sketch.strip():
+        return None, "missingProofMetadata"
+    proof_error = _validate_phase1b_proof_body(revised)
+    if proof_error:
+        return None, proof_error
+    return _BlueprintNodeEdit(action, node_name, replacement, revised), ""
+
+
+def _render_edited_blueprint(current: Blueprint, nodes: list[BlueprintNode]) -> Blueprint:
+    names = [node.name for node in nodes]
+    if len(names) != len(set(names)):
+        raise ValueError("duplicateNodeName")
+    node_map = {node.name: node for node in nodes}
+    root = node_map.get(current.target_theorem)
+    if root is None or root.kind != "theorem":
+        raise ValueError("missingOrInvalidRoot")
+    for node in nodes:
+        unknown = [dependency for dependency in node.dependencies if dependency not in node_map]
+        if unknown:
+            raise ValueError(
+                f"unknownDependencies:{node.name}:{','.join(unknown)}"
+            )
+
+    draft = Blueprint(
+        nodes=nodes,
+        lean_file="",
+        target_theorem=current.target_theorem,
+        phase2_header=current.phase2_header,
+    )
+    ordered = draft.dependency_order()
+    definitions = [node for node in nodes if node.kind == "definition"]
+    proofs = [
+        node for node in ordered
+        if node.kind != "definition" and node.name != current.target_theorem
+    ]
+    ordered_nodes = definitions + proofs + [root]
+    parts = [current.phase2_header.rstrip()]
+    if _PENDING_HELPER_RE.search(current.lean_file):
+        parts.append(_PENDING_HELPER)
+    parts.extend(node.lean_declaration.strip() for node in ordered_nodes)
+    lean_code = "\n\n".join(part for part in parts if part.strip()).strip() + "\n"
+    revised = _parse_blueprint(lean_code, current.target_theorem)
+    if [node.name for node in revised.nodes] != [node.name for node in ordered_nodes]:
+        raise ValueError("editedBlueprintParseMismatch")
+    revised.dependency_order()
+    return revised
+
+
+def _apply_node_edits(
+    current: Blueprint,
+    edits: list[_BlueprintNodeEdit],
+) -> Blueprint:
+    by_name = {node.name: node for node in current.nodes}
+    additions: list[BlueprintNode] = []
+    for edit in edits:
+        if edit.action == "delete":
+            by_name.pop(edit.node_name, None)
+        elif edit.action == "replace" and edit.revised_node is not None:
+            by_name[edit.node_name] = edit.revised_node
+        elif edit.action == "add" and edit.revised_node is not None:
+            by_name[edit.node_name] = edit.revised_node
+            additions.append(edit.revised_node)
+    existing_order = [
+        by_name[node.name]
+        for node in current.nodes
+        if node.name in by_name
+    ]
+    existing_names = {node.name for node in existing_order}
+    final_nodes = existing_order + [node for node in additions if node.name not in existing_names]
+    return _render_edited_blueprint(current, final_nodes)
+
+
+def _phase1b_feedback(
+    issues: list[SemanticIssue],
+    result: CompilerResult,
+    source_contexts: list[dict[str, Any]],
+    structural_errors: list[str],
+    standalone_report: Phase2StandaloneReport,
+    rejected: list[dict[str, Any]],
+) -> str:
+    sections: list[str] = []
+    if issues:
+        sections.append("Deterministic semantic-fidelity diagnostics:\n" + format_semantic_issues(issues))
+        blocking = [issue for issue in issues if issue.severity == "error"]
+        if blocking:
+            sections.append(
+                "Issue-specific node repair rules:\n"
+                + _semantic_repair_guidance(blocking)
+            )
+    if result.diagnostics:
+        sections.append(
+            "Lean errors/goals (sorry warnings are intentionally omitted):\n"
+            + "\n".join(result.diagnostics)
+            + _format_lean_source_contexts(source_contexts)
+        )
+    if structural_errors:
+        sections.append(
+            "Phase 2 structural contract errors:\n"
+            + format_phase2_contract_errors(structural_errors, limit=100)
+        )
+    if standalone_report.issues:
+        sections.append(
+            "Phase 2 standalone contract errors:\n"
+            + format_phase2_standalone_issues(standalone_report.issues)
+            + "\n\nMake every missing object explicit in a binder or Blueprint definition, "
+            "and list every proof-node dependency in sorry_using."
+        )
+    elif standalone_report.not_run_reason:
+        sections.append(
+            "Phase 2 standalone contract check was not run: "
+            + standalone_report.not_run_reason
+        )
+    if rejected:
+        sections.append("Rejected node edits from the previous round:\n" + "\n".join(
+            f"- {item.get('node_name') or '<unknown>'}: {item['reason']}"
+            for item in rejected
+        ))
+    return "\n\n".join(sections) or "No diagnostics."
+
+
+@dataclass
+class _Phase1BValidation:
+    lean_result: CompilerResult
+    semantic_issues: list[SemanticIssue]
+    source_contexts: list[dict[str, Any]]
+    structural_errors: list[str]
+    standalone_report: Phase2StandaloneReport
+
+    @property
+    def passed(self) -> bool:
+        return (
+            self.lean_result.success
+            and not any(issue.severity == "error" for issue in self.semantic_issues)
+            and not self.structural_errors
+            and not self.standalone_report.issues
+            and self.standalone_report.skipped_pending_node_count == 0
+        )
+
+
+def _phase1b_validation_details(
+    validation: _Phase1BValidation,
+) -> dict[str, Any]:
+    semantic_errors = [
+        issue.to_dict() for issue in validation.semantic_issues
+        if issue.severity == "error"
+    ]
+    semantic_warnings = [
+        issue.to_dict() for issue in validation.semantic_issues
+        if issue.severity == "warning"
+    ]
+    standalone = validation.standalone_report
+    return {
+        "passed": validation.passed,
+        "wholeFileLeanSuccess": validation.lean_result.success,
+        "leanErrors": list(validation.lean_result.diagnostics),
+        "semanticErrors": semantic_errors,
+        "semanticWarnings": semantic_warnings,
+        "phase2StructuralErrors": list(validation.structural_errors),
+        "phase2StandaloneErrors": [
+            issue.to_dict() for issue in standalone.issues
+        ],
+        "phase2StandaloneSummary": {
+            "checkedNodeCount": standalone.checked_node_count,
+            "cachedNodeCount": standalone.cached_node_count,
+            "skippedPendingNodeCount": standalone.skipped_pending_node_count,
+            "failedNodeCount": len(standalone.issues),
+            "notRunReason": standalone.not_run_reason,
+            "durationMs": standalone.duration_ms,
+        },
+    }
+
+
+def _emit_phase1b_validation_result(
+    tracer,
+    *,
+    thm_name: str,
+    round_index: int,
+    validation: _Phase1BValidation,
+    reused_candidate: bool,
+) -> None:
+    if tracer is None:
+        return
+    details = _phase1b_validation_details(validation)
+    tracer.emit(TraceEvent(
+        kind="phase1BValidationResult",
+        thm_name=thm_name,
+        turn=round_index,
+        args={
+            "phase": "phase1B",
+            "round": round_index,
+            "reusedCandidate": reused_candidate,
+            "wholeFileLeanSuccess": details["wholeFileLeanSuccess"],
+            "leanErrorCount": len(details["leanErrors"]),
+            "semanticErrorCount": len(details["semanticErrors"]),
+            "semanticWarningCount": len(details["semanticWarnings"]),
+            "phase2StructuralErrorCount": len(details["phase2StructuralErrors"]),
+            "phase2StandaloneErrorCount": len(details["phase2StandaloneErrors"]),
+            **details["phase2StandaloneSummary"],
+        },
+        ok=validation.passed,
+    ))
+
+
+def _skipped_standalone_report(
+    tracer,
+    *,
+    thm_name: str,
+    round_index: int,
+    reason: str,
+) -> Phase2StandaloneReport:
+    if tracer is not None:
+        tracer.emit(TraceEvent(
+            kind="phase2StandaloneCheckStart",
+            thm_name=thm_name,
+            turn=round_index,
+            args={
+                "phase": "phase1B", "round": round_index,
+                "checkedNodeCount": 0, "cachedNodeCount": 0,
+                "skippedPendingNodeCount": 0, "notRunReason": reason,
+            },
+        ))
+    report = Phase2StandaloneReport((), 0, 0, 0, 0.0, reason)
+    _emit_standalone_report(
+        tracer, thm_name=thm_name, round_index=round_index, report=report,
+    )
+    return report
+
+
+def _validate_phase1b_candidate(
+    blueprint: Blueprint,
+    *,
+    compiler: KiminaLeanCompiler,
+    semantic_manifest,
+    claimed_answer: str,
+    semantic_fidelity_enabled: bool,
+    semantic_require_step_ids: bool,
+    semantic_static_gate: bool,
+    standalone_concurrency: int,
+    standalone_cache: dict[str, CompilerResult],
+    tracer,
+    thm_name: str,
+    round_index: int,
+    skip_pending: bool,
+) -> _Phase1BValidation:
+    lean_result = compiler.check_blueprint(
+        blueprint.lean_file, blueprint.target_theorem,
+    )
+    if lean_result.failure_kind == "infra":
+        raise KiminaInfrastructureError(
+            "\n".join(lean_result.diagnostics) or lean_result.raw_output[-2000:]
+        )
+    semantic_issues = _phase1_semantic_issues(
+        blueprint, semantic_manifest, claimed_answer=claimed_answer,
+        semantic_fidelity_enabled=semantic_fidelity_enabled,
+        semantic_require_step_ids=semantic_require_step_ids,
+        semantic_static_gate=semantic_static_gate,
+        allow_pending_claims=False,
+    )
+    structural_errors = phase2_contract_errors(blueprint)
+    source_contexts = _lean_source_contexts(
+        lean_result, blueprint, semantic_manifest,
+    )
+    _emit_semantic_check(
+        tracer, thm_name=thm_name, phase="phase1B", attempt=1,
+        turn=round_index, issues=semantic_issues,
+    )
+    _emit_lean_check_result(
+        tracer, thm_name=thm_name, phase="phase1B",
+        attempt=round_index, target=blueprint.target_theorem,
+        result=lean_result, source_contexts=source_contexts,
+    )
+    if not lean_result.success:
+        standalone_report = _skipped_standalone_report(
+            tracer, thm_name=thm_name, round_index=round_index,
+            reason="wholeFileCompileFailed",
+        )
+    elif structural_errors:
+        standalone_report = _skipped_standalone_report(
+            tracer, thm_name=thm_name, round_index=round_index,
+            reason="phase2StructuralContractFailed",
+        )
+    else:
+        standalone_report = phase2_standalone_contract_report(
+            blueprint, compiler,
+            concurrency=standalone_concurrency,
+            skip_pending=skip_pending,
+            cache=standalone_cache,
+            tracer=tracer,
+            thm_name=thm_name,
+            round_index=round_index,
+        )
+    validation = _Phase1BValidation(
+        lean_result=lean_result,
+        semantic_issues=semantic_issues,
+        source_contexts=source_contexts,
+        structural_errors=structural_errors,
+        standalone_report=standalone_report,
+    )
+    _emit_phase1b_validation_result(
+        tracer, thm_name=thm_name, round_index=round_index,
+        validation=validation, reused_candidate=False,
+    )
+    return validation
+
+
+def _phase1_semantic_issues(
+    blueprint: Blueprint,
+    semantic_manifest,
+    *,
+    claimed_answer: str,
+    semantic_fidelity_enabled: bool,
+    semantic_require_step_ids: bool,
+    semantic_static_gate: bool,
+    allow_pending_claims: bool,
+) -> list[SemanticIssue]:
+    if not semantic_fidelity_enabled:
+        pending: list[SemanticIssue] = []
+        for node in blueprint.nodes:
+            if "PendingBlueprintClaim" not in node.lean_declaration:
+                continue
+            exact = re.search(
+                rf':\s*PendingBlueprintClaim\s+"{re.escape(node.name)}"\s*:=',
+                node.lean_declaration,
+            )
+            malformed = node.kind == "definition" or node.name == blueprint.target_theorem or not exact
+            pending.append(SemanticIssue(
+                "malformedPendingClaim" if malformed else "unresolvedPendingClaim",
+                "PendingBlueprintClaim is malformed."
+                if malformed else
+                "The Phase-1A placeholder has not been replaced by a concrete proposition.",
+                node_name=node.name,
+                step_id=node.source_step_id,
+            ))
+        return [] if allow_pending_claims else pending
+    all_issues = validate_blueprint_fidelity(
+        blueprint,
+        semantic_manifest,
+        claimed_answer=claimed_answer,
+        require_step_bindings=(
+            semantic_require_step_ids if semantic_fidelity_enabled else False
+        ),
+        allow_pending_claims=allow_pending_claims,
+    )
+    return _enabled_semantic_issues(
+        all_issues,
+        require_step_ids=semantic_require_step_ids,
+        static_gate=semantic_static_gate,
+    )
+
+
+def _run_phase1b_patch_session(
+    client,
+    model: str,
+    blueprint: Blueprint,
+    *,
+    compiler: KiminaLeanCompiler,
+    informal_statement: str,
+    prompt_proof: str,
+    claimed_answer: str,
+    semantic_manifest,
+    semantic_fidelity_enabled: bool,
+    semantic_require_step_ids: bool,
+    semantic_static_gate: bool,
+    max_rounds: int,
+    max_tool_calls_per_turn: int,
+    phase2_contract_check_concurrency: int,
+    tracer,
+    thm_name: str,
+    candidate_history: list[str],
+    candidate_labels: list[str],
+) -> Blueprint:
+    current = blueprint
+    standalone_cache: dict[str, CompilerResult] = {}
+    validation = _validate_phase1b_candidate(
+        current, compiler=compiler, semantic_manifest=semantic_manifest,
+        claimed_answer=claimed_answer,
+        semantic_fidelity_enabled=semantic_fidelity_enabled,
+        semantic_require_step_ids=semantic_require_step_ids,
+        semantic_static_gate=semantic_static_gate,
+        standalone_concurrency=phase2_contract_check_concurrency,
+        standalone_cache=standalone_cache,
+        tracer=tracer, thm_name=thm_name, round_index=0,
+        skip_pending=True,
+    )
+    rejected: list[dict[str, Any]] = []
+    edit_history: list[dict[str, Any]] = []
+
+    for round_index in range(1, max_rounds + 1):
+        if validation.passed:
+            break
+        feedback = _phase1b_feedback(
+            validation.semantic_issues,
+            validation.lean_result,
+            validation.source_contexts,
+            validation.structural_errors,
+            validation.standalone_report,
+            rejected,
+        )
+        node_inventory = "\n".join(
+            f"- {node.name}: hash={_node_hash(node)} kind={node.kind} "
+            f"step={node.source_step_id or '<missing>'} deps={node.dependencies}"
+            for node in current.nodes
+        )
+        messages = [
+            {"role": "system", "content": _PHASE1B_SYSTEM_PROMPT},
+            {"role": "user", "content": (
+                f"Problem:\n{informal_statement}\n\nCOT Steps:\n{prompt_proof}\n\n"
+                f"Claimed answer: `{claimed_answer}`\n\nEditable node inventory:\n{node_inventory}\n\n"
+                f"Current complete Blueprint:\n```lean\n{current.lean_file}\n```\n\n"
+                f"Latest diagnostics:\n{feedback}"
+            )},
+        ]
+        response = chat_completion_with_retry(
+            client,
+            tracer=tracer,
+            thm_name=thm_name,
+            phase="phase1B",
+            model_id=model,
+            operation="blueprint_node_edit",
+            trace_args={"attempt": 1, "turn": round_index},
+            model=model,
+            messages=messages,
+            tools=[_PHASE1_EDIT_NODE_TOOL],
+            tool_choice="required",
+            parallel_tool_calls=True,
+            max_completion_tokens=phase1_request_max_tokens(messages),
+            **_reasoning_kwargs(model),
+        )
+        _emit_usage(tracer, thm_name, "phase1B", model, response)
+        _emit_llm_response(
+            tracer, thm_name=thm_name, phase="phase1B", model=model,
+            response=response, attempt=1, turn=round_index,
+        )
+        calls = list(response.choices[0].message.tool_calls or [])
+        accepted: list[_BlueprintNodeEdit] = []
+        call_records: list[dict[str, Any]] = []
+        rejected = []
+        seen_nodes: set[str] = set()
+        for call in calls[:max_tool_calls_per_turn]:
+            started_ns = time.monotonic_ns()
+            span_id = uuid.uuid4().hex
+            node_name = ""
+            action = ""
+            reason = ""
+            args: dict[str, Any] = {}
+            try:
+                raw_args = json.loads(call.function.arguments or "{}")
+                if not isinstance(raw_args, dict):
+                    raise ValueError("arguments must be an object")
+                args = raw_args
+                action = str(args.get("action") or "")
+                node_name = str(args.get("node_name") or "")
+            except (json.JSONDecodeError, ValueError) as exc:
+                reason = f"invalidArguments:{exc}"
+            trace_args = {
+                "phase": "phase1B", "round": round_index,
+                "action": action, "node_name": node_name,
+            }
+            if tracer is not None:
+                tracer.emit(TraceEvent(
+                    kind="tool_call", thm_name=thm_name, turn=round_index,
+                    call_id=call.id, tool_name=str(call.function.name),
+                    span_id=span_id, args=trace_args,
+                ))
+            if not reason:
+                if call.function.name != "editBlueprintNode":
+                    reason = "notAllowed"
+                elif node_name in seen_nodes:
+                    reason = "duplicateNodeInRound"
+                else:
+                    edit, reason = _validate_node_edit(
+                        current,
+                        action=action,
+                        node_name=node_name,
+                        expected_hash=str(args.get("expected_node_hash") or ""),
+                        replacement=str(args.get("replacement") or ""),
+                    )
+                    if not reason and edit is not None:
+                        accepted.append(edit)
+                        seen_nodes.add(node_name)
+            call_records.append({
+                "call": call, "started_ns": started_ns, "span_id": span_id,
+                "node_name": node_name, "action": action, "reason": reason,
+            })
+        if len(calls) > max_tool_calls_per_turn:
+            rejected.extend({"node_name": "", "reason": "overTurnLimit"}
+                            for _ in calls[max_tool_calls_per_turn:])
+        applied = False
+        if accepted:
+            try:
+                current = _apply_node_edits(current, accepted)
+                applied = True
+            except ValueError as exc:
+                batch_reason = f"atomicBatchRejected:{exc}"
+                for record in call_records:
+                    if not record["reason"]:
+                        record["reason"] = batch_reason
+                accepted = []
+
+        for record in call_records:
+            reason = str(record["reason"] or "")
+            if reason:
+                rejected.append({
+                    "node_name": record["node_name"], "reason": reason,
+                    "action": record["action"],
+                })
+            if tracer is not None:
+                call = record["call"]
+                trace_args = {
+                    "phase": "phase1B", "round": round_index,
+                    "action": record["action"], "node_name": record["node_name"],
+                }
+                tracer.emit(TraceEvent(
+                    kind="tool_result", thm_name=thm_name, turn=round_index,
+                    call_id=call.id, tool_name=str(call.function.name),
+                    span_id=record["span_id"],
+                    result=reason or "editAccepted", ok=not bool(reason),
+                    args=trace_args,
+                    duration_ms=(time.monotonic_ns() - record["started_ns"]) / 1_000_000,
+                ))
+
+        identical_edits = [
+            {"action": record["action"], "nodeName": record["node_name"]}
+            for record in call_records
+            if record["reason"] == "identicalReplacement"
+        ]
+        accepted_edits = [
+            {"action": record["action"], "nodeName": record["node_name"]}
+            for record in call_records
+            if not record["reason"]
+        ]
+        edit_history.append({
+            "round": round_index,
+            "candidateApplied": applied,
+            "accepted": accepted_edits,
+            "rejected": [
+                {
+                    "action": str(item.get("action") or ""),
+                    "nodeName": str(item.get("node_name") or ""),
+                    "reason": str(item.get("reason") or ""),
+                }
+                for item in rejected
+                if item.get("reason") != "identicalReplacement"
+            ],
+            "identical": identical_edits,
+        })
+
+        if applied:
+            candidate_history.append(current.lean_file)
+            candidate_labels.append(f"phase1b_round_{round_index}")
+            validation = _validate_phase1b_candidate(
+                current, compiler=compiler, semantic_manifest=semantic_manifest,
+                claimed_answer=claimed_answer,
+                semantic_fidelity_enabled=semantic_fidelity_enabled,
+                semantic_require_step_ids=semantic_require_step_ids,
+                semantic_static_gate=semantic_static_gate,
+                standalone_concurrency=phase2_contract_check_concurrency,
+                standalone_cache=standalone_cache,
+                tracer=tracer, thm_name=thm_name, round_index=round_index,
+                skip_pending=True,
+            )
+        else:
+            # The candidate is byte-identical. Re-emit the logical standalone check
+            # from its hash cache without spending another Lean compilation.
+            if validation.lean_result.success and not validation.structural_errors:
+                report = phase2_standalone_contract_report(
+                    current, compiler,
+                    concurrency=phase2_contract_check_concurrency,
+                    skip_pending=True, cache=standalone_cache,
+                    tracer=tracer, thm_name=thm_name, round_index=round_index,
+                )
+            else:
+                report = _skipped_standalone_report(
+                    tracer, thm_name=thm_name, round_index=round_index,
+                    reason=("wholeFileCompileFailed" if not validation.lean_result.success
+                            else "phase2StructuralContractFailed"),
+                )
+            validation = _Phase1BValidation(
+                validation.lean_result, validation.semantic_issues,
+                validation.source_contexts, validation.structural_errors, report,
+            )
+            _emit_phase1b_validation_result(
+                tracer, thm_name=thm_name, round_index=round_index,
+                validation=validation, reused_candidate=True,
+            )
+    else:
+        if not validation.passed:
+            feedback = _phase1b_feedback(
+                validation.semantic_issues, validation.lean_result,
+                validation.source_contexts, validation.structural_errors,
+                validation.standalone_report, rejected,
+            )
+            raise BlueprintGenerationError(
+                f"Phase 1B failed after {max_rounds} node-edit rounds.",
+                last_candidate=current.lean_file,
+                diagnostics=[feedback],
+                attempt=max_rounds,
+                failure_stage="phase1BFailed",
+                candidate_history=candidate_history,
+                candidate_labels=candidate_labels,
+                validation_details=_phase1b_validation_details(validation),
+                node_edit_rounds=edit_history,
+            )
+
+    final_code = _strip_pending_helper(current.lean_file)
+    final = _parse_blueprint(final_code, current.target_theorem)
+    final_validation = _validate_phase1b_candidate(
+        final, compiler=compiler, semantic_manifest=semantic_manifest,
+        claimed_answer=claimed_answer,
+        semantic_fidelity_enabled=semantic_fidelity_enabled,
+        semantic_require_step_ids=semantic_require_step_ids,
+        semantic_static_gate=semantic_static_gate,
+        standalone_concurrency=phase2_contract_check_concurrency,
+        standalone_cache=standalone_cache,
+        tracer=tracer, thm_name=thm_name, round_index=max_rounds + 1,
+        skip_pending=False,
+    )
+    if not final_validation.passed:
+        raise BlueprintGenerationError(
+            "Final Phase 1B validation failed after removing PendingBlueprintClaim helper.",
+            last_candidate=final_code,
+            diagnostics=[_phase1b_feedback(
+                final_validation.semantic_issues, final_validation.lean_result,
+                final_validation.source_contexts, final_validation.structural_errors,
+                final_validation.standalone_report, [],
+            )],
+            failure_stage="phase1BFinalValidation",
+            candidate_history=candidate_history,
+            candidate_labels=candidate_labels,
+            validation_details=_phase1b_validation_details(final_validation),
+            node_edit_rounds=edit_history,
+        )
+    candidate_history.append(final_code)
+    candidate_labels.append("phase1b_final")
+    final.semantic_gate_results.append({
+        "stage": "phase1B_final",
+        "passed": True,
+        "issues": [issue.to_dict() for issue in final_validation.semantic_issues],
+        "warning_count": sum(
+            issue.severity == "warning"
+            for issue in final_validation.semantic_issues
+        ),
+        "phase2_structural_error_count": 0,
+        "phase2_standalone_error_count": 0,
+    })
+    final.phase1b_validation = _phase1b_validation_details(final_validation)
+    final.phase1b_edit_history = list(edit_history)
+    return final
+
+
 def generate_blueprint_from_informal(
     informal_statement: str,
     informal_proof: str | None,
@@ -1351,13 +2548,7 @@ def generate_blueprint_from_informal(
     phase1_max_tool_calls_per_turn: int = 3,
     phase1_mathlib_search_max_calls: int = 3,
 ) -> Blueprint:
-    """Generate and strictly validate a blueprint from informal text only.
-
-    Unlike generate_blueprint(), this entry point has no formal Lean theorem
-    signature to preserve. The model must formalize the main theorem itself,
-    but the theorem identifier is fixed by target_name so downstream
-    checkpointing, validation, and scoring remain stable.
-    """
+    """Generate a Phase-1A draft, then edit its nodes and DAG in Phase 1B."""
     if phase1_max_tool_turns <= 0 or phase1_max_tool_calls_per_turn <= 0:
         raise ValueError("Phase-1 tool turn/call limits must be positive")
     if phase1_mathlib_search_max_calls < 0:
@@ -1405,7 +2596,8 @@ def generate_blueprint_from_informal(
         {
             "role": "system",
             "content": ROBUSTPA_BLUEPRINT_SYSTEM_PROMPT
-            + semantic_system_suffix,
+            + semantic_system_suffix
+            + _PHASE1A_SKELETON_SUFFIX,
         },
         {
             "role": "user",
@@ -1427,16 +2619,14 @@ def generate_blueprint_from_informal(
     last_candidate = ""
     last_diagnostics: list[str] = []
     last_finish_reason: str | None = None
-    last_failure_stage = "model_output"
-    observed_semantic_issues: list[str] = []
+    last_failure_stage = "phase1A_model_output"
     candidate_history: list[str] = []
+    candidate_labels: list[str] = []
     tool_cache: dict[str, tuple[str, bool]] = {}
     search_state = {"count": 0}
     retrieval = MathlibRetrieval()
+    phase1a_blueprint: Blueprint | None = None
     for attempt in range(max_retries):
-        semantic_check_issues: list[SemanticIssue] = []
-        semantic_check_errors: list[SemanticIssue] = []
-        candidate: Blueprint | None = None
         session = _run_phase1_tool_session(
             client, model, tuple(dict(message) for message in messages),
             compiler=compiler, target_name=target_name, retrieval=retrieval,
@@ -1451,76 +2641,77 @@ def generate_blueprint_from_informal(
             semantic_fidelity_enabled=semantic_fidelity_enabled,
             semantic_require_step_ids=semantic_require_step_ids,
             semantic_static_gate=semantic_static_gate,
+            allow_pending_claims=True,
+            trace_phase="phase1A",
         )
         lean_code = session.successful_lean_code or session.lean_code
         last_candidate = lean_code
         candidate_history.append(lean_code)
+        candidate_labels.append(f"phase1a_attempt_{attempt + 1}")
         last_finish_reason = session.finish_reason
         emitted_target = _extract_target_name(lean_code, "")
+        feedback_parts: list[str] = []
         if emitted_target != target_name:
-            last_error_feedback = (
+            feedback_parts.append(
                 f"The main theorem must be named `{target_name}`, but the "
                 f"latest output's final theorem is `{emitted_target or '<missing>'}`."
             )
-            last_diagnostics = [last_error_feedback]
-            last_failure_stage = "blueprint_contract"
-            feedback = (
-                f"{last_error_feedback}\n\n"
-                "Re-emit the whole Lean file with exactly one main theorem "
-                f"named `{target_name}`."
+        candidate = _parse_blueprint(lean_code, target_name)
+        semantic_check_issues = _enabled_semantic_issues(
+            validate_blueprint_fidelity(
+                candidate,
+                semantic_manifest,
+                claimed_answer=claimed_answer,
+                require_step_bindings=semantic_require_step_ids,
+                allow_pending_claims=True,
+            ) if semantic_fidelity_enabled and candidate.nodes else [],
+            require_step_ids=semantic_require_step_ids,
+            static_gate=semantic_static_gate,
+        )
+        semantic_check_errors = [
+            issue for issue in semantic_check_issues if issue.severity == "error"
+        ]
+        phase1a_blocking_semantic_issues = _phase1a_blocking_semantic_issues(
+            semantic_check_issues
+        )
+        _emit_semantic_check(
+            tracer, thm_name=thm_name, phase="phase1A",
+            attempt=attempt + 1, issues=semantic_check_issues,
+            blocking_issues=phase1a_blocking_semantic_issues,
+        )
+        if phase1a_blocking_semantic_issues:
+            feedback_parts.append(
+                "The deterministic semantic gate rejected the skeleton:\n"
+                + format_semantic_issues(phase1a_blocking_semantic_issues)
             )
-            _set_latest_blueprint_retry(
-                messages,
-                base_messages,
-                lean_code,
-                feedback,
-                finish_reason=last_finish_reason,
+        contract_errors: list[str] = []
+        if not candidate.nodes:
+            contract_errors.append("no_blueprint_nodes: no annotated declarations were parsed.")
+        else:
+            contract_errors.extend(_phase1a_contract_errors(candidate))
+            contract_errors.extend(phase2_contract_errors(candidate))
+        if contract_errors:
+            feedback_parts.append(
+                "Phase 1A skeleton contract errors:\n"
+                + format_phase2_contract_errors(contract_errors, limit=100)
             )
-            continue
 
-        if semantic_fidelity_enabled:
-            candidate = _parse_blueprint(lean_code, target_name)
-            if candidate.nodes:
-                all_semantic_check_issues = validate_blueprint_fidelity(
-                    candidate,
-                    semantic_manifest,
-                    claimed_answer=claimed_answer,
-                    require_step_bindings=semantic_require_step_ids,
-                )
-                semantic_check_issues = _enabled_semantic_issues(
-                    all_semantic_check_issues,
-                    require_step_ids=semantic_require_step_ids,
-                    static_gate=semantic_static_gate,
-                )
-                semantic_check_errors = [
-                    issue for issue in semantic_check_issues
-                    if issue.severity == "error"
-                ]
-                _emit_semantic_check(
-                    tracer,
-                    thm_name=thm_name,
-                    phase="phase1",
-                    attempt=attempt + 1,
-                    issues=semantic_check_issues,
-                )
-                if semantic_check_errors:
-                    for issue in semantic_check_errors:
-                        issue_key = ":".join(
-                            part for part in (issue.code, issue.step_id, issue.node_name) if part
-                        )
-                        if issue_key not in observed_semantic_issues:
-                            observed_semantic_issues.append(issue_key)
-
-        result = compiler.check_blueprint(lean_code, target_name)
-        if candidate is None:
-            candidate = _parse_blueprint(lean_code, target_name)
+        result = (
+            compiler.check_blueprint(lean_code, target_name)
+            if emitted_target == target_name
+            else CompilerResult(
+                False,
+                errors=[feedback_parts[0]],
+                failure_kind="lean",
+            )
+        )
         lean_source_contexts = _lean_source_contexts(
             result, candidate, semantic_manifest,
         )
         _emit_lean_check_result(
             tracer,
             thm_name=thm_name,
-            phase="phase1",
+            phase="phase1A",
             attempt=attempt + 1,
             target=target_name,
             result=result,
@@ -1530,192 +2721,116 @@ def generate_blueprint_from_informal(
             raise KiminaInfrastructureError(
                 "\n".join(result.diagnostics) or result.raw_output[-2000:]
             )
-        if semantic_check_errors:
-            # The repair budget is deliberately one turn.  Compile the same
-            # rejected candidate as well so that this single turn receives
-            # both semantic and Lean diagnostics instead of discovering Lean
-            # errors only after it has spent its sole repair on graph shape.
-            semantic_feedback = format_semantic_issues(semantic_check_errors)
-            lean_feedback = ""
-            if not result.success:
-                lean_feedback = (
-                    "\n\nThe same candidate also failed Lean compilation:\n\n"
-                    + ("\n".join(result.diagnostics) or result.raw_output[-2000:])
-                    + _format_lean_source_contexts(lean_source_contexts)
-                )
-            last_error_feedback = (
-                "The local semantic-fidelity gate rejected this candidate:\n\n"
-                f"{semantic_feedback}{lean_feedback}"
-            )
-            last_diagnostics = [last_error_feedback]
-            last_failure_stage = "semantic_gate"
-            feedback = (
-                f"{last_error_feedback}\n\nCorrect all listed translation and Lean "
-                "errors in one pass and re-emit the entire file. Preserve the source COT "
-                "exactly; a false step must remain a proposition and explicit proof gap.\n\n"
-                f"Issue-specific repair rules:\n{_semantic_repair_guidance(semantic_check_errors)}\n\n"
-                "Previously observed issues that must not regress: "
-                f"{', '.join(observed_semantic_issues)}"
-            )
-            _set_latest_blueprint_retry(
-                messages,
-                base_messages,
-                lean_code,
-                feedback,
-                finish_reason=last_finish_reason,
-            )
-            continue
-        if result.success:
-            try:
-                parsed = _parse_blueprint(lean_code, target_name)
-            except Exception as exc:  # noqa: BLE001
-                parsed = None
-                last_error_feedback = f"Blueprint parsing failed: {type(exc).__name__}: {exc}"
-                last_failure_stage = "parse"
-            if parsed is None:
-                pass
-            elif not parsed.nodes:
-                last_error_feedback = (
-                    "The file compiled, but contains no `@[blueprint ...]`-annotated declarations."
-                )
-                last_failure_stage = "parse"
-            else:
-                if semantic_fidelity_enabled:
-                    parsed.semantic_gate_results.append({
-                        "stage": "phase1_local_gate",
-                        "passed": True,
-                        "issues": [issue.to_dict() for issue in semantic_check_issues],
-                        "warning_count": sum(
-                            issue.severity == "warning" for issue in semantic_check_issues
-                        ),
-                        "require_step_ids": semantic_require_step_ids,
-                        "static_gate": semantic_static_gate,
-                    })
-                contract_errors = phase2_contract_errors(parsed)
-                if not contract_errors:
-                    contract_errors = phase2_standalone_contract_errors(
-                        parsed,
-                        compiler,
-                        concurrency=phase2_contract_check_concurrency,
-                    )
-                if not contract_errors:
-                    audit_risk_reasons = (
-                        semantic_audit_risk_reasons(
-                            parsed,
-                            semantic_manifest,
-                            claimed_answer=claimed_answer,
-                        )
-                        if semantic_audit_mode == "risk"
-                        else []
-                    )
-                    should_audit = (
-                        semantic_audit_mode == "full"
-                        or (semantic_audit_mode == "risk" and bool(audit_risk_reasons))
-                    )
-                    if semantic_audit_mode == "risk" and not should_audit:
-                        parsed.semantic_gate_results.append({
-                            "stage": "phase1_semantic_audit",
-                            "passed": True,
-                            "mode": "risk",
-                            "routed": False,
-                            "risk_reasons": [],
-                        })
-                    if should_audit:
-                        try:
-                            audit = run_semantic_audit(
-                                model,
-                                prompt_proof,
-                                parsed.lean_file,
-                                mode=semantic_audit_mode,
-                                informal_statement=informal_statement,
-                                claimed_answer=claimed_answer,
-                                client=client,
-                                tracer=tracer,
-                                thm_name=thm_name,
-                                phase="phase1_semantic_audit",
-                            )
-                            audit_feedback = audit.diagnostics
-                            audit_passed = audit.passed
-                        except SemanticAuditFormatError as exc:
-                            audit_feedback = (
-                                f"Audit response format was invalid ({exc.reason}). "
-                                "The next candidate must still satisfy every source-step contract."
-                            )
-                            audit_passed = False
-                        if audit_passed:
-                            parsed.candidate_history = list(candidate_history)
-                            parsed.semantic_audit_result = asdict(audit)
-                            parsed.semantic_gate_results.append({
-                                "stage": "phase1_semantic_audit",
-                                "passed": True,
-                                "mode": semantic_audit_mode,
-                                "routed": True,
-                                "risk_reasons": audit_risk_reasons,
-                                "diagnostics": audit.diagnostics,
-                                "request_id": audit.request_id,
-                                "total_tokens": audit.total_tokens,
-                            })
-                            return parsed
-                        last_error_feedback = (
-                            "The semantic-fidelity audit rejected this candidate:\n\n"
-                            f"{audit_feedback}"
-                        )
-                        last_diagnostics = [last_error_feedback]
-                        last_failure_stage = "semantic_audit"
-                        feedback = (
-                            f"{last_error_feedback}\n\nRepair only the Lean translation. "
-                            "Do not repair, weaken, or omit any original COT Step clause. "
-                            "Re-emit the complete blueprint with the same step bindings."
-                        )
-                        _set_latest_blueprint_retry(
-                            messages,
-                            base_messages,
-                            lean_code,
-                            feedback,
-                            finish_reason=last_finish_reason,
-                        )
-                        continue
-                    parsed.candidate_history = list(candidate_history)
-                    return parsed
-                last_error_feedback = (
-                    "The file compiled, but the blueprint is not usable by Phase 2:\n\n"
-                    f"{format_phase2_contract_errors(contract_errors)}"
-                )
-                last_failure_stage = "blueprint_contract"
-        else:
-            last_error_feedback = (
+        if not result.success:
+            feedback_parts.append(
+                "Lean compilation failed:\n"
+                +
                 ("\n".join(result.diagnostics) or result.raw_output[-2000:])
                 + _format_lean_source_contexts(lean_source_contexts)
             )
-            last_failure_stage = "lean_check"
+        if not feedback_parts and result.success:
+            phase1a_blueprint = candidate
+            phase1a_blueprint.semantic_gate_results.append({
+                "stage": "phase1A",
+                "passed": True,
+                "issues": [issue.to_dict() for issue in semantic_check_issues],
+                "warning_count": sum(issue.severity == "warning" for issue in semantic_check_issues),
+                "deferred_error_count": len(semantic_check_errors),
+            })
+            break
+        last_error_feedback = "\n\n".join(feedback_parts)
         last_diagnostics = list(result.diagnostics) or [last_error_feedback]
-
-        feedback = (
-            f"lean_compile reported errors (attempt {attempt + 1}/{max_retries}):\n\n"
-            f"{last_error_feedback}\n\n"
-            "Fix the issues and call lean_compile again."
-        )
+        last_failure_stage = "phase1AValidation"
         _set_latest_blueprint_retry(
-            messages,
-            base_messages,
-            lean_code,
-            feedback,
+            messages, base_messages, lean_code,
+            last_error_feedback
+            + "\n\nRegenerate the complete Phase 1A skeleton and fix every listed issue.",
             finish_reason=last_finish_reason,
         )
+    if phase1a_blueprint is None:
+        raise BlueprintGenerationError(
+            f"Phase 1A skeleton generation failed after {max_retries} attempts. "
+            f"Last error:\n{last_error_feedback[-2000:]}",
+            last_candidate=last_candidate,
+            diagnostics=last_diagnostics,
+            attempt=max_retries,
+            finish_reason=last_finish_reason,
+            failure_stage=last_failure_stage,
+            candidate_history=candidate_history,
+            candidate_labels=candidate_labels,
+        )
 
-    message = (
-        f"Informal blueprint generation failed after {max_retries} attempts. "
-        f"Last error:\n{last_error_feedback[-2000:]}"
-    )
-    raise BlueprintGenerationError(
-        message,
-        last_candidate=last_candidate,
-        diagnostics=last_diagnostics,
-        attempt=max_retries,
-        finish_reason=last_finish_reason,
-        failure_stage=last_failure_stage,
+    final = _run_phase1b_patch_session(
+        client, model, phase1a_blueprint,
+        compiler=compiler,
+        informal_statement=informal_statement,
+        prompt_proof=prompt_proof,
+        claimed_answer=claimed_answer,
+        semantic_manifest=semantic_manifest,
+        semantic_fidelity_enabled=semantic_fidelity_enabled,
+        semantic_require_step_ids=semantic_require_step_ids,
+        semantic_static_gate=semantic_static_gate,
+        max_rounds=phase1_max_tool_turns,
+        max_tool_calls_per_turn=phase1_max_tool_calls_per_turn,
+        phase2_contract_check_concurrency=phase2_contract_check_concurrency,
+        tracer=tracer,
+        thm_name=thm_name,
         candidate_history=candidate_history,
+        candidate_labels=candidate_labels,
     )
+    contract_errors = phase2_contract_errors(final)
+    if not contract_errors:
+        contract_errors = phase2_standalone_contract_errors(
+            final, compiler, concurrency=phase2_contract_check_concurrency,
+        )
+    if contract_errors:
+        raise BlueprintGenerationError(
+            "Phase 1B produced a Blueprint that is not usable by Phase 2:\n"
+            + format_phase2_contract_errors(contract_errors),
+            last_candidate=final.lean_file,
+            diagnostics=contract_errors,
+            failure_stage="blueprint_contract",
+            candidate_history=candidate_history,
+            candidate_labels=candidate_labels,
+        )
+    if semantic_audit_mode != "none":
+        audit_risk_reasons = (
+            semantic_audit_risk_reasons(
+                final, semantic_manifest, claimed_answer=claimed_answer,
+            ) if semantic_audit_mode == "risk" else []
+        )
+        should_audit = semantic_audit_mode == "full" or bool(audit_risk_reasons)
+        if should_audit:
+            try:
+                audit = run_semantic_audit(
+                    model, prompt_proof, final.lean_file,
+                    mode=semantic_audit_mode,
+                    informal_statement=informal_statement,
+                    claimed_answer=claimed_answer,
+                    client=client, tracer=tracer, thm_name=thm_name,
+                    phase="phase1_semantic_audit",
+                )
+            except SemanticAuditFormatError as exc:
+                raise BlueprintGenerationError(
+                    f"Semantic audit response was invalid: {exc.reason}",
+                    last_candidate=final.lean_file,
+                    failure_stage="semantic_audit",
+                    candidate_history=candidate_history,
+                    candidate_labels=candidate_labels,
+                ) from exc
+            if not audit.passed:
+                raise BlueprintGenerationError(
+                    "Semantic audit rejected the Phase 1B Blueprint:\n" + audit.diagnostics,
+                    last_candidate=final.lean_file,
+                    diagnostics=[audit.diagnostics],
+                    failure_stage="semantic_audit",
+                    candidate_history=candidate_history,
+                    candidate_labels=candidate_labels,
+                )
+            final.semantic_audit_result = asdict(audit)
+    final.candidate_history = list(candidate_history)
+    final.candidate_labels = list(candidate_labels)
+    return final
 
 
 def _build_user_prompt(theorem_stmt: str, nl_proof: str | None) -> str:

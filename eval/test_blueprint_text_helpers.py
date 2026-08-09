@@ -11,12 +11,17 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from blueprint import (  # noqa: E402
     BlueprintNode,
+    _apply_node_edits,
     _extract_lean_code,
+    _node_hash,
     _parse_blueprint,
+    _validate_node_edit,
     extract_blueprint_signature,
+    format_phase2_standalone_issues,
     phase2_contract_error_counts,
     phase2_contract_errors,
     phase2_standalone_contract_errors,
+    phase2_standalone_contract_report,
     render_solved_declaration,
     strip_blueprint_attr,
 )
@@ -111,6 +116,95 @@ theorem root : True := by
         self.assertEqual(errors, [])
         self.assertEqual(compiler.batch_concurrency, 8)
         self.assertEqual(compiler.request_count, 18)
+
+    def test_standalone_report_maps_ambient_identifier_to_target_node(self) -> None:
+        blueprint = _parse_blueprint('''import Mathlib
+variable (x : Nat)
+@[blueprint
+  (statement := /-- Preserve the ambient value. -/)
+  (proof := /-- Reflexive only for the contract fixture. -/)]
+theorem root : x = x := by sorry_using []
+''', "root")
+
+        class Compiler:
+            def check_many(self, requests, **_kwargs):
+                self.request_code = requests[0].lean_code
+                return [CompilerResult(False, errors=[
+                    '{"severity":"error","pos":{"line":5,"column":15},'
+                    '"data":"Unknown identifier `x`"}'
+                ])]
+
+        compiler = Compiler()
+        report = phase2_standalone_contract_report(blueprint, compiler)
+        self.assertNotIn("variable (x", compiler.request_code)
+        self.assertEqual(len(report.issues), 1)
+        issue = report.issues[0]
+        self.assertEqual(issue.code, "phase2StandaloneFailed")
+        self.assertEqual(issue.error_kind, "unknownIdentifier")
+        self.assertEqual(issue.identifiers, ("x",))
+        self.assertEqual(issue.node_name, "root")
+
+    def test_standalone_cache_reuses_unchanged_code_and_invalidates_edit(self) -> None:
+        blueprint = _parse_blueprint('''import Mathlib
+@[blueprint (title := "COT_STEP:S001")
+  (statement := /-- One equals one. -/)
+  (proof := /-- Deferred. -/)]
+theorem root : (1 : Nat) = 1 := by sorry_using []
+''', "root")
+
+        class Compiler:
+            request_count = 0
+
+            def check_many(self, requests, **_kwargs):
+                self.request_count += len(requests)
+                return [CompilerResult(True) for _ in requests]
+
+        compiler = Compiler()
+        cache = {}
+        first = phase2_standalone_contract_report(blueprint, compiler, cache=cache)
+        second = phase2_standalone_contract_report(blueprint, compiler, cache=cache)
+        self.assertEqual((first.cached_node_count, second.cached_node_count), (0, 1))
+        self.assertEqual(compiler.request_count, 1)
+
+        root = blueprint.node_by_name("root")
+        replacement = '''@[blueprint (title := "COT_STEP:S001")
+  (statement := /-- Two minus one equals one. -/)
+  (proof := /-- Deferred. -/)]
+theorem root : (2 : Nat) - 1 = 1 := by sorry_using []'''
+        edit, reason = _validate_node_edit(
+            blueprint, action="replace", node_name="root",
+            expected_hash=_node_hash(root), replacement=replacement,
+        )
+        self.assertEqual(reason, "")
+        revised = _apply_node_edits(blueprint, [edit])
+        third = phase2_standalone_contract_report(revised, compiler, cache=cache)
+        self.assertEqual(third.cached_node_count, 0)
+        self.assertEqual(compiler.request_count, 2)
+
+    def test_standalone_feedback_groups_repeated_root_cause_without_dropping_nodes(self) -> None:
+        declarations = []
+        for index in range(13):
+            kind = "theorem" if index == 12 else "lemma"
+            name = "root" if index == 12 else f"node_{index}"
+            declarations.append(f'''@[blueprint
+  (statement := /-- Node {index}. -/)
+  (proof := /-- Deferred. -/)]
+{kind} {name} : missingObject = missingObject := by sorry_using []''')
+        blueprint = _parse_blueprint("\n".join(declarations), "root")
+
+        class Compiler:
+            def check_many(self, requests, **_kwargs):
+                return [CompilerResult(False, errors=[
+                    '{"severity":"error","pos":{"line":5,"column":1},'
+                    '"data":"Unknown identifier `missingObject`"}'
+                ]) for _ in requests]
+
+        report = phase2_standalone_contract_report(blueprint, Compiler())
+        rendered = format_phase2_standalone_issues(report.issues)
+        self.assertEqual(len(report.issues), 13)
+        self.assertIn("node_0", rendered)
+        self.assertIn("root", rendered)
+        self.assertEqual(rendered.count("Representative diagnostic"), 1)
 
     def test_extract_lean_code_treats_none_content_as_empty(self) -> None:
         self.assertEqual(_extract_lean_code(None), "")

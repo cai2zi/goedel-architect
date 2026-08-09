@@ -6,6 +6,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -328,12 +329,18 @@ def _write_blueprint_snapshot(
     return path
 
 
-def _write_phase1_candidates(blueprint_dir: Path, candidates: list[str]) -> list[str]:
-    """Persist the immutable initial candidate and its single repair separately."""
+def _write_phase1_candidates(
+    blueprint_dir: Path,
+    candidates: list[str],
+    labels: list[str] | None = None,
+) -> list[str]:
+    """Persist labeled Phase-1A attempts and Phase-1B patch-round snapshots."""
     blueprint_dir.mkdir(parents=True, exist_ok=True)
     paths: list[str] = []
     for index, candidate in enumerate(candidates):
-        path = blueprint_dir / f"phase1_iter{index}.lean"
+        label = labels[index] if labels and index < len(labels) else f"phase1_iter{index}"
+        safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label)
+        path = blueprint_dir / f"{safe_label}.lean"
         path.write_text(candidate.rstrip() + "\n", encoding="utf-8")
         paths.append(str(path))
     return paths
@@ -494,6 +501,12 @@ def _result_row(
         "semantic_gate_results": semantic_gate_results,
         "semantic_warning_codes": semantic_warning_codes,
         "semantic_warning_count": len(semantic_warnings),
+        "phase1b_validation": dict(
+            blueprint.phase1b_validation if blueprint is not None else {}
+        ),
+        "phase1b_edit_history": list(
+            blueprint.phase1b_edit_history if blueprint is not None else []
+        ),
         **score,
     }
     if traceback_text:
@@ -595,7 +608,9 @@ async def _run_record(
                     phase1_mathlib_search_max_calls=args.phase1_mathlib_search_max_calls,
                 ),
             )
-            _write_phase1_candidates(blueprint_dir, blueprint.candidate_history)
+            _write_phase1_candidates(
+                blueprint_dir, blueprint.candidate_history, blueprint.candidate_labels,
+            )
             state = CheckpointState(
                 informal_statement=record.informal_statement,
                 informal_proof=record.informal_proof,
@@ -795,7 +810,9 @@ async def _run_record(
         if isinstance(exc, BlueprintGenerationError) and exc.last_candidate.strip():
             blueprint_dir.mkdir(parents=True, exist_ok=True)
             candidate_paths = _write_phase1_candidates(
-                blueprint_dir, exc.candidate_history or [exc.last_candidate]
+                blueprint_dir,
+                exc.candidate_history or [exc.last_candidate],
+                exc.candidate_labels,
             )
             candidate_path = blueprint_dir / "phase1_failed_last.lean"
             diagnostics_path = blueprint_dir / "phase1_failed_last.json"
@@ -805,12 +822,16 @@ async def _run_record(
                 "failure_stage": exc.failure_stage,
                 "finish_reason": exc.finish_reason,
                 "diagnostics": exc.diagnostics,
+                "validation": exc.validation_details,
+                "node_edit_rounds": exc.node_edit_rounds,
             })
             row.update({
                 "failed_blueprint_candidate_path": str(candidate_path),
                 "failed_blueprint_diagnostics_path": str(diagnostics_path),
                 "failed_blueprint_failure_stage": exc.failure_stage,
                 "phase1_candidate_paths": candidate_paths,
+                "phase1b_validation": exc.validation_details,
+                "phase1b_edit_history": exc.node_edit_rounds,
             })
         return row
     finally:

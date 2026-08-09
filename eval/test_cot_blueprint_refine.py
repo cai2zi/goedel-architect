@@ -23,7 +23,13 @@ sys.path.insert(0, str(REPO_ROOT / "experiments"))
 from blueprint import (  # noqa: E402
     Blueprint,
     BlueprintGenerationError,
+    _apply_node_edits,
+    _node_hash,
     _parse_blueprint,
+    _phase1a_contract_errors,
+    _run_phase1b_patch_session,
+    _strip_pending_helper,
+    _validate_node_edit,
     generate_blueprint_from_informal,
 )
 from kimina_lean_compiler import CompilerResult  # noqa: E402
@@ -421,6 +427,276 @@ theorem target : source_value = 7 := by sorry_using [source_value]
         self.assertNotIn("LAST_SUBMITTED_PROOF", context)
 
 
+class Phase1ABNodePatchTest(unittest.TestCase):
+    def skeleton(self):
+        code = '''import Mathlib
+import Architect
+def PendingBlueprintClaim (_nodeId : String) : Prop := True
+@[blueprint (title := "COT_STEP:S001")
+  (statement := /--
+Binds:
+- x : Nat
+Assumes:
+- x = 1
+Claims:
+- x = 1
+Use:
+- none
+  -/)
+  (proof := /-- Derive:
+- preserve the source equality
+  -/)]
+lemma setup (x : Nat) (h : x = 1) : PendingBlueprintClaim "setup" := by sorry_using []
+@[blueprint (title := "COT_STEP:S002") (statement := /-- root -/) (proof := /-- root -/)]
+theorem root : (1:Nat) = 1 := by sorry_using [setup]
+'''
+        return _parse_blueprint(code, "root")
+
+    def test_phase1a_contract_accepts_canonical_skeleton(self) -> None:
+        self.assertEqual(_phase1a_contract_errors(self.skeleton()), [])
+
+    def test_phase1a_contract_also_accepts_concrete_non_root_claim(self) -> None:
+        blueprint = self.skeleton()
+        node = blueprint.node_by_name("setup")
+        replacement = '''@[blueprint (title := "COT_STEP:S001")
+  (statement := /-- Binds: x. Assumes: x = 1. Claims: x = 1. Use: none. -/)
+  (proof := /-- Derive: use the source equality. -/)]
+lemma setup (x : Nat) (h : x = 1) : x = 1 := by sorry_using []'''
+        edit, reason = _validate_node_edit(
+            blueprint, action="replace", node_name=node.name,
+            expected_hash=_node_hash(node), replacement=replacement,
+        )
+        self.assertEqual(reason, "")
+        concrete = _apply_node_edits(blueprint, [edit])
+        self.assertEqual(_phase1a_contract_errors(concrete), [])
+
+    def test_phase1a_contract_accepts_free_form_metadata_without_headings(self) -> None:
+        blueprint = self.skeleton()
+        node = blueprint.node_by_name("setup")
+        replacement = '''@[blueprint (title := "COT_STEP:S001")
+  (statement := /-- For a natural number equal to one, preserve that equality. -/)
+  (proof := /-- The supplied equality is exactly the intended conclusion. -/)]
+lemma setup (x : Nat) (h : x = 1) : PendingBlueprintClaim "setup" := by sorry_using []'''
+        edit, reason = _validate_node_edit(
+            blueprint, action="replace", node_name=node.name,
+            expected_hash=_node_hash(node), replacement=replacement,
+        )
+        self.assertEqual(reason, "")
+        revised = _apply_node_edits(blueprint, [edit])
+        self.assertEqual(_phase1a_contract_errors(revised), [])
+
+    def test_phase1a_contract_requires_statement_and_proof_metadata(self) -> None:
+        code = '''import Mathlib
+import Architect
+def PendingBlueprintClaim (_nodeId : String) : Prop := True
+@[blueprint (title := "COT_STEP:S001")]
+def source_object : Nat := 1
+@[blueprint (title := "COT_STEP:S001")]
+lemma setup : PendingBlueprintClaim "setup" := by sorry_using [source_object]
+@[blueprint (title := "COT_STEP:S002") (statement := /-- root -/) (proof := /-- root -/)]
+theorem root : (1 : Nat) = 1 := by sorry_using [setup]
+'''
+        errors = _phase1a_contract_errors(_parse_blueprint(code, "root"))
+        self.assertTrue(any(error.startswith("missing_statement_metadata: node `source_object`")
+                            for error in errors))
+        self.assertTrue(any(error.startswith("missing_statement_metadata: node `setup`")
+                            for error in errors))
+        self.assertTrue(any(error.startswith("missing_proof_metadata: proof node `setup`")
+                            for error in errors))
+
+    def test_node_edit_changes_binders_conclusion_and_dependencies(self) -> None:
+        blueprint = self.skeleton()
+        node = blueprint.node_by_name("setup")
+        replacement = '''@[blueprint (title := "COT_STEP:S001")
+  (statement := /-- Binds: x; Assumes: x = 1; Claims: x = 1; Use: none -/)
+  (proof := /-- Derive: use the source equality -/)]
+lemma setup (x : Nat) (h : x = 1) : x = 1 := by sorry_using []'''
+        accepted, reason = _validate_node_edit(
+            blueprint, action="replace", node_name="setup", expected_hash=_node_hash(node),
+            replacement=replacement,
+        )
+        self.assertEqual(reason, "")
+        revised = _apply_node_edits(blueprint, [accepted])
+        self.assertIn(": x = 1 := by sorry_using []", revised.node_by_name("setup").lean_declaration)
+        self.assertEqual(revised.node_by_name("root").lean_declaration,
+                         blueprint.node_by_name("root").lean_declaration)
+
+    def test_node_edit_supports_dag_changes_and_rejects_invalid_edits(self) -> None:
+        blueprint = self.skeleton()
+        node = blueprint.node_by_name("setup")
+        changed_dependency = '''@[blueprint (title := "COT_STEP:S001")
+  (statement := /-- Binds: x; Assumes: h; Claims: x = 1; Use: root -/)
+  (proof := /-- Derive: h -/)]
+lemma setup (x : Nat) : x = 1 := by sorry_using [root]'''
+        edit, reason = _validate_node_edit(
+            blueprint, action="replace", node_name="setup", expected_hash=_node_hash(node),
+            replacement=changed_dependency,
+        )
+        self.assertEqual(reason, "")
+        with self.assertRaisesRegex(ValueError, "dependency cycle"):
+            _apply_node_edits(blueprint, [edit])
+        _replacement, reason = _validate_node_edit(
+            blueprint, action="replace", node_name="setup", expected_hash="stale",
+            replacement=changed_dependency,
+        )
+        self.assertEqual(reason, "staleNodeHash")
+        _replacement, reason = _validate_node_edit(
+            blueprint, action="replace", node_name="setup", expected_hash=_node_hash(node),
+            replacement=node.lean_declaration,
+        )
+        self.assertEqual(reason, "identicalReplacement")
+        tactic_before_placeholder = '''@[blueprint (title := "COT_STEP:S001")
+  (statement := /-- State the source equality. -/)
+  (proof := /-- Preserve the proof gap. -/)]
+lemma setup (x : Nat) (h : x = 1) : x = 1 := by
+  exact h
+  sorry_using []'''
+        _replacement, reason = _validate_node_edit(
+            blueprint, action="replace", node_name="setup", expected_hash=_node_hash(node),
+            replacement=tactic_before_placeholder,
+        )
+        self.assertEqual(reason, "proofBodyMustBeSorryUsingOnly")
+
+    def test_node_edits_add_delete_change_kind_and_protect_root(self) -> None:
+        blueprint = self.skeleton()
+        added = '''@[blueprint (title := "COT_STEP:S001")
+  (statement := /-- A shared source object. -/)]
+def shared_value : Nat := 1'''
+        add_edit, reason = _validate_node_edit(
+            blueprint, action="add", node_name="shared_value",
+            expected_hash="", replacement=added,
+        )
+        self.assertEqual(reason, "")
+        revised = _apply_node_edits(blueprint, [add_edit])
+        self.assertIsNotNone(revised.node_by_name("shared_value"))
+
+        setup = revised.node_by_name("setup")
+        changed_kind = '''@[blueprint (title := "COT_STEP:S001")
+  (statement := /-- Represent the source object directly. -/)]
+def setup : Nat := shared_value'''
+        replace_edit, reason = _validate_node_edit(
+            revised, action="replace", node_name="setup",
+            expected_hash=_node_hash(setup), replacement=changed_kind,
+        )
+        self.assertEqual(reason, "")
+        revised = _apply_node_edits(revised, [replace_edit])
+        self.assertEqual(revised.node_by_name("setup").kind, "definition")
+
+        root = revised.node_by_name("root")
+        _edit, reason = _validate_node_edit(
+            revised, action="delete", node_name="root",
+            expected_hash=_node_hash(root), replacement="",
+        )
+        self.assertEqual(reason, "rootMutationNotAllowed")
+
+    def test_pending_helper_is_removed_without_changing_nodes(self) -> None:
+        blueprint = self.skeleton()
+        final_code = _strip_pending_helper(blueprint.lean_file)
+        self.assertNotIn("def PendingBlueprintClaim", final_code)
+        self.assertEqual(
+            [node.name for node in _parse_blueprint(final_code, "root").nodes],
+            ["setup", "root"],
+        )
+
+    @staticmethod
+    def patch_response(tool_calls):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="", tool_calls=tool_calls),
+                finish_reason="tool_calls",
+            )],
+            usage=None,
+        )
+
+    def test_phase1b_applies_parallel_node_tools_and_compiles_once_per_round(self) -> None:
+        blueprint = self.skeleton()
+        node = blueprint.node_by_name("setup")
+        replacement = '''@[blueprint (title := "COT_STEP:S001")
+  (statement := /-- Binds: x; Assumes: x = 1; Claims: x = 1; Use: none -/)
+  (proof := /-- Derive: use h -/)]
+lemma setup (x : Nat) (h : x = 1) : x = 1 := by sorry_using []'''
+        call = SimpleNamespace(
+            id="patch-1", type="function",
+            function=SimpleNamespace(
+                name="editBlueprintNode",
+                arguments=json.dumps({
+                    "action": "replace",
+                    "node_name": "setup",
+                    "expected_node_hash": _node_hash(node),
+                    "replacement": replacement,
+                    "reason": "complete the pending claim",
+                }),
+            ),
+        )
+
+        class Compiler:
+            def __init__(self):
+                self.calls = 0
+
+            def check_blueprint(self, *_args):
+                self.calls += 1
+                return CompilerResult(True)
+
+            def check_many(self, requests, **_kwargs):
+                return [CompilerResult(True) for _ in requests]
+
+        compiler = Compiler()
+        history, labels = [], []
+        events = []
+        tracer = SimpleNamespace(emit=events.append)
+        with patch(
+            "blueprint.chat_completion_with_retry",
+            return_value=self.patch_response([call]),
+        ):
+            final = _run_phase1b_patch_session(
+                object(), "model", blueprint,
+                compiler=compiler, informal_statement="p", prompt_proof="cot",
+                claimed_answer="1", semantic_manifest=None,
+                semantic_fidelity_enabled=False, semantic_require_step_ids=False,
+                semantic_static_gate=False, max_rounds=2,
+                max_tool_calls_per_turn=8, phase2_contract_check_concurrency=2,
+                tracer=tracer, thm_name="sample",
+                candidate_history=history, candidate_labels=labels,
+            )
+        self.assertNotIn("PendingBlueprintClaim", final.lean_file)
+        self.assertEqual(compiler.calls, 3)  # initial, one merged round, final cleanup
+        self.assertEqual(labels, ["phase1b_round_1", "phase1b_final"])
+        self.assertEqual(final.phase1b_edit_history[0]["accepted"], [
+            {"action": "replace", "nodeName": "setup"},
+        ])
+        validation_rounds = [
+            event.turn for event in events
+            if event.kind == "phase1BValidationResult"
+        ]
+        self.assertEqual(validation_rounds, [0, 1, 3])
+        tool_kinds = [event.kind for event in events if event.call_id == "patch-1"]
+        self.assertEqual(tool_kinds, ["tool_call", "tool_result"])
+
+    def test_phase1b_uses_all_rounds_when_model_makes_no_edit(self) -> None:
+        compiler = SimpleNamespace(
+            check_blueprint=lambda *_args: CompilerResult(True),
+            check_many=lambda requests, **_kwargs: [CompilerResult(True) for _ in requests],
+        )
+        with patch(
+            "blueprint.chat_completion_with_retry",
+            return_value=self.patch_response([]),
+        ):
+            with self.assertRaises(BlueprintGenerationError) as caught:
+                _run_phase1b_patch_session(
+                    object(), "model", self.skeleton(),
+                    compiler=compiler, informal_statement="p", prompt_proof="cot",
+                    claimed_answer="1", semantic_manifest=None,
+                    semantic_fidelity_enabled=False, semantic_require_step_ids=False,
+                    semantic_static_gate=False, max_rounds=2,
+                    max_tool_calls_per_turn=8, phase2_contract_check_concurrency=2,
+                    tracer=None, thm_name="sample",
+                    candidate_history=[], candidate_labels=[],
+                )
+        self.assertEqual(caught.exception.failure_stage, "phase1BFailed")
+        self.assertFalse(caught.exception.validation_details["passed"])
+        self.assertEqual(len(caught.exception.node_edit_rounds), 2)
+
+
 class InvalidBlueprintRecoveryTest(unittest.TestCase):
     def test_saved_artifact_is_preferred_then_trace_is_used(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -459,7 +735,7 @@ class InvalidBlueprintRecoveryTest(unittest.TestCase):
                     compiler=SimpleNamespace(), max_retries=1,
                 )
         self.assertIn("wrong_name", caught.exception.last_candidate)
-        self.assertEqual(caught.exception.failure_stage, "blueprint_contract")
+        self.assertEqual(caught.exception.failure_stage, "phase1AValidation")
 
     def test_whole_cot_mode_hides_step_grounding_from_generation_prompt(self) -> None:
         source_cot = "First derive x = 2. Therefore the answer is 2."
@@ -1588,10 +1864,18 @@ class AblationConfigurationTest(unittest.TestCase):
         repair = load_config(
             "qwen3_8b_397b_wrong76_step_v2_phase1_tools_repair4", []
         )
+        phase1ab = load_config(
+            "qwen3_8b_397b_wrong76_step_v3_phase1_ab", []
+        )
         self.assertEqual(list(whole.include_ids), [])
         self.assertEqual(list(repair.include_ids), [])
+        self.assertEqual(list(phase1ab.include_ids), [])
         self.assertEqual(whole.blueprint.phase1_concurrency, 76)
         self.assertEqual(repair.blueprint.phase1_concurrency, 76)
+        self.assertEqual(phase1ab.blueprint.phase1_concurrency, 76)
+        self.assertEqual(phase1ab.blueprint.blueprint_max_retries, 2)
+        self.assertEqual(phase1ab.blueprint.phase1_max_tool_turns, 8)
+        self.assertEqual(phase1ab.blueprint.phase1_max_tool_calls_per_turn, 8)
         self.assertEqual(whole.blueprint.semantic_source_mode, "whole_cot")
         self.assertEqual(repair.blueprint.semantic_source_mode, "step_grounded")
         self.assertEqual(whole.blueprint.blueprint_max_retries, 2)

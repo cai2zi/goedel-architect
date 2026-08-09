@@ -7,7 +7,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "experiments"), str(ROOT / "src")]
 
-from blueprint import _parse_blueprint, _render_step_grounded_proof  # noqa: E402
+from blueprint import (  # noqa: E402
+    _parse_blueprint,
+    _phase1a_blocking_semantic_issues,
+    _render_step_grounded_proof,
+)
 from cot_blueprint_refine.formal_steps import (  # noqa: E402
     encode_formal_step_manifest,
     make_formal_step_manifest,
@@ -71,6 +75,20 @@ theorem root : (1 + 0:Nat) = 1 := by sorry_using [support]
         self.assertIn("stepNotRootReachable", codes)
         self.assertTrue(all(issue.severity == "warning" for issue in issues))
 
+    def test_missing_step_is_deferred_in_phase1a_but_remains_an_error(self) -> None:
+        code = '''import Mathlib
+import Architect
+@[blueprint (title := "COT_STEP:S002") (statement := /-- result -/)]
+theorem root : (1 : Nat) = 1 := by sorry_using []
+'''
+        issues = validate_blueprint_fidelity(
+            _parse_blueprint(code, "root"), manifest(), claimed_answer="1",
+            require_step_bindings=True,
+        )
+        missing = next(issue for issue in issues if issue.code == "stepMappingAbsent")
+        self.assertEqual(missing.severity, "error")
+        self.assertNotIn(missing, _phase1a_blocking_semantic_issues(issues))
+
     def test_prop_true_is_rejected(self) -> None:
         code = '''import Mathlib
 import Architect
@@ -91,6 +109,44 @@ theorem root : (1:Nat) = 1 := by sorry_using [fake]
         self.assertEqual((issue.source_start, issue.source_end), (0, 14))
         self.assertEqual(issue.category, "semanticDegeneration")
 
+    def test_phase1a_pending_claim_is_allowed_but_phase1b_rejects_it(self) -> None:
+        code = '''import Mathlib
+import Architect
+def PendingBlueprintClaim (_nodeId : String) : Prop := True
+@[blueprint (title := "COT_STEP:S001") (statement := /-- pending -/)]
+lemma setup : PendingBlueprintClaim "setup" := by sorry_using []
+@[blueprint (title := "COT_STEP:S002") (statement := /-- result -/)]
+theorem root : (1:Nat) = 1 := by sorry_using [setup]
+'''
+        blueprint = _parse_blueprint(code, "root")
+        phase1a_codes = {issue.code for issue in validate_blueprint_fidelity(
+            blueprint, manifest(), claimed_answer="1", require_step_bindings=True,
+            allow_pending_claims=True,
+        )}
+        phase1b_issues = validate_blueprint_fidelity(
+            blueprint, manifest(), claimed_answer="1", require_step_bindings=True,
+            allow_pending_claims=False,
+        )
+        self.assertNotIn("unresolvedPendingClaim", phase1a_codes)
+        pending = next(issue for issue in phase1b_issues if issue.code == "unresolvedPendingClaim")
+        self.assertEqual((pending.step_id, pending.node_name), ("S001", "setup"))
+
+    def test_pending_claim_must_match_node_and_cannot_be_root_or_definition(self) -> None:
+        code = '''import Mathlib
+import Architect
+def PendingBlueprintClaim (_nodeId : String) : Prop := True
+@[blueprint (title := "COT_STEP:S001") (statement := /-- wrong id -/)]
+lemma setup : PendingBlueprintClaim "other" := by sorry_using []
+@[blueprint (title := "COT_STEP:S002") (statement := /-- pending root -/)]
+theorem root : PendingBlueprintClaim "root" := by sorry_using [setup]
+'''
+        issues = validate_blueprint_fidelity(
+            _parse_blueprint(code, "root"), manifest(), claimed_answer="1",
+            require_step_bindings=True, allow_pending_claims=True,
+        )
+        malformed = [issue for issue in issues if issue.code == "malformedPendingClaim"]
+        self.assertEqual({issue.node_name for issue in malformed}, {"setup", "root"})
+
     def test_duplicate_root_conclusion_is_rejected(self) -> None:
         code = '''import Mathlib
 import Architect
@@ -106,19 +162,20 @@ theorem root : (1:Nat) = 1 := by sorry_using [early]
         issue = next(item for item in issues if item.code == "duplicateRootConclusion")
         self.assertEqual(issue.category, "answerGrounding")
 
-    def test_claimed_answer_definition_is_rejected(self) -> None:
+    def test_source_definition_matching_claimed_answer_is_not_rejected(self) -> None:
         code = '''import Mathlib
 import Architect
-@[blueprint (title := "COT_STEP:S001") (statement := /-- hard coded -/)]
-def answer : Nat := 1
+@[blueprint (title := "COT_STEP:S001") (statement := /-- The circle has one arc. -/)]
+def num_arcs : Nat := 1
 @[blueprint (title := "COT_STEP:S002") (statement := /-- result -/)]
-theorem root : answer = 1 := by sorry_using [answer]
+theorem root : num_arcs = 1 := by sorry_using [num_arcs]
 '''
         codes = {issue.code for issue in validate_blueprint_fidelity(
             _parse_blueprint(code, "root"), manifest(), claimed_answer="1",
             require_step_bindings=True,
         )}
-        self.assertIn("claimedAnswerInDefinition", codes)
+        self.assertNotIn("claimedAnswerInDefinition", codes)
+        self.assertNotIn("claimedAnswerInPropDefinition", codes)
 
     def test_semantic_audit_requires_complete_step_inventory(self) -> None:
         parsed = parse_semantic_audit(
