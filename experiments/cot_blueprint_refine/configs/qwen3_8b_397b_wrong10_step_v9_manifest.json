@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "selection": "same 7 coupled failures + 3 controls as v7",
+  "selection": "same 7 coupled failures + 3 controls as v7/v8",
   "seed_provenance": "v5 candidates preserved as phase1b_seed.lean by the v6 seed experiment",
   "include_ids": [
     "MATH-500/test/precalculus/1056.json",

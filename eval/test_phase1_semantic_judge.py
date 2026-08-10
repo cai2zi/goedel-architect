@@ -13,12 +13,10 @@ sys.path[:0] = [str(ROOT / "experiments"), str(ROOT / "src")]
 from blueprint import (  # noqa: E402
     _parse_blueprint,
     _phase1a_contract_errors,
-    _phase1b_search_or_edit_response,
     _phase2_preflight_file,
-    _update_semantic_obligations,
 )
+from phase1b import _update_obligations  # noqa: E402
 from cot_blueprint_refine.formal_steps import make_formal_step_manifest  # noqa: E402
-from mathlib_retrieval import LemmaResult  # noqa: E402
 from semantic_audit import (  # noqa: E402
     FormalDecompilerResult,
     SemanticAuditFormatError,
@@ -191,9 +189,9 @@ class SemanticAuditV2Test(unittest.TestCase):
         )
         first = StrictComparatorResult(*parsed[:-1], parsed[-1], "", "", "stop", "r", 0, 0, 0)
         ledger = {}
-        open_items = _update_semantic_obligations(
+        open_items = _update_obligations(
             ledger, view=view, decompiler=decompiler, comparator=first,
-            semantic_manifest=manifest, round_index=1, tracer=None, thm_name="x",
+            semantic_manifest=manifest, round_index=1,
         )
         self.assertEqual(len(open_items), 1)
         oid = open_items[0]["obligation_id"]
@@ -205,12 +203,12 @@ class SemanticAuditV2Test(unittest.TestCase):
             json.dumps(changed), manifest=manifest, view=view, decompiler=decompiler,
             open_obligations=open_items,
         )
-        still_open = _update_semantic_obligations(
+        still_open = _update_obligations(
             ledger, view=view, decompiler=decompiler,
             comparator=StrictComparatorResult(
                 *parsed_changed[:-1], parsed_changed[-1], "", "", "stop", "r", 0, 0, 0,
             ),
-            semantic_manifest=manifest, round_index=2, tracer=None, thm_name="x",
+            semantic_manifest=manifest, round_index=2,
         )
         self.assertEqual([item["obligation_id"] for item in still_open], [oid])
         parsed = parse_strict_comparator(
@@ -220,9 +218,9 @@ class SemanticAuditV2Test(unittest.TestCase):
             open_obligations=open_items,
         )
         second = StrictComparatorResult(*parsed[:-1], parsed[-1], "", "", "stop", "r", 0, 0, 0)
-        self.assertEqual(_update_semantic_obligations(
+        self.assertEqual(_update_obligations(
             ledger, view=view, decompiler=decompiler, comparator=second,
-            semantic_manifest=manifest, round_index=3, tracer=None, thm_name="x",
+            semantic_manifest=manifest, round_index=3,
         ), ())
 
     def test_comparator_prompt_says_wrong_cot_is_not_a_truth_failure(self) -> None:
@@ -302,78 +300,6 @@ theorem root : (1 : Nat) = 1 := by sorry_using [setup]
         preflight = _phase2_preflight_file(blueprint, blueprint.node_by_name("root"))
         self.assertIn("def PendingBlueprintClaim", preflight)
         self.assertLess(preflight.index("def PendingBlueprintClaim"), preflight.index("lemma setup"))
-
-
-class SearchThenEditTest(unittest.TestCase):
-    @staticmethod
-    def _call(name: str, arguments: dict, call_id: str):
-        function = SimpleNamespace(name=name, arguments=json.dumps(arguments))
-        return SimpleNamespace(
-            id=call_id,
-            function=function,
-            model_dump=lambda: {
-                "id": call_id, "type": "function",
-                "function": {"name": name, "arguments": function.arguments},
-            },
-        )
-
-    @staticmethod
-    def _model_response(calls):
-        return SimpleNamespace(choices=[SimpleNamespace(
-            message=SimpleNamespace(content="", tool_calls=calls),
-        )])
-
-    def test_search_then_edit_uses_same_round_and_defers_mixed_edit(self) -> None:
-        search = self._call("mathlib_search", {
-            "query": "natural addition identity", "target_node_names": ["setup"], "k": 5,
-        }, "search-1")
-        mixed_edit = self._call("editBlueprintSubgraph", {
-            "edits": [{"action": "replace", "node_name": "setup",
-                       "expected_node_hash": "h", "replacement": "x"}],
-        }, "edit-deferred")
-        final_edit = self._call("editBlueprintSubgraph", {
-            "edits": [{"action": "replace", "node_name": "setup",
-                       "expected_node_hash": "h", "replacement": "x"}],
-        }, "edit-2")
-        responses = [self._model_response([search, mixed_edit]), self._model_response([final_edit])]
-        retrieval = SimpleNamespace(search=lambda *_args: [
-            LemmaResult("Nat.add_zero", "n + 0 = n", None),
-        ])
-        events = []
-        with patch("blueprint._call_phase1b_model", side_effect=responses) as model_call:
-            response = _phase1b_search_or_edit_response(
-                object(), "model", [{"role": "user", "content": "repair"}],
-                retrieval=retrieval, search_cache={}, search_limit=3, edit_limit=32,
-                round_index=9, max_rounds=16, tracer=SimpleNamespace(emit=events.append),
-                thm_name="sample",
-            )
-        self.assertIs(response, responses[1])
-        self.assertEqual(model_call.call_count, 2)
-        self.assertIn("Mode: EDIT ONLY", model_call.call_args.args[2][-1]["content"])
-        deferred = [event for event in events if event.kind == "tool_result"
-                    and event.call_id == "edit-deferred"]
-        self.assertEqual(deferred[0].result, "editDeferredUntilAfterSearch")
-
-    def test_search_limit_and_query_cache_are_enforced(self) -> None:
-        calls = [self._call("mathlib_search", {
-            "query": "same query", "target_node_names": ["setup"], "k": 5,
-        }, f"search-{index}") for index in range(4)]
-        counter = {"calls": 0}
-
-        def search(*_args):
-            counter["calls"] += 1
-            return [LemmaResult("Nat.add_zero", "n + 0 = n", "")]
-
-        with patch("blueprint._call_phase1b_model", side_effect=[
-            self._model_response(calls), self._model_response([]),
-        ]):
-            _phase1b_search_or_edit_response(
-                object(), "model", [{"role": "user", "content": "repair"}],
-                retrieval=SimpleNamespace(search=search), search_cache={}, search_limit=3,
-                edit_limit=32, round_index=1, max_rounds=16, tracer=None,
-                thm_name="sample",
-            )
-        self.assertEqual(counter["calls"], 1)
 
 
 if __name__ == "__main__":

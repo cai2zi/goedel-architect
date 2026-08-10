@@ -183,9 +183,6 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
     args.phase1_max_tool_turns = int(args.phase1_max_tool_turns)
     args.phase1_max_tool_calls_per_turn = int(args.phase1_max_tool_calls_per_turn)
     args.phase1_mathlib_search_max_calls = int(args.phase1_mathlib_search_max_calls)
-    args.phase1b_mathlib_search_max_calls_per_round = int(
-        args.phase1b_mathlib_search_max_calls_per_round
-    )
     args.phase1b_formal_decompiler_max_tokens = int(
         args.phase1b_formal_decompiler_max_tokens
     )
@@ -195,12 +192,20 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
     args.phase1b_semantic_format_max_attempts = int(
         args.phase1b_semantic_format_max_attempts
     )
-    args.phase1b_planning_enabled = bool(args.phase1b_planning_enabled)
+    args.phase1b_repair_strategy = str(args.phase1b_repair_strategy)
+    args.phase1b_editor_attempts_per_turn = int(
+        args.phase1b_editor_attempts_per_turn
+    )
     args.phase1b_plan_max_tokens = int(args.phase1b_plan_max_tokens)
-    args.phase1b_plan_format_max_attempts = int(args.phase1b_plan_format_max_attempts)
+    args.phase1b_plan_format_attempts = int(args.phase1b_plan_format_attempts)
     args.phase1b_plan_max_chars = int(args.phase1b_plan_max_chars)
+    args.phase1b_progress_controller_max_tokens = int(
+        args.phase1b_progress_controller_max_tokens
+    )
+    args.phase1b_progress_controller_format_attempts = int(
+        args.phase1b_progress_controller_format_attempts
+    )
     args.phase1b_subgraph_max_edits = int(args.phase1b_subgraph_max_edits)
-    args.phase1b_deterministic_rollback = bool(args.phase1b_deterministic_rollback)
     seed_root = getattr(args, "phase1b_seed_blueprint_root", None)
     args.phase1b_seed_blueprint_root = (
         _resolve_path(seed_root, original_cwd) if seed_root else None
@@ -240,8 +245,6 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("node_max_negation_probe_turns must be non-negative")
     if args.critical_negation_max_turns < 0:
         raise ValueError("critical_negation_max_turns must be non-negative")
-    if args.phase1b_mathlib_search_max_calls_per_round < 0:
-        raise ValueError("phase1b_mathlib_search_max_calls_per_round must be non-negative")
     if args.phase1b_formal_decompiler_max_tokens <= 0:
         raise ValueError("phase1b_formal_decompiler_max_tokens must be positive")
     if args.phase1b_strict_comparator_max_tokens <= 0:
@@ -250,12 +253,26 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("phase1b_semantic_format_max_attempts must be positive")
     if args.phase1b_plan_max_tokens <= 0:
         raise ValueError("phase1b_plan_max_tokens must be positive")
-    if args.phase1b_plan_format_max_attempts <= 0:
-        raise ValueError("phase1b_plan_format_max_attempts must be positive")
+    if args.phase1b_repair_strategy not in {
+        "progressController", "planDirect", "directEdit",
+    }:
+        raise ValueError(
+            "phase1b_repair_strategy must be progressController, planDirect, or directEdit"
+        )
+    if args.phase1b_editor_attempts_per_turn <= 0:
+        raise ValueError("phase1b_editor_attempts_per_turn must be positive")
+    if args.phase1b_plan_format_attempts <= 0:
+        raise ValueError("phase1b_plan_format_attempts must be positive")
     if args.phase1b_plan_max_chars <= 0:
         raise ValueError("phase1b_plan_max_chars must be positive")
     if args.phase1b_subgraph_max_edits <= 0:
         raise ValueError("phase1b_subgraph_max_edits must be positive")
+    if args.phase1b_progress_controller_max_tokens <= 0:
+        raise ValueError("phase1b_progress_controller_max_tokens must be positive")
+    if args.phase1b_progress_controller_format_attempts <= 0:
+        raise ValueError(
+            "phase1b_progress_controller_format_attempts must be positive"
+        )
     if args.phase1b_seed_required and args.phase1b_seed_blueprint_root is None:
         raise ValueError(
             "phase1b_seed_required=true requires phase1b_seed_blueprint_root"
@@ -620,17 +637,20 @@ def _result_row(
         "phase1b_semantic_format_max_attempts": (
             args.phase1b_semantic_format_max_attempts
         ),
-        "phase1b_planning_enabled": bool(args.phase1b_planning_enabled),
+        "phase1b_repair_strategy": args.phase1b_repair_strategy,
+        "phase1b_editor_attempts_per_turn": args.phase1b_editor_attempts_per_turn,
         "phase1b_plan_max_tokens": args.phase1b_plan_max_tokens,
-        "phase1b_plan_format_max_attempts": args.phase1b_plan_format_max_attempts,
+        "phase1b_plan_format_attempts": args.phase1b_plan_format_attempts,
         "phase1b_plan_max_chars": args.phase1b_plan_max_chars,
+        "phase1b_progress_controller_max_tokens": (
+            args.phase1b_progress_controller_max_tokens
+        ),
+        "phase1b_progress_controller_format_attempts": (
+            args.phase1b_progress_controller_format_attempts
+        ),
         "phase1b_subgraph_max_edits": args.phase1b_subgraph_max_edits,
-        "phase1b_deterministic_rollback": bool(args.phase1b_deterministic_rollback),
         "phase1b_seed_blueprint_root": str(args.phase1b_seed_blueprint_root or ""),
         "phase1b_seed_required": bool(args.phase1b_seed_required),
-        "phase1b_mathlib_search_max_calls_per_round": (
-            args.phase1b_mathlib_search_max_calls_per_round
-        ),
         "semantic_source_mode": str(args.semantic_source_mode),
         "semantic_status": state.semantic_status if state else "",
         "semantic_gate_results": semantic_gate_results,
@@ -661,7 +681,9 @@ def _accepted_phase1_status(blueprint: Blueprint) -> str:
 def _failed_phase1_status(exc: Exception) -> str:
     if not isinstance(exc, BlueprintGenerationError):
         return "infraError"
-    if exc.failure_stage == "phase1BSemanticAuditFormat":
+    if exc.failure_stage in {
+        "phase1BSemanticAuditFormat", "phase1BProgressControllerFormat",
+    }:
         return "infraError"
     audit = exc.validation_details.get("semanticAudit")
     if isinstance(audit, dict):
@@ -766,9 +788,6 @@ async def _run_record(
                     phase1_max_tool_turns=args.phase1_max_tool_turns,
                     phase1_max_tool_calls_per_turn=args.phase1_max_tool_calls_per_turn,
                     phase1_mathlib_search_max_calls=args.phase1_mathlib_search_max_calls,
-                    phase1b_mathlib_search_max_calls_per_round=(
-                        args.phase1b_mathlib_search_max_calls_per_round
-                    ),
                     phase1b_semantic_audit_enabled=(
                         args.phase1b_semantic_audit_enabled
                     ),
@@ -781,16 +800,22 @@ async def _run_record(
                     phase1b_semantic_format_max_attempts=(
                         args.phase1b_semantic_format_max_attempts
                     ),
-                    phase1b_planning_enabled=args.phase1b_planning_enabled,
+                    phase1b_repair_strategy=args.phase1b_repair_strategy,
+                    phase1b_editor_attempts_per_turn=(
+                        args.phase1b_editor_attempts_per_turn
+                    ),
                     phase1b_plan_max_tokens=args.phase1b_plan_max_tokens,
-                    phase1b_plan_format_max_attempts=(
-                        args.phase1b_plan_format_max_attempts
+                    phase1b_plan_format_attempts=(
+                        args.phase1b_plan_format_attempts
                     ),
                     phase1b_plan_max_chars=args.phase1b_plan_max_chars,
-                    phase1b_subgraph_max_edits=args.phase1b_subgraph_max_edits,
-                    phase1b_deterministic_rollback=(
-                        args.phase1b_deterministic_rollback
+                    phase1b_progress_controller_max_tokens=(
+                        args.phase1b_progress_controller_max_tokens
                     ),
+                    phase1b_progress_controller_format_attempts=(
+                        args.phase1b_progress_controller_format_attempts
+                    ),
+                    phase1b_subgraph_max_edits=args.phase1b_subgraph_max_edits,
                     phase1b_seed_lean_code=phase1b_seed_lean_code,
                 ),
             )

@@ -1,6 +1,6 @@
 input_predictions: /ssd/czx/czx_work/cot_blueprint_refine/subsets/qwen3_8b_original_answer_incorrect/predictions.jsonl
 output_base: /ssd/czx/czx_work/cot_blueprint_refine
-exp_name: qwen3_8b_397b_wrong10_step_v8_phase1b_repair_spec
+exp_name: qwen3_8b_397b_wrong10_step_v9_progress_controller
 resume: false
 python_bin: /ssd/miniconda3/envs/lean4-czx/bin/python
 include_ids: []
@@ -24,23 +24,23 @@ blueprint:
   phase1_max_tool_turns: 8
   phase1_max_tool_calls_per_turn: 32
   phase1_mathlib_search_max_calls: 16
-  phase1b_mathlib_search_max_calls_per_round: 3
   phase1b_semantic_audit_enabled: true
   phase1b_formal_decompiler_max_tokens: 4096
   phase1b_strict_comparator_max_tokens: 4096
   phase1b_semantic_format_max_attempts: 2
-  phase1b_planning_enabled: true
-  # v8: this Planner emits the fixed-text executable RepairSpec.
-  phase1b_plan_max_tokens: 1024
-  phase1b_plan_format_max_attempts: 2
-  phase1b_plan_max_chars: 800
+  phase1b_repair_strategy: progressController
+  phase1b_editor_attempts_per_turn: 3
+  phase1b_plan_max_tokens: 768
+  phase1b_plan_format_attempts: 2
+  phase1b_plan_max_chars: 600
+  phase1b_progress_controller_max_tokens: 2048
+  phase1b_progress_controller_format_attempts: 2
   phase1b_subgraph_max_edits: 8
-  phase1b_deterministic_rollback: true
   phase1b_seed_blueprint_root: /ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong22_step_v6_phase1b_repair/robustpa/blueprint/blueprints
   phase1b_seed_filename: phase1b_seed.lean
   phase1b_seed_required: true
   phase1b_seed_prepared_data_root: /ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong76_step_v5_phase1_ab_semantic_judge/prepared/data
-  phase1b_seed_include_ids_path: /ssd/czx/goedel-architect/experiments/cot_blueprint_refine/configs/qwen3_8b_397b_wrong10_step_v8_phase1b_repair_spec_manifest.json
+  phase1b_seed_include_ids_path: /ssd/czx/goedel-architect/experiments/cot_blueprint_refine/configs/qwen3_8b_397b_wrong10_step_v9_manifest.json
   max_refinement_iterations: 0
   node_max_prove_turns: 1
   node_max_negation_probe_turns: 0

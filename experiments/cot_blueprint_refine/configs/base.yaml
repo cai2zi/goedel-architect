@@ -89,17 +89,18 @@ blueprint:
   phase1_max_tool_turns: 3
   phase1_max_tool_calls_per_turn: 3
   phase1_mathlib_search_max_calls: 3
-  phase1b_mathlib_search_max_calls_per_round: 3
   phase1b_semantic_audit_enabled: false
   phase1b_formal_decompiler_max_tokens: 4096
   phase1b_strict_comparator_max_tokens: 4096
   phase1b_semantic_format_max_attempts: 2
-  phase1b_planning_enabled: false
-  phase1b_plan_max_tokens: 1024
-  phase1b_plan_format_max_attempts: 2
-  phase1b_plan_max_chars: 800
+  phase1b_repair_strategy: directEdit
+  phase1b_editor_attempts_per_turn: 3
+  phase1b_plan_max_tokens: 768
+  phase1b_plan_format_attempts: 2
+  phase1b_plan_max_chars: 600
+  phase1b_progress_controller_max_tokens: 2048
+  phase1b_progress_controller_format_attempts: 2
   phase1b_subgraph_max_edits: 8
-  phase1b_deterministic_rollback: true
   phase1b_seed_blueprint_root: null
   phase1b_seed_filename: phase1b_final.lean
   phase1b_seed_required: false
