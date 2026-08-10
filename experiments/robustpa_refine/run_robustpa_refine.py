@@ -33,6 +33,7 @@ from blueprint import (  # noqa: E402
     BlueprintGenerationError,
     generate_blueprint_from_informal,
 )
+from blueprint_review_viewer.review_schema import index_entry, write_review_artifact  # noqa: E402
 from checkpoint import CheckpointState, RunStatus  # noqa: E402
 from robustpa_refine.io_utils import append_jsonl, safe_stem, unlink_if_exists, write_json  # noqa: E402
 from robustpa_refine.runtime import (  # noqa: E402
@@ -1327,8 +1328,23 @@ async def _run_experiment(
                 rounds_path=rounds_path,
                 rounds_lock=rounds_lock,
             )
+            # Review artifacts are deliberately derived after a terminal row is
+            # available.  They are read-only snapshots: a viewer never writes
+            # back into this experiment or mutates any Blueprint candidate.
+            try:
+                review_path, review = write_review_artifact(output_root, row)
+                row["review_schema_version"] = review.get("schemaVersion")
+                row["review_artifact_path"] = str(review_path)
+            except Exception as exc:  # Observability must not invalidate an experiment.
+                row["review_artifact_error"] = f"{type(exc).__name__}: {exc}"
             async with results_lock:
                 append_jsonl(results_path, row)
+                if row.get("review_artifact_path"):
+                    artifact_path = Path(str(row["review_artifact_path"]))
+                    append_jsonl(
+                        output_root / "review_index.jsonl",
+                        index_entry(artifact_path, output_root, review),
+                    )
                 existing[row["id"]] = row
             tqdm.write(f"[record-{row['status']}] {record.unique_id} root_proved={row.get('root_proved')}")
 
