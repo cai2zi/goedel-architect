@@ -327,13 +327,13 @@ class SearchThenEditTest(unittest.TestCase):
         search = self._call("mathlib_search", {
             "query": "natural addition identity", "target_node_names": ["setup"], "k": 5,
         }, "search-1")
-        mixed_edit = self._call("editBlueprintNode", {
-            "action": "replace", "node_name": "setup", "expected_node_hash": "h",
-            "replacement": "x", "reason": "r",
+        mixed_edit = self._call("editBlueprintSubgraph", {
+            "edits": [{"action": "replace", "node_name": "setup",
+                       "expected_node_hash": "h", "replacement": "x"}],
         }, "edit-deferred")
-        final_edit = self._call("editBlueprintNode", {
-            "action": "replace", "node_name": "setup", "expected_node_hash": "h",
-            "replacement": "x", "reason": "r",
+        final_edit = self._call("editBlueprintSubgraph", {
+            "edits": [{"action": "replace", "node_name": "setup",
+                       "expected_node_hash": "h", "replacement": "x"}],
         }, "edit-2")
         responses = [self._model_response([search, mixed_edit]), self._model_response([final_edit])]
         retrieval = SimpleNamespace(search=lambda *_args: [

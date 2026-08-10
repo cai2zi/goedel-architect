@@ -6,7 +6,9 @@ and validates the resulting @[blueprint]-annotated Lean file via LeanArchitect.
 from __future__ import annotations
 
 from collections import Counter
+import copy
 from dataclasses import asdict, dataclass, field
+import difflib
 from functools import lru_cache
 import hashlib
 import json
@@ -765,32 +767,145 @@ _PHASE1B_MATHLIB_SEARCH_TOOL = {
     },
 }
 
-_PHASE1_EDIT_NODE_TOOL = {
+_PHASE1B_EDIT_SUBGRAPH_TOOL = {
     "type": "function",
     "function": {
-        "name": "editBlueprintNode",
+        "name": "editBlueprintSubgraph",
         "description": (
-            "Add, replace, or delete exactly one @[blueprint] declaration in the current "
-            "Lean file. Replacing a node may change its kind, COT_STEP binding, statement, "
-            "and sorry_using dependencies. Issue parallel calls for every independently "
-            "repairable node named by the diagnostics."
+            "Atomically add, replace, or delete one or more @[blueprint] declarations "
+            "authorized by the approved RepairSpec. Planned declarations that do not "
+            "need a real change may be omitted. The effective batch is rejected if any "
+            "edit or the rebuilt dependency DAG is invalid."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["add", "replace", "delete"]},
-                "node_name": {"type": "string"},
-                "expected_node_hash": {"type": "string"},
-                "replacement": {"type": "string"},
-                "reason": {"type": "string"},
+                "edits": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string", "enum": ["add", "replace", "delete"],
+                            },
+                            "node_name": {"type": "string"},
+                            "expected_node_hash": {"type": "string"},
+                            "replacement": {"type": "string"},
+                        },
+                        "required": [
+                            "action", "node_name", "expected_node_hash", "replacement",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
             },
-            "required": [
-                "action", "node_name", "expected_node_hash", "replacement", "reason",
-            ],
+            "required": ["edits"],
             "additionalProperties": False,
         },
     },
 }
+
+
+@dataclass(frozen=True)
+class _Phase1BNodeContract:
+    node_name: str
+    action: str
+    goal: str
+    must_reference: tuple[str, ...] = ()
+    add_dependencies: tuple[str, ...] = ()
+    remove_dependencies: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _Phase1BPlan:
+    repair_mode: str
+    target_obligations: tuple[str, ...]
+    edit_nodes: tuple[str, ...]
+    shared_objects: tuple[tuple[str, str], ...]
+    node_contracts: tuple[_Phase1BNodeContract, ...]
+    forbidden: tuple[str, ...]
+    text: str
+    raw_content: str = ""
+    attempts: tuple[dict[str, Any], ...] = ()
+
+    def contract_for(self, node_name: str) -> _Phase1BNodeContract | None:
+        return next(
+            (item for item in self.node_contracts if item.node_name == node_name),
+            None,
+        )
+
+    def stable_hash(self) -> str:
+        payload = {
+            "repair_mode": self.repair_mode,
+            "target_obligations": list(self.target_obligations),
+            "edit_nodes": list(self.edit_nodes),
+            "shared_objects": [list(item) for item in self.shared_objects],
+            "node_contracts": [asdict(item) for item in self.node_contracts],
+            "forbidden": list(self.forbidden),
+            "text": self.text,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()
+        ).hexdigest()
+
+
+class _Phase1BPlanFormatError(ValueError):
+    def __init__(self, reason: str, *, attempts: Sequence[dict[str, Any]] = ()) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.attempts = tuple(attempts)
+
+
+_PHASE1B_PLANNER_SYSTEM_PROMPT = r"""
+You produce one executable repair specification for a Lean Blueprint. Do not
+emit Lean and do not use tools. Preserve the supplied COT even when it is
+mathematically wrong. Repair its formal object binding, relation direction and
+dependency path rather than solving the problem yourself.
+
+Return exactly these headings in this order and no Markdown fence:
+
+REPAIR_MODE:
+localRepair
+
+TARGET_OBLIGATIONS:
+- <exact supplied obligation ID>
+
+EDIT_NODES:
+- <existing or new Blueprint declaration name>
+
+SHARED_OBJECTS:
+- <Blueprint node name> | <short role>
+
+NODE_CONTRACTS:
+- <node> | action=add|replace|delete | goal=<formal semantic goal> | must_reference=<comma-separated Blueprint node names or none> | add_dependencies=<comma-separated Blueprint node names or none> | remove_dependencies=<comma-separated Blueprint node names or none>
+
+FORBIDDEN:
+- reflexiveEquality
+
+PLAN:
+<a concrete natural-language plan under the supplied character limit>
+
+REPAIR_MODE is exactly localRepair or objectRebuild. Use localRepair for a
+single clause, relation direction, binder, or dependency repair. Use
+objectRebuild when the root has the wrong target object, the answer is
+ungrounded, several Steps lack a shared source object, or relevant nodes are
+disconnected from the root. An objectRebuild must edit the root and declare at
+least one shared Blueprint object. Plan it root target first, then shared model,
+key relation, Step claims, and root dependencies.
+
+Use one physical line per NODE_CONTRACT and do not place `|` inside goal text.
+Every EDIT_NODES entry needs exactly one contract. `must_reference` means exact
+shared-object identifiers that must occur in the formal type or definition
+body; do not repeat proof parents there merely because they are dependencies.
+Dependencies name proof parents in sorry_using. Definitions have no
+sorry_using dependencies: for a definition use must_reference and set both
+dependency fields to none. Never list one dependency in both add and remove.
+Select at most the supplied
+node limit. Use `- none` only for an empty SHARED_OBJECTS or FORBIDDEN section.
+Never invent obligation IDs or edit an existing node absent from the inventory.
+"""
 
 _PENDING_HELPER = 'def PendingBlueprintClaim (_nodeId : String) : Prop := True'
 _PENDING_HELPER_RE = re.compile(
@@ -971,17 +1086,25 @@ conclusion, not a local literal definition that makes the claim reflexive.
 
 _PHASE1B_SYSTEM_PROMPT = r"""
 You are completing an editable Lean Blueprint skeleton. You receive the original
-problem, its immutable COT Steps, the latest complete Lean file, and the latest
-deterministic semantic, Lean, and Phase-2 standalone diagnostics.
+problem, its immutable COT Steps, an approved RepairSpec, the latest complete
+Lean file, and current diagnostics.
 
 At the start of a repair round you may either call `mathlib_search` for exact
-Mathlib names/types, or call `editBlueprintNode` immediately. Never mix search
+Mathlib names/types, or call `editBlueprintSubgraph` immediately. Never mix search
 and edit calls in one response. After search results are returned, the runner
-will request an EDIT-only response. One edit call adds, replaces, or deletes one
-`@[blueprint]` declaration. Call it once for EVERY independently repairable
-listed node in parallel, up to the supplied call budget.
+will request an EDIT-only response. Call `editBlueprintSubgraph` exactly once.
+Its edits array may contain any non-empty subset of RepairSpec EDIT_NODES, but
+must never include an unplanned declaration. Include every node whose formal
+declaration really changes; do not resend an unchanged declaration merely
+because the Planner listed it. The effective changed subgraph is atomic.
 
-For each edit:
+Follow each NODE_CONTRACT exactly. Its action is fixed. The revised formal type
+or definition body must literally reference every `must_reference` Blueprint
+identifier. Its `sorry_using` dependency list must add/remove the specified
+dependencies. The natural-language goal describes the formal semantic change;
+comments do not satisfy it.
+
+For each item in `edits`:
 - use `add` to cover a missing COT Step or introduce a shared formal object;
 - use `replace` to repair a declaration, change a non-root declaration kind,
   change its Step binding, or add/remove dependencies in `sorry_using [...]`;
@@ -1012,7 +1135,7 @@ For each edit:
   result or an ordinary local declaration to `sorry_using`. Every sorry_using
   name must be an existing Blueprint node.
 
-The runner applies the valid node edits atomically and then compiles the complete file.
+The runner applies the subgraph atomically and then compiles the complete file.
 Do not return a whole Blueprint as prose or code.
 """
 
@@ -2138,6 +2261,137 @@ def _apply_node_edits(
     return _render_edited_blueprint(current, final_nodes)
 
 
+def _phase1b_formal_surface(node: BlueprintNode) -> str:
+    """Formal content counted by RepairSpec must_reference checks."""
+    source = node.full_declaration() if node.kind == "definition" else node.signature()
+    return _strip_lean_comments(source)
+
+
+def _validate_repair_contract(
+    edit: _BlueprintNodeEdit,
+    contract: _Phase1BNodeContract,
+) -> list[str]:
+    errors: list[str] = []
+    if edit.action != contract.action:
+        errors.append(
+            f"actionMismatch:{edit.node_name}:expected={contract.action}:actual={edit.action}"
+        )
+    revised = edit.revised_node
+    if edit.action == "delete" or revised is None:
+        if contract.must_reference or contract.add_dependencies:
+            errors.append(f"deleteContractHasPositiveRequirements:{edit.node_name}")
+        return errors
+    dependencies = set(revised.dependencies)
+    surface = _phase1b_formal_surface(revised)
+    if revised.kind == "definition":
+        # A definition cannot have a sorry_using DAG edge. If the Planner placed a
+        # shared object in add_dependencies, require it in the formal body instead.
+        missing_dependencies = [
+            item for item in contract.add_dependencies
+            if re.search(
+                rf"(?<![A-Za-z0-9_'.]){re.escape(item)}(?![A-Za-z0-9_'.])",
+                surface,
+            ) is None
+        ]
+    else:
+        missing_dependencies = [
+            item for item in contract.add_dependencies if item not in dependencies
+        ]
+    retained_dependencies = [
+        item for item in contract.remove_dependencies if item in dependencies
+    ]
+    if missing_dependencies:
+        errors.append(
+            f"missingPlannedDependencies:{edit.node_name}:"
+            + ",".join(missing_dependencies)
+        )
+    if retained_dependencies:
+        errors.append(
+            f"plannedDependenciesNotRemoved:{edit.node_name}:"
+            + ",".join(retained_dependencies)
+        )
+    missing_references = [
+        item for item in contract.must_reference
+        # Proof-node parents are executable uses through sorry_using. Requiring the
+        # theorem identifier in the proposition as well is usually ill-typed/redundant.
+        if not (revised.kind in {"lemma", "theorem"} and item in dependencies)
+        if re.search(
+            rf"(?<![A-Za-z0-9_'.]){re.escape(item)}(?![A-Za-z0-9_'.])",
+            surface,
+        ) is None
+    ]
+    if missing_references:
+        errors.append(
+            f"missingPlannedFormalReferences:{edit.node_name}:"
+            + ",".join(missing_references)
+        )
+    return errors
+
+
+def _phase1b_semantic_snapshot(validation: _Phase1BValidation) -> dict[str, Any]:
+    comparator = validation.strict_comparator_result
+    open_items = list(validation.open_semantic_obligations)
+    return {
+        "openObligationIds": [
+            str(item.get("obligation_id") or "") for item in open_items
+        ],
+        "rootTargetObject": (
+            bool(comparator.root.get("target_object_preserved"))
+            if comparator is not None else None
+        ),
+        "rootAnswerGrounding": (
+            bool(comparator.root.get("answer_grounded"))
+            if comparator is not None else None
+        ),
+        "requiredPathDisconnections": sum(
+            str(item.get("category") or "") == "dagDisconnected"
+            for item in open_items
+        ),
+    }
+
+
+def _phase1b_semantic_delta(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    *,
+    target_obligations: Sequence[str],
+    ledger: dict[str, dict[str, Any]],
+    round_index: int,
+    changed_nodes: Sequence[str],
+    noop_nodes: Sequence[str],
+) -> dict[str, Any]:
+    before_ids = set(before.get("openObligationIds") or ())
+    after_ids = set(after.get("openObligationIds") or ())
+    targets = set(target_obligations)
+    new_ids = sorted(after_ids - before_ids)
+    return {
+        "resolvedTargetObligations": sorted(targets - after_ids),
+        "stillOpenTargetObligations": sorted(targets & after_ids),
+        "newObligations": [
+            item for item in new_ids
+            if int((ledger.get(item) or {}).get("firstRound") or -1) == round_index
+        ],
+        "reopenedObligations": [
+            item for item in new_ids
+            if int((ledger.get(item) or {}).get("firstRound") or round_index) < round_index
+        ],
+        "rootTargetObject": {
+            "before": before.get("rootTargetObject"),
+            "after": after.get("rootTargetObject"),
+        },
+        "rootAnswerGrounding": {
+            "before": before.get("rootAnswerGrounding"),
+            "after": after.get("rootAnswerGrounding"),
+        },
+        "requiredPathDisconnections": {
+            "before": int(before.get("requiredPathDisconnections") or 0),
+            "after": int(after.get("requiredPathDisconnections") or 0),
+        },
+        "changedFormalNodes": list(changed_nodes),
+        "noOpNodes": list(noop_nodes),
+    }
+
+
 def _phase1b_feedback(
     issues: list[SemanticIssue],
     result: CompilerResult,
@@ -2819,6 +3073,446 @@ def _with_semantic_audit(
     )
 
 
+def _parse_phase1b_plan(
+    content: str,
+    *,
+    known_obligation_ids: Sequence[str],
+    known_node_names: Sequence[str],
+    known_node_kinds: dict[str, str],
+    root_node_name: str,
+    force_object_rebuild: bool,
+    max_nodes: int,
+    max_chars: int,
+) -> _Phase1BPlan:
+    headings = (
+        "REPAIR_MODE", "TARGET_OBLIGATIONS", "EDIT_NODES", "SHARED_OBJECTS",
+        "NODE_CONTRACTS", "FORBIDDEN", "PLAN",
+    )
+    pattern = re.compile(
+        r"\AREPAIR_MODE:\s*\n(?P<mode>.*?)\n\s*"
+        r"TARGET_OBLIGATIONS:\s*\n(?P<obligations>.*?)\n\s*"
+        r"EDIT_NODES:\s*\n(?P<nodes>.*?)\n\s*"
+        r"SHARED_OBJECTS:\s*\n(?P<objects>.*?)\n\s*"
+        r"NODE_CONTRACTS:\s*\n(?P<contracts>.*?)\n\s*"
+        r"FORBIDDEN:\s*\n(?P<forbidden>.*?)\n\s*"
+        r"PLAN:\s*\n(?P<plan>.*)\Z",
+        re.DOTALL,
+    )
+    match = pattern.fullmatch(content.strip())
+    if match is None:
+        raise _Phase1BPlanFormatError(
+            "missing or reordered headings: " + "/".join(headings)
+        )
+
+    def bullets(block: str, label: str) -> tuple[str, ...]:
+        values: list[str] = []
+        for raw in block.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if not line.startswith("-"):
+                raise _Phase1BPlanFormatError(f"{label} entries must start with '-'")
+            value = line[1:].strip()
+            if not value:
+                raise _Phase1BPlanFormatError(f"{label} contains an empty entry")
+            values.append(value)
+        return tuple(values)
+
+    mode = match.group("mode").strip()
+    if mode not in {"localRepair", "objectRebuild"}:
+        raise _Phase1BPlanFormatError(
+            "REPAIR_MODE must be exactly localRepair or objectRebuild"
+        )
+    obligations = bullets(match.group("obligations"), "TARGET_OBLIGATIONS")
+    nodes = bullets(match.group("nodes"), "EDIT_NODES")
+    raw_objects = bullets(match.group("objects"), "SHARED_OBJECTS")
+    raw_contracts = bullets(match.group("contracts"), "NODE_CONTRACTS")
+    forbidden = bullets(match.group("forbidden"), "FORBIDDEN")
+    plan_text = match.group("plan").strip()
+    known_obligations = set(known_obligation_ids)
+    known_nodes = set(known_node_names)
+    if not plan_text:
+        raise _Phase1BPlanFormatError("PLAN must be non-empty")
+    if len(plan_text) > max_chars:
+        raise _Phase1BPlanFormatError(
+            f"PLAN exceeds {max_chars} characters ({len(plan_text)})"
+        )
+    if not nodes:
+        raise _Phase1BPlanFormatError("EDIT_NODES must be non-empty")
+    if len(nodes) > max_nodes:
+        raise _Phase1BPlanFormatError(
+            f"EDIT_NODES exceeds the limit of {max_nodes}"
+        )
+    if len(set(nodes)) != len(nodes):
+        raise _Phase1BPlanFormatError("EDIT_NODES contains duplicates")
+    # Existing names are validated here; syntactically valid absent names are additions.
+    for node_name in nodes:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_']*", node_name):
+            raise _Phase1BPlanFormatError(f"invalid Blueprint node name: {node_name}")
+    if known_obligations:
+        if not obligations or "none" in obligations:
+            raise _Phase1BPlanFormatError(
+                "at least one known obligation ID is required while obligations are open"
+            )
+        unknown = [item for item in obligations if item not in known_obligations]
+        if unknown:
+            raise _Phase1BPlanFormatError(
+                "unknown obligation IDs: " + ", ".join(unknown)
+            )
+    elif obligations != ("none",):
+        raise _Phase1BPlanFormatError(
+            "TARGET_OBLIGATIONS must contain only 'none' when no obligations are open"
+        )
+    if len(set(obligations)) != len(obligations):
+        raise _Phase1BPlanFormatError("TARGET_OBLIGATIONS contains duplicates")
+
+    shared_objects: list[tuple[str, str]] = []
+    if raw_objects != ("none",):
+        if "none" in raw_objects:
+            raise _Phase1BPlanFormatError(
+                "SHARED_OBJECTS cannot mix 'none' with objects"
+            )
+        for row in raw_objects:
+            parts = [item.strip() for item in row.split("|", 1)]
+            if len(parts) != 2 or not parts[0] or not parts[1]:
+                raise _Phase1BPlanFormatError(
+                    "SHARED_OBJECTS entries must be '<node> | <role>'"
+                )
+            if parts[0] not in known_nodes | set(nodes):
+                raise _Phase1BPlanFormatError(
+                    f"unknown shared object node: {parts[0]}"
+                )
+            shared_objects.append((parts[0], parts[1]))
+    if len({item[0] for item in shared_objects}) != len(shared_objects):
+        raise _Phase1BPlanFormatError("SHARED_OBJECTS contains duplicate nodes")
+
+    def names_field(value: str, *, label: str) -> tuple[str, ...]:
+        if value == "none":
+            return ()
+        values = tuple(item.strip() for item in value.split(",") if item.strip())
+        if not values or len(set(values)) != len(values):
+            raise _Phase1BPlanFormatError(f"invalid or duplicate {label}")
+        unknown = [item for item in values if item not in known_nodes | set(nodes)]
+        if unknown:
+            raise _Phase1BPlanFormatError(
+                f"unknown nodes in {label}: " + ", ".join(unknown)
+            )
+        return values
+
+    contracts: list[_Phase1BNodeContract] = []
+    for row in raw_contracts:
+        parts = [item.strip() for item in row.split("|")]
+        if len(parts) != 6 or not parts[0]:
+            raise _Phase1BPlanFormatError(
+                "NODE_CONTRACTS entries require node plus action/goal/"
+                "must_reference/add_dependencies/remove_dependencies"
+            )
+        values: dict[str, str] = {}
+        for part in parts[1:]:
+            key, separator, value = part.partition("=")
+            if not separator or key.strip() in values:
+                raise _Phase1BPlanFormatError("invalid NODE_CONTRACTS field")
+            values[key.strip()] = value.strip()
+        required = {
+            "action", "goal", "must_reference", "add_dependencies",
+            "remove_dependencies",
+        }
+        if set(values) != required:
+            raise _Phase1BPlanFormatError(
+                "NODE_CONTRACTS fields must be exactly: " + ", ".join(sorted(required))
+            )
+        node_name = parts[0]
+        action = values["action"]
+        if node_name not in nodes:
+            raise _Phase1BPlanFormatError(
+                f"NODE_CONTRACTS names node absent from EDIT_NODES: {node_name}"
+            )
+        if action not in {"add", "replace", "delete"}:
+            raise _Phase1BPlanFormatError(f"invalid action for {node_name}: {action}")
+        if (node_name in known_nodes and action == "add") or (
+            node_name not in known_nodes and action != "add"
+        ):
+            raise _Phase1BPlanFormatError(
+                f"action does not match node existence for {node_name}"
+            )
+        if not values["goal"]:
+            raise _Phase1BPlanFormatError(f"empty goal for {node_name}")
+        add_dependencies = names_field(
+            values["add_dependencies"], label=f"{node_name}.add_dependencies",
+        )
+        remove_dependencies = names_field(
+            values["remove_dependencies"], label=f"{node_name}.remove_dependencies",
+        )
+        # A contradictory add/remove entry is normalized to the positive final-state
+        # requirement. This preserves the only executable interpretation: keep/add it.
+        remove_dependencies = tuple(
+            item for item in remove_dependencies if item not in set(add_dependencies)
+        )
+        contracts.append(_Phase1BNodeContract(
+            node_name=node_name,
+            action=action,
+            goal=values["goal"],
+            must_reference=names_field(
+                values["must_reference"], label=f"{node_name}.must_reference",
+            ),
+            add_dependencies=add_dependencies,
+            remove_dependencies=remove_dependencies,
+        ))
+    if len(contracts) != len(nodes) or {item.node_name for item in contracts} != set(nodes):
+        raise _Phase1BPlanFormatError(
+            "every EDIT_NODES entry must have exactly one NODE_CONTRACTS entry"
+        )
+
+    allowed_forbidden = {
+        "reflexiveEquality", "answerOnlyWitness", "unconstrainedExists",
+        "localAnswerLiteral",
+    }
+    if forbidden == ("none",):
+        forbidden = ()
+    elif "none" in forbidden:
+        raise _Phase1BPlanFormatError("FORBIDDEN cannot mix 'none' with patterns")
+    else:
+        unknown_forbidden = [item for item in forbidden if item not in allowed_forbidden]
+        if unknown_forbidden:
+            raise _Phase1BPlanFormatError(
+                "unknown FORBIDDEN patterns: " + ", ".join(unknown_forbidden)
+            )
+        if len(set(forbidden)) != len(forbidden):
+            raise _Phase1BPlanFormatError("FORBIDDEN contains duplicates")
+
+    root_obligation = any(
+        ":rootTargetObject:" in item or ":rootAnswerGrounding:" in item
+        for item in obligations
+    )
+    if root_obligation and mode != "objectRebuild":
+        raise _Phase1BPlanFormatError(
+            "rootTargetObject/rootAnswerGrounding requires objectRebuild"
+        )
+    if mode == "objectRebuild" and not shared_objects:
+        raise _Phase1BPlanFormatError("objectRebuild requires SHARED_OBJECTS")
+    if mode == "objectRebuild" and root_node_name not in nodes:
+        raise _Phase1BPlanFormatError(
+            f"objectRebuild must include root `{root_node_name}` in EDIT_NODES"
+        )
+    if force_object_rebuild and mode != "objectRebuild":
+        raise _Phase1BPlanFormatError(
+            "semanticStagnation with an open root/object obligation requires objectRebuild"
+        )
+    contract_by_name = {item.node_name: item for item in contracts}
+    deleted_shared = [
+        name for name, _role in shared_objects
+        if contract_by_name.get(name) is not None
+        and contract_by_name[name].action == "delete"
+    ]
+    if deleted_shared:
+        raise _Phase1BPlanFormatError(
+            "shared objects cannot be deleted: " + ", ".join(deleted_shared)
+        )
+    return _Phase1BPlan(
+        mode, obligations, nodes, tuple(shared_objects), tuple(contracts),
+        tuple(forbidden), plan_text, raw_content=content,
+    )
+
+
+def _phase1b_planner_messages(
+    *,
+    informal_statement: str,
+    claimed_answer: str,
+    prompt_proof: str,
+    blueprint: Blueprint,
+    validation: _Phase1BValidation,
+    feedback: str,
+    max_nodes: int,
+    previous_rollback: dict[str, Any] | None,
+    previous_semantic_delta: dict[str, Any] | None,
+    semantic_stagnation: bool,
+) -> list[dict[str, str]]:
+    view = build_formal_view(blueprint)
+    decompiled = validation.formal_decompiler_result
+    decompiled_by_name = {
+        node.node_name: {
+            "translation": node.translation,
+            "semantic_effect": node.semantic_effect,
+            "introduced_objects": list(node.introduced_objects),
+            "referenced_objects": list(node.referenced_objects),
+        }
+        for node in (decompiled.nodes if decompiled is not None else ())
+    }
+    nodes = [{
+        "node_name": node.node_name,
+        "hash": _node_hash(blueprint.node_by_name(node.node_name)),
+        "kind": node.kind,
+        "step_id": node.step_id,
+        "dependencies": list(node.dependencies),
+        "sanitized_formal_lean": node.declaration,
+        "decompiled": decompiled_by_name.get(node.node_name),
+    } for node in view.nodes]
+    payload: dict[str, Any] = {
+        "problem": informal_statement,
+        "claimed_answer": claimed_answer,
+        "cot_steps": prompt_proof,
+        "formal_view_hash": view.sha256,
+        "root": view.root_name,
+        "root_closure": list(view.root_closure),
+        "nodes": nodes,
+        "open_obligations": list(validation.open_semantic_obligations),
+        "current_diagnostics": feedback,
+        "maximum_edit_nodes": max_nodes,
+        "semantic_stagnation": semantic_stagnation,
+    }
+    if previous_rollback:
+        payload["previous_rollback"] = previous_rollback
+    if previous_semantic_delta:
+        payload["previous_semantic_delta"] = previous_semantic_delta
+    return [
+        {"role": "system", "content": _PHASE1B_PLANNER_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ]
+
+
+def _run_phase1b_planner(
+    client,
+    model: str,
+    messages: list[dict[str, str]],
+    *,
+    known_obligation_ids: Sequence[str],
+    known_node_names: Sequence[str],
+    known_node_kinds: dict[str, str],
+    root_node_name: str,
+    force_object_rebuild: bool,
+    rejected_spec_hashes: set[str],
+    max_tokens: int,
+    max_attempts: int,
+    max_nodes: int,
+    max_chars: int,
+    round_index: int,
+    tracer,
+    thm_name: str,
+) -> _Phase1BPlan:
+    base_messages = list(messages)
+    attempts: list[dict[str, Any]] = []
+    span_id = uuid.uuid4().hex
+    started_ns = time.monotonic_ns()
+    if tracer is not None:
+        tracer.emit(TraceEvent(
+            kind="phase1BRepairSpecStart", thm_name=thm_name, turn=round_index,
+            span_id=span_id,
+            args={"round": round_index, "maxAttempts": max_attempts,
+                  "maxTokens": max_tokens, "maxEditNodes": max_nodes},
+        ))
+    for attempt in range(1, max_attempts + 1):
+        response = chat_completion_with_retry(
+            client,
+            tracer=tracer,
+            thm_name=thm_name,
+            phase="phase1BPlanner",
+            model_id=model,
+            operation="phase1b_repair_plan",
+            trace_args={"round": round_index, "attempt": attempt},
+            model=model,
+            messages=messages,
+            temperature=0,
+            max_completion_tokens=max_tokens,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        )
+        _emit_usage(tracer, thm_name, "phase1BPlanner", model, response)
+        _emit_llm_response(
+            tracer, thm_name=thm_name, phase="phase1BPlanner", model=model,
+            response=response, attempt=attempt, turn=round_index,
+        )
+        choice = response.choices[0]
+        content = str(choice.message.content or "")
+        usage = getattr(response, "usage", None)
+        record = {
+            "attempt": attempt,
+            "rawContent": content,
+            "finishReason": getattr(choice, "finish_reason", None),
+            "promptTokens": int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0,
+            "completionTokens": int(getattr(usage, "completion_tokens", 0) or 0) if usage else 0,
+        }
+        try:
+            raw_spec_hash = hashlib.sha256(content.encode()).hexdigest()
+            if raw_spec_hash in rejected_spec_hashes:
+                raise _Phase1BPlanFormatError(
+                    "this RepairSpec is byte-identical to a previously used RepairSpec"
+                )
+            if str(record["finishReason"] or "").lower() == "length":
+                raise _Phase1BPlanFormatError("planner response truncated")
+            plan = _parse_phase1b_plan(
+                content,
+                known_obligation_ids=known_obligation_ids,
+                known_node_names=known_node_names,
+                known_node_kinds=known_node_kinds,
+                root_node_name=root_node_name,
+                force_object_rebuild=force_object_rebuild,
+                max_nodes=max_nodes,
+                max_chars=max_chars,
+            )
+            if plan.stable_hash() in rejected_spec_hashes:
+                raise _Phase1BPlanFormatError(
+                    "this RepairSpec is identical to a previously used RepairSpec"
+                )
+        except _Phase1BPlanFormatError as exc:
+            record["error"] = exc.reason
+            attempts.append(record)
+            if attempt == max_attempts:
+                if tracer is not None:
+                    tracer.emit(TraceEvent(
+                        kind="phase1BRepairSpecEnd", thm_name=thm_name, turn=round_index,
+                        span_id=span_id, result=exc.reason, ok=False,
+                        args={"round": round_index, "attemptCount": len(attempts)},
+                        duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
+                    ))
+                raise _Phase1BPlanFormatError(exc.reason, attempts=attempts) from exc
+            messages = [
+                *base_messages,
+                {"role": "user", "content": (
+                    f"The previous RepairSpec was rejected: {exc.reason}. Return only "
+                    "the seven required headings. Copy exact obligation IDs; use 1-"
+                    f"{max_nodes} unique Lean declaration names and keep PLAN within "
+                    f"{max_chars} characters (shorten it materially; do not repeat the "
+                    "same text). For proof nodes, use add_dependencies for sorry_using "
+                    "parents and reserve must_reference for identifiers that literally "
+                    "occur in the proposition. Definitions have no dependencies. Never "
+                    "put one dependency in both add/remove. Existing nodes must use "
+                    "replace/delete; absent nodes use add. The only valid obligation IDs are: "
+                    f"{list(known_obligation_ids) or ['none']}. Existing node names are: "
+                    f"{known_node_kinds}. The exact root is `{root_node_name}`. "
+                    "New syntactically valid node names are "
+                    "also allowed."
+                )},
+            ]
+            continue
+        attempts.append(record)
+        plan = _Phase1BPlan(
+            plan.repair_mode, plan.target_obligations, plan.edit_nodes,
+            plan.shared_objects, plan.node_contracts, plan.forbidden, plan.text,
+            raw_content=content, attempts=tuple(attempts),
+        )
+        if tracer is not None:
+            tracer.emit(TraceEvent(
+                kind="phase1BRepairSpecResult", thm_name=thm_name, turn=round_index,
+                span_id=span_id, result=content,
+                args={"round": round_index,
+                      "repairMode": plan.repair_mode,
+                      "targetObligations": list(plan.target_obligations),
+                      "editNodes": list(plan.edit_nodes), "plan": plan.text,
+                      "sharedObjects": [list(item) for item in plan.shared_objects],
+                      "nodeContracts": [asdict(item) for item in plan.node_contracts],
+                      "forbidden": list(plan.forbidden),
+                      "repairSpecHash": plan.stable_hash(),
+                      "attempts": list(plan.attempts)}, ok=True,
+            ))
+            tracer.emit(TraceEvent(
+                kind="phase1BRepairSpecEnd", thm_name=thm_name, turn=round_index,
+                span_id=span_id, ok=True,
+                args={"round": round_index, "attemptCount": len(attempts)},
+                duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
+            ))
+        return plan
+    raise AssertionError("unreachable")
+
+
 def _call_phase1b_model(
     client,
     model: str,
@@ -2873,7 +3567,8 @@ def _phase1b_search_or_edit_response(
         "\n\n## Current Tool Budget\n"
         f"Phase 1B round: {round_index} / {max_rounds}\n"
         f"Remaining repair rounds including this round: {remaining}\n"
-        f"Maximum editBlueprintNode calls in an edit response: {edit_limit}\n"
+        "Maximum editBlueprintSubgraph calls in an edit response: 1\n"
+        f"Maximum node edits inside that subgraph: {edit_limit}\n"
         f"Maximum mathlib_search calls before editing: {search_limit}\n"
         "Choose SEARCH-only or EDIT-only; never mix them."
     )
@@ -2892,14 +3587,15 @@ def _phase1b_search_or_edit_response(
                 "round": round_index,
                 "maxRounds": max_rounds,
                 "remainingRounds": remaining,
-                "maxEditCalls": edit_limit,
+                "maxEditCalls": 1,
+                "maxSubgraphEdits": edit_limit,
                 "maxMathlibSearchCalls": search_limit,
                 "mode": "SEARCH_OR_EDIT",
             },
         ))
-    tools = [_PHASE1_EDIT_NODE_TOOL]
+    tools = [_PHASE1B_EDIT_SUBGRAPH_TOOL]
     if search_limit > 0:
-        tools = [_PHASE1B_MATHLIB_SEARCH_TOOL, _PHASE1_EDIT_NODE_TOOL]
+        tools = [_PHASE1B_MATHLIB_SEARCH_TOOL, _PHASE1B_EDIT_SUBGRAPH_TOOL]
     first = _call_phase1b_model(
         client, model, initial_messages,
         tools=tools,
@@ -2933,7 +3629,7 @@ def _phase1b_search_or_edit_response(
             ok = False
         else:
             ok = True
-            if name == "editBlueprintNode":
+            if name == "editBlueprintSubgraph":
                 output = "editDeferredUntilAfterSearch"
                 ok = False
             elif name != "mathlib_search":
@@ -3018,7 +3714,8 @@ def _phase1b_search_or_edit_response(
             "## Current Tool Budget\n"
             f"Phase 1B round: {round_index} / {max_rounds}\n"
             "Mode: EDIT ONLY\n"
-            f"Maximum editBlueprintNode calls: {edit_limit}\n"
+            "Maximum editBlueprintSubgraph calls: 1\n"
+            f"Maximum node edits inside the subgraph: {edit_limit}\n"
             "Do not call mathlib_search again in this round."
         )},
     ]
@@ -3030,14 +3727,15 @@ def _phase1b_search_or_edit_response(
             args={
                 "phase": "phase1B",
                 "round": round_index,
-                "maxEditCalls": edit_limit,
+                "maxEditCalls": 1,
+                "maxSubgraphEdits": edit_limit,
                 "maxMathlibSearchCalls": 0,
                 "mode": "EDIT_ONLY",
             },
         ))
     return _call_phase1b_model(
         client, model, edit_messages,
-        tools=[_PHASE1_EDIT_NODE_TOOL],
+        tools=[_PHASE1B_EDIT_SUBGRAPH_TOOL],
         operation="blueprint_node_edit_after_search",
         round_index=round_index,
         tracer=tracer,
@@ -3045,7 +3743,7 @@ def _phase1b_search_or_edit_response(
     )
 
 
-def _run_phase1b_patch_session(
+def _run_phase1b_patch_session_v8_unused(
     client,
     model: str,
     blueprint: Blueprint,
@@ -3071,9 +3769,16 @@ def _run_phase1b_patch_session(
     semantic_format_max_attempts: int = 2,
     retrieval: MathlibRetrieval | None = None,
     mathlib_search_max_calls_per_round: int = 0,
+    planning_enabled: bool = False,
+    plan_max_tokens: int = 1024,
+    plan_format_max_attempts: int = 2,
+    plan_max_chars: int = 800,
+    subgraph_max_edits: int = 8,
+    deterministic_rollback: bool = True,
 ) -> Blueprint:
-    current = blueprint
-    initial_pending_names = _pending_node_names(current)
+    committed = blueprint
+    current = committed
+    initial_pending_names = _pending_node_names(committed)
     previous_pending_names = initial_pending_names
     standalone_cache: dict[str, CompilerResult] = {}
     decompiler_cache: dict[str, FormalDecompilerResult] = {}
@@ -3095,6 +3800,11 @@ def _run_phase1b_patch_session(
     )
     rejected: list[dict[str, Any]] = []
     edit_history: list[dict[str, Any]] = []
+    previous_rollback: dict[str, Any] | None = None
+    previous_semantic_delta: dict[str, Any] | None = None
+    used_repair_spec_hashes: set[str] = set()
+    stagnant_commit_count = 0
+    rejected_candidate_hash = ""
     _emit_pending_summary(
         tracer, thm_name=thm_name, phase="phase1B", round_index=0,
         blueprint=current, initial_names=initial_pending_names,
@@ -3161,14 +3871,137 @@ def _run_phase1b_patch_session(
         node_inventory = "\n".join(
             f"- {node.name}: hash={_node_hash(node)} kind={node.kind} "
             f"step={node.source_step_id or '<missing>'} deps={node.dependencies}"
-            for node in current.nodes
+            for node in committed.nodes
         )
+        plan: _Phase1BPlan | None = None
+        if planning_enabled:
+            semantic_stagnation = stagnant_commit_count >= 2
+            force_object_rebuild = semantic_stagnation and any(
+                str(item.get("category") or "") in {
+                    "rootTargetObject", "rootAnswerGrounding", "unbound_objects",
+                }
+                for item in validation.open_semantic_obligations
+            )
+            planner_messages = _phase1b_planner_messages(
+                informal_statement=informal_statement,
+                claimed_answer=claimed_answer,
+                prompt_proof=prompt_proof,
+                blueprint=committed,
+                validation=validation,
+                feedback=feedback,
+                max_nodes=subgraph_max_edits,
+                previous_rollback=previous_rollback,
+                previous_semantic_delta=previous_semantic_delta,
+                semantic_stagnation=semantic_stagnation,
+            )
+            if semantic_stagnation and tracer is not None:
+                tracer.emit(TraceEvent(
+                    kind="phase1BSemanticStagnation", thm_name=thm_name,
+                    turn=round_index,
+                    args={"round": round_index,
+                          "stagnantCommitCount": stagnant_commit_count,
+                          "forceObjectRebuild": force_object_rebuild,
+                          "previousSemanticDelta": previous_semantic_delta},
+                    ok=False,
+                ))
+            try:
+                plan = _run_phase1b_planner(
+                    client,
+                    model,
+                    planner_messages,
+                    known_obligation_ids=[
+                        str(item.get("obligation_id") or "")
+                        for item in validation.open_semantic_obligations
+                    ],
+                    known_node_names=[node.name for node in committed.nodes],
+                    known_node_kinds={node.name: node.kind for node in committed.nodes},
+                    root_node_name=committed.target_theorem,
+                    force_object_rebuild=force_object_rebuild,
+                    rejected_spec_hashes=used_repair_spec_hashes,
+                    max_tokens=plan_max_tokens,
+                    max_attempts=plan_format_max_attempts,
+                    max_nodes=subgraph_max_edits,
+                    max_chars=plan_max_chars,
+                    round_index=round_index,
+                    tracer=tracer,
+                    thm_name=thm_name,
+                )
+            except _Phase1BPlanFormatError as exc:
+                raw_spec = str(exc.attempts[-1].get("rawContent") or "") \
+                    if exc.attempts else ""
+                spec_hash = hashlib.sha256(raw_spec.encode()).hexdigest() \
+                    if raw_spec else ""
+                if spec_hash:
+                    used_repair_spec_hashes.add(spec_hash)
+                reason = "repairSpecFormat:" + exc.reason
+                previous_rollback = {
+                    "repair_spec": raw_spec,
+                    "repair_spec_hash": spec_hash,
+                    "target_obligations": [],
+                    "edited_nodes": [],
+                    "effective_nodes": [],
+                    "no_op_nodes": [],
+                    "failed_declarations": [],
+                    "error_summary": reason,
+                    "rejected_candidate_hash": "",
+                }
+                edit_history.append({
+                    "round": round_index,
+                    "repairMode": "",
+                    "repairSpecHash": spec_hash,
+                    "plan": "",
+                    "targetObligations": [],
+                    "plannedNodes": [],
+                    "sharedObjects": [],
+                    "nodeContracts": [],
+                    "forbidden": [],
+                    "actualNodes": [],
+                    "effectiveNodes": [],
+                    "noOpNodes": [],
+                    "semanticDelta": {},
+                    "candidateApplied": False,
+                    "committed": False,
+                    "rolledBack": True,
+                    "rollbackReasons": [reason],
+                    "accepted": [],
+                    "rejected": [{"node_name": "", "action": "", "reason": reason}],
+                    "identical": [],
+                    "committedHash": hashlib.sha256(
+                        committed.lean_file.encode()
+                    ).hexdigest(),
+                })
+                if tracer is not None:
+                    committed_digest = hashlib.sha256(
+                        committed.lean_file.encode()
+                    ).hexdigest()
+                    tracer.emit(TraceEvent(
+                        kind="phase1BSubgraphRollback", thm_name=thm_name,
+                        turn=round_index,
+                        args={"round": round_index,
+                              "committedHashBefore": committed_digest,
+                              "committedHashAfter": committed_digest,
+                              "candidateHash": "", "editedNodes": [],
+                              "reasons": [reason]},
+                        ok=False,
+                    ))
+                previous_pending_names = _pending_node_names(committed)
+                continue
+            used_repair_spec_hashes.add(plan.stable_hash())
+        else:
+            fallback_node = committed.target_theorem
+            plan = _Phase1BPlan(
+                "localRepair", ("none",), (fallback_node,), (),
+                (_Phase1BNodeContract(
+                    fallback_node, "replace", "Repair the current diagnostics.",
+                ),), (), "Repair the current deterministic diagnostics.",
+            )
         messages = [
             {"role": "system", "content": _PHASE1B_SYSTEM_PROMPT},
             {"role": "user", "content": (
                 f"Problem:\n{informal_statement}\n\nCOT Steps:\n{prompt_proof}\n\n"
                 f"Claimed answer: `{claimed_answer}`\n\nEditable node inventory:\n{node_inventory}\n\n"
-                f"Current complete Blueprint:\n```lean\n{current.lean_file}\n```\n\n"
+                f"Approved repair Plan:\n{plan.raw_content or plan.text}\n\n"
+                f"Current complete Blueprint:\n```lean\n{committed.lean_file}\n```\n\n"
                 f"Latest diagnostics:\n{feedback}"
             )},
         ]
@@ -3179,131 +4012,138 @@ def _run_phase1b_patch_session(
             retrieval=phase1b_retrieval,
             search_cache=search_cache,
             search_limit=mathlib_search_max_calls_per_round,
-            edit_limit=max_tool_calls_per_turn,
+            edit_limit=subgraph_max_edits,
             round_index=round_index,
             max_rounds=max_rounds,
             tracer=tracer,
             thm_name=thm_name,
         )
         calls = list(response.choices[0].message.tool_calls or [])
-        accepted: list[_BlueprintNodeEdit] = []
-        call_records: list[dict[str, Any]] = []
+        started_ns = time.monotonic_ns()
+        span_id = uuid.uuid4().hex
+        committed_hash = hashlib.sha256(committed.lean_file.encode()).hexdigest()
+        semantic_before = _phase1b_semantic_snapshot(validation)
+        candidate: Blueprint | None = None
+        candidate_validation: _Phase1BValidation | None = None
+        edits: list[_BlueprintNodeEdit] = []
+        edit_rows: list[dict[str, str]] = []
+        no_op_rows: list[dict[str, str]] = []
+        contract_errors: list[str] = []
+        rollback_reasons: list[str] = []
+        rollback_diagnostics: list[str] = []
+        failed_declarations: list[str] = []
+        round_semantic_delta: dict[str, Any] | None = None
         rejected = []
-        seen_nodes: set[str] = set()
-        for call in calls[:max_tool_calls_per_turn]:
-            started_ns = time.monotonic_ns()
-            span_id = uuid.uuid4().hex
-            node_name = ""
-            action = ""
-            reason = ""
-            args: dict[str, Any] = {}
+        call = calls[0] if len(calls) == 1 else None
+        if tracer is not None:
+            tracer.emit(TraceEvent(
+                kind="phase1BSubgraphEditStart", thm_name=thm_name,
+                turn=round_index, span_id=span_id,
+                call_id=getattr(call, "id", ""), tool_name="editBlueprintSubgraph",
+                args={"round": round_index, "committedHash": committed_hash,
+                      "plannedNodes": list(plan.edit_nodes)},
+            ))
+        if len(calls) != 1:
+            rollback_reasons.append(
+                "missingSubgraphCall" if not calls else "multipleSubgraphCalls"
+            )
+        elif str(call.function.name) != "editBlueprintSubgraph":
+            rollback_reasons.append("notAllowed")
+        else:
+            current_edit_node = ""
             try:
-                raw_args = json.loads(call.function.arguments or "{}")
-                if not isinstance(raw_args, dict):
-                    raise ValueError("arguments must be an object")
-                args = raw_args
-                action = str(args.get("action") or "")
-                node_name = str(args.get("node_name") or "")
-            except (json.JSONDecodeError, ValueError) as exc:
-                reason = f"invalidArguments:{exc}"
-            trace_args = {
-                "phase": "phase1B", "round": round_index,
-                "action": action, "node_name": node_name,
-            }
-            if tracer is not None:
-                tracer.emit(TraceEvent(
-                    kind="tool_call", thm_name=thm_name, turn=round_index,
-                    call_id=call.id, tool_name=str(call.function.name),
-                    span_id=span_id, args=trace_args,
-                ))
-            if not reason:
-                if call.function.name != "editBlueprintNode":
-                    reason = "notAllowed"
-                elif node_name in seen_nodes:
-                    reason = "duplicateNodeInRound"
-                else:
+                args = json.loads(call.function.arguments or "{}")
+                raw_edits = args.get("edits") if isinstance(args, dict) else None
+                if not isinstance(raw_edits, list):
+                    raise ValueError("edits must be an array")
+                if not 1 <= len(raw_edits) <= subgraph_max_edits:
+                    raise ValueError(
+                        f"edits must contain 1..{subgraph_max_edits} items"
+                    )
+                actual_names = [
+                    str(item.get("node_name") or "")
+                    for item in raw_edits if isinstance(item, dict)
+                ]
+                if len(actual_names) != len(raw_edits):
+                    raise ValueError("every edit must be an object")
+                if len(set(actual_names)) != len(actual_names):
+                    raise ValueError("duplicateNodeInSubgraph")
+                if planning_enabled and not set(actual_names).issubset(set(plan.edit_nodes)):
+                    raise ValueError("planCoverageMismatch")
+                for item in raw_edits:
+                    allowed = {"action", "node_name", "expected_node_hash", "replacement"}
+                    if set(item) != allowed:
+                        raise ValueError("invalidEditSchema")
+                    action = str(item.get("action") or "")
+                    node_name = str(item.get("node_name") or "")
+                    current_edit_node = node_name
+                    contract = plan.contract_for(node_name) if planning_enabled else None
+                    if planning_enabled and contract is None:
+                        raise ValueError(f"missingNodeContract:{node_name}")
+                    if contract is not None and action != contract.action:
+                        raise ValueError(
+                            f"actionMismatch:{node_name}:"
+                            f"expected={contract.action}:actual={action}"
+                        )
                     edit, reason = _validate_node_edit(
-                        current,
+                        committed,
                         action=action,
                         node_name=node_name,
-                        expected_hash=str(args.get("expected_node_hash") or ""),
-                        replacement=str(args.get("replacement") or ""),
+                        expected_hash=str(item.get("expected_node_hash") or ""),
+                        replacement=str(item.get("replacement") or ""),
                     )
-                    if not reason and edit is not None:
-                        accepted.append(edit)
-                        seen_nodes.add(node_name)
-            call_records.append({
-                "call": call, "started_ns": started_ns, "span_id": span_id,
-                "node_name": node_name, "action": action, "reason": reason,
-            })
-        if len(calls) > max_tool_calls_per_turn:
-            rejected.extend({"node_name": "", "reason": "overTurnLimit"}
-                            for _ in calls[max_tool_calls_per_turn:])
-        applied = False
-        if accepted:
-            try:
-                current = _apply_node_edits(current, accepted)
-                applied = True
-            except ValueError as exc:
-                batch_reason = f"atomicBatchRejected:{exc}"
-                for record in call_records:
-                    if not record["reason"]:
-                        record["reason"] = batch_reason
-                accepted = []
+                    row = {"action": action, "nodeName": node_name}
+                    if reason == "identicalReplacement":
+                        no_op_rows.append(row)
+                        continue
+                    edit_rows.append(row)
+                    if reason or edit is None:
+                        raise ValueError(reason or "invalidEdit")
+                    if contract is not None:
+                        errors = _validate_repair_contract(edit, contract)
+                        if errors:
+                            contract_errors.extend(errors)
+                            raise ValueError(";".join(errors))
+                    edits.append(edit)
+                if no_op_rows and tracer is not None:
+                    tracer.emit(TraceEvent(
+                        kind="phase1BNoOpFiltered", thm_name=thm_name,
+                        turn=round_index, span_id=span_id,
+                        args={"round": round_index,
+                              "noOpNodes": [row["nodeName"] for row in no_op_rows],
+                              "effectiveNodes": [row["nodeName"] for row in edit_rows]},
+                        ok=bool(edits),
+                    ))
+                if not edits:
+                    raise ValueError("noEffectiveEdit")
+                candidate = _apply_node_edits(committed, edits)
+                candidate_hash = hashlib.sha256(candidate.lean_file.encode()).hexdigest()
+                if candidate_hash == rejected_candidate_hash:
+                    raise ValueError("repeatedRejectedCandidateHash")
+            except (json.JSONDecodeError, ValueError) as exc:
+                rollback_reasons.append(f"subgraphRejected:{exc}")
+                if current_edit_node:
+                    failed_declarations.append(current_edit_node)
+                rollback_diagnostics.append(str(exc))
+        if tracer is not None:
+            tracer.emit(TraceEvent(
+                kind="phase1BRepairSpecValidation", thm_name=thm_name,
+                turn=round_index, span_id=span_id,
+                args={"round": round_index,
+                      "repairSpecHash": plan.stable_hash(),
+                      "plannedNodes": list(plan.edit_nodes),
+                      "actualNodes": [row["nodeName"] for row in edit_rows + no_op_rows],
+                      "effectiveNodes": [row["nodeName"] for row in edit_rows],
+                      "noOpNodes": [row["nodeName"] for row in no_op_rows],
+                      "contractErrors": contract_errors},
+                ok=not rollback_reasons,
+            ))
 
-        for record in call_records:
-            reason = str(record["reason"] or "")
-            if reason:
-                rejected.append({
-                    "node_name": record["node_name"], "reason": reason,
-                    "action": record["action"],
-                })
-            if tracer is not None:
-                call = record["call"]
-                trace_args = {
-                    "phase": "phase1B", "round": round_index,
-                    "action": record["action"], "node_name": record["node_name"],
-                }
-                tracer.emit(TraceEvent(
-                    kind="tool_result", thm_name=thm_name, turn=round_index,
-                    call_id=call.id, tool_name=str(call.function.name),
-                    span_id=record["span_id"],
-                    result=reason or "editAccepted", ok=not bool(reason),
-                    args=trace_args,
-                    duration_ms=(time.monotonic_ns() - record["started_ns"]) / 1_000_000,
-                ))
-
-        identical_edits = [
-            {"action": record["action"], "nodeName": record["node_name"]}
-            for record in call_records
-            if record["reason"] == "identicalReplacement"
-        ]
-        accepted_edits = [
-            {"action": record["action"], "nodeName": record["node_name"]}
-            for record in call_records
-            if not record["reason"]
-        ]
-        edit_history.append({
-            "round": round_index,
-            "candidateApplied": applied,
-            "accepted": accepted_edits,
-            "rejected": [
-                {
-                    "action": str(item.get("action") or ""),
-                    "nodeName": str(item.get("node_name") or ""),
-                    "reason": str(item.get("reason") or ""),
-                }
-                for item in rejected
-                if item.get("reason") != "identicalReplacement"
-            ],
-            "identical": identical_edits,
-        })
-
-        if applied:
-            candidate_history.append(current.lean_file)
-            candidate_labels.append(f"phase1b_round_{round_index}")
-            validation = _validate_phase1b_candidate(
-                current, compiler=compiler, semantic_manifest=semantic_manifest,
+        if candidate is not None and not rollback_reasons:
+            candidate_history.append(candidate.lean_file)
+            candidate_labels.append(f"phase1b_round_{round_index}_candidate")
+            candidate_validation = _validate_phase1b_candidate(
+                candidate, compiler=compiler, semantic_manifest=semantic_manifest,
                 claimed_answer=claimed_answer,
                 semantic_fidelity_enabled=semantic_fidelity_enabled,
                 semantic_require_step_ids=semantic_require_step_ids,
@@ -3314,52 +4154,228 @@ def _run_phase1b_patch_session(
                 skip_pending=True,
                 semantic_audit_required=semantic_audit_enabled,
             )
-            if semantic_audit_enabled:
+            before_errors = {
+                (issue.code, issue.node_name, issue.step_id)
+                for issue in validation.semantic_issues if issue.severity == "error"
+            }
+            new_errors = [
+                issue for issue in candidate_validation.semantic_issues
+                if issue.severity == "error"
+                and (issue.code, issue.node_name, issue.step_id) not in before_errors
+            ]
+            malformed_pending = [
+                issue for issue in candidate_validation.semantic_issues
+                if issue.code == "malformedPendingClaim"
+            ]
+            if not candidate_validation.lean_result.success:
+                rollback_reasons.append("wholeFileLeanFailed")
+                rollback_diagnostics.extend(candidate_validation.lean_result.diagnostics)
+                failed_declarations.extend(
+                    str(item.get("node_name") or "")
+                    for item in candidate_validation.source_contexts
+                )
+            if new_errors:
+                rollback_reasons.append(
+                    "newStaticHardErrors:" + ",".join(sorted({item.code for item in new_errors}))
+                )
+                rollback_diagnostics.extend(
+                    f"{item.code} node={item.node_name or '<none>'} "
+                    f"step={item.step_id or '<none>'}: {item.message}"
+                    for item in new_errors
+                )
+                failed_declarations.extend(item.node_name for item in new_errors)
+            if len(candidate_validation.pending_node_names) > len(validation.pending_node_names):
+                rollback_reasons.append("pendingCountIncreased")
+            if malformed_pending:
+                rollback_reasons.append("malformedPendingClaim")
+                failed_declarations.extend(item.node_name for item in malformed_pending)
+            if candidate_validation.structural_errors:
+                rollback_reasons.append("phase2StructuralFailed")
+                rollback_diagnostics.extend(candidate_validation.structural_errors)
+            if candidate_validation.standalone_report.issues:
+                rollback_reasons.append("phase2StandaloneFailed")
+                rollback_diagnostics.extend(
+                    str(getattr(item, "diagnostic", "") or item)
+                    for item in candidate_validation.standalone_report.issues
+                )
+                failed_declarations.extend(
+                    str(getattr(item, "node_name", "") or "")
+                    for item in candidate_validation.standalone_report.issues
+                )
+
+        should_rollback = bool(rollback_reasons) and deterministic_rollback
+        if candidate is not None and not should_rollback and not rollback_reasons:
+            committed = candidate
+            current = committed
+            validation = candidate_validation
+            assert validation is not None
+            if semantic_audit_enabled and _semantic_audit_eligible(validation):
+                try:
+                    validation = _with_semantic_audit(
+                        validation,
+                        committed,
+                        client=client,
+                        model=model,
+                        informal_statement=informal_statement,
+                        claimed_answer=claimed_answer,
+                        semantic_manifest=semantic_manifest,
+                        formal_decompiler_max_tokens=formal_decompiler_max_tokens,
+                        strict_comparator_max_tokens=strict_comparator_max_tokens,
+                        format_max_attempts=semantic_format_max_attempts,
+                        decompiler_cache=decompiler_cache,
+                        comparator_cache=comparator_cache,
+                        obligation_ledger=semantic_obligation_ledger,
+                        tracer=tracer,
+                        thm_name=thm_name,
+                        round_index=round_index,
+                    )
+                    _emit_phase1b_validation_result(
+                        tracer, thm_name=thm_name, round_index=round_index,
+                        validation=validation, reused_candidate=True,
+                    )
+                except SemanticAuditFormatError as exc:
+                    raise BlueprintGenerationError(
+                        f"Phase 1B semantic audit response was invalid: {exc.reason}",
+                        last_candidate=committed.lean_file,
+                        diagnostics=[exc.reason, json.dumps(exc.attempts, ensure_ascii=False)],
+                        attempt=round_index,
+                        failure_stage="phase1BSemanticAuditFormat",
+                        candidate_history=candidate_history,
+                        candidate_labels=candidate_labels,
+                        validation_details=_phase1b_validation_details(validation),
+                        node_edit_rounds=edit_history,
+                    ) from exc
+            elif semantic_audit_enabled:
                 validation.open_semantic_obligations = _open_semantic_obligations(
                     semantic_obligation_ledger
                 )
                 validation.semantic_obligation_ledger = tuple(
                     dict(item) for item in semantic_obligation_ledger.values()
                 )
+            semantic_after = _phase1b_semantic_snapshot(validation)
+            round_semantic_delta = _phase1b_semantic_delta(
+                semantic_before,
+                semantic_after,
+                target_obligations=plan.target_obligations,
+                ledger=semantic_obligation_ledger,
+                round_index=round_index,
+                changed_nodes=[row["nodeName"] for row in edit_rows],
+                noop_nodes=[row["nodeName"] for row in no_op_rows],
+            )
+            previous_semantic_delta = round_semantic_delta
+            if validation.strict_comparator_result is not None:
+                if round_semantic_delta["resolvedTargetObligations"]:
+                    stagnant_commit_count = 0
+                else:
+                    stagnant_commit_count += 1
+            if tracer is not None:
+                tracer.emit(TraceEvent(
+                    kind="phase1BSemanticDelta", thm_name=thm_name,
+                    turn=round_index,
+                    args={"round": round_index, **round_semantic_delta,
+                          "stagnantCommitCount": stagnant_commit_count},
+                    ok=bool(round_semantic_delta["resolvedTargetObligations"]),
+                ))
+            previous_rollback = None
+            rejected_candidate_hash = ""
+            outcome = "commit"
+            if tracer is not None:
+                tracer.emit(TraceEvent(
+                    kind="phase1BSubgraphCommit", thm_name=thm_name,
+                    turn=round_index,
+                    args={"round": round_index, "committedHashBefore": committed_hash,
+                          "committedHashAfter": hashlib.sha256(
+                              committed.lean_file.encode()
+                          ).hexdigest(), "editedNodes": [row["nodeName"] for row in edit_rows]},
+                    ok=True,
+                ))
         else:
-            # The candidate is byte-identical. Re-emit the logical standalone check
-            # from its hash cache without spending another Lean compilation.
-            if validation.lean_result.success and not validation.structural_errors:
-                report = phase2_standalone_contract_report(
-                    current, compiler,
-                    concurrency=phase2_contract_check_concurrency,
-                    skip_pending=True, cache=standalone_cache,
-                    tracer=tracer, thm_name=thm_name, round_index=round_index,
-                )
-            else:
-                report = _skipped_standalone_report(
-                    tracer, thm_name=thm_name, round_index=round_index,
-                    reason=("wholeFileCompileFailed" if not validation.lean_result.success
-                            else "phase2StructuralContractFailed"),
-                )
-            validation = _Phase1BValidation(
-                lean_result=validation.lean_result,
-                semantic_issues=validation.semantic_issues,
-                source_contexts=validation.source_contexts,
-                structural_errors=validation.structural_errors,
-                standalone_report=report,
-                pending_node_names=_pending_node_names(current),
-                formal_decompiler_result=validation.formal_decompiler_result,
-                strict_comparator_result=validation.strict_comparator_result,
-                open_semantic_obligations=validation.open_semantic_obligations,
-                semantic_obligation_ledger=validation.semantic_obligation_ledger,
-                semantic_audit_required=semantic_audit_enabled,
+            current = committed
+            outcome = "rollback"
+            if candidate is not None:
+                rejected_candidate_hash = hashlib.sha256(candidate.lean_file.encode()).hexdigest()
+            summary_reason = "; ".join(rollback_reasons) or "candidateNotApplied"
+            detailed_diagnostic = "\n".join(
+                dict.fromkeys(item.strip() for item in rollback_diagnostics if item.strip())
+            )[:4000]
+            diagnostic = (
+                summary_reason + "\n" + detailed_diagnostic
+                if detailed_diagnostic else summary_reason
             )
-            _emit_phase1b_validation_result(
-                tracer, thm_name=thm_name, round_index=round_index,
-                validation=validation, reused_candidate=True,
-            )
+            failed_declarations = list(dict.fromkeys(
+                name for name in failed_declarations if name
+            )) or [row["nodeName"] for row in edit_rows + no_op_rows]
+            rejected = [{"node_name": row["nodeName"], "action": row["action"],
+                         "reason": summary_reason} for row in edit_rows + no_op_rows] or [
+                {"node_name": "", "action": "", "reason": summary_reason}
+            ]
+            previous_rollback = {
+                "repair_spec": plan.raw_content or plan.text,
+                "repair_spec_hash": plan.stable_hash(),
+                "target_obligations": list(plan.target_obligations),
+                "edited_nodes": [row["nodeName"] for row in edit_rows + no_op_rows],
+                "effective_nodes": [row["nodeName"] for row in edit_rows],
+                "no_op_nodes": [row["nodeName"] for row in no_op_rows],
+                "failed_declarations": failed_declarations,
+                "error_summary": diagnostic,
+                "rejected_candidate_hash": rejected_candidate_hash,
+            }
+            if tracer is not None:
+                tracer.emit(TraceEvent(
+                    kind="phase1BSubgraphRollback", thm_name=thm_name,
+                    turn=round_index,
+                    args={"round": round_index, "committedHashBefore": committed_hash,
+                          "committedHashAfter": hashlib.sha256(
+                              committed.lean_file.encode()
+                          ).hexdigest(), "candidateHash": rejected_candidate_hash,
+                          "editedNodes": [row["nodeName"] for row in edit_rows],
+                          "noOpNodes": [row["nodeName"] for row in no_op_rows],
+                          "reasons": rollback_reasons},
+                    ok=False,
+                ))
+        if tracer is not None:
+            tracer.emit(TraceEvent(
+                kind="phase1BSubgraphEditResult", thm_name=thm_name,
+                turn=round_index, span_id=span_id,
+                call_id=getattr(call, "id", ""), tool_name="editBlueprintSubgraph",
+                result=outcome, ok=outcome == "commit",
+                args={"round": round_index, "plannedNodes": list(plan.edit_nodes),
+                      "actualEdits": edit_rows + no_op_rows,
+                      "effectiveEdits": edit_rows,
+                      "noOpEdits": no_op_rows,
+                      "rollbackReasons": rollback_reasons,
+                      "committedHash": hashlib.sha256(committed.lean_file.encode()).hexdigest()},
+                duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
+            ))
+        edit_history.append({
+            "round": round_index,
+            "repairMode": plan.repair_mode,
+            "repairSpecHash": plan.stable_hash(),
+            "plan": plan.text,
+            "targetObligations": list(plan.target_obligations),
+            "plannedNodes": list(plan.edit_nodes),
+            "sharedObjects": [list(item) for item in plan.shared_objects],
+            "nodeContracts": [asdict(item) for item in plan.node_contracts],
+            "forbidden": list(plan.forbidden),
+            "actualNodes": [row["nodeName"] for row in edit_rows + no_op_rows],
+            "effectiveNodes": [row["nodeName"] for row in edit_rows],
+            "noOpNodes": [row["nodeName"] for row in no_op_rows],
+            "semanticDelta": dict(round_semantic_delta or {}),
+            "candidateApplied": outcome == "commit",
+            "committed": outcome == "commit",
+            "rolledBack": outcome == "rollback",
+            "rollbackReasons": rollback_reasons,
+            "accepted": edit_rows if outcome == "commit" else [],
+            "rejected": rejected,
+            "identical": list(no_op_rows),
+            "committedHash": hashlib.sha256(committed.lean_file.encode()).hexdigest(),
+        })
         _emit_pending_summary(
             tracer, thm_name=thm_name, phase="phase1B", round_index=round_index,
-            blueprint=current, initial_names=initial_pending_names,
+            blueprint=committed, initial_names=initial_pending_names,
             previous_names=previous_pending_names,
         )
-        previous_pending_names = _pending_node_names(current)
+        previous_pending_names = _pending_node_names(committed)
     else:
         if (
             semantic_audit_enabled
@@ -3558,6 +4574,12 @@ def generate_blueprint_from_informal(
     phase1b_strict_comparator_max_tokens: int = 4096,
     phase1b_semantic_format_max_attempts: int = 2,
     phase1b_seed_lean_code: str = "",
+    phase1b_planning_enabled: bool = False,
+    phase1b_plan_max_tokens: int = 1024,
+    phase1b_plan_format_max_attempts: int = 2,
+    phase1b_plan_max_chars: int = 800,
+    phase1b_subgraph_max_edits: int = 8,
+    phase1b_deterministic_rollback: bool = True,
 ) -> Blueprint:
     """Generate a Phase-1A draft, then edit its nodes and DAG in Phase 1B."""
     if phase1_max_tool_turns <= 0 or phase1_max_tool_calls_per_turn <= 0:
@@ -3572,6 +4594,14 @@ def generate_blueprint_from_informal(
         raise ValueError("Phase-1B Strict Comparator max tokens must be positive")
     if phase1b_semantic_format_max_attempts <= 0:
         raise ValueError("Phase-1B semantic format attempts must be positive")
+    if phase1b_plan_max_tokens <= 0:
+        raise ValueError("Phase-1B Planner max tokens must be positive")
+    if phase1b_plan_format_max_attempts <= 0:
+        raise ValueError("Phase-1B Planner format attempts must be positive")
+    if phase1b_plan_max_chars <= 0:
+        raise ValueError("Phase-1B Plan max characters must be positive")
+    if phase1b_subgraph_max_edits <= 0:
+        raise ValueError("Phase-1B subgraph edit limit must be positive")
     if semantic_source_mode not in SEMANTIC_SOURCE_MODES:
         raise ValueError(
             "semantic_source_mode must be one of: step_grounded, whole_cot"
@@ -3879,6 +4909,12 @@ def generate_blueprint_from_informal(
         semantic_format_max_attempts=phase1b_semantic_format_max_attempts,
         retrieval=retrieval,
         mathlib_search_max_calls_per_round=phase1b_mathlib_search_max_calls_per_round,
+        planning_enabled=phase1b_planning_enabled,
+        plan_max_tokens=phase1b_plan_max_tokens,
+        plan_format_max_attempts=phase1b_plan_format_max_attempts,
+        plan_max_chars=phase1b_plan_max_chars,
+        subgraph_max_edits=phase1b_subgraph_max_edits,
+        deterministic_rollback=phase1b_deterministic_rollback,
         phase2_contract_check_concurrency=phase2_contract_check_concurrency,
         tracer=tracer,
         thm_name=thm_name,

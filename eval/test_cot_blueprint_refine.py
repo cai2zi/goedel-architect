@@ -23,13 +23,16 @@ sys.path.insert(0, str(REPO_ROOT / "experiments"))
 from blueprint import (  # noqa: E402
     Blueprint,
     BlueprintGenerationError,
+    _Phase1BNodeContract,
     _apply_node_edits,
     _node_hash,
     _parse_blueprint,
+    _parse_phase1b_plan,
     _phase1a_contract_errors,
     _run_phase1b_patch_session,
     _strip_pending_helper,
     _validate_node_edit,
+    _validate_repair_contract,
     generate_blueprint_from_informal,
 )
 from kimina_lean_compiler import CompilerResult  # noqa: E402
@@ -604,6 +607,24 @@ def setup : Nat := shared_value'''
         )
         self.assertEqual(reason, "rootMutationNotAllowed")
 
+    def test_repair_contract_checks_formal_reference_and_dependencies(self) -> None:
+        blueprint = self.skeleton()
+        root = blueprint.node_by_name("root")
+        replacement = '''@[blueprint (title := "COT_STEP:S002")
+  (statement := /-- Reuse the setup object in the final relation. -/)
+  (proof := /-- Depend on setup. -/)]
+theorem root : (1 : Nat) = 1 := by sorry_using [setup]'''
+        edit, reason = _validate_node_edit(
+            blueprint, action="replace", node_name="root",
+            expected_hash=_node_hash(root), replacement=replacement,
+        )
+        self.assertEqual(reason, "")
+        errors = _validate_repair_contract(edit, _Phase1BNodeContract(
+            "root", "replace", "reuse source object", must_reference=("source_object",),
+            add_dependencies=(),
+        ))
+        self.assertEqual(errors, ["missingPlannedFormalReferences:root:source_object"])
+
     def test_pending_helper_is_removed_without_changing_nodes(self) -> None:
         blueprint = self.skeleton()
         final_code = _strip_pending_helper(blueprint.lean_file)
@@ -633,13 +654,14 @@ lemma setup (x : Nat) (h : x = 1) : x = 1 := by sorry_using []'''
         call = SimpleNamespace(
             id="patch-1", type="function",
             function=SimpleNamespace(
-                name="editBlueprintNode",
+                name="editBlueprintSubgraph",
                 arguments=json.dumps({
-                    "action": "replace",
-                    "node_name": "setup",
-                    "expected_node_hash": _node_hash(node),
-                    "replacement": replacement,
-                    "reason": "complete the pending claim",
+                    "edits": [{
+                        "action": "replace",
+                        "node_name": "setup",
+                        "expected_node_hash": _node_hash(node),
+                        "replacement": replacement,
+                    }],
                 }),
             ),
         )
@@ -675,7 +697,7 @@ lemma setup (x : Nat) (h : x = 1) : x = 1 := by sorry_using []'''
             )
         self.assertNotIn("PendingBlueprintClaim", final.lean_file)
         self.assertEqual(compiler.calls, 3)  # initial, one merged round, final cleanup
-        self.assertEqual(labels, ["phase1b_round_1", "phase1b_final"])
+        self.assertEqual(labels, ["phase1b_round_1_candidate", "phase1b_final"])
         self.assertEqual(final.phase1b_edit_history[0]["accepted"], [
             {"action": "replace", "nodeName": "setup"},
         ])
@@ -685,7 +707,7 @@ lemma setup (x : Nat) (h : x = 1) : x = 1 := by sorry_using []'''
         ]
         self.assertEqual(validation_rounds, [0, 1, 3])
         tool_kinds = [event.kind for event in events if event.call_id == "patch-1"]
-        self.assertEqual(tool_kinds, ["tool_call", "tool_result"])
+        self.assertEqual(tool_kinds, ["phase1BSubgraphEditStart", "phase1BSubgraphEditResult"])
 
     def test_phase1b_uses_all_rounds_when_model_makes_no_edit(self) -> None:
         compiler = SimpleNamespace(
@@ -710,6 +732,332 @@ lemma setup (x : Nat) (h : x = 1) : x = 1 := by sorry_using []'''
         self.assertEqual(caught.exception.failure_stage, "phase1BFailed")
         self.assertFalse(caught.exception.validation_details["passed"])
         self.assertEqual(len(caught.exception.node_edit_rounds), 2)
+
+    def test_phase1b_plan_parser_enforces_inventory_and_limits(self) -> None:
+        content = """REPAIR_MODE:
+localRepair
+
+TARGET_OBLIGATIONS:
+- semantic:missing:x
+
+EDIT_NODES:
+- setup
+- root
+
+SHARED_OBJECTS:
+- none
+
+NODE_CONTRACTS:
+- setup | action=replace | goal=bind x to the source object | must_reference=none | add_dependencies=none | remove_dependencies=none
+- root | action=replace | goal=use the repaired setup | must_reference=none | add_dependencies=setup | remove_dependencies=none
+
+FORBIDDEN:
+- reflexiveEquality
+
+PLAN:
+Replace setup and reconnect the root to the same formal object."""
+        plan = _parse_phase1b_plan(
+            content,
+            known_obligation_ids=["semantic:missing:x"],
+            known_node_names=["setup", "root"],
+            known_node_kinds={"setup": "lemma", "root": "theorem"},
+            root_node_name="root",
+            force_object_rebuild=False,
+            max_nodes=8,
+            max_chars=800,
+        )
+        self.assertEqual(plan.edit_nodes, ("setup", "root"))
+        self.assertEqual(plan.repair_mode, "localRepair")
+        self.assertEqual(plan.contract_for("root").add_dependencies, ("setup",))
+        with self.assertRaises(ValueError):
+            _parse_phase1b_plan(
+                content.replace("semantic:missing:x", "semantic:unknown:x"),
+                known_obligation_ids=["semantic:missing:x"],
+                known_node_names=["setup", "root"],
+                known_node_kinds={"setup": "lemma", "root": "theorem"},
+                root_node_name="root",
+                force_object_rebuild=False,
+                max_nodes=8,
+                max_chars=800,
+            )
+        with self.assertRaises(ValueError):
+            _parse_phase1b_plan(
+                content.replace("- root\n\nSHARED", "- setup\n\nSHARED"),
+                known_obligation_ids=["semantic:missing:x"],
+                known_node_names=["setup", "root"],
+                known_node_kinds={"setup": "lemma", "root": "theorem"},
+                root_node_name="root",
+                force_object_rebuild=False,
+                max_nodes=8,
+                max_chars=800,
+            )
+
+    def test_phase1b_root_obligation_requires_object_rebuild_and_root(self) -> None:
+        content = """REPAIR_MODE:
+objectRebuild
+
+TARGET_OBLIGATIONS:
+- semantic:rootTargetObject:x
+
+EDIT_NODES:
+- source_object
+- root
+
+SHARED_OBJECTS:
+- source_object | shared source model
+
+NODE_CONTRACTS:
+- source_object | action=add | goal=model the source object | must_reference=none | add_dependencies=none | remove_dependencies=none
+- root | action=replace | goal=state the answer about source_object | must_reference=source_object | add_dependencies=source_object | remove_dependencies=none
+
+FORBIDDEN:
+- answerOnlyWitness
+
+PLAN:
+Build the shared source object first and make the root reuse it."""
+        plan = _parse_phase1b_plan(
+            content,
+            known_obligation_ids=["semantic:rootTargetObject:x"],
+            known_node_names=["setup", "root"],
+            known_node_kinds={"setup": "lemma", "root": "theorem"},
+            root_node_name="root",
+            force_object_rebuild=False,
+            max_nodes=8,
+            max_chars=800,
+        )
+        self.assertEqual(plan.repair_mode, "objectRebuild")
+        self.assertEqual(plan.shared_objects[0][0], "source_object")
+        missing_root = "\n".join(
+            line for line in content.splitlines()
+            if line != "- root" and not line.startswith("- root |")
+        )
+        with self.assertRaisesRegex(ValueError, "must include root"):
+            _parse_phase1b_plan(
+                missing_root,
+                known_obligation_ids=["semantic:rootTargetObject:x"],
+                known_node_names=["setup", "root"],
+                known_node_kinds={"setup": "lemma", "root": "theorem"},
+                root_node_name="root",
+                force_object_rebuild=False,
+                max_nodes=8,
+                max_chars=800,
+            )
+
+    def test_phase1b_deterministic_failure_rolls_back_committed_candidate(self) -> None:
+        blueprint = self.skeleton()
+        node = blueprint.node_by_name("setup")
+        replacement = '''@[blueprint (title := "COT_STEP:S001")
+  (statement := /-- Preserve the source relation. -/)
+  (proof := /-- Use the source assumption. -/)]
+lemma setup (x : Nat) (h : x = 1) : x = 2 := by sorry_using []'''
+        plan_response = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="""REPAIR_MODE:
+localRepair
+
+TARGET_OBLIGATIONS:
+- none
+
+EDIT_NODES:
+- setup
+
+SHARED_OBJECTS:
+- none
+
+NODE_CONTRACTS:
+- setup | action=replace | goal=state the intended source relation | must_reference=none | add_dependencies=none | remove_dependencies=none
+
+FORBIDDEN:
+- reflexiveEquality
+
+PLAN:
+Replace setup with the intended relation.""", tool_calls=[]),
+                finish_reason="stop",
+            )], usage=None,
+        )
+        edit_call = SimpleNamespace(
+            id="subgraph-1", type="function",
+            function=SimpleNamespace(
+                name="editBlueprintSubgraph",
+                arguments=json.dumps({"edits": [{
+                    "action": "replace", "node_name": "setup",
+                    "expected_node_hash": _node_hash(node),
+                    "replacement": replacement,
+                }]}),
+            ),
+        )
+        edit_response = self.patch_response([edit_call])
+
+        class Compiler:
+            def __init__(self):
+                self.calls = 0
+
+            def check_blueprint(self, *_args):
+                self.calls += 1
+                return CompilerResult(self.calls != 2, errors=[] if self.calls != 2 else ["bad"])
+
+            def check_many(self, requests, **_kwargs):
+                return [CompilerResult(True) for _ in requests]
+
+        events = []
+        with patch(
+            "blueprint.chat_completion_with_retry",
+            side_effect=[plan_response, edit_response],
+        ):
+            with self.assertRaises(BlueprintGenerationError) as caught:
+                _run_phase1b_patch_session(
+                    object(), "model", blueprint,
+                    compiler=Compiler(), informal_statement="p", prompt_proof="cot",
+                    claimed_answer="1", semantic_manifest=None,
+                    semantic_fidelity_enabled=False, semantic_require_step_ids=False,
+                    semantic_static_gate=False, max_rounds=1,
+                    max_tool_calls_per_turn=8, phase2_contract_check_concurrency=2,
+                    tracer=SimpleNamespace(emit=events.append), thm_name="sample",
+                    candidate_history=[], candidate_labels=[], planning_enabled=True,
+                )
+        self.assertEqual(caught.exception.last_candidate, blueprint.lean_file)
+        self.assertTrue(caught.exception.node_edit_rounds[0]["rolledBack"])
+        rollback = next(event for event in events if event.kind == "phase1BSubgraphRollback")
+        self.assertEqual(
+            rollback.args["committedHashBefore"], rollback.args["committedHashAfter"]
+        )
+
+    def test_phase1b_filters_identical_edit_and_commits_effective_subset(self) -> None:
+        blueprint = self.skeleton()
+        setup = blueprint.node_by_name("setup")
+        root = blueprint.node_by_name("root")
+        revised_root = root.lean_declaration.replace(
+            "(statement := /-- root -/)",
+            "(statement := /-- root with an explicit final dependency -/)",
+        )
+        plan_response = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="""REPAIR_MODE:
+localRepair
+
+TARGET_OBLIGATIONS:
+- none
+
+EDIT_NODES:
+- setup
+- root
+
+SHARED_OBJECTS:
+- none
+
+NODE_CONTRACTS:
+- setup | action=replace | goal=retain the setup | must_reference=none | add_dependencies=none | remove_dependencies=none
+- root | action=replace | goal=connect the final result | must_reference=none | add_dependencies=setup | remove_dependencies=none
+
+FORBIDDEN:
+- reflexiveEquality
+
+PLAN:
+Keep the valid setup and update the root metadata without discarding the batch.""",
+                    tool_calls=[]),
+                finish_reason="stop",
+            )], usage=None,
+        )
+        edit_call = SimpleNamespace(
+            id="subgraph-noop", type="function",
+            function=SimpleNamespace(
+                name="editBlueprintSubgraph",
+                arguments=json.dumps({"edits": [
+                    {"action": "replace", "node_name": "setup",
+                     "expected_node_hash": _node_hash(setup),
+                     "replacement": setup.lean_declaration},
+                    {"action": "replace", "node_name": "root",
+                     "expected_node_hash": _node_hash(root),
+                     "replacement": revised_root},
+                ]}),
+            ),
+        )
+        compiler = SimpleNamespace(
+            check_blueprint=lambda *_args: CompilerResult(True),
+            check_many=lambda requests, **_kwargs: [CompilerResult(True) for _ in requests],
+        )
+        events = []
+        with patch("blueprint.chat_completion_with_retry", side_effect=[
+            plan_response, self.patch_response([edit_call]),
+        ]):
+            with self.assertRaises(BlueprintGenerationError) as caught:
+                _run_phase1b_patch_session(
+                    object(), "model", blueprint,
+                    compiler=compiler, informal_statement="p", prompt_proof="cot",
+                    claimed_answer="1", semantic_manifest=None,
+                    semantic_fidelity_enabled=False, semantic_require_step_ids=False,
+                    semantic_static_gate=False, max_rounds=1,
+                    max_tool_calls_per_turn=8, phase2_contract_check_concurrency=2,
+                    tracer=SimpleNamespace(emit=events.append), thm_name="sample",
+                    candidate_history=[], candidate_labels=[], planning_enabled=True,
+                )
+        history = caught.exception.node_edit_rounds[0]
+        self.assertTrue(history["committed"])
+        self.assertEqual(history["effectiveNodes"], ["root"])
+        self.assertEqual(history["noOpNodes"], ["setup"])
+        self.assertTrue(any(event.kind == "phase1BNoOpFiltered" for event in events))
+
+    def test_repair_spec_format_exhaustion_consumes_round_without_terminal_format_stage(self) -> None:
+        bad_plan = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="not a RepairSpec", tool_calls=[]),
+                finish_reason="stop",
+            )], usage=None,
+        )
+        compiler = SimpleNamespace(
+            check_blueprint=lambda *_args: CompilerResult(True),
+            check_many=lambda requests, **_kwargs: [CompilerResult(True) for _ in requests],
+        )
+        with patch("blueprint.chat_completion_with_retry", side_effect=[bad_plan, bad_plan]):
+            with self.assertRaises(BlueprintGenerationError) as caught:
+                _run_phase1b_patch_session(
+                    object(), "model", self.skeleton(),
+                    compiler=compiler, informal_statement="p", prompt_proof="cot",
+                    claimed_answer="1", semantic_manifest=None,
+                    semantic_fidelity_enabled=False, semantic_require_step_ids=False,
+                    semantic_static_gate=False, max_rounds=1,
+                    max_tool_calls_per_turn=8, phase2_contract_check_concurrency=2,
+                    tracer=None, thm_name="sample", candidate_history=[],
+                    candidate_labels=[], planning_enabled=True,
+                )
+        self.assertEqual(caught.exception.failure_stage, "phase1BFailed")
+        self.assertIn(
+            "repairSpecFormat:",
+            caught.exception.node_edit_rounds[0]["rollbackReasons"][0],
+        )
+
+    def test_invalid_repair_spec_hash_cannot_repeat_in_later_round(self) -> None:
+        bad_plan = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="the exact same invalid spec", tool_calls=[]),
+                finish_reason="stop",
+            )], usage=None,
+        )
+        compiler = SimpleNamespace(
+            check_blueprint=lambda *_args: CompilerResult(True),
+            check_many=lambda requests, **_kwargs: [CompilerResult(True) for _ in requests],
+        )
+        with patch(
+            "blueprint.chat_completion_with_retry",
+            side_effect=[bad_plan, bad_plan, bad_plan, bad_plan],
+        ):
+            with self.assertRaises(BlueprintGenerationError) as caught:
+                _run_phase1b_patch_session(
+                    object(), "model", self.skeleton(),
+                    compiler=compiler, informal_statement="p", prompt_proof="cot",
+                    claimed_answer="1", semantic_manifest=None,
+                    semantic_fidelity_enabled=False, semantic_require_step_ids=False,
+                    semantic_static_gate=False, max_rounds=2,
+                    max_tool_calls_per_turn=8, phase2_contract_check_concurrency=2,
+                    tracer=None, thm_name="sample", candidate_history=[],
+                    candidate_labels=[], planning_enabled=True,
+                )
+        history = caught.exception.node_edit_rounds
+        self.assertEqual(len(history), 2)
+        self.assertIn(
+            "byte-identical to a previously used RepairSpec",
+            history[1]["rollbackReasons"][0],
+        )
 
 
 class InvalidBlueprintRecoveryTest(unittest.TestCase):

@@ -24,7 +24,14 @@ phase1b_semantic_audit_enabled: false
 phase1b_formal_decompiler_max_tokens: 4096
 phase1b_strict_comparator_max_tokens: 4096
 phase1b_semantic_format_max_attempts: 2
+phase1b_planning_enabled: false
+phase1b_plan_max_tokens: 1024
+phase1b_plan_format_max_attempts: 2
+phase1b_plan_max_chars: 800
+phase1b_subgraph_max_edits: 8
+phase1b_deterministic_rollback: true
 phase1b_seed_blueprint_root: null
+phase1b_seed_filename: phase1b_final.lean
 phase1b_seed_required: false
 node_max_prove_turns: 8
 # Set to 0 to disable the formal-negation probe after normal proving fails.

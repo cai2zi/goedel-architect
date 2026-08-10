@@ -195,11 +195,20 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
     args.phase1b_semantic_format_max_attempts = int(
         args.phase1b_semantic_format_max_attempts
     )
+    args.phase1b_planning_enabled = bool(args.phase1b_planning_enabled)
+    args.phase1b_plan_max_tokens = int(args.phase1b_plan_max_tokens)
+    args.phase1b_plan_format_max_attempts = int(args.phase1b_plan_format_max_attempts)
+    args.phase1b_plan_max_chars = int(args.phase1b_plan_max_chars)
+    args.phase1b_subgraph_max_edits = int(args.phase1b_subgraph_max_edits)
+    args.phase1b_deterministic_rollback = bool(args.phase1b_deterministic_rollback)
     seed_root = getattr(args, "phase1b_seed_blueprint_root", None)
     args.phase1b_seed_blueprint_root = (
         _resolve_path(seed_root, original_cwd) if seed_root else None
     )
     args.phase1b_seed_required = bool(getattr(args, "phase1b_seed_required", False))
+    args.phase1b_seed_filename = str(
+        getattr(args, "phase1b_seed_filename", "phase1b_final.lean")
+    )
     _validate_args(args)
     return args
 
@@ -239,10 +248,20 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("phase1b_strict_comparator_max_tokens must be positive")
     if args.phase1b_semantic_format_max_attempts <= 0:
         raise ValueError("phase1b_semantic_format_max_attempts must be positive")
+    if args.phase1b_plan_max_tokens <= 0:
+        raise ValueError("phase1b_plan_max_tokens must be positive")
+    if args.phase1b_plan_format_max_attempts <= 0:
+        raise ValueError("phase1b_plan_format_max_attempts must be positive")
+    if args.phase1b_plan_max_chars <= 0:
+        raise ValueError("phase1b_plan_max_chars must be positive")
+    if args.phase1b_subgraph_max_edits <= 0:
+        raise ValueError("phase1b_subgraph_max_edits must be positive")
     if args.phase1b_seed_required and args.phase1b_seed_blueprint_root is None:
         raise ValueError(
             "phase1b_seed_required=true requires phase1b_seed_blueprint_root"
         )
+    if Path(args.phase1b_seed_filename).name != args.phase1b_seed_filename:
+        raise ValueError("phase1b_seed_filename must be a basename")
     if args.semantic_source_mode not in {"step_grounded", "whole_cot"}:
         raise ValueError("semantic_source_mode must be one of: step_grounded, whole_cot")
     if args.semantic_source_mode == "whole_cot" and not args.semantic_fidelity_enabled:
@@ -379,7 +398,7 @@ def _load_phase1b_seed_blueprint(
     root = args.phase1b_seed_blueprint_root
     if root is None:
         return ""
-    seed_path = root / record.subset / record.split / record.record_id / "phase1b_final.lean"
+    seed_path = root / record.subset / record.split / record.record_id / args.phase1b_seed_filename
     metadata_path = root.parent / "results.jsonl"
     metadata = _seed_result_rows(str(metadata_path)).get(record.source_id)
     problems: list[str] = []
@@ -601,6 +620,12 @@ def _result_row(
         "phase1b_semantic_format_max_attempts": (
             args.phase1b_semantic_format_max_attempts
         ),
+        "phase1b_planning_enabled": bool(args.phase1b_planning_enabled),
+        "phase1b_plan_max_tokens": args.phase1b_plan_max_tokens,
+        "phase1b_plan_format_max_attempts": args.phase1b_plan_format_max_attempts,
+        "phase1b_plan_max_chars": args.phase1b_plan_max_chars,
+        "phase1b_subgraph_max_edits": args.phase1b_subgraph_max_edits,
+        "phase1b_deterministic_rollback": bool(args.phase1b_deterministic_rollback),
         "phase1b_seed_blueprint_root": str(args.phase1b_seed_blueprint_root or ""),
         "phase1b_seed_required": bool(args.phase1b_seed_required),
         "phase1b_mathlib_search_max_calls_per_round": (
@@ -755,6 +780,16 @@ async def _run_record(
                     ),
                     phase1b_semantic_format_max_attempts=(
                         args.phase1b_semantic_format_max_attempts
+                    ),
+                    phase1b_planning_enabled=args.phase1b_planning_enabled,
+                    phase1b_plan_max_tokens=args.phase1b_plan_max_tokens,
+                    phase1b_plan_format_max_attempts=(
+                        args.phase1b_plan_format_max_attempts
+                    ),
+                    phase1b_plan_max_chars=args.phase1b_plan_max_chars,
+                    phase1b_subgraph_max_edits=args.phase1b_subgraph_max_edits,
+                    phase1b_deterministic_rollback=(
+                        args.phase1b_deterministic_rollback
                     ),
                     phase1b_seed_lean_code=phase1b_seed_lean_code,
                 ),
