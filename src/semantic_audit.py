@@ -1,454 +1,926 @@
-"""Optional one-request semantic audit for COT-grounded Lean blueprints.
+"""Strict two-stage Phase-1B semantic audit.
 
-This module is deliberately independent of the main pipeline.  Callers may
-route only selected examples through it without changing Blueprint generation
-or proof scheduling.
+The formal decompiler never sees the problem or COT.  The strict comparator
+receives its frozen literal translation and reports concrete omissions or
+weakenings.  The runner, rather than the model, computes the final PASS bit.
 """
 from __future__ import annotations
 
-import os
+import hashlib
+import json
 import re
-from dataclasses import dataclass
-from typing import Any, Literal
+from dataclasses import asdict, dataclass
+from typing import Any, Mapping, Sequence
 
-from llm_client import chat_completion_with_retry, make_client
-from semantic_fidelity import _strip_lean_comments
+from llm_client import chat_completion_with_retry
 from tracer import TraceEvent
 
 
-AuditMode = Literal["risk", "full"]
-SEMANTIC_AUDIT_FLAG_RE = re.compile(r"\[\[SEMANTIC_AUDIT=(PASS|FAIL)\]\]")
-_COT_STEP_ID_RE = re.compile(r"\[COT_STEP\s+(S\d{3,})\]")
-_STEPS_LINE_RE = re.compile(r"\[\[STEPS=([^\]]*)\]\]")
-_STEP_ENTRY_RE = re.compile(r"(S\d{3,}):(OK|MISSING|MISMATCH)")
-_BLUEPRINT_PROSE_FIELD_RE = re.compile(
-    r"\((?:statement|proof)\s*:=\s*"
-    r"(?:/--.*?-/|\"(?:\\.|[^\"\\])*\")\)\s*",
-    re.DOTALL,
-)
-_SORRY_USING_BODY_RE = re.compile(
-    r":=\s*by\s+sorry_using\s*\[[^\]]*\]",
-    re.DOTALL,
-)
+PROMPT_VERSION = "phase1b-semantic-audit-v7"
+SEMANTIC_EFFECTS = {"objectDefinition", "proposition", "vacuous"}
 
 
-SYSTEM_PROMPT = """You are a proposition-coverage auditor, not a proof judge.
+DECOMPILER_SYSTEM_PROMPT = r"""You are a literal Lean semantic decompiler.
+You receive only sanitized Lean declarations and their graph metadata. You do
+not receive the source problem, chain-of-thought, claimed answer, Blueprint
+comments, or proof bodies. Translate exactly what each formal declaration
+means. Never infer intended mathematics from identifier names.
 
-Compare the original problem, claimed answer, numbered source COT, and the
-formal-only Lean view. Use this mechanical decision procedure:
+`semantic_effect` must be:
+- `objectDefinition` for a non-vacuous object/function/set/relation definition;
+- `proposition` for a non-vacuous proposition;
+- `vacuous` only for True shells, literal reflexive/answer aliases such as
+  `let x := 64; x = 64`, unconstrained witnesses, or declarations that impose
+  no substantive mathematical constraint. A theorem which repeats the same
+  non-vacuous proposition as an earlier node is still `proposition`: graph
+  redundancy is not semantic vacuity, and a final COT answer restatement may
+  legitimately repeat its supporting lemma's proposition.
 
-1. For every `[COT_STEP ...]`, inventory all mathematical clauses it asserts,
-   including false, contradictory, and unsupported clauses. A Step may map to
-   several Lean declarations which must be judged collectively.
-2. Find Lean propositions or definition bodies that jointly state each Step about the
-   same objects, bindings, assumptions, quantifiers, relations, constants,
-   branches, and polarity.
-3. Check that the root asks the original problem's question about the same
-   object and preserves the COT's claimed final answer.
-4. PASS exactly when this proposition inventory is covered without a
-   substantive replacement, omission, weakening, strengthening, or silent
-   correction. Mathematical truth and provability are irrelevant. Headings,
-   lead-ins, and method narration inside a Step need no separate declaration.
+Return exactly one JSON object with this shape and no Markdown:
+{"nodes":[{"node_name":"n","kind":"definition","translation":"...",
+"semantic_effect":"objectDefinition","introduced_objects":[],
+"referenced_objects":[]}]}
 
-The Lean view intentionally removes prose, proof bodies, and dependency lists;
-every displayed `by sorry` means "this source proposition is unproved here".
-A deterministic checker has already verified step IDs, root reachability, and
-graph closure. Never judge whether a node is used, whether its parents prove it,
-whether the root logically follows, or whether an extra dependency is needed.
-Do not repair or re-grade the COT. A faithfully translated mathematically wrong
-COT must PASS.
+Include every supplied node exactly once and in supplied order. Keep every
+translation under 80 words. Object arrays contain only identifiers literally
+introduced or referenced by the sanitized formal declaration; graph
+dependencies are not formal references. For every implication or quantified
+theorem, explicitly distinguish assumptions from the conclusion using the
+words "Assuming ..., concludes ...". Never promote a hypothesis into the
+conclusion, and never infer a geometric/counting meaning from the node name.
+"""
 
-An unsupported jump is preserved by stating its conclusion as its own Lean
-lemma with `by sorry`; no missing-justification lemma is required. If the COT
-counts a restricted family and then explicitly writes `N = K`, the required
-formal node is simply `N = K`. Do not demand an unstated necessity, converse,
-or set equivalence. A weaker node `restrictedCount = K` is not enough.
-Coverage may pass through transparent definitions: `restrictedCount := 27^3`
-together with `N = restrictedCount` exactly states `N = 27^3` and MUST NOT be
-rejected merely because the equality is split across two declarations.
 
-Concrete calibration: if the source separately asserts (a) a single-cube
-biconditional, (b) an all-27-divisible sufficiency statement for a sum, (c) the
-unsupported total-count jump, and (d) the final result, then a view containing
-`cube_divisibility_condition : ... ↔ ...`,
-`all_divisible_by_27_implies_sum_divisible : ... → ...`,
-`total_valid_triples : N = 27^3 := by sorry`, and a root about that same `N`
-MUST PASS. Requiring another "only if" lemma is itself an audit error.
+COMPARATOR_SYSTEM_PROMPT = r"""You are a strict semantic-translation
+comparator, not a proof or truth judge. The source COT may be mathematically
+wrong, contradictory, or unsupported. An exact formalization of that wrong
+claim is faithful. Reject only formal omissions, weakenings, added content,
+object replacement, unbound objects, wrong relation/direction, or a DAG that
+does not preserve the source use-chain.
 
-Near-miss calibration: if that source contains the one-variable biconditional
-and only an all-three-divisible sufficiency statement, a Blueprint that omits
-the one-variable proposition and instead states
-`sumDivisible ↔ allThreeDivisible` MUST FAIL. The added aggregate converse is
-not the source's one-variable claim, even when the total-count gap is retained.
+The formal translations were produced by a separate decompiler that could not
+see the COT. Treat them as frozen evidence. A matching answer literal is never
+sufficient: the root must constrain the same source object used by the COT.
+Comments and names carry no semantic credit. `exists x, x = answer` is
+unfaithful unless x is constrained as the source object. A Step mapped to
+several nodes is covered only when the nodes jointly encode every mathematical
+clause. A vacuous node never contributes coverage.
 
-FAIL only for a formal mismatch: changed object identity/binding, truth
-condition, quantifier/polarity, number, premise/filter, relation direction,
-case/branch, final conclusion/answer, or a substantive source claim absent from
-formal Lean. `True`, self-equality, an unconstrained existential, a hard-coded
-answer definition, or an added premise are failures when they replace source
-content. A source `assume` may become a hypothesis, but a source `let x := v`
-must retain the binding to `v`. Splitting/merging helpers, equivalent notation,
-specialization used by the COT, and declaration order are not failures.
+Dependencies are judged separately from node truth. Do not demand a formal
+proof that a parent entails its child; decide whether the listed parents match
+the earlier COT results the child claims to use. An unreachable Step is allowed
+only when the COT explicitly abandons it, diagnoses it as an error, or keeps it
+as a genuinely independent branch. Ordinary sequential calculations used in
+the final answer are not side branches.
 
-Lean identifier names and conventional subscripts carry no semantics. Never
-infer "inner", "outer", incidence, tangency, validity, or another relation from
-a name alone; require the relation in a formal type/body, and follow the
-source's explicit equations even when its naming is unconventional. Conversely,
-numeric definitions such as `sphereRadius := 11` do not formalize the source's
-sphere, torus, tangency, incidence, or two-circle constraints unless formal
-relations connect those objects and quantities.
+Perform a mechanical clause audit before writing JSON:
+1. Split each source Step into its atomic mathematical assertions, including
+   quantifier strength (`all`, `exists`, `unique`, `exactly`), object identity,
+   restrictions, relation direction, and asserted conclusion.
+2. Compare each assertion only with the literal frozen node translations and
+   sanitized formal types mapped to that Step. A node identifier, dependency
+   label, or suggestive English name is routing metadata and earns zero credit.
+3. A property present only as a hypothesis is not a formalized conclusion. A
+   theorem that assumes the desired relation and concludes an already-given
+   fact is missing or direction-reversed.
+4. Do not add source concepts while composing `combined_formal_translation`.
+   It must be a faithful compression of the frozen translations. If the source
+   says "diameters form a unique rectangle" while the formal conclusion only
+   constructs a four-element endpoint set, report the rectangle and uniqueness
+   clauses as missing; never insert them into the combined translation.
+5. Existence does not encode uniqueness, a finite collection of stated size
+   does not say it is the complete collection of valid objects, and arbitrary
+   coordinates do not encode the original geometric object unless the formal
+   constraints bind them to it.
+6. Compare every conjunct and inequality. Boundary-only, one-sided, or
+   restricted-family claims are weakened when the source includes an interior,
+   converse, total-count bridge, or additional condition.
 
-If inconsistent source prose says "outer = R+a = 9" and "inner = R-a = 3"
-but then explicitly computes `r_i - r_o = 9 - 3`, a formal `r_i := 9` and
-`r_o := 3` preserves the source's algebra. Do not swap them based on conventional
-subscript meanings. Missing formal tangency or circle relations may still FAIL.
+Never repair, reinterpret, or charitably complete the formalization. When in
+doubt, describe the literal formal conclusion first and record the absent
+source clause in the appropriate issue array.
 
-The FIRST LINE must be exactly one marker:
-[[SEMANTIC_AUDIT=PASS]]
-[[SEMANTIC_AUDIT=FAIL]]
+Return exactly one JSON object and no Markdown. It must have exactly these
+top-level keys: `steps`, `root`, `unreachable_steps`, `dependency_issues`, and
+`obligation_results`. Every issue in the four Step issue arrays has keys
+`clause`, `node_names`, and `reason`, with no extra keys. Every dependency issue
+has exactly `node_name`, `step_id`, and `reason`. Copy the supplied Step,
+unreachable-Step, and open-obligation inventories exactly and in order. Do not
+invent obligation IDs: when `required_obligation_ids` is empty,
+`obligation_results` must be `[]`. When there are no dependency issues, return
+`dependency_issues: []`.
 
-The SECOND LINE must be exactly one compact inventory containing every supplied
-Step ID once, in source order, with status OK, MISSING, or MISMATCH:
-`[[STEPS=S001:OK,S002:MISSING]]`.
+Be terse so the complete inventory fits the output budget. Each
+`combined_formal_translation` and the root translation must be at most 25
+words. Each clause must be at most 20 words and every reason at most 15 words.
+An obligation reason may simply say "fixed" or name the still-missing formal
+relation. Never restate the full source Step inside a reason, and do not
+duplicate the same explanation across issue categories. Empty inventories
+must be literal `[]`. Completeness of the JSON inventory is more important
+than stylistic explanation.
 
-PASS is legal only when every status is OK. FAIL requires at least one MISSING
-or MISMATCH. For FAIL, output at most two diagnostic lines after the inventory,
-each `S004.C002: ...` and at most 45 words. Each line must cite one explicit
-source Step and its mismatching Lean signature. Do not duplicate a root cause.
-Do not output chain-of-thought, proof critique, a rewritten proof, or discussion.
-Decide before emitting the first token, never revise the inventory afterward,
-and stop after the permitted diagnostic lines. Emit exactly one decision marker
-and one complete inventory."""
+An open obligation is a persistent repair question, not an immutable verdict.
+Re-evaluate every obligation against the CURRENT Formal View. Set `resolved`
+to true exactly when its stated defect is absent now. In particular, if an old
+`vacuousNode` obligation names a node that is now a concrete non-vacuous
+proposition/object definition and faithfully covers its source clause, return
+`resolved:true`; do not keep it false merely because it appears in the open
+inventory or because the former diagnosis was once valid. Conversely, an
+obligation may not disappear by omission: copy its ID and explicitly report
+the current evidence. The issue arrays describe current defects; do not
+re-create a repaired historical defect just to justify keeping an obligation
+open.
+"""
 
 
 @dataclass(frozen=True)
-class ParsedSemanticAudit:
-    passed: bool
-    flag: Literal["PASS", "FAIL"]
-    diagnostics: str
-    step_statuses: tuple[tuple[str, str], ...] = ()
+class FormalNodeView:
+    node_name: str
+    kind: str
+    step_id: str
+    dependencies: tuple[str, ...]
+    declaration: str
+    is_root: bool
+    in_root_closure: bool
 
 
 @dataclass(frozen=True)
-class SemanticAuditResult:
-    passed: bool
-    flag: Literal["PASS", "FAIL"]
-    diagnostics: str
+class FormalView:
+    nodes: tuple[FormalNodeView, ...]
+    root_name: str
+    root_closure: tuple[str, ...]
+    sha256: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class FormalNodeTranslation:
+    node_name: str
+    kind: str
+    translation: str
+    semantic_effect: str
+    introduced_objects: tuple[str, ...]
+    referenced_objects: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class FormalDecompilerResult:
+    nodes: tuple[FormalNodeTranslation, ...]
     raw_content: str
     reasoning_content: str
-    model: str
-    mode: AuditMode
     finish_reason: str | None
-    truncated: bool
     request_id: str
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
-    step_statuses: tuple[tuple[str, str], ...] = ()
+    attempts: tuple[dict[str, Any], ...] = ()
+
+    @property
+    def vacuous_nodes(self) -> tuple[str, ...]:
+        return tuple(node.node_name for node in self.nodes if node.semantic_effect == "vacuous")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class StrictComparatorResult:
+    steps: tuple[dict[str, Any], ...]
+    root: dict[str, Any]
+    unreachable_steps: tuple[dict[str, Any], ...]
+    dependency_issues: tuple[dict[str, Any], ...]
+    obligation_results: tuple[dict[str, Any], ...]
+    passed: bool
+    raw_content: str
+    reasoning_content: str
+    finish_reason: str | None
+    request_id: str
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    attempts: tuple[dict[str, Any], ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 class SemanticAuditFormatError(ValueError):
-    """The model response did not contain one unambiguous final audit flag."""
-
     def __init__(
         self,
         reason: str,
         *,
-        raw_content: str,
-        markers: tuple[str, ...] = (),
+        raw_content: str = "",
+        attempts: Sequence[dict[str, Any]] = (),
     ) -> None:
         super().__init__(f"semantic audit format error: {reason}")
         self.reason = reason
         self.raw_content = raw_content
-        self.markers = markers
+        self.attempts = tuple(attempts)
 
 
-def semantic_audit_formal_view(blueprint_lean: str) -> str:
-    """Keep formal statements/bodies while hiding proof-grading distractions."""
-    without_prose_fields = _BLUEPRINT_PROSE_FIELD_RE.sub("", blueprint_lean)
-    without_comments = _strip_lean_comments(without_prose_fields)
-    return _SORRY_USING_BODY_RE.sub(":= by sorry", without_comments).strip()
+def _strip_lean_comments(text: str) -> str:
+    """Strip nested Lean comments without corrupting strings."""
+    output: list[str] = []
+    index = 0
+    block_depth = 0
+    line_comment = False
+    in_string = False
+    while index < len(text):
+        ch = text[index]
+        nxt = text[index + 1] if index + 1 < len(text) else ""
+        if line_comment:
+            if ch == "\n":
+                line_comment = False
+                output.append(ch)
+            index += 1
+            continue
+        if block_depth:
+            if ch == "/" and nxt == "-":
+                block_depth += 1
+                index += 2
+            elif ch == "-" and nxt == "/":
+                block_depth -= 1
+                index += 2
+            else:
+                if ch == "\n":
+                    output.append(ch)
+                index += 1
+            continue
+        if in_string:
+            output.append(ch)
+            if ch == "\\" and index + 1 < len(text):
+                output.append(text[index + 1])
+                index += 2
+                continue
+            if ch == '"':
+                in_string = False
+            index += 1
+            continue
+        if ch == '"':
+            in_string = True
+            output.append(ch)
+            index += 1
+        elif ch == "-" and nxt == "-":
+            line_comment = True
+            index += 2
+        elif ch == "/" and nxt == "-":
+            block_depth = 1
+            index += 2
+        else:
+            output.append(ch)
+            index += 1
+    return "\n".join(line.rstrip() for line in "".join(output).splitlines() if line.strip()).strip()
 
 
-def _max_tokens() -> int:
-    value = int(os.environ.get("GOEDEL_SEMANTIC_AUDIT_MAX_TOKENS", "1024"))
-    if value <= 0:
-        raise ValueError("GOEDEL_SEMANTIC_AUDIT_MAX_TOKENS must be positive")
-    return value
+def _base_step_id(value: str) -> str:
+    return str(value or "").split(".", 1)[0]
 
 
-def build_semantic_audit_messages(
-    numbered_cot: str,
-    blueprint_lean: str,
-    *,
-    mode: AuditMode,
-    informal_statement: str = "",
-    claimed_answer: str = "",
-) -> list[dict[str, str]]:
-    if mode not in {"risk", "full"}:
-        raise ValueError("semantic audit mode must be 'risk' or 'full'")
-    problem_text = informal_statement.strip() or "(not supplied by caller)"
-    answer_text = claimed_answer.strip() or "(not supplied by caller)"
-    formal_blueprint = semantic_audit_formal_view(blueprint_lean)
-    user = f"""Audit mode: {mode}
-
-## Original informal problem statement
-
-{problem_text}
-
-## Claimed answer from the original COT
-
-{answer_text}
-
-## Numbered original COT
-
-{numbered_cot}
-
-## Formal-only Blueprint Lean audit view
-
-```lean
-{formal_blueprint}
-```
-
-Audit all step-to-node mappings in this single response. Confirm that the root
-and answer-bearing nodes refer to the exact object asked for in the original
-problem and preserve the source COT's claimed answer. Remember that an
-incorrect source solution must still PASS when it is translated faithfully;
-do not repair or re-grade it. Emit the unique decision marker as the first
-line and the complete compact Step inventory as the second line, before any
-concise diagnostics."""
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user},
-    ]
-
-
-def _step_ids(numbered_cot: str) -> tuple[str, ...]:
-    return tuple(dict.fromkeys(_COT_STEP_ID_RE.findall(numbered_cot)))
-
-
-def parse_semantic_audit(
-    content: str,
-    *,
-    expected_step_ids: tuple[str, ...] = (),
-) -> ParsedSemanticAudit:
-    matches = list(SEMANTIC_AUDIT_FLAG_RE.finditer(content))
-    markers = tuple(match.group(1) for match in matches)
-    if not matches:
-        raise SemanticAuditFormatError(
-            "flag missing", raw_content=content, markers=markers,
+def build_formal_view(blueprint: Any) -> FormalView:
+    node_names = {node.name for node in blueprint.nodes}
+    declarations: dict[str, str] = {}
+    effective: dict[str, tuple[str, ...]] = {}
+    for node in blueprint.nodes:
+        raw = node.full_declaration() if node.kind == "definition" else node.signature()
+        declaration = _strip_lean_comments(raw)
+        declarations[node.name] = declaration
+        effective[node.name] = tuple(
+            dep for dep in node.dependencies if dep in node_names
         )
-    if len(set(markers)) > 1:
-        raise SemanticAuditFormatError(
-            "conflicting flags", raw_content=content, markers=markers,
-        )
-    if len(matches) != 1:
-        raise SemanticAuditFormatError(
-            "duplicate flag", raw_content=content, markers=markers,
-        )
-    match = matches[0]
-    lines = content.splitlines()
-    first_line = lines[0] if lines else ""
-    if SEMANTIC_AUDIT_FLAG_RE.fullmatch(first_line.strip()) is None:
-        raise SemanticAuditFormatError(
-            "flag is not the first line", raw_content=content, markers=markers,
-        )
-    flag = match.group(1)
-    step_statuses: tuple[tuple[str, str], ...] = ()
-    diagnostic_lines = lines[1:]
-    if expected_step_ids:
-        if len(lines) < 2 or _STEPS_LINE_RE.fullmatch(lines[1].strip()) is None:
-            raise SemanticAuditFormatError(
-                "complete Step inventory is not the second line",
-                raw_content=content,
-                markers=markers,
-            )
-        inventory = _STEPS_LINE_RE.fullmatch(lines[1].strip())
-        assert inventory is not None
-        payload = inventory.group(1)
-        entries = payload.split(",") if payload else []
-        parsed_entries: list[tuple[str, str]] = []
-        for entry in entries:
-            entry_match = _STEP_ENTRY_RE.fullmatch(entry.strip())
-            if entry_match is None:
-                raise SemanticAuditFormatError(
-                    "malformed Step inventory entry",
-                    raw_content=content,
-                    markers=markers,
-                )
-            parsed_entries.append((entry_match.group(1), entry_match.group(2)))
-        actual_ids = tuple(step_id for step_id, _status in parsed_entries)
-        if actual_ids != expected_step_ids:
-            raise SemanticAuditFormatError(
-                "Step inventory is incomplete, duplicated, or out of source order",
-                raw_content=content,
-                markers=markers,
-            )
-        statuses = tuple(status for _step_id, status in parsed_entries)
-        if flag == "PASS" and any(status != "OK" for status in statuses):
-            raise SemanticAuditFormatError(
-                "PASS contains a non-OK Step status",
-                raw_content=content,
-                markers=markers,
-            )
-        if flag == "FAIL" and all(status == "OK" for status in statuses):
-            raise SemanticAuditFormatError(
-                "FAIL contains no missing or mismatched Step",
-                raw_content=content,
-                markers=markers,
-            )
-        step_statuses = tuple(parsed_entries)
-        diagnostic_lines = lines[2:]
-    diagnostics = "\n".join(diagnostic_lines).strip()
-    return ParsedSemanticAudit(
-        passed=flag == "PASS",
-        flag=flag,
-        diagnostics=diagnostics,
-        step_statuses=step_statuses,
+    closure: set[str] = set()
+    stack = [blueprint.target_theorem]
+    while stack:
+        name = stack.pop()
+        if name in closure or name not in node_names:
+            continue
+        closure.add(name)
+        stack.extend(effective.get(name, ()))
+    views = tuple(FormalNodeView(
+        node.name,
+        node.kind,
+        _base_step_id(node.source_step_id),
+        effective[node.name],
+        declarations[node.name],
+        node.name == blueprint.target_theorem,
+        node.name in closure,
+    ) for node in blueprint.nodes)
+    payload = json.dumps(
+        {"root": blueprint.target_theorem, "nodes": [asdict(node) for node in views]},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return FormalView(
+        views,
+        blueprint.target_theorem,
+        tuple(node.node_name for node in views if node.in_root_closure),
+        hashlib.sha256(payload.encode()).hexdigest(),
     )
 
 
-def _message_parts(response: Any) -> tuple[str, str, str | None]:
+def formal_decompiler_messages(view: FormalView) -> list[dict[str, str]]:
+    inventory = [{
+        "node_name": node.node_name,
+        "kind": node.kind,
+        "step_id": node.step_id,
+        "dependencies": list(node.dependencies),
+        "is_root": node.is_root,
+        "in_root_closure": node.in_root_closure,
+        "sanitized_formal_lean": node.declaration,
+    } for node in view.nodes]
+    return [
+        {"role": "system", "content": DECOMPILER_SYSTEM_PROMPT},
+        {"role": "user", "content": (
+            f"Formal View SHA-256: {view.sha256}\n"
+            + json.dumps({"root": view.root_name, "nodes": inventory}, ensure_ascii=False)
+        )},
+    ]
+
+
+def _json_object(content: str) -> dict[str, Any]:
+    text = content.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL | re.I)
+    if fenced:
+        text = fenced.group(1).strip()
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise SemanticAuditFormatError(f"invalid JSON: {exc}", raw_content=content) from exc
+    if not isinstance(value, dict):
+        raise SemanticAuditFormatError("top-level value must be an object", raw_content=content)
+    return value
+
+
+def _string(value: Any, label: str, raw: str, *, allow_empty: bool = False) -> str:
+    if not isinstance(value, str) or (not allow_empty and not value.strip()):
+        raise SemanticAuditFormatError(f"{label} must be a string", raw_content=raw)
+    return value.strip()
+
+
+def _strings(value: Any, label: str, raw: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise SemanticAuditFormatError(f"{label} must be an array of strings", raw_content=raw)
+    return tuple(item.strip() for item in value)
+
+
+def parse_formal_decompiler(content: str, *, view: FormalView) -> tuple[FormalNodeTranslation, ...]:
+    value = _json_object(content)
+    if set(value) != {"nodes"} or not isinstance(value["nodes"], list):
+        raise SemanticAuditFormatError("top-level key must be exactly nodes", raw_content=content)
+    parsed: list[FormalNodeTranslation] = []
+    for index, item in enumerate(value["nodes"]):
+        expected_keys = {
+            "node_name", "kind", "translation", "semantic_effect",
+            "introduced_objects", "referenced_objects",
+        }
+        if not isinstance(item, dict) or set(item) != expected_keys:
+            raise SemanticAuditFormatError(f"nodes[{index}] has invalid keys", raw_content=content)
+        effect = _string(item["semantic_effect"], "semantic_effect", content)
+        if effect not in SEMANTIC_EFFECTS:
+            raise SemanticAuditFormatError(f"invalid semantic_effect {effect}", raw_content=content)
+        parsed.append(FormalNodeTranslation(
+            _string(item["node_name"], "node_name", content),
+            _string(item["kind"], "kind", content),
+            _string(item["translation"], "translation", content),
+            effect,
+            _strings(item["introduced_objects"], "introduced_objects", content),
+            _strings(item["referenced_objects"], "referenced_objects", content),
+        ))
+    if [item.node_name for item in parsed] != [node.node_name for node in view.nodes]:
+        raise SemanticAuditFormatError("node inventory is incomplete, duplicated, or reordered", raw_content=content)
+    expected_kinds = {node.node_name: node.kind for node in view.nodes}
+    if any(item.kind != expected_kinds[item.node_name] for item in parsed):
+        raise SemanticAuditFormatError("node kind does not match Formal View", raw_content=content)
+    return tuple(parsed)
+
+
+def _manifest_steps(manifest: Any) -> list[Any]:
+    return list(getattr(manifest, "steps", ()) or ())
+
+
+def _unreachable_inventory(view: FormalView, manifest: Any) -> list[dict[str, Any]]:
+    nodes_by_step: dict[str, list[FormalNodeView]] = {}
+    for node in view.nodes:
+        nodes_by_step.setdefault(node.step_id, []).append(node)
+    inventory = []
+    for step in _manifest_steps(manifest):
+        nodes = nodes_by_step.get(step.step_id, [])
+        if nodes and not any(node.in_root_closure for node in nodes):
+            inventory.append({
+                "step_id": step.step_id,
+                "node_names": [node.node_name for node in nodes],
+            })
+    return inventory
+
+
+def strict_comparator_messages(
+    informal_statement: str,
+    claimed_answer: str,
+    manifest: Any,
+    view: FormalView,
+    decompiler: FormalDecompilerResult,
+    open_obligations: Sequence[Mapping[str, Any]],
+) -> list[dict[str, str]]:
+    steps = [{"step_id": step.step_id, "source": step.source_text} for step in _manifest_steps(manifest)]
+    payload = {
+        "problem": informal_statement,
+        "claimed_answer": claimed_answer,
+        "cot_steps": steps,
+        "formal_view": view.to_dict(),
+        "frozen_node_translations": [asdict(node) for node in decompiler.nodes],
+        "unreachable_step_inventory": _unreachable_inventory(view, manifest),
+        "unreachable_node_inventory": [
+            node.node_name for node in view.nodes if not node.in_root_closure
+        ],
+        "open_obligations": [dict(item) for item in open_obligations],
+        "required_unreachable_step_ids": [
+            item["step_id"] for item in _unreachable_inventory(view, manifest)
+        ],
+        "required_obligation_ids": [
+            str(item.get("obligation_id") or "") for item in open_obligations
+        ],
+        "required_output_shape": {
+            "steps": [{
+                "step_id": "S001",
+                "combined_formal_translation": "...",
+                "missing_clauses": [{"clause": "...", "node_names": ["n"], "reason": "..."}],
+                "weakened_clauses": [{"clause": "...", "node_names": ["n"], "reason": "..."}],
+                "unbound_objects": [{"clause": "...", "node_names": ["n"], "reason": "..."}],
+                "wrong_relations": [{"clause": "...", "node_names": ["n"], "reason": "..."}],
+            }],
+            "root": {
+                "translation": "...",
+                "target_object_preserved": True,
+                "answer_grounded": True,
+                "reasons": [],
+            },
+            "unreachable_steps": [{
+                "step_id": "S003", "justified_side_branch": False, "reason": "...",
+            }],
+            "dependency_issues": [{"node_name": "n", "step_id": "S001", "reason": "..."}],
+            "obligation_results": [{"obligation_id": "semantic:...", "resolved": False, "reason": "..."}],
+        },
+    }
+    return [
+        {"role": "system", "content": COMPARATOR_SYSTEM_PROMPT},
+        {"role": "user", "content": (
+            json.dumps(payload, ensure_ascii=False)
+            + "\n\nNON-NEGOTIABLE OUTPUT INVENTORY:\n"
+            + "- Step IDs in order: " + json.dumps([step["step_id"] for step in steps])
+            + "\n- unreachable_steps IDs in order: "
+            + json.dumps(payload["required_unreachable_step_ids"])
+            + "\n- obligation_results IDs in order: "
+            + json.dumps(payload["required_obligation_ids"])
+            + "\nCopy these three inventories exactly. Every item in missing_clauses, "
+              "weakened_clauses, unbound_objects, and wrong_relations must use "
+              "exactly {clause, node_names, reason}; even an unbound object issue "
+              "must use `clause` and `node_names`, never an `object` key."
+        )},
+    ]
+
+
+_STEP_KEYS = {
+    "step_id", "combined_formal_translation", "missing_clauses",
+    "weakened_clauses", "unbound_objects", "wrong_relations",
+}
+_ISSUE_KEYS = {"clause", "node_names", "reason"}
+
+
+def _parse_step_issues(
+    values: Any,
+    *,
+    label: str,
+    known_nodes: set[str],
+    raw: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(values, list):
+        raise SemanticAuditFormatError(f"{label} must be an array", raw_content=raw)
+    parsed = []
+    for index, item in enumerate(values):
+        if not isinstance(item, dict) or set(item) != _ISSUE_KEYS:
+            raise SemanticAuditFormatError(f"{label}[{index}] has invalid keys", raw_content=raw)
+        nodes = _strings(item["node_names"], f"{label}.node_names", raw)
+        if any(node not in known_nodes for node in nodes):
+            raise SemanticAuditFormatError(f"{label} references unknown node", raw_content=raw)
+        parsed.append({
+            "clause": _string(item["clause"], f"{label}.clause", raw),
+            "node_names": list(nodes),
+            "reason": _string(item["reason"], f"{label}.reason", raw),
+        })
+    return parsed
+
+
+def parse_strict_comparator(
+    content: str,
+    *,
+    manifest: Any,
+    view: FormalView,
+    decompiler: FormalDecompilerResult,
+    open_obligations: Sequence[Mapping[str, Any]],
+) -> tuple[
+    tuple[dict[str, Any], ...], dict[str, Any], tuple[dict[str, Any], ...],
+    tuple[dict[str, Any], ...], tuple[dict[str, Any], ...], bool,
+]:
+    value = _json_object(content)
+    top_keys = {"steps", "root", "unreachable_steps", "dependency_issues", "obligation_results"}
+    if set(value) != top_keys:
+        raise SemanticAuditFormatError("invalid comparator top-level keys", raw_content=content)
+    if not isinstance(value["steps"], list):
+        raise SemanticAuditFormatError("steps must be an array", raw_content=content)
+    known_nodes = {node.node_name for node in view.nodes}
+    known_steps = [step.step_id for step in _manifest_steps(manifest)]
+    parsed_steps = []
+    for index, item in enumerate(value["steps"]):
+        if not isinstance(item, dict) or set(item) != _STEP_KEYS:
+            raise SemanticAuditFormatError(f"steps[{index}] has invalid keys", raw_content=content)
+        step_id = _string(item["step_id"], "step_id", content)
+        parsed = {
+            "step_id": step_id,
+            "combined_formal_translation": _string(
+                item["combined_formal_translation"], "combined_formal_translation", content,
+            ),
+        }
+        for key in ("missing_clauses", "weakened_clauses", "unbound_objects", "wrong_relations"):
+            parsed[key] = _parse_step_issues(
+                item[key], label=f"{step_id}.{key}", known_nodes=known_nodes, raw=content,
+            )
+        parsed_steps.append(parsed)
+    if [item["step_id"] for item in parsed_steps] != known_steps:
+        raise SemanticAuditFormatError("Step inventory is incomplete, duplicated, or reordered", raw_content=content)
+
+    root = value["root"]
+    if not isinstance(root, dict) or set(root) != {
+        "translation", "target_object_preserved", "answer_grounded", "reasons",
+    }:
+        raise SemanticAuditFormatError("root has invalid keys", raw_content=content)
+    if not isinstance(root["target_object_preserved"], bool) or not isinstance(root["answer_grounded"], bool):
+        raise SemanticAuditFormatError("root verdicts must be booleans", raw_content=content)
+    parsed_root = {
+        "translation": _string(root["translation"], "root.translation", content),
+        "target_object_preserved": root["target_object_preserved"],
+        "answer_grounded": root["answer_grounded"],
+        "reasons": list(_strings(root["reasons"], "root.reasons", content)),
+    }
+
+    expected_unreachable = [item["step_id"] for item in _unreachable_inventory(view, manifest)]
+    raw_unreachable = value["unreachable_steps"]
+    if not isinstance(raw_unreachable, list):
+        raise SemanticAuditFormatError("unreachable_steps must be an array", raw_content=content)
+    unreachable = []
+    for item in raw_unreachable:
+        if not isinstance(item, dict) or set(item) != {"step_id", "justified_side_branch", "reason"}:
+            raise SemanticAuditFormatError("unreachable_steps item has invalid keys", raw_content=content)
+        if not isinstance(item["justified_side_branch"], bool):
+            raise SemanticAuditFormatError("justified_side_branch must be boolean", raw_content=content)
+        unreachable.append({
+            "step_id": _string(item["step_id"], "unreachable step_id", content),
+            "justified_side_branch": item["justified_side_branch"],
+            "reason": _string(item["reason"], "unreachable reason", content),
+        })
+    if [item["step_id"] for item in unreachable] != expected_unreachable:
+        raise SemanticAuditFormatError(
+            "unreachable Step inventory is incomplete or reordered; "
+            f"expected={expected_unreachable} got={[item['step_id'] for item in unreachable]}",
+            raw_content=content,
+        )
+
+    raw_dependencies = value["dependency_issues"]
+    if not isinstance(raw_dependencies, list):
+        raise SemanticAuditFormatError("dependency_issues must be an array", raw_content=content)
+    dependencies = []
+    for item in raw_dependencies:
+        if not isinstance(item, dict) or set(item) != {"node_name", "step_id", "reason"}:
+            raise SemanticAuditFormatError("dependency issue has invalid keys", raw_content=content)
+        node_name = _string(item["node_name"], "dependency node", content)
+        step_id = _string(item["step_id"], "dependency step", content)
+        if node_name not in known_nodes or step_id not in known_steps:
+            raise SemanticAuditFormatError("dependency issue has unknown node/Step", raw_content=content)
+        dependencies.append({
+            "node_name": node_name, "step_id": step_id,
+            "reason": _string(item["reason"], "dependency reason", content),
+        })
+
+    expected_obligations = [str(item.get("obligation_id") or "") for item in open_obligations]
+    raw_results = value["obligation_results"]
+    if not isinstance(raw_results, list):
+        raise SemanticAuditFormatError("obligation_results must be an array", raw_content=content)
+    obligation_results = []
+    for item in raw_results:
+        if not isinstance(item, dict) or set(item) != {"obligation_id", "resolved", "reason"}:
+            raise SemanticAuditFormatError("obligation result has invalid keys", raw_content=content)
+        if not isinstance(item["resolved"], bool):
+            raise SemanticAuditFormatError("obligation resolved must be boolean", raw_content=content)
+        obligation_results.append({
+            "obligation_id": _string(item["obligation_id"], "obligation_id", content),
+            "resolved": item["resolved"],
+            "reason": _string(item["reason"], "obligation reason", content),
+        })
+    if [item["obligation_id"] for item in obligation_results] != expected_obligations:
+        raise SemanticAuditFormatError(
+            "obligation inventory is incomplete or reordered; "
+            f"expected={expected_obligations} "
+            f"got={[item['obligation_id'] for item in obligation_results]}",
+            raw_content=content,
+        )
+
+    has_step_issues = any(
+        any(step[key] for key in ("missing_clauses", "weakened_clauses", "unbound_objects", "wrong_relations"))
+        for step in parsed_steps
+    )
+    passed = (
+        not has_step_issues
+        and parsed_root["target_object_preserved"]
+        and parsed_root["answer_grounded"]
+        and not parsed_root["reasons"]
+        and all(item["justified_side_branch"] for item in unreachable)
+        and not dependencies
+        and all(item["resolved"] for item in obligation_results)
+        and not decompiler.vacuous_nodes
+    )
+    return (
+        tuple(parsed_steps), parsed_root, tuple(unreachable), tuple(dependencies),
+        tuple(obligation_results), passed,
+    )
+
+
+def semantic_audit_cache_key(model: str, messages: Sequence[Mapping[str, Any]]) -> str:
+    payload = json.dumps(
+        {"version": PROMPT_VERSION, "model": model, "messages": list(messages)},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _response_parts(response: Any) -> tuple[str, str, str | None, str, tuple[int, int, int]]:
     choice = response.choices[0]
     message = choice.message
     content = str(getattr(message, "content", None) or "")
     reasoning = getattr(message, "reasoning_content", None)
     if reasoning is None and getattr(message, "model_extra", None):
         reasoning = message.model_extra.get("reasoning_content")
-    return content, str(reasoning or ""), getattr(choice, "finish_reason", None)
-
-
-def _request_id(response: Any) -> str:
-    return str(
-        getattr(response, "request_id", None)
-        or getattr(response, "_request_id", None)
-        or getattr(response, "id", None)
-        or ""
-    )
-
-
-def _usage(response: Any) -> tuple[int, int, int]:
     usage = getattr(response, "usage", None)
-    if usage is None:
-        return 0, 0, 0
-    prompt = getattr(usage, "prompt_tokens", None)
-    completion = getattr(usage, "completion_tokens", None)
-    if prompt is None:
-        prompt = getattr(usage, "input_tokens", 0)
-    if completion is None:
-        completion = getattr(usage, "output_tokens", 0)
-    prompt = int(prompt or 0)
-    completion = int(completion or 0)
-    total = int(getattr(usage, "total_tokens", 0) or prompt + completion)
-    return prompt, completion, total
+    prompt = int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0
+    completion = int(getattr(usage, "completion_tokens", 0) or 0) if usage else 0
+    total = int(getattr(usage, "total_tokens", 0) or prompt + completion) if usage else 0
+    request_id = str(getattr(response, "id", None) or getattr(response, "_request_id", None) or "")
+    return content, str(reasoning or ""), getattr(choice, "finish_reason", None), request_id, (prompt, completion, total)
 
 
-def run_semantic_audit(
+def _run_stage(
+    client: Any,
     model: str,
-    numbered_cot: str,
-    blueprint_lean: str,
     *,
-    mode: AuditMode = "risk",
-    informal_statement: str = "",
-    claimed_answer: str = "",
-    client: Any | None = None,
+    messages: list[dict[str, str]],
+    parser,
+    parser_kwargs: dict[str, Any],
+    max_tokens: int,
+    max_attempts: int,
+    tracer,
+    thm_name: str,
+    round_index: int,
+    phase: str,
+    operation: str,
+) -> tuple[Any, str, str, str | None, str, tuple[dict[str, Any], ...], tuple[int, int, int]]:
+    base_messages = list(messages)
+    attempts: list[dict[str, Any]] = []
+    for attempt in range(1, max_attempts + 1):
+        response = chat_completion_with_retry(
+            client, tracer=tracer, thm_name=thm_name, phase=phase,
+            model_id=model, operation=operation,
+            trace_args={"round": round_index, "attempt": attempt},
+            model=model, messages=messages, temperature=0,
+            max_completion_tokens=max_tokens,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        )
+        content, reasoning, finish_reason, request_id, usage = _response_parts(response)
+        truncated = str(finish_reason or "").lower() == "length"
+        attempts.append({
+            "attempt": attempt, "rawContent": content, "reasoningContent": reasoning,
+            "finishReason": finish_reason, "requestId": request_id,
+            "truncated": truncated, "promptTokens": usage[0],
+            "completionTokens": usage[1], "totalTokens": usage[2],
+        })
+        try:
+            if truncated:
+                raise SemanticAuditFormatError("response truncated", raw_content=content)
+            parsed = parser(content, **parser_kwargs)
+        except SemanticAuditFormatError as exc:
+            if attempt == max_attempts:
+                raise SemanticAuditFormatError(
+                    exc.reason, raw_content=content, attempts=attempts,
+                ) from exc
+            if operation == "phase1b_formal_decompiler":
+                schema_guidance = (
+                    "Every nodes item must have exactly node_name, kind, translation, "
+                    "semantic_effect, introduced_objects, and referenced_objects. "
+                    "Copy the required node inventory exactly in the supplied order."
+                )
+            else:
+                schema_guidance = (
+                    "A Step issue is exactly {\"clause\":string,"
+                    "\"node_names\":[string],\"reason\":string}; a dependency issue "
+                    "is exactly {\"node_name\":string,\"step_id\":string,"
+                    "\"reason\":string}; an obligation result is exactly "
+                    "{\"obligation_id\":string,\"resolved\":boolean,"
+                    "\"reason\":string}. Copy all required inventories exactly and "
+                    "do not invent obligation IDs. This is a compact retry: keep "
+                    "translations at most 15 words and every clause/reason at "
+                    "most 10 words; omit all explanation outside the JSON."
+                )
+            messages = [
+                *base_messages,
+                {"role": "user", "content": (
+                    f"The previous JSON was rejected: {exc.reason}. Generate it again "
+                    "from the original input. Return one corrected JSON object only. "
+                    "Use no Markdown and no extra keys. " + schema_guidance
+                )},
+            ]
+            continue
+        aggregate = tuple(sum(item[key] for item in attempts) for key in (
+            "promptTokens", "completionTokens", "totalTokens",
+        ))
+        return parsed, content, reasoning, finish_reason, request_id, tuple(attempts), aggregate
+    raise AssertionError("unreachable")
+
+
+def run_formal_decompiler(
+    client: Any,
+    model: str,
+    *,
+    view: FormalView,
+    max_tokens: int,
+    max_attempts: int,
     tracer=None,
     thm_name: str = "",
-    phase: str = "semantic_audit",
-    max_tokens: int | None = None,
-) -> SemanticAuditResult:
-    """Run one batched semantic-audit completion and return a strict result.
-
-    Transport retries are handled by the shared retry layer; no format-repair
-    request is issued, so a successful API call consumes exactly one model
-    completion.
-    """
-    messages = build_semantic_audit_messages(
-        numbered_cot,
-        blueprint_lean,
-        mode=mode,
-        informal_statement=informal_statement,
-        claimed_answer=claimed_answer,
-    )
-    expected_step_ids = _step_ids(numbered_cot)
-    token_budget = _max_tokens() if max_tokens is None else int(max_tokens)
-    if token_budget <= 0:
-        raise ValueError("max_tokens must be positive")
-    resolved_client = client if client is not None else make_client(model)
-    response = chat_completion_with_retry(
-        resolved_client,
-        tracer=tracer,
-        thm_name=thm_name,
-        phase=phase,
-        model_id=model,
-        operation="semantic_audit",
-        trace_args={
-            "mode": mode,
-            "informal_statement_chars": len(informal_statement),
-            "claimed_answer_chars": len(claimed_answer),
-            "step_count": len(expected_step_ids),
-        },
-        model=model,
-        messages=messages,
-        temperature=0,
-        max_completion_tokens=token_budget,
-        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-    )
-    content, reasoning, finish_reason = _message_parts(response)
-    prompt_tokens, completion_tokens, total_tokens = _usage(response)
-    request_id = _request_id(response)
-    truncated = str(finish_reason or "").lower() == "length"
-
+    round_index: int = 0,
+) -> FormalDecompilerResult:
     if tracer is not None:
         tracer.emit(TraceEvent(
-            kind="llm_usage",
-            thm_name=thm_name,
-            args={
-                "phase": phase,
-                "model": model,
-                "operation": "semantic_audit",
-                "mode": mode,
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": total_tokens,
-            },
+            kind="phase1BFormalDecompileStart", thm_name=thm_name, turn=round_index,
+            args={"round": round_index, "formalViewHash": view.sha256, "nodeCount": len(view.nodes)},
+        ))
+    parsed, content, reasoning, finish, request_id, attempts, usage = _run_stage(
+        client, model, messages=formal_decompiler_messages(view),
+        parser=parse_formal_decompiler, parser_kwargs={"view": view},
+        max_tokens=max_tokens, max_attempts=max_attempts, tracer=tracer,
+        thm_name=thm_name, round_index=round_index,
+        phase="phase1BFormalDecompiler", operation="phase1b_formal_decompiler",
+    )
+    result = FormalDecompilerResult(
+        parsed, content, reasoning, finish, request_id,
+        usage[0], usage[1], usage[2], attempts,
+    )
+    if tracer is not None:
+        tracer.emit(TraceEvent(
+            kind="phase1BFormalDecompileResult", thm_name=thm_name, turn=round_index,
+            args={"round": round_index, "formalViewHash": view.sha256,
+                  "vacuousNodes": list(result.vacuous_nodes), "result": result.to_dict()},
+            ok=not bool(result.vacuous_nodes),
         ))
         tracer.emit(TraceEvent(
-            kind="llm_response",
-            thm_name=thm_name,
-            result=content,
-            args={
-                "phase": phase,
-                "model": model,
-                "operation": "semantic_audit",
-                "mode": mode,
-                "request_id": request_id,
-                "finish_reason": finish_reason,
-                "truncated": truncated,
-                "reasoning_content": reasoning,
-            },
+            kind="phase1BFormalDecompileEnd", thm_name=thm_name, turn=round_index,
+            args={"round": round_index, "attemptCount": len(attempts),
+                  "promptTokens": usage[0], "completionTokens": usage[1],
+                  "totalTokens": usage[2], "requestId": request_id},
+            ok=True,
         ))
+    return result
 
-    if truncated:
-        raise SemanticAuditFormatError(
-            "response was truncated; marker is not a complete audit decision",
-            raw_content=content,
-            markers=tuple(match.group(1) for match in SEMANTIC_AUDIT_FLAG_RE.finditer(content)),
-        )
-    parsed = parse_semantic_audit(content, expected_step_ids=expected_step_ids)
-    return SemanticAuditResult(
-        passed=parsed.passed,
-        flag=parsed.flag,
-        diagnostics=parsed.diagnostics,
-        step_statuses=parsed.step_statuses,
-        raw_content=content,
-        reasoning_content=reasoning,
-        model=model,
-        mode=mode,
-        finish_reason=finish_reason,
-        truncated=truncated,
-        request_id=request_id,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        total_tokens=total_tokens,
+
+def run_strict_comparator(
+    client: Any,
+    model: str,
+    *,
+    informal_statement: str,
+    claimed_answer: str,
+    manifest: Any,
+    view: FormalView,
+    decompiler: FormalDecompilerResult,
+    open_obligations: Sequence[Mapping[str, Any]],
+    max_tokens: int,
+    max_attempts: int,
+    tracer=None,
+    thm_name: str = "",
+    round_index: int = 0,
+) -> StrictComparatorResult:
+    messages = strict_comparator_messages(
+        informal_statement, claimed_answer, manifest, view, decompiler, open_obligations,
     )
+    cache_key = semantic_audit_cache_key(model, messages)
+    if tracer is not None:
+        tracer.emit(TraceEvent(
+            kind="phase1BStrictCompareStart", thm_name=thm_name, turn=round_index,
+            args={"round": round_index, "formalViewHash": view.sha256,
+                  "cacheKey": cache_key, "stepCount": len(_manifest_steps(manifest)),
+                  "openObligationCount": len(open_obligations)},
+        ))
+    parsed, content, reasoning, finish, request_id, attempts, usage = _run_stage(
+        client, model, messages=messages, parser=parse_strict_comparator,
+        parser_kwargs={
+            "manifest": manifest, "view": view, "decompiler": decompiler,
+            "open_obligations": open_obligations,
+        },
+        max_tokens=max_tokens, max_attempts=max_attempts, tracer=tracer,
+        thm_name=thm_name, round_index=round_index,
+        phase="phase1BStrictComparator", operation="phase1b_strict_comparator",
+    )
+    steps, root, unreachable, dependencies, obligation_results, passed = parsed
+    result = StrictComparatorResult(
+        steps, root, unreachable, dependencies, obligation_results, passed,
+        content, reasoning, finish, request_id, usage[0], usage[1], usage[2], attempts,
+    )
+    if tracer is not None:
+        tracer.emit(TraceEvent(
+            kind="phase1BStrictCompareResult", thm_name=thm_name, turn=round_index,
+            args={"round": round_index, "formalViewHash": view.sha256,
+                  "cacheKey": cache_key, "passed": passed, "result": result.to_dict()},
+            ok=passed,
+        ))
+        tracer.emit(TraceEvent(
+            kind="phase1BStrictCompareEnd", thm_name=thm_name, turn=round_index,
+            args={"round": round_index, "passed": passed, "attemptCount": len(attempts),
+                  "promptTokens": usage[0], "completionTokens": usage[1],
+                  "totalTokens": usage[2], "requestId": request_id},
+            ok=passed,
+        ))
+    return result
+
+
+def comparator_defects(result: StrictComparatorResult) -> list[dict[str, Any]]:
+    defects: list[dict[str, Any]] = []
+    for step in result.steps:
+        for category in ("missing_clauses", "weakened_clauses", "unbound_objects", "wrong_relations"):
+            for item in step[category]:
+                defects.append({
+                    "category": category,
+                    "step_id": step["step_id"],
+                    "node_names": list(item["node_names"]),
+                    "requirement": item["clause"],
+                    "reason": item["reason"],
+                })
+    if not result.root["target_object_preserved"]:
+        defects.append({
+            "category": "rootTargetObject", "step_id": "",
+            "node_names": [], "requirement": "Preserve the source target object in root.",
+            "reason": "; ".join(result.root["reasons"]) or "Root target object changed.",
+        })
+    if not result.root["answer_grounded"]:
+        defects.append({
+            "category": "rootAnswerGrounding", "step_id": "",
+            "node_names": [], "requirement": "Ground the answer in the source object.",
+            "reason": "; ".join(result.root["reasons"]) or "Answer is ungrounded.",
+        })
+    for item in result.unreachable_steps:
+        if not item["justified_side_branch"]:
+            defects.append({
+                "category": "dagDisconnected", "step_id": item["step_id"],
+                "node_names": [], "requirement": "Connect this final-path Step to root.",
+                "reason": item["reason"],
+            })
+    for item in result.dependency_issues:
+        defects.append({
+            "category": "dependencyFidelity", "step_id": item["step_id"],
+            "node_names": [item["node_name"]],
+            "requirement": "Repair the source use-chain dependency.",
+            "reason": item["reason"],
+        })
+    return defects
+
+
+def format_semantic_audit_feedback(
+    decompiler: FormalDecompilerResult,
+    comparator: StrictComparatorResult,
+    open_obligations: Sequence[Mapping[str, Any]],
+) -> str:
+    if comparator.passed and not open_obligations and not decompiler.vacuous_nodes:
+        return "Strict semantic audit PASSED."
+    lines = ["Strict semantic audit FAILED."]
+    if decompiler.vacuous_nodes:
+        lines.append("Vacuous formal nodes: " + ", ".join(decompiler.vacuous_nodes))
+    if open_obligations:
+        lines.append("Open persistent semantic obligations:")
+        for item in open_obligations:
+            lines.append(
+                f"- {item.get('obligation_id')} step={item.get('step_id') or '<root>'} "
+                f"nodes={','.join(item.get('node_names') or []) or '<joint/root>'}: "
+                f"{item.get('requirement')} Reason: {item.get('reason')}"
+            )
+    else:
+        for defect in comparator_defects(comparator):
+            nodes = ",".join(defect["node_names"]) or "<joint/root>"
+            lines.append(
+                f"- {defect['category']} step={defect['step_id'] or '<root>'} "
+                f"nodes={nodes}: {defect['requirement']} Reason: {defect['reason']}"
+            )
+    return "\n".join(lines)
+
+
+__all__ = [
+    "PROMPT_VERSION", "FormalDecompilerResult", "FormalView",
+    "SemanticAuditFormatError", "StrictComparatorResult", "build_formal_view",
+    "comparator_defects", "formal_decompiler_messages", "format_semantic_audit_feedback",
+    "parse_formal_decompiler", "parse_strict_comparator", "run_formal_decompiler",
+    "run_strict_comparator", "semantic_audit_cache_key", "strict_comparator_messages",
+]

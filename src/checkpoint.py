@@ -47,7 +47,6 @@ class CheckpointState:
     semantic_static_gate: bool = False
     semantic_minimal_ir: bool = False
     semantic_freeze_refinement: bool = False
-    semantic_audit_mode: str = "none"
     semantic_source_mode: str = "step_grounded"
     # Immutable iter=0 snapshot plus an append-only record of local gate
     # decisions.  Plain dictionaries keep checkpoint JSON forward-compatible.

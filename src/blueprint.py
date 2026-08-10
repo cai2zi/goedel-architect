@@ -16,7 +16,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from blueprint_text import (
     BLUEPRINT_DECL_KW as _BLUEPRINT_DECL_KW,
@@ -36,12 +36,23 @@ from kimina_lean_compiler import (
 )
 from llm_client import chat_completion_with_retry, make_client
 from mathlib_retrieval import MathlibRetrieval
-from semantic_audit import SemanticAuditFormatError, run_semantic_audit
+from semantic_audit import (
+    FormalDecompilerResult,
+    SemanticAuditFormatError,
+    StrictComparatorResult,
+    build_formal_view,
+    comparator_defects,
+    formal_decompiler_messages,
+    format_semantic_audit_feedback,
+    run_formal_decompiler,
+    run_strict_comparator,
+    semantic_audit_cache_key,
+    strict_comparator_messages,
+)
 from semantic_fidelity import (
     SemanticIssue,
     format_semantic_issues,
     parse_cot_manifest,
-    semantic_audit_risk_reasons,
     validate_blueprint_fidelity,
 )
 from goedel_prompts import load, render
@@ -162,11 +173,10 @@ quantity by `∃ (x : T), x = c`.  In particular, the root must state the answer
 about the modeled object under the original conditions, rather than only
 asserting that an unrelated witness with the answer value exists.
 
-The root theorem itself must perform the COT's final inference. Do not create
-a non-root lemma/theorem with the same complete proposition as the root merely
-because the COT repeats or emphasizes its final answer. A final verbal answer
-restatement contributes no extra Blueprint node; depend directly on the last
-substantive premises and give their conclusion to the root.
+The root theorem itself must perform the COT's final inference. If the COT has
+a distinct final answer-restatement Step, preserve its Step mapping without
+inventing new mathematics; repeated conclusions are allowed when the source
+itself repeats them.
 """
 
 
@@ -209,9 +219,9 @@ escape hatch. A derived equation must be a conclusion from its actual source
 dependencies, not a fresh premise assumed by the node meant to derive it.
 
 Keep every claimed quantity tied to the original problem object and givens.
-The root must state the claimed answer about that modeled object. It must
-perform the COT's final inference directly; do not create a non-root node with
-the same complete proposition merely because the COT repeats its answer.
+The root must state the claimed answer about that modeled object. If the COT
+repeats the final answer in its own Step, formalize that Step normally; an
+earlier node may legitimately have the same proposition as the root.
 """
 
 
@@ -255,6 +265,7 @@ _PHASE1A_IMMUTABLE_SEMANTIC_CODES = {
     "malformedStepMapping",
     "unknownStepMapping",
     "rootNotFinalStep",
+    "malformedPendingClaim",
 }
 
 
@@ -637,7 +648,11 @@ def _semantic_repair_guidance(issues: list[SemanticIssue]) -> str:
             "Replace every vacuous type/body with the exact source proposition over the "
             "same shared objects, then connect that substantive node to the root."
         )
-    if any(code.startswith("unconstrainedExists") for code in codes):
+    if any(
+        code.startswith("unconstrainedExists")
+        or code.startswith("unboundAnswerWitness")
+        for code in codes
+    ):
         guidance.append(
             "Model the original constrained object and givens explicitly; the root must "
             "answer the original question, not merely choose a closed witness."
@@ -646,11 +661,6 @@ def _semantic_repair_guidance(issues: list[SemanticIssue]) -> str:
         guidance.append(
             "Keep the original COT's claimed answer literally in the root proposition "
             "about the original modeled object."
-        )
-    if "duplicateRootConclusion" in codes:
-        guidance.append(
-            "Remove the duplicated non-root answer proposition. Let the root perform the "
-            "final inference directly from the last substantive premises."
         )
     if codes.intersection({"reflexiveStep", "reflexiveRoot"}):
         guidance.append(
@@ -729,6 +739,32 @@ _PHASE1_MATHLIB_SEARCH_TOOL = {
     },
 }
 
+_PHASE1B_MATHLIB_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "mathlib_search",
+        "description": (
+            "Search Mathlib for exact names and type signatures needed to repair the "
+            "listed Blueprint nodes. Search results are external constants, never "
+            "sorry_using dependencies."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "target_node_names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                },
+                "k": {"type": "integer", "minimum": 1, "maximum": 5, "default": 5},
+            },
+            "required": ["query", "target_node_names"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 _PHASE1_EDIT_NODE_TOOL = {
     "type": "function",
     "function": {
@@ -762,6 +798,115 @@ _PENDING_HELPER_RE = re.compile(
     r":\s*Prop\s*:=\s*True\s*$"
 )
 
+
+def _strip_lean_comments(source: str) -> str:
+    """Remove nested Lean comments while preserving line boundaries."""
+    result: list[str] = []
+    index = 0
+    block_depth = 0
+    in_string = False
+    while index < len(source):
+        pair = source[index:index + 2]
+        char = source[index]
+        if block_depth:
+            if pair == "/-":
+                block_depth += 1
+                index += 2
+            elif pair == "-/":
+                block_depth -= 1
+                index += 2
+            else:
+                if char == "\n":
+                    result.append(char)
+                index += 1
+            continue
+        if not in_string and pair == "/-":
+            block_depth = 1
+            index += 2
+            continue
+        if not in_string and pair == "--":
+            newline = source.find("\n", index + 2)
+            if newline < 0:
+                break
+            result.append("\n")
+            index = newline + 1
+            continue
+        result.append(char)
+        if char == '"' and (index == 0 or source[index - 1] != "\\"):
+            in_string = not in_string
+        index += 1
+    return "".join(result)
+
+
+def _unannotated_local_declaration_errors(blueprint: Blueprint) -> list[str]:
+    """Reject source commands that Phase 1B's safe-header rebuild would drop."""
+    residue = blueprint.lean_file
+    for node in blueprint.nodes:
+        residue = residue.replace(node.lean_declaration, "", 1)
+    residue = _PENDING_HELPER_RE.sub("", residue, count=1)
+    residue = _strip_lean_comments(residue)
+    unexpected: list[str] = []
+    for raw_line in residue.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if re.match(r"^(?:import|open(?:\s+scoped)?|set_option)\b", line):
+            continue
+        unexpected.append(line)
+    if not unexpected:
+        return []
+    preview = "; ".join(unexpected[:8])
+    suffix = "" if len(unexpected) <= 8 else f"; ... and {len(unexpected) - 8} more lines"
+    return [
+        "unannotatedLocalDeclaration: Phase 1B preserves only imports/options and "
+        "@[blueprint] declarations. Convert every local declaration to a Blueprint "
+        f"node or remove it. Unexpected source: {preview}{suffix}"
+    ]
+
+
+def _pending_node_names(blueprint: Blueprint) -> tuple[str, ...]:
+    return tuple(
+        node.name for node in blueprint.nodes
+        if node.kind in {"lemma", "theorem"}
+        and "PendingBlueprintClaim" in node.signature()
+    )
+
+
+def _emit_pending_summary(
+    tracer,
+    *,
+    thm_name: str,
+    phase: str,
+    round_index: int,
+    blueprint: Blueprint,
+    initial_names: Sequence[str] = (),
+    previous_names: Sequence[str] = (),
+) -> None:
+    if tracer is None:
+        return
+    current = set(_pending_node_names(blueprint))
+    initial = set(initial_names)
+    previous = set(previous_names)
+    tracer.emit(TraceEvent(
+        kind="phase1PendingSummary",
+        thm_name=thm_name,
+        turn=round_index,
+        args={
+            "phase": phase,
+            "round": round_index,
+            "phase1ARootPending": (
+                blueprint.target_theorem in current if phase == "phase1A" else False
+            ),
+            "initialPendingNodeCount": len(initial) if initial_names else len(current),
+            "pendingNodeCount": len(current),
+            "pendingNodes": sorted(current),
+            "resolvedPendingNodes": sorted(previous - current),
+            "resolvedPendingNodeCount": len(previous - current),
+            "finalPendingNodeCount": len(current) if phase == "phase1BFinal" else None,
+        },
+        ok=not current if phase == "phase1BFinal" else True,
+    ))
+
 _PHASE1A_SKELETON_SUFFIX = r"""
 
 ## Phase 1A: compilable Blueprint skeleton
@@ -774,13 +919,21 @@ this exact unannotated helper declaration once:
 This helper is the one deliberate exception to the earlier rule against plain
 top-level helper declarations. Do not annotate it with `@[blueprint]`.
 
-Every Definition must already have a real, non-vacuous body. A non-root
-Lemma/Theorem may either state its concrete Lean proposition immediately or,
+Apart from that canonical helper, emit no plain local declaration, `variable`,
+`section`, `namespace`, `axiom`, or `partial def`. Every locally introduced
+object required by the Blueprint must itself be an `@[blueprint]` definition.
+Imported Mathlib constants may be used directly in formal types and definition
+bodies. Every name inside `sorry_using [...]` must be the name of an existing
+`@[blueprint]` node; never list an ordinary definition or Mathlib declaration.
+
+Every Definition must already have a real, non-vacuous body. Any
+Lemma/Theorem, including the root theorem, may either state its concrete Lean proposition immediately or,
 when that proposition is not yet reliable, temporarily use exactly
 `PendingBlueprintClaim "declaration_name"` as its complete conclusion. Its
 proof body must still be `by sorry_using [...]` with the real DAG dependencies.
-The root theorem must state the concrete source conclusion and claimed answer;
-the root may never be pending.
+When the root is pending, its statement metadata must still describe the exact
+source conclusion and claimed answer, and its dependency list must represent
+the intended final inference. Phase 1B must replace every pending conclusion.
 
 For every node, write a concise, non-empty natural-language `statement` that
 identifies the source objects, relevant assumptions, and exact intended
@@ -804,6 +957,16 @@ initial DAG reduces later edits. Before calling `lean_compile`, check that every
 meaningful statement and every proof node has a meaningful proof sketch. A
 node that already has a faithful, type-correct concrete proposition does not
 need to remain pending.
+
+Prefer one shared typed model for source objects and reuse it through later
+Steps and the root.  For geometry, counting, or probability problems whose
+Mathlib-native representation is disproportionately expensive, define a small
+typed structure or abstract relation for the original configuration, a setup
+predicate for exactly the source givens, and quantity functions over that same
+model.  Later lemmas and the root must bind the same model; do not reopen fresh
+existential witnesses for the same points, arcs, sets, probabilities, or
+counts in every Step.  A COT-derived numeric value belongs in a lemma/theorem
+conclusion, not a local literal definition that makes the claim reflexive.
 """
 
 _PHASE1B_SYSTEM_PROMPT = r"""
@@ -811,10 +974,12 @@ You are completing an editable Lean Blueprint skeleton. You receive the original
 problem, its immutable COT Steps, the latest complete Lean file, and the latest
 deterministic semantic, Lean, and Phase-2 standalone diagnostics.
 
-You may act only by calling `editBlueprintNode`. One call adds, replaces, or
-deletes one `@[blueprint]` declaration. In a single response, call the tool once
-for EVERY independently repairable listed node, in parallel, up to the supplied
-call budget. Do not stop after repairing only the first pending/error node.
+At the start of a repair round you may either call `mathlib_search` for exact
+Mathlib names/types, or call `editBlueprintNode` immediately. Never mix search
+and edit calls in one response. After search results are returned, the runner
+will request an EDIT-only response. One edit call adds, replaces, or deletes one
+`@[blueprint]` declaration. Call it once for EVERY independently repairable
+listed node in parallel, up to the supplied call budget.
 
 For each edit:
 - use `add` to cover a missing COT Step or introduce a shared formal object;
@@ -842,6 +1007,10 @@ For each edit:
 - every symbol needed by a Phase-2 node must come from an explicit binder, a
   Blueprint definition, or a transitive `sorry_using` dependency. Never rely
   on ambient `variable`, `section`, `namespace`, `axiom`, or `partial def` state.
+- Mathlib search results are imported external constants, not Blueprint nodes.
+  They may appear in formal types or definition bodies, but never add a Mathlib
+  result or an ordinary local declaration to `sorry_using`. Every sorry_using
+  name must be an existing Blueprint node.
 
 The runner applies the valid node edits atomically and then compiles the complete file.
 Do not return a whole Blueprint as prose or code.
@@ -1052,10 +1221,7 @@ def _run_phase1_tool_session(
                 lean_code = str(args["lean_code"])
                 parsed_candidate = _parse_blueprint(lean_code, target_name)
                 if trace_phase == "phase1A":
-                    phase1a_contract_issues = [
-                        *_phase1a_contract_errors(parsed_candidate),
-                        *phase2_contract_errors(parsed_candidate),
-                    ]
+                    phase1a_contract_issues = _phase1a_contract_errors(parsed_candidate)
                     if not parsed_candidate.nodes:
                         phase1a_contract_issues.append(
                             "no_blueprint_nodes: no annotated declarations were parsed."
@@ -1367,17 +1533,24 @@ class Phase2StandaloneReport:
 
 def _phase2_preflight_case(blueprint: Blueprint, node: BlueprintNode) -> _Phase2PreflightCase:
     entries: list[tuple[str, str]] = [("<phase2Header>", blueprint.phase2_header.rstrip())]
+    ancestor_deps = _transitive_node_deps(node, blueprint)
+    included_proof_nodes = [
+        dep_node for dep_node in blueprint.dependency_order()
+        if dep_node.kind != "definition" and dep_node.name in ancestor_deps
+    ]
+    if any(
+        "PendingBlueprintClaim" in candidate.signature()
+        for candidate in [*included_proof_nodes, node]
+    ):
+        entries.append(("<pendingHelper>", _PENDING_HELPER))
     entries.extend(
         (definition.name, definition.full_declaration())
         for definition in blueprint.nodes
         if definition.kind == "definition" and definition.name != node.name
     )
-    ancestor_deps = _transitive_node_deps(node, blueprint)
     entries.extend(
         (dep_node.name, dep_node.full_declaration())
-        for dep_node in blueprint.dependency_order()
-        if dep_node.kind != "definition"
-        and dep_node.name in ancestor_deps
+        for dep_node in included_proof_nodes
     )
     entries.append((node.name, node.full_declaration()))
 
@@ -1443,6 +1616,7 @@ def _emit_standalone_report(
     thm_name: str,
     round_index: int,
     report: Phase2StandaloneReport,
+    phase: str = "phase1B",
 ) -> None:
     if tracer is None:
         return
@@ -1452,7 +1626,7 @@ def _emit_standalone_report(
         thm_name=thm_name,
         turn=round_index,
         args={
-            "phase": "phase1B",
+            "phase": phase,
             "round": round_index,
             "checkedNodeCount": report.checked_node_count,
             "cachedNodeCount": report.cached_node_count,
@@ -1477,6 +1651,7 @@ def phase2_standalone_contract_report(
     tracer=None,
     thm_name: str = "",
     round_index: int = 0,
+    trace_phase: str = "phase1B",
 ) -> Phase2StandaloneReport:
     """Compile proof nodes exactly as Phase 2 will assemble them."""
     if concurrency <= 0:
@@ -1498,7 +1673,7 @@ def phase2_standalone_contract_report(
             thm_name=thm_name,
             turn=round_index,
             args={
-                "phase": "phase1B", "round": round_index,
+                "phase": trace_phase, "round": round_index,
                 "checkedNodeCount": len(cases),
                 "cachedNodeCount": len(cases) - len(uncached),
                 "skippedPendingNodeCount": len(skipped),
@@ -1547,7 +1722,7 @@ def phase2_standalone_contract_report(
                 thm_name=thm_name,
                 turn=round_index,
                 args={
-                    "phase": "phase1B", "round": round_index,
+                    "phase": trace_phase, "round": round_index,
                     "nodeName": case.node_name,
                     "preflightHash": case.code_hash,
                     "cacheHit": case.code_hash not in {item.code_hash for item in uncached},
@@ -1565,6 +1740,7 @@ def phase2_standalone_contract_report(
     )
     _emit_standalone_report(
         tracer, thm_name=thm_name, round_index=round_index, report=report,
+        phase=trace_phase,
     )
     return report
 
@@ -1619,7 +1795,14 @@ def format_phase2_standalone_issues(
 def phase2_contract_errors(blueprint: Blueprint) -> list[str]:
     """Return structural errors that would make Phase 2 node proving invalid."""
     errors: list[str] = []
+    node_names = set(blueprint.nodes_by_name())
     for node in blueprint.nodes:
+        unknown = [name for name in node.dependencies if name not in node_names]
+        if unknown:
+            errors.append(
+                f"nonBlueprintDependency: node `{node.name}` lists names that are not "
+                f"@[blueprint] nodes: {unknown}."
+            )
         if node.kind not in {"lemma", "theorem"}:
             continue
         current_decl = extract_current_node_decl(node.lean_declaration)
@@ -1787,8 +1970,18 @@ def _pending_helper_errors(lean_code: str) -> list[str]:
 
 
 def _phase1a_contract_errors(blueprint: Blueprint) -> list[str]:
-    errors = _pending_helper_errors(blueprint.lean_file)
+    errors = [
+        *_pending_helper_errors(blueprint.lean_file),
+        *_unannotated_local_declaration_errors(blueprint),
+        *phase2_contract_errors(blueprint),
+    ]
     for node in blueprint.nodes:
+        if node.kind == "definition" and "PendingBlueprintClaim" in node.lean_declaration:
+            errors.append(
+                f"pendingDefinition: definition `{node.name}` must have a concrete body; "
+                "PendingBlueprintClaim is only valid as the complete conclusion of a "
+                "lemma/theorem."
+            )
         if not node.statement.strip():
             errors.append(
                 f"missing_statement_metadata: node `{node.name}` must have a non-empty "
@@ -1801,8 +1994,6 @@ def _phase1a_contract_errors(blueprint: Blueprint) -> list[str]:
                 f"missing_proof_metadata: proof node `{node.name}` must have a non-empty "
                 "`proof := /-- ... -/` annotation."
             )
-        if node.name == blueprint.target_theorem and "PendingBlueprintClaim" in node.signature():
-            errors.append("pending_root: the root theorem must have a concrete proposition.")
     return errors
 
 
@@ -1954,6 +2145,9 @@ def _phase1b_feedback(
     structural_errors: list[str],
     standalone_report: Phase2StandaloneReport,
     rejected: list[dict[str, Any]],
+    formal_decompiler_result: FormalDecompilerResult | None = None,
+    strict_comparator_result: StrictComparatorResult | None = None,
+    open_semantic_obligations: Sequence[dict[str, Any]] = (),
 ) -> str:
     sections: list[str] = []
     if issues:
@@ -1987,6 +2181,24 @@ def _phase1b_feedback(
             "Phase 2 standalone contract check was not run: "
             + standalone_report.not_run_reason
         )
+    if formal_decompiler_result is not None and strict_comparator_result is not None:
+        if not strict_comparator_result.passed or open_semantic_obligations:
+            sections.append(format_semantic_audit_feedback(
+                formal_decompiler_result,
+                strict_comparator_result,
+                open_semantic_obligations,
+            ))
+    elif open_semantic_obligations:
+        sections.append(
+            "Open persistent semantic obligations (the current candidate is not yet "
+            "eligible for semantic re-audit):\n"
+            + "\n".join(
+                f"- {item.get('obligation_id')} step={item.get('step_id') or '<root>'} "
+                f"nodes={','.join(item.get('node_names') or []) or '<joint/root>'}: "
+                f"{item.get('requirement')} Reason: {item.get('reason')}"
+                for item in open_semantic_obligations
+            )
+        )
     if rejected:
         sections.append("Rejected node edits from the previous round:\n" + "\n".join(
             f"- {item.get('node_name') or '<unknown>'}: {item['reason']}"
@@ -2002,15 +2214,33 @@ class _Phase1BValidation:
     source_contexts: list[dict[str, Any]]
     structural_errors: list[str]
     standalone_report: Phase2StandaloneReport
+    pending_node_names: tuple[str, ...] = ()
+    formal_decompiler_result: FormalDecompilerResult | None = None
+    strict_comparator_result: StrictComparatorResult | None = None
+    open_semantic_obligations: tuple[dict[str, Any], ...] = ()
+    semantic_obligation_ledger: tuple[dict[str, Any], ...] = ()
+    semantic_audit_required: bool = False
 
     @property
-    def passed(self) -> bool:
+    def base_passed(self) -> bool:
         return (
             self.lean_result.success
             and not any(issue.severity == "error" for issue in self.semantic_issues)
             and not self.structural_errors
             and not self.standalone_report.issues
             and self.standalone_report.skipped_pending_node_count == 0
+            and not self.pending_node_names
+        )
+
+    @property
+    def passed(self) -> bool:
+        return self.base_passed and (
+            not self.semantic_audit_required
+            or (
+                self.strict_comparator_result is not None
+                and self.strict_comparator_result.passed
+                and not self.open_semantic_obligations
+            )
         )
 
 
@@ -2044,6 +2274,22 @@ def _phase1b_validation_details(
             "notRunReason": standalone.not_run_reason,
             "durationMs": standalone.duration_ms,
         },
+        "pendingNodes": list(validation.pending_node_names),
+        "pendingNodeCount": len(validation.pending_node_names),
+        "semanticAuditRequired": validation.semantic_audit_required,
+        "semanticAudit": ({
+            "formalDecompiler": validation.formal_decompiler_result.to_dict(),
+            "strictComparator": validation.strict_comparator_result.to_dict(),
+            "obligations": list(validation.semantic_obligation_ledger),
+            "openObligations": list(validation.open_semantic_obligations),
+            "classification": (
+                "strictAccepted"
+                if validation.passed and not semantic_warnings else
+                "acceptedWithJustifiedSideBranches"
+                if validation.passed else "semanticRejected"
+            ),
+        } if validation.formal_decompiler_result is not None
+             and validation.strict_comparator_result is not None else None),
     }
 
 
@@ -2072,6 +2318,16 @@ def _emit_phase1b_validation_result(
             "semanticWarningCount": len(details["semanticWarnings"]),
             "phase2StructuralErrorCount": len(details["phase2StructuralErrors"]),
             "phase2StandaloneErrorCount": len(details["phase2StandaloneErrors"]),
+            "pendingNodeCount": details["pendingNodeCount"],
+            "semanticAuditRequired": details["semanticAuditRequired"],
+            "semanticAuditPassed": (
+                details["semanticAudit"]["strictComparator"]["passed"]
+                if details["semanticAudit"] is not None else None
+            ),
+            "openSemanticObligationCount": (
+                len(details["semanticAudit"]["openObligations"])
+                if details["semanticAudit"] is not None else 0
+            ),
             **details["phase2StandaloneSummary"],
         },
         ok=validation.passed,
@@ -2118,6 +2374,7 @@ def _validate_phase1b_candidate(
     thm_name: str,
     round_index: int,
     skip_pending: bool,
+    semantic_audit_required: bool = False,
 ) -> _Phase1BValidation:
     lean_result = compiler.check_blueprint(
         blueprint.lean_file, blueprint.target_theorem,
@@ -2172,6 +2429,8 @@ def _validate_phase1b_candidate(
         source_contexts=source_contexts,
         structural_errors=structural_errors,
         standalone_report=standalone_report,
+        pending_node_names=_pending_node_names(blueprint),
+        semantic_audit_required=semantic_audit_required,
     )
     _emit_phase1b_validation_result(
         tracer, thm_name=thm_name, round_index=round_index,
@@ -2199,7 +2458,7 @@ def _phase1_semantic_issues(
                 rf':\s*PendingBlueprintClaim\s+"{re.escape(node.name)}"\s*:=',
                 node.lean_declaration,
             )
-            malformed = node.kind == "definition" or node.name == blueprint.target_theorem or not exact
+            malformed = node.kind == "definition" or not exact
             pending.append(SemanticIssue(
                 "malformedPendingClaim" if malformed else "unresolvedPendingClaim",
                 "PendingBlueprintClaim is malformed."
@@ -2225,6 +2484,567 @@ def _phase1_semantic_issues(
     )
 
 
+_SEMANTIC_AUDIT_BLOCKING_BINDING_CODES = {
+    "emptyCotManifest",
+    "missingRoot",
+    "missingStepMapping",
+    "multipleStepMappings",
+    "malformedStepMapping",
+    "unknownStepMapping",
+    "rootNotFinalStep",
+    "stepMappingAbsent",
+}
+
+
+def _semantic_audit_eligible(validation: _Phase1BValidation) -> bool:
+    return (
+        validation.lean_result.success
+        and not validation.pending_node_names
+        and not any(
+            issue.severity == "error"
+            and issue.code in _SEMANTIC_AUDIT_BLOCKING_BINDING_CODES
+            for issue in validation.semantic_issues
+        )
+    )
+
+
+def _semantic_obligation_id(
+    defect: dict[str, Any],
+    semantic_manifest=None,
+) -> str:
+    step_id = str(defect.get("step_id") or "")
+    source_clause_hash = ""
+    if semantic_manifest is not None and step_id:
+        step = getattr(semantic_manifest, "by_id", {}).get(step_id.split(".", 1)[0])
+        if step is not None:
+            source_clause_hash = str(getattr(step, "source_sha256", "") or "")
+    if not source_clause_hash:
+        source_clause_hash = hashlib.sha256(
+            str(defect.get("requirement") or "").encode()
+        ).hexdigest()
+    payload = {
+        "category": str(defect.get("category") or "semanticDefect"),
+        "step_id": step_id,
+        "node_names": sorted(str(name) for name in defect.get("node_names") or ()),
+        "source_clause_hash": source_clause_hash,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:20]
+    return f"semantic:{payload['category']}:{digest}"
+
+
+def _open_semantic_obligations(
+    ledger: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    return tuple(
+        dict(item) for item in ledger.values() if item.get("status") == "open"
+    )
+
+
+def _update_semantic_obligations(
+    ledger: dict[str, dict[str, Any]],
+    *,
+    view,
+    decompiler: FormalDecompilerResult,
+    comparator: StrictComparatorResult,
+    semantic_manifest=None,
+    round_index: int,
+    tracer,
+    thm_name: str,
+) -> tuple[dict[str, Any], ...]:
+    old_open = {
+        key for key, item in ledger.items() if item.get("status") == "open"
+    }
+    for verdict in comparator.obligation_results:
+        obligation_id = str(verdict["obligation_id"])
+        item = ledger.get(obligation_id)
+        if item is None:
+            continue
+        item["lastCheckedRound"] = round_index
+        item["lastJudgeReason"] = str(verdict["reason"])
+        item["status"] = "resolved" if verdict["resolved"] else "open"
+        if tracer is not None:
+            tracer.emit(TraceEvent(
+                kind="phase1BSemanticObligationResult",
+                thm_name=thm_name,
+                turn=round_index,
+                args={
+                    "phase": "phase1B",
+                    "round": round_index,
+                    **dict(item),
+                    "resolved": bool(verdict["resolved"]),
+                },
+                ok=bool(verdict["resolved"]),
+            ))
+
+    node_steps = {node.node_name: node.step_id for node in view.nodes}
+    defects = comparator_defects(comparator)
+    defects.extend({
+        "category": "vacuousNode",
+        "step_id": node_steps.get(node_name, ""),
+        "node_names": [node_name],
+        "requirement": "Replace the vacuous formal declaration with the source Step's actual constraint.",
+        "reason": "The literal formal decompiler classified this node as vacuous.",
+    } for node_name in decompiler.vacuous_nodes)
+    grouped_defects: dict[str, dict[str, Any]] = {}
+    for defect in defects:
+        obligation_id = _semantic_obligation_id(defect, semantic_manifest)
+        grouped = grouped_defects.get(obligation_id)
+        if grouped is None:
+            grouped_defects[obligation_id] = dict(defect)
+            continue
+        requirements = [
+            item for item in (
+                str(grouped.get("requirement") or ""),
+                str(defect.get("requirement") or ""),
+            ) if item
+        ]
+        reasons = [
+            item for item in (
+                str(grouped.get("reason") or ""),
+                str(defect.get("reason") or ""),
+            ) if item
+        ]
+        grouped["requirement"] = " | ".join(dict.fromkeys(requirements))
+        grouped["reason"] = " | ".join(dict.fromkeys(reasons))
+
+    new_ids: list[str] = []
+    reopened_ids: list[str] = []
+    for obligation_id, defect in grouped_defects.items():
+        existing = ledger.get(obligation_id)
+        if existing is None:
+            ledger[obligation_id] = {
+                "obligation_id": obligation_id,
+                "category": str(defect.get("category") or "semanticDefect"),
+                "step_id": str(defect.get("step_id") or ""),
+                "node_names": list(defect.get("node_names") or ()),
+                "requirement": str(defect.get("requirement") or ""),
+                "reason": str(defect.get("reason") or ""),
+                "firstRound": round_index,
+                "lastCheckedRound": round_index,
+                "status": "open",
+            }
+            new_ids.append(obligation_id)
+        else:
+            if existing.get("status") != "open":
+                reopened_ids.append(obligation_id)
+            existing.update({
+                "node_names": list(defect.get("node_names") or ()),
+                "requirement": str(defect.get("requirement") or ""),
+                "reason": str(defect.get("reason") or ""),
+                "lastCheckedRound": round_index,
+                "status": "open",
+            })
+    current_open = _open_semantic_obligations(ledger)
+    if tracer is not None:
+        tracer.emit(TraceEvent(
+            kind="phase1BSemanticObligationsUpdated",
+            thm_name=thm_name,
+            turn=round_index,
+            args={
+                "phase": "phase1B",
+                "round": round_index,
+                "newObligationIds": new_ids,
+                "reopenedObligationIds": reopened_ids,
+                "resolvedObligationIds": sorted(
+                    old_open - {item["obligation_id"] for item in current_open}
+                ),
+                "openObligationCount": len(current_open),
+                "openObligations": list(current_open),
+            },
+            ok=not bool(current_open),
+        ))
+    return current_open
+
+
+def _emit_cached_formal_decompiler(
+    tracer,
+    *,
+    thm_name: str,
+    round_index: int,
+    view,
+    result: FormalDecompilerResult,
+) -> None:
+    if tracer is None:
+        return
+    tracer.emit(TraceEvent(
+        kind="phase1BFormalDecompileStart", thm_name=thm_name, turn=round_index,
+        args={"round": round_index, "formalViewHash": view.sha256,
+              "nodeCount": len(view.nodes), "cacheHit": True},
+    ))
+    tracer.emit(TraceEvent(
+        kind="phase1BFormalDecompileResult", thm_name=thm_name, turn=round_index,
+        args={"round": round_index, "formalViewHash": view.sha256,
+              "cacheHit": True, "vacuousNodes": list(result.vacuous_nodes),
+              "result": result.to_dict()},
+        ok=not bool(result.vacuous_nodes),
+    ))
+    tracer.emit(TraceEvent(
+        kind="phase1BFormalDecompileEnd", thm_name=thm_name, turn=round_index,
+        args={"round": round_index, "cacheHit": True, "attemptCount": 0,
+              "promptTokens": 0, "completionTokens": 0, "totalTokens": 0},
+        ok=True,
+    ))
+
+
+def _emit_cached_strict_comparator(
+    tracer,
+    *,
+    thm_name: str,
+    round_index: int,
+    view,
+    cache_key: str,
+    result: StrictComparatorResult,
+) -> None:
+    if tracer is None:
+        return
+    tracer.emit(TraceEvent(
+        kind="phase1BStrictCompareStart", thm_name=thm_name, turn=round_index,
+        args={"round": round_index, "formalViewHash": view.sha256,
+              "cacheKey": cache_key, "cacheHit": True},
+    ))
+    tracer.emit(TraceEvent(
+        kind="phase1BStrictCompareResult", thm_name=thm_name, turn=round_index,
+        args={"round": round_index, "formalViewHash": view.sha256,
+              "cacheKey": cache_key, "cacheHit": True, "passed": result.passed,
+              "result": result.to_dict()},
+        ok=result.passed,
+    ))
+    tracer.emit(TraceEvent(
+        kind="phase1BStrictCompareEnd", thm_name=thm_name, turn=round_index,
+        args={"round": round_index, "cacheHit": True, "passed": result.passed,
+              "attemptCount": 0, "promptTokens": 0,
+              "completionTokens": 0, "totalTokens": 0},
+        ok=result.passed,
+    ))
+
+
+def _with_semantic_audit(
+    validation: _Phase1BValidation,
+    blueprint: Blueprint,
+    *,
+    client,
+    model: str,
+    informal_statement: str,
+    claimed_answer: str,
+    semantic_manifest,
+    formal_decompiler_max_tokens: int,
+    strict_comparator_max_tokens: int,
+    format_max_attempts: int,
+    decompiler_cache: dict[str, FormalDecompilerResult],
+    comparator_cache: dict[str, StrictComparatorResult],
+    obligation_ledger: dict[str, dict[str, Any]],
+    tracer,
+    thm_name: str,
+    round_index: int,
+) -> _Phase1BValidation:
+    view = build_formal_view(blueprint)
+    decompiler = decompiler_cache.get(view.sha256)
+    if decompiler is None:
+        decompiler = run_formal_decompiler(
+            client,
+            model,
+            view=view,
+            max_tokens=formal_decompiler_max_tokens,
+            max_attempts=format_max_attempts,
+            tracer=tracer,
+            thm_name=thm_name,
+            round_index=round_index,
+        )
+        decompiler_cache[view.sha256] = decompiler
+    else:
+        _emit_cached_formal_decompiler(
+            tracer, thm_name=thm_name, round_index=round_index,
+            view=view, result=decompiler,
+        )
+
+    open_before = _open_semantic_obligations(obligation_ledger)
+    comparator_messages = strict_comparator_messages(
+        informal_statement,
+        claimed_answer,
+        semantic_manifest,
+        view,
+        decompiler,
+        open_before,
+    )
+    cache_key = semantic_audit_cache_key(model, comparator_messages)
+    comparator = comparator_cache.get(cache_key)
+    if comparator is None:
+        comparator = run_strict_comparator(
+            client,
+            model,
+            informal_statement=informal_statement,
+            claimed_answer=claimed_answer,
+            manifest=semantic_manifest,
+            view=view,
+            decompiler=decompiler,
+            open_obligations=open_before,
+            max_tokens=strict_comparator_max_tokens,
+            max_attempts=format_max_attempts,
+            tracer=tracer,
+            thm_name=thm_name,
+            round_index=round_index,
+        )
+        comparator_cache[cache_key] = comparator
+    else:
+        _emit_cached_strict_comparator(
+            tracer, thm_name=thm_name, round_index=round_index,
+            view=view, cache_key=cache_key, result=comparator,
+        )
+    open_after = _update_semantic_obligations(
+        obligation_ledger,
+        view=view,
+        decompiler=decompiler,
+        comparator=comparator,
+        semantic_manifest=semantic_manifest,
+        round_index=round_index,
+        tracer=tracer,
+        thm_name=thm_name,
+    )
+    return _Phase1BValidation(
+        lean_result=validation.lean_result,
+        semantic_issues=validation.semantic_issues,
+        source_contexts=validation.source_contexts,
+        structural_errors=validation.structural_errors,
+        standalone_report=validation.standalone_report,
+        pending_node_names=validation.pending_node_names,
+        formal_decompiler_result=decompiler,
+        strict_comparator_result=comparator,
+        open_semantic_obligations=open_after,
+        semantic_obligation_ledger=tuple(
+            dict(item) for item in obligation_ledger.values()
+        ),
+        semantic_audit_required=True,
+    )
+
+
+def _call_phase1b_model(
+    client,
+    model: str,
+    messages: list[dict[str, Any]],
+    *,
+    tools: list[dict[str, Any]],
+    operation: str,
+    round_index: int,
+    tracer,
+    thm_name: str,
+):
+    response = chat_completion_with_retry(
+        client,
+        tracer=tracer,
+        thm_name=thm_name,
+        phase="phase1B",
+        model_id=model,
+        operation=operation,
+        trace_args={"attempt": 1, "turn": round_index},
+        model=model,
+        messages=messages,
+        tools=tools,
+        tool_choice="required",
+        parallel_tool_calls=True,
+        max_completion_tokens=phase1_request_max_tokens(messages),
+        **_reasoning_kwargs(model),
+    )
+    _emit_usage(tracer, thm_name, "phase1B", model, response)
+    _emit_llm_response(
+        tracer, thm_name=thm_name, phase="phase1B", model=model,
+        response=response, attempt=1, turn=round_index,
+    )
+    return response
+
+
+def _phase1b_search_or_edit_response(
+    client,
+    model: str,
+    messages: list[dict[str, Any]],
+    *,
+    retrieval: MathlibRetrieval,
+    search_cache: dict[str, str],
+    search_limit: int,
+    edit_limit: int,
+    round_index: int,
+    max_rounds: int,
+    tracer,
+    thm_name: str,
+):
+    remaining = max_rounds - round_index + 1
+    budget = (
+        "\n\n## Current Tool Budget\n"
+        f"Phase 1B round: {round_index} / {max_rounds}\n"
+        f"Remaining repair rounds including this round: {remaining}\n"
+        f"Maximum editBlueprintNode calls in an edit response: {edit_limit}\n"
+        f"Maximum mathlib_search calls before editing: {search_limit}\n"
+        "Choose SEARCH-only or EDIT-only; never mix them."
+    )
+    initial_messages = [dict(item) for item in messages]
+    initial_messages[-1] = {
+        **initial_messages[-1],
+        "content": str(initial_messages[-1].get("content") or "") + budget,
+    }
+    if tracer is not None:
+        tracer.emit(TraceEvent(
+            kind="phase1BToolBudget",
+            thm_name=thm_name,
+            turn=round_index,
+            args={
+                "phase": "phase1B",
+                "round": round_index,
+                "maxRounds": max_rounds,
+                "remainingRounds": remaining,
+                "maxEditCalls": edit_limit,
+                "maxMathlibSearchCalls": search_limit,
+                "mode": "SEARCH_OR_EDIT",
+            },
+        ))
+    tools = [_PHASE1_EDIT_NODE_TOOL]
+    if search_limit > 0:
+        tools = [_PHASE1B_MATHLIB_SEARCH_TOOL, _PHASE1_EDIT_NODE_TOOL]
+    first = _call_phase1b_model(
+        client, model, initial_messages,
+        tools=tools,
+        operation="blueprint_node_search_or_edit",
+        round_index=round_index,
+        tracer=tracer,
+        thm_name=thm_name,
+    )
+    calls = list(first.choices[0].message.tool_calls or [])
+    if not any(str(call.function.name) == "mathlib_search" for call in calls):
+        return first
+
+    assistant_payload = {
+        "role": "assistant",
+        "content": first.choices[0].message.content or "",
+        "tool_calls": [call.model_dump() for call in calls],
+    }
+    tool_messages: list[dict[str, Any]] = []
+    search_count = 0
+    for call in calls:
+        name = str(call.function.name)
+        started_ns = time.monotonic_ns()
+        span_id = uuid.uuid4().hex
+        try:
+            args = json.loads(call.function.arguments or "{}")
+            if not isinstance(args, dict):
+                raise ValueError("arguments must be an object")
+        except (json.JSONDecodeError, ValueError) as exc:
+            args = {}
+            output = f"invalidArguments:{exc}"
+            ok = False
+        else:
+            ok = True
+            if name == "editBlueprintNode":
+                output = "editDeferredUntilAfterSearch"
+                ok = False
+            elif name != "mathlib_search":
+                output = "notAllowed"
+                ok = False
+            elif search_count >= search_limit:
+                output = "searchCallLimitExceeded"
+                ok = False
+            else:
+                query = str(args.get("query") or "").strip()
+                targets = args.get("target_node_names")
+                if not query or not isinstance(targets, list) or not targets:
+                    output = "invalidArguments"
+                    ok = False
+                else:
+                    search_count += 1
+                    k = min(5, max(1, int(args.get("k", 5))))
+                    cache_key = hashlib.sha256(
+                        json.dumps({"query": query, "k": k}, sort_keys=True).encode()
+                    ).hexdigest()
+                    cache_hit = cache_key in search_cache
+                    if cache_hit:
+                        output = search_cache[cache_key]
+                    else:
+                        hits = retrieval.search(query, k)
+                        seen_names: set[str] = set()
+                        rendered: list[str] = []
+                        for hit in hits:
+                            if hit.name in seen_names:
+                                continue
+                            seen_names.add(hit.name)
+                            doc = re.sub(r"\s+", " ", str(hit.docstring or "")).strip()[:240]
+                            lines = [
+                                f"- {hit.name}",
+                                f"  Type: {str(hit.type_sig or '<unknown>')}",
+                            ]
+                            if doc:
+                                lines.append(f"  Doc: {doc}")
+                            rendered.append("\n".join(lines))
+                        output = "\n".join(rendered) or "No Mathlib results."
+                        search_cache[cache_key] = output
+                    args = {**args, "cache_hit": cache_hit, "cache_key": cache_key}
+                    if tracer is not None:
+                        tracer.emit(TraceEvent(
+                            kind="phase1BMathlibSearchResult",
+                            thm_name=thm_name,
+                            turn=round_index,
+                            args={
+                                "phase": "phase1B",
+                                "round": round_index,
+                                "query": query,
+                                "targetNodeNames": list(targets),
+                                "cacheKey": cache_key,
+                                "cacheHit": cache_hit,
+                                "result": output,
+                            },
+                            ok=True,
+                        ))
+        if tracer is not None:
+            tracer.emit(TraceEvent(
+                kind="tool_call", thm_name=thm_name, turn=round_index,
+                call_id=call.id, tool_name=name, span_id=span_id,
+                args={"phase": "phase1B", "round": round_index, "arguments": args},
+            ))
+            tracer.emit(TraceEvent(
+                kind="tool_result", thm_name=thm_name, turn=round_index,
+                call_id=call.id, tool_name=name, span_id=span_id,
+                result=output, ok=ok,
+                args={"phase": "phase1B", "round": round_index, "arguments": args},
+                duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
+            ))
+        tool_messages.append({
+            "role": "tool", "tool_call_id": call.id, "content": output,
+        })
+    edit_messages = [
+        *initial_messages,
+        assistant_payload,
+        *tool_messages,
+        {"role": "user", "content": (
+            "## Mathlib Search Results For This Repair Round\n"
+            "The tool results above are available for the targeted nodes.\n\n"
+            "## Current Tool Budget\n"
+            f"Phase 1B round: {round_index} / {max_rounds}\n"
+            "Mode: EDIT ONLY\n"
+            f"Maximum editBlueprintNode calls: {edit_limit}\n"
+            "Do not call mathlib_search again in this round."
+        )},
+    ]
+    if tracer is not None:
+        tracer.emit(TraceEvent(
+            kind="phase1BToolBudget",
+            thm_name=thm_name,
+            turn=round_index,
+            args={
+                "phase": "phase1B",
+                "round": round_index,
+                "maxEditCalls": edit_limit,
+                "maxMathlibSearchCalls": 0,
+                "mode": "EDIT_ONLY",
+            },
+        ))
+    return _call_phase1b_model(
+        client, model, edit_messages,
+        tools=[_PHASE1_EDIT_NODE_TOOL],
+        operation="blueprint_node_edit_after_search",
+        round_index=round_index,
+        tracer=tracer,
+        thm_name=thm_name,
+    )
+
+
 def _run_phase1b_patch_session(
     client,
     model: str,
@@ -2245,9 +3065,22 @@ def _run_phase1b_patch_session(
     thm_name: str,
     candidate_history: list[str],
     candidate_labels: list[str],
+    semantic_audit_enabled: bool = False,
+    formal_decompiler_max_tokens: int = 4096,
+    strict_comparator_max_tokens: int = 4096,
+    semantic_format_max_attempts: int = 2,
+    retrieval: MathlibRetrieval | None = None,
+    mathlib_search_max_calls_per_round: int = 0,
 ) -> Blueprint:
     current = blueprint
+    initial_pending_names = _pending_node_names(current)
+    previous_pending_names = initial_pending_names
     standalone_cache: dict[str, CompilerResult] = {}
+    decompiler_cache: dict[str, FormalDecompilerResult] = {}
+    comparator_cache: dict[str, StrictComparatorResult] = {}
+    semantic_obligation_ledger: dict[str, dict[str, Any]] = {}
+    search_cache: dict[str, str] = {}
+    phase1b_retrieval = retrieval or MathlibRetrieval()
     validation = _validate_phase1b_candidate(
         current, compiler=compiler, semantic_manifest=semantic_manifest,
         claimed_answer=claimed_answer,
@@ -2258,11 +3091,60 @@ def _run_phase1b_patch_session(
         standalone_cache=standalone_cache,
         tracer=tracer, thm_name=thm_name, round_index=0,
         skip_pending=True,
+        semantic_audit_required=semantic_audit_enabled,
     )
     rejected: list[dict[str, Any]] = []
     edit_history: list[dict[str, Any]] = []
+    _emit_pending_summary(
+        tracer, thm_name=thm_name, phase="phase1B", round_index=0,
+        blueprint=current, initial_names=initial_pending_names,
+    )
 
     for round_index in range(1, max_rounds + 1):
+        should_audit = (
+            semantic_audit_enabled
+            and _semantic_audit_eligible(validation)
+            and validation.strict_comparator_result is None
+        )
+        if should_audit:
+            try:
+                validation = _with_semantic_audit(
+                    validation,
+                    current,
+                    client=client,
+                    model=model,
+                    informal_statement=informal_statement,
+                    claimed_answer=claimed_answer,
+                    semantic_manifest=semantic_manifest,
+                    formal_decompiler_max_tokens=formal_decompiler_max_tokens,
+                    strict_comparator_max_tokens=strict_comparator_max_tokens,
+                    format_max_attempts=semantic_format_max_attempts,
+                    decompiler_cache=decompiler_cache,
+                    comparator_cache=comparator_cache,
+                    obligation_ledger=semantic_obligation_ledger,
+                    tracer=tracer,
+                    thm_name=thm_name,
+                    round_index=round_index - 1,
+                )
+                _emit_phase1b_validation_result(
+                    tracer, thm_name=thm_name, round_index=round_index - 1,
+                    validation=validation, reused_candidate=True,
+                )
+            except SemanticAuditFormatError as exc:
+                raise BlueprintGenerationError(
+                    f"Phase 1B semantic audit response was invalid: {exc.reason}",
+                    last_candidate=current.lean_file,
+                    diagnostics=[
+                        exc.reason,
+                        json.dumps(exc.attempts, ensure_ascii=False),
+                    ],
+                    attempt=round_index,
+                    failure_stage="phase1BSemanticAuditFormat",
+                    candidate_history=candidate_history,
+                    candidate_labels=candidate_labels,
+                    validation_details=_phase1b_validation_details(validation),
+                    node_edit_rounds=edit_history,
+                ) from exc
         if validation.passed:
             break
         feedback = _phase1b_feedback(
@@ -2272,6 +3154,9 @@ def _run_phase1b_patch_session(
             validation.structural_errors,
             validation.standalone_report,
             rejected,
+            validation.formal_decompiler_result,
+            validation.strict_comparator_result,
+            validation.open_semantic_obligations,
         )
         node_inventory = "\n".join(
             f"- {node.name}: hash={_node_hash(node)} kind={node.kind} "
@@ -2287,26 +3172,18 @@ def _run_phase1b_patch_session(
                 f"Latest diagnostics:\n{feedback}"
             )},
         ]
-        response = chat_completion_with_retry(
+        response = _phase1b_search_or_edit_response(
             client,
+            model,
+            messages,
+            retrieval=phase1b_retrieval,
+            search_cache=search_cache,
+            search_limit=mathlib_search_max_calls_per_round,
+            edit_limit=max_tool_calls_per_turn,
+            round_index=round_index,
+            max_rounds=max_rounds,
             tracer=tracer,
             thm_name=thm_name,
-            phase="phase1B",
-            model_id=model,
-            operation="blueprint_node_edit",
-            trace_args={"attempt": 1, "turn": round_index},
-            model=model,
-            messages=messages,
-            tools=[_PHASE1_EDIT_NODE_TOOL],
-            tool_choice="required",
-            parallel_tool_calls=True,
-            max_completion_tokens=phase1_request_max_tokens(messages),
-            **_reasoning_kwargs(model),
-        )
-        _emit_usage(tracer, thm_name, "phase1B", model, response)
-        _emit_llm_response(
-            tracer, thm_name=thm_name, phase="phase1B", model=model,
-            response=response, attempt=1, turn=round_index,
         )
         calls = list(response.choices[0].message.tool_calls or [])
         accepted: list[_BlueprintNodeEdit] = []
@@ -2435,7 +3312,15 @@ def _run_phase1b_patch_session(
                 standalone_cache=standalone_cache,
                 tracer=tracer, thm_name=thm_name, round_index=round_index,
                 skip_pending=True,
+                semantic_audit_required=semantic_audit_enabled,
             )
+            if semantic_audit_enabled:
+                validation.open_semantic_obligations = _open_semantic_obligations(
+                    semantic_obligation_ledger
+                )
+                validation.semantic_obligation_ledger = tuple(
+                    dict(item) for item in semantic_obligation_ledger.values()
+                )
         else:
             # The candidate is byte-identical. Re-emit the logical standalone check
             # from its hash cache without spending another Lean compilation.
@@ -2453,19 +3338,86 @@ def _run_phase1b_patch_session(
                             else "phase2StructuralContractFailed"),
                 )
             validation = _Phase1BValidation(
-                validation.lean_result, validation.semantic_issues,
-                validation.source_contexts, validation.structural_errors, report,
+                lean_result=validation.lean_result,
+                semantic_issues=validation.semantic_issues,
+                source_contexts=validation.source_contexts,
+                structural_errors=validation.structural_errors,
+                standalone_report=report,
+                pending_node_names=_pending_node_names(current),
+                formal_decompiler_result=validation.formal_decompiler_result,
+                strict_comparator_result=validation.strict_comparator_result,
+                open_semantic_obligations=validation.open_semantic_obligations,
+                semantic_obligation_ledger=validation.semantic_obligation_ledger,
+                semantic_audit_required=semantic_audit_enabled,
             )
             _emit_phase1b_validation_result(
                 tracer, thm_name=thm_name, round_index=round_index,
                 validation=validation, reused_candidate=True,
             )
+        _emit_pending_summary(
+            tracer, thm_name=thm_name, phase="phase1B", round_index=round_index,
+            blueprint=current, initial_names=initial_pending_names,
+            previous_names=previous_pending_names,
+        )
+        previous_pending_names = _pending_node_names(current)
     else:
+        if (
+            semantic_audit_enabled
+            and _semantic_audit_eligible(validation)
+            and validation.strict_comparator_result is None
+        ):
+            try:
+                validation = _with_semantic_audit(
+                    validation,
+                    current,
+                    client=client,
+                    model=model,
+                    informal_statement=informal_statement,
+                    claimed_answer=claimed_answer,
+                    semantic_manifest=semantic_manifest,
+                    formal_decompiler_max_tokens=formal_decompiler_max_tokens,
+                    strict_comparator_max_tokens=strict_comparator_max_tokens,
+                    format_max_attempts=semantic_format_max_attempts,
+                    decompiler_cache=decompiler_cache,
+                    comparator_cache=comparator_cache,
+                    obligation_ledger=semantic_obligation_ledger,
+                    tracer=tracer,
+                    thm_name=thm_name,
+                    round_index=max_rounds,
+                )
+                _emit_phase1b_validation_result(
+                    tracer, thm_name=thm_name, round_index=max_rounds,
+                    validation=validation, reused_candidate=True,
+                )
+            except SemanticAuditFormatError as exc:
+                raise BlueprintGenerationError(
+                    f"Final Phase 1B semantic audit response was invalid: {exc.reason}",
+                    last_candidate=current.lean_file,
+                    diagnostics=[
+                        exc.reason,
+                        json.dumps(exc.attempts, ensure_ascii=False),
+                    ],
+                    attempt=max_rounds,
+                    failure_stage="phase1BSemanticAuditFormat",
+                    candidate_history=candidate_history,
+                    candidate_labels=candidate_labels,
+                    validation_details=_phase1b_validation_details(validation),
+                    node_edit_rounds=edit_history,
+                ) from exc
         if not validation.passed:
+            _emit_pending_summary(
+                tracer, thm_name=thm_name, phase="phase1BFinal",
+                round_index=max_rounds, blueprint=current,
+                initial_names=initial_pending_names,
+                previous_names=previous_pending_names,
+            )
             feedback = _phase1b_feedback(
                 validation.semantic_issues, validation.lean_result,
                 validation.source_contexts, validation.structural_errors,
                 validation.standalone_report, rejected,
+                validation.formal_decompiler_result,
+                validation.strict_comparator_result,
+                validation.open_semantic_obligations,
             )
             raise BlueprintGenerationError(
                 f"Phase 1B failed after {max_rounds} node-edit rounds.",
@@ -2491,6 +3443,57 @@ def _run_phase1b_patch_session(
         standalone_cache=standalone_cache,
         tracer=tracer, thm_name=thm_name, round_index=max_rounds + 1,
         skip_pending=False,
+        semantic_audit_required=semantic_audit_enabled,
+    )
+    if semantic_audit_enabled:
+        final_validation.open_semantic_obligations = _open_semantic_obligations(
+            semantic_obligation_ledger
+        )
+        final_validation.semantic_obligation_ledger = tuple(
+            dict(item) for item in semantic_obligation_ledger.values()
+        )
+    if semantic_audit_enabled and _semantic_audit_eligible(final_validation):
+        try:
+            final_validation = _with_semantic_audit(
+                final_validation,
+                final,
+                client=client,
+                model=model,
+                informal_statement=informal_statement,
+                claimed_answer=claimed_answer,
+                semantic_manifest=semantic_manifest,
+                formal_decompiler_max_tokens=formal_decompiler_max_tokens,
+                strict_comparator_max_tokens=strict_comparator_max_tokens,
+                format_max_attempts=semantic_format_max_attempts,
+                decompiler_cache=decompiler_cache,
+                comparator_cache=comparator_cache,
+                obligation_ledger=semantic_obligation_ledger,
+                tracer=tracer,
+                thm_name=thm_name,
+                round_index=max_rounds + 1,
+            )
+            _emit_phase1b_validation_result(
+                tracer, thm_name=thm_name, round_index=max_rounds + 1,
+                validation=final_validation, reused_candidate=True,
+            )
+        except SemanticAuditFormatError as exc:
+            raise BlueprintGenerationError(
+                f"Final Phase 1B semantic audit response was invalid: {exc.reason}",
+                last_candidate=final_code,
+                diagnostics=[
+                    exc.reason,
+                    json.dumps(exc.attempts, ensure_ascii=False),
+                ],
+                failure_stage="phase1BSemanticAuditFormat",
+                candidate_history=candidate_history,
+                candidate_labels=candidate_labels,
+                validation_details=_phase1b_validation_details(final_validation),
+                node_edit_rounds=edit_history,
+            ) from exc
+    _emit_pending_summary(
+        tracer, thm_name=thm_name, phase="phase1BFinal",
+        round_index=max_rounds + 1, blueprint=final,
+        initial_names=initial_pending_names, previous_names=previous_pending_names,
     )
     if not final_validation.passed:
         raise BlueprintGenerationError(
@@ -2500,6 +3503,9 @@ def _run_phase1b_patch_session(
                 final_validation.semantic_issues, final_validation.lean_result,
                 final_validation.source_contexts, final_validation.structural_errors,
                 final_validation.standalone_report, [],
+                final_validation.formal_decompiler_result,
+                final_validation.strict_comparator_result,
+                final_validation.open_semantic_obligations,
             )],
             failure_stage="phase1BFinalValidation",
             candidate_history=candidate_history,
@@ -2542,19 +3548,30 @@ def generate_blueprint_from_informal(
     semantic_require_step_ids: bool = False,
     semantic_static_gate: bool = False,
     semantic_minimal_ir: bool = False,
-    semantic_audit_mode: str = "none",
     semantic_source_mode: str = "step_grounded",
     phase1_max_tool_turns: int = 3,
     phase1_max_tool_calls_per_turn: int = 3,
     phase1_mathlib_search_max_calls: int = 3,
+    phase1b_mathlib_search_max_calls_per_round: int = 3,
+    phase1b_semantic_audit_enabled: bool = False,
+    phase1b_formal_decompiler_max_tokens: int = 4096,
+    phase1b_strict_comparator_max_tokens: int = 4096,
+    phase1b_semantic_format_max_attempts: int = 2,
+    phase1b_seed_lean_code: str = "",
 ) -> Blueprint:
     """Generate a Phase-1A draft, then edit its nodes and DAG in Phase 1B."""
     if phase1_max_tool_turns <= 0 or phase1_max_tool_calls_per_turn <= 0:
         raise ValueError("Phase-1 tool turn/call limits must be positive")
     if phase1_mathlib_search_max_calls < 0:
         raise ValueError("Phase-1 search limit must be non-negative")
-    if semantic_audit_mode not in {"none", "risk", "full"}:
-        raise ValueError("semantic_audit_mode must be one of: none, risk, full")
+    if phase1b_mathlib_search_max_calls_per_round < 0:
+        raise ValueError("Phase-1B per-round search limit must be non-negative")
+    if phase1b_formal_decompiler_max_tokens <= 0:
+        raise ValueError("Phase-1B Formal Decompiler max tokens must be positive")
+    if phase1b_strict_comparator_max_tokens <= 0:
+        raise ValueError("Phase-1B Strict Comparator max tokens must be positive")
+    if phase1b_semantic_format_max_attempts <= 0:
+        raise ValueError("Phase-1B semantic format attempts must be positive")
     if semantic_source_mode not in SEMANTIC_SOURCE_MODES:
         raise ValueError(
             "semantic_source_mode must be one of: step_grounded, whole_cot"
@@ -2563,7 +3580,7 @@ def generate_blueprint_from_informal(
         semantic_require_step_ids
         or semantic_static_gate
         or semantic_minimal_ir
-        or semantic_audit_mode != "none"
+        or phase1b_semantic_audit_enabled
     ) and not semantic_fidelity_enabled:
         raise ValueError("semantic subfeatures require semantic_fidelity_enabled=true")
     if semantic_source_mode == "whole_cot" and not semantic_fidelity_enabled:
@@ -2608,7 +3625,7 @@ def generate_blueprint_from_informal(
                 informal_proof=prompt_proof,
             ) + (
                 "\n\nThe claimed final answer that must remain grounded in the original "
-                f"problem object and final COT step is: `{claimed_answer}`."
+                f"problem object and final formalized COT step is: `{claimed_answer}`."
                 if semantic_fidelity_enabled else ""
             ),
         },
@@ -2626,7 +3643,28 @@ def generate_blueprint_from_informal(
     search_state = {"count": 0}
     retrieval = MathlibRetrieval()
     phase1a_blueprint: Blueprint | None = None
-    for attempt in range(max_retries):
+    if phase1b_seed_lean_code.strip():
+        seed_target = _extract_target_name(phase1b_seed_lean_code, "")
+        if seed_target != target_name:
+            raise BlueprintGenerationError(
+                f"Seed Blueprint target `{seed_target or '<missing>'}` does not match "
+                f"expected `{target_name}`.",
+                last_candidate=phase1b_seed_lean_code,
+                diagnostics=["seed theorem name mismatch"],
+                failure_stage="seedBlueprintInvalid",
+            )
+        phase1a_blueprint = _parse_blueprint(phase1b_seed_lean_code, target_name)
+        if not phase1a_blueprint.nodes:
+            raise BlueprintGenerationError(
+                "Seed Blueprint contains no parsed Blueprint nodes.",
+                last_candidate=phase1b_seed_lean_code,
+                diagnostics=["seed has no Blueprint nodes"],
+                failure_stage="seedBlueprintInvalid",
+            )
+        candidate_history.append(phase1a_blueprint.lean_file)
+        candidate_labels.append("phase1b_seed")
+
+    for attempt in range(max_retries if phase1a_blueprint is None else 0):
         session = _run_phase1_tool_session(
             client, model, tuple(dict(message) for message in messages),
             compiler=compiler, target_name=target_name, retrieval=retrieval,
@@ -2657,6 +3695,10 @@ def generate_blueprint_from_informal(
                 f"latest output's final theorem is `{emitted_target or '<missing>'}`."
             )
         candidate = _parse_blueprint(lean_code, target_name)
+        _emit_pending_summary(
+            tracer, thm_name=thm_name, phase="phase1A",
+            round_index=attempt + 1, blueprint=candidate,
+        )
         semantic_check_issues = _enabled_semantic_issues(
             validate_blueprint_fidelity(
                 candidate,
@@ -2689,7 +3731,6 @@ def generate_blueprint_from_informal(
             contract_errors.append("no_blueprint_nodes: no annotated declarations were parsed.")
         else:
             contract_errors.extend(_phase1a_contract_errors(candidate))
-            contract_errors.extend(phase2_contract_errors(candidate))
         if contract_errors:
             feedback_parts.append(
                 "Phase 1A skeleton contract errors:\n"
@@ -2728,14 +3769,74 @@ def generate_blueprint_from_informal(
                 ("\n".join(result.diagnostics) or result.raw_output[-2000:])
                 + _format_lean_source_contexts(lean_source_contexts)
             )
+        canonical_candidate: Blueprint | None = None
         if not feedback_parts and result.success:
-            phase1a_blueprint = candidate
+            try:
+                canonical_candidate = _render_edited_blueprint(candidate, list(candidate.nodes))
+            except ValueError as exc:
+                feedback_parts.append(
+                    "Phase 1A canonical rebuild failed:\n"
+                    f"- {exc}\n"
+                    "Every sorry_using dependency must be an existing @[blueprint] node."
+                )
+            else:
+                canonical_result = compiler.check_blueprint(
+                    canonical_candidate.lean_file, target_name,
+                )
+                if canonical_result.failure_kind == "infra":
+                    raise KiminaInfrastructureError(
+                        "\n".join(canonical_result.diagnostics)
+                        or canonical_result.raw_output[-2000:]
+                    )
+                if tracer is not None:
+                    tracer.emit(TraceEvent(
+                        kind="phase1ACanonicalCheck",
+                        thm_name=thm_name,
+                        turn=attempt + 1,
+                        args={
+                            "phase": "phase1A",
+                            "attempt": attempt + 1,
+                            "sourceHash": hashlib.sha256(lean_code.encode()).hexdigest(),
+                            "canonicalHash": hashlib.sha256(
+                                canonical_candidate.lean_file.encode()
+                            ).hexdigest(),
+                        },
+                        ok=canonical_result.success,
+                    ))
+                if not canonical_result.success:
+                    feedback_parts.append(
+                        "Phase 1A canonical rebuild does not compile:\n"
+                        + ("\n".join(canonical_result.diagnostics)
+                           or canonical_result.raw_output[-4000:])
+                    )
+                else:
+                    standalone_report = phase2_standalone_contract_report(
+                        canonical_candidate,
+                        compiler,
+                        concurrency=phase2_contract_check_concurrency,
+                        skip_pending=True,
+                        tracer=tracer,
+                        thm_name=thm_name,
+                        round_index=attempt + 1,
+                        trace_phase="phase1A",
+                    )
+                    if standalone_report.issues:
+                        feedback_parts.append(
+                            "Phase 1A concrete-node standalone checks failed:\n"
+                            + format_phase2_standalone_issues(standalone_report.issues)
+                        )
+                candidate_history.append(canonical_candidate.lean_file)
+                candidate_labels.append(f"phase1a_canonical_attempt_{attempt + 1}")
+        if not feedback_parts and result.success and canonical_candidate is not None:
+            phase1a_blueprint = canonical_candidate
             phase1a_blueprint.semantic_gate_results.append({
                 "stage": "phase1A",
                 "passed": True,
                 "issues": [issue.to_dict() for issue in semantic_check_issues],
                 "warning_count": sum(issue.severity == "warning" for issue in semantic_check_issues),
                 "deferred_error_count": len(semantic_check_errors),
+                "phase1ARootPending": target_name in _pending_node_names(canonical_candidate),
+                "initialPendingNodeCount": len(_pending_node_names(canonical_candidate)),
             })
             break
         last_error_feedback = "\n\n".join(feedback_parts)
@@ -2772,6 +3873,12 @@ def generate_blueprint_from_informal(
         semantic_static_gate=semantic_static_gate,
         max_rounds=phase1_max_tool_turns,
         max_tool_calls_per_turn=phase1_max_tool_calls_per_turn,
+        semantic_audit_enabled=phase1b_semantic_audit_enabled,
+        formal_decompiler_max_tokens=phase1b_formal_decompiler_max_tokens,
+        strict_comparator_max_tokens=phase1b_strict_comparator_max_tokens,
+        semantic_format_max_attempts=phase1b_semantic_format_max_attempts,
+        retrieval=retrieval,
+        mathlib_search_max_calls_per_round=phase1b_mathlib_search_max_calls_per_round,
         phase2_contract_check_concurrency=phase2_contract_check_concurrency,
         tracer=tracer,
         thm_name=thm_name,
@@ -2793,41 +3900,8 @@ def generate_blueprint_from_informal(
             candidate_history=candidate_history,
             candidate_labels=candidate_labels,
         )
-    if semantic_audit_mode != "none":
-        audit_risk_reasons = (
-            semantic_audit_risk_reasons(
-                final, semantic_manifest, claimed_answer=claimed_answer,
-            ) if semantic_audit_mode == "risk" else []
-        )
-        should_audit = semantic_audit_mode == "full" or bool(audit_risk_reasons)
-        if should_audit:
-            try:
-                audit = run_semantic_audit(
-                    model, prompt_proof, final.lean_file,
-                    mode=semantic_audit_mode,
-                    informal_statement=informal_statement,
-                    claimed_answer=claimed_answer,
-                    client=client, tracer=tracer, thm_name=thm_name,
-                    phase="phase1_semantic_audit",
-                )
-            except SemanticAuditFormatError as exc:
-                raise BlueprintGenerationError(
-                    f"Semantic audit response was invalid: {exc.reason}",
-                    last_candidate=final.lean_file,
-                    failure_stage="semantic_audit",
-                    candidate_history=candidate_history,
-                    candidate_labels=candidate_labels,
-                ) from exc
-            if not audit.passed:
-                raise BlueprintGenerationError(
-                    "Semantic audit rejected the Phase 1B Blueprint:\n" + audit.diagnostics,
-                    last_candidate=final.lean_file,
-                    diagnostics=[audit.diagnostics],
-                    failure_stage="semantic_audit",
-                    candidate_history=candidate_history,
-                    candidate_labels=candidate_labels,
-                )
-            final.semantic_audit_result = asdict(audit)
+    if final.phase1b_validation.get("semanticAudit"):
+        final.semantic_audit_result = dict(final.phase1b_validation["semanticAudit"])
     final.candidate_history = list(candidate_history)
     final.candidate_labels = list(candidate_labels)
     return final

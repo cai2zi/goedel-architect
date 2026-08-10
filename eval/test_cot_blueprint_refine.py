@@ -455,6 +455,21 @@ theorem root : (1:Nat) = 1 := by sorry_using [setup]
     def test_phase1a_contract_accepts_canonical_skeleton(self) -> None:
         self.assertEqual(_phase1a_contract_errors(self.skeleton()), [])
 
+    def test_phase1a_contract_accepts_pending_root(self) -> None:
+        blueprint = self.skeleton()
+        root = blueprint.node_by_name("root")
+        replacement = '''@[blueprint (title := "COT_STEP:S002")
+  (statement := /-- The source concludes that the requested value is one. -/)
+  (proof := /-- Derive the requested answer from `setup`. -/)]
+theorem root : PendingBlueprintClaim "root" := by sorry_using [setup]'''
+        edit, reason = _validate_node_edit(
+            blueprint, action="replace", node_name="root",
+            expected_hash=_node_hash(root), replacement=replacement,
+        )
+        self.assertEqual(reason, "")
+        pending_root = _apply_node_edits(blueprint, [edit])
+        self.assertEqual(_phase1a_contract_errors(pending_root), [])
+
     def test_phase1a_contract_also_accepts_concrete_non_root_claim(self) -> None:
         blueprint = self.skeleton()
         node = blueprint.node_by_name("setup")

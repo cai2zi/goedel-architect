@@ -79,6 +79,7 @@ def run_cot_split(config: DictConfig) -> dict[str, Any]:
             "cot_step_cot_tokens": result.cot_tokens,
             "cot_step_splitter_attempts": len(result.attempts),
             "cot_step_splitter_cached": result.cached,
+            "cot_required_step_count": len(manifest["steps"]),
             "cot_manifest_schema": SCHEMA_NAME,
             "cot_manifest_schema_version": SCHEMA_VERSION,
         })
@@ -92,6 +93,7 @@ def run_cot_split(config: DictConfig) -> dict[str, Any]:
         "steps_per_row": _distribution(step_counts),
         "chars_per_step": _distribution(chars_per_step),
         "total_steps": sum(step_counts), "outside_recommended_range": outside_prior,
+        "required_steps": sum(len(result.spans) for result in results.values()),
         "exact_source_coverage_rows": len(rows),
     }
     write_json(artifact_root / "manifest_metrics.json", metrics)

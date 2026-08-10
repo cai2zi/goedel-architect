@@ -86,9 +86,14 @@ def preflight_model(model: str, base_url: str, api_key: str = "dummy") -> None:
 
 def _blueprint_result_is_terminal(row: dict[str, Any], *, retry_error_results: bool) -> bool:
     status = str(row.get("status") or "")
-    if bool(row.get("root_proved")) or status in {"solved", "exhausted", "phase1_accepted"}:
+    if bool(row.get("root_proved")) or status in {
+        "solved", "exhausted", "phase1_accepted", "strictAccepted",
+        "acceptedWithJustifiedSideBranches",
+    }:
         return True
-    return status == "error" and not retry_error_results
+    return status in {
+        "error", "semanticRejected", "structuralRejected", "infraError",
+    } and not retry_error_results
 
 
 def blueprint_results_complete(config: DictConfig) -> bool:
@@ -161,16 +166,20 @@ def run_blueprint(
     preflight_kimina(config)
     root = output_root(config)
     robustpa_output_base = root / "robustpa"
+    robustpa_data_root = Path(str(
+        blueprint.get("phase1b_seed_prepared_data_root", prepared_dir(config) / "data")
+    ))
     overrides = [
         "exp_name=blueprint",
-        f"data_root={prepared_dir(config) / 'data'}",
+        f"data_root={robustpa_data_root}",
         f"output_base={robustpa_output_base}",
         f"model={blueprint.model}",
         f"openai_base_url={blueprint.openai_base_url}",
         f"subset={DATASET_SUBSET}",
         "split=null",
         "limit=null",
-        "problem_id=null",
+        f"problem_id={blueprint.get('problem_id', 'null') or 'null'}",
+        f"include_source_ids_path={blueprint.get('phase1b_seed_include_ids_path', 'null') or 'null'}",
         f"resume={str(bool(config.resume)).lower()}",
         f"retry_error_results={str(bool(blueprint.get('retry_error_results', False))).lower()}",
         f"max_refinement_iterations={blueprint.max_refinement_iterations}",
@@ -187,7 +196,13 @@ def run_blueprint(
         f"semantic_static_gate={str(bool(blueprint.get('semantic_static_gate', False))).lower()}",
         f"semantic_minimal_ir={str(bool(blueprint.get('semantic_minimal_ir', False))).lower()}",
         f"semantic_freeze_refinement={str(bool(blueprint.get('semantic_freeze_refinement', False))).lower()}",
-        f"semantic_audit_mode={blueprint.get('semantic_audit_mode', 'none')}",
+        f"phase1b_semantic_audit_enabled={str(bool(blueprint.get('phase1b_semantic_audit_enabled', False))).lower()}",
+        f"phase1b_formal_decompiler_max_tokens={int(blueprint.get('phase1b_formal_decompiler_max_tokens', 4096))}",
+        f"phase1b_strict_comparator_max_tokens={int(blueprint.get('phase1b_strict_comparator_max_tokens', 4096))}",
+        f"phase1b_semantic_format_max_attempts={int(blueprint.get('phase1b_semantic_format_max_attempts', 2))}",
+        f"phase1b_seed_blueprint_root={blueprint.get('phase1b_seed_blueprint_root', 'null') or 'null'}",
+        f"phase1b_seed_required={str(bool(blueprint.get('phase1b_seed_required', False))).lower()}",
+        f"phase1b_mathlib_search_max_calls_per_round={int(blueprint.get('phase1b_mathlib_search_max_calls_per_round', 3))}",
         f"semantic_source_mode={blueprint.get('semantic_source_mode', 'step_grounded')}",
         f"proof_policy={blueprint.get('proof_policy', 'full')}",
         f"critical_negation_max_turns={int(blueprint.get('critical_negation_max_turns', 0))}",
@@ -241,9 +256,6 @@ def run_blueprint(
     env["GOEDEL_PROVER_MAX_TOKENS"] = str(int(blueprint.prover_max_tokens))
     env["GOEDEL_PROVER_LENGTH_RETRY_MAX_TOKENS"] = str(
         int(blueprint.get("prover_length_retry_max_tokens", blueprint.prover_max_tokens))
-    )
-    env["GOEDEL_SEMANTIC_AUDIT_MAX_TOKENS"] = str(
-        int(blueprint.get("semantic_audit_max_tokens", 1024))
     )
     command = [
         str(config.python_bin),

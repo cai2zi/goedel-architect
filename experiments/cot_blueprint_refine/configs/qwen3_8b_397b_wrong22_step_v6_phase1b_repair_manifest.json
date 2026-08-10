@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "selection": "14 high-confidence negatives + 3 reachability risks + 5 positive controls",
+  "include_ids": [
+    "MATH-500/test/counting_and_probability/765.json",
+    "MATH-500/test/counting_and_probability/731.json",
+    "aime_2025/14",
+    "cmimc_2025/23",
+    "MATH-500/test/precalculus/1056.json",
+    "MATH-500/test/geometry/434.json",
+    "MATH-500/test/prealgebra/1865.json",
+    "MATH-500/test/prealgebra/378.json",
+    "cmimc_2025/38",
+    "hmmt_feb_2025/16",
+    "hmmt_feb_2025/18",
+    "MATH-500/test/counting_and_probability/430.json",
+    "aime_2024/81",
+    "aime_2025/20",
+    "cmimc_2025/5",
+    "cmimc_2025/30",
+    "aime_2024/62",
+    "cmimc_2025/9",
+    "brumo_2025/6",
+    "MATH-500/test/intermediate_algebra/662.json",
+    "aime_2025/15",
+    "brumo_2025/3"
+  ]
+}

@@ -108,8 +108,8 @@ class MathlibRetrieval:
                 continue
             results.append(LemmaResult(
                 name=name,
-                type_sig=r.get("type", ""),
-                docstring=r.get("docstring", r.get("doc", "")),
+                type_sig=str(r.get("type") or ""),
+                docstring=str(r.get("docstring") or r.get("doc") or ""),
             ))
         return results
 

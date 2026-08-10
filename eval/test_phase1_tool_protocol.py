@@ -124,7 +124,7 @@ theorem root : True := by sorry_using []
 
         source_text = "Therefore the answer is one."
         semantic_manifest = CotManifest((CotStep(
-            "S001", 0, len(source_text), source_text, "hash", role="conclusion",
+            "S001", 0, len(source_text), source_text, "hash",
         ),))
         compiler = SimpleNamespace(check_blueprint=lambda *_args: CompilerResult(True))
         with patch("blueprint.chat_completion_with_retry", side_effect=complete):
@@ -174,7 +174,7 @@ theorem root : (2 : Nat) - 1 = 1 := by sorry_using []
 
         source_text = "Therefore the answer is one."
         semantic_manifest = CotManifest((CotStep(
-            "S001", 0, len(source_text), source_text, "hash", role="conclusion",
+            "S001", 0, len(source_text), source_text, "hash",
         ),))
         with patch("blueprint.chat_completion_with_retry", side_effect=complete):
             result = _run_phase1_tool_session(
@@ -208,7 +208,7 @@ theorem root : (2 : Nat) - 1 = 1 := by sorry_using []
 '''
         source_text = "Therefore the answer is one."
         semantic_manifest = CotManifest((CotStep(
-            "S001", 0, len(source_text), source_text, "hash", role="conclusion",
+            "S001", 0, len(source_text), source_text, "hash",
         ),))
         with patch(
             "blueprint.chat_completion_with_retry",

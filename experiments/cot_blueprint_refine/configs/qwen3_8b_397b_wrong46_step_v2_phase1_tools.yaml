@@ -88,7 +88,6 @@ blueprint:
   semantic_static_gate: true
   semantic_minimal_ir: false
   semantic_freeze_refinement: true
-  semantic_audit_mode: none
 
 judge:
   enabled: false

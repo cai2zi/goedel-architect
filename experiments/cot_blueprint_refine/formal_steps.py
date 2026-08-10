@@ -9,7 +9,7 @@ from typing import Any
 
 
 SCHEMA_NAME = "cot_formal_steps"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 _STEP_ID_RE = re.compile(r"S[0-9]{3,}")
 
 
@@ -28,10 +28,11 @@ def make_formal_step_manifest(
     if not isinstance(source, str) or not source:
         raise FormalStepValidationError("source must be a non-empty string")
     steps = []
+    width = max(3, len(str(len(spans))))
     for index, (start, end) in enumerate(spans, start=1):
         text = source[start:end]
         steps.append({
-            "step_id": f"S{index:03d}",
+            "step_id": f"S{index:0{width}d}",
             "source_start": start,
             "source_end": end,
             "source_text": text,

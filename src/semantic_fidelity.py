@@ -32,11 +32,9 @@ class CotStep:
     source_end: int = 0
     source_text: str = ""
     source_sha256: str = ""
-    role: str = "derived_claim"
     depends_on: tuple[str, ...] = ()
     numbers: tuple[str, ...] = ()
     relations: tuple[str, ...] = ()
-    requires_formalization: bool = True
 
     @property
     def base_id(self) -> str:
@@ -58,12 +56,7 @@ class CotManifest:
 
     @property
     def final_step_id(self) -> str:
-        conclusions = [
-            step.step_id
-            for step in self.steps
-            if step.role in {"conclusion", "final", "final_claim"}
-        ]
-        return conclusions[-1] if conclusions else (self.steps[-1].step_id if self.steps else "")
+        return self.steps[-1].step_id if self.steps else ""
 
 
 @dataclass(frozen=True)
@@ -132,8 +125,6 @@ def parse_cot_manifest(value: Any) -> CotManifest:
             source_end=int(step["source_end"]),
             source_text=str(step["source_text"]),
             source_sha256=str(step["source_sha256"]),
-            role="conclusion" if index == len(raw_steps) else "derived_claim",
-            requires_formalization=True,
         )
         for index, step in enumerate(raw_steps, start=1)
     ))
@@ -403,6 +394,77 @@ def _is_reflexive(text: str) -> bool:
     return bool(left) and _normalize_expr(left) == _normalize_expr(right)
 
 
+def _leading_let_parts(text: str) -> tuple[list[tuple[str, str]], str]:
+    rest = text.strip()
+    bindings: list[tuple[str, str]] = []
+    while rest.startswith("let "):
+        match = re.match(
+            r"^let\s+([A-Za-z_][A-Za-z0-9_']*)"
+            r"(?:\s*:\s*.*?)?\s*:=\s*",
+            rest,
+            re.DOTALL,
+        )
+        if match is None:
+            break
+        start = match.end()
+        depth = 0
+        in_string = False
+        escaped = False
+        separator = -1
+        for index in range(start, len(rest)):
+            char = rest[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char in "([{":
+                depth += 1
+            elif char in ")]}":
+                depth = max(0, depth - 1)
+            elif depth == 0 and char in ";\n":
+                separator = index
+                break
+        if separator < 0:
+            break
+        bindings.append((match.group(1), rest[start:separator].strip()))
+        rest = rest[separator + 1:].strip()
+    return bindings, rest
+
+
+def _let_terminal(text: str) -> str:
+    """Return the proposition after a simple leading Lean ``let`` block.
+
+    This intentionally does not evaluate arbitrary Lean.  It recognizes the
+    generated one-line local declarations that previously hid a final ``True``
+    or a closed reflexive answer alias from the high-confidence gate.
+    """
+    bindings, terminal = _leading_let_parts(text)
+    return terminal if bindings else text.strip()
+
+
+def _zeta_simple_literal_lets(text: str) -> str:
+    """Substitute only closed literal one-line lets in the terminal claim."""
+    parsed, terminal = _leading_let_parts(text)
+    bindings: dict[str, str] = {}
+    for name, raw_value in parsed:
+        value = raw_value.strip()
+        # Restrict deterministic substitution to closed scalar literals.
+        if not re.fullmatch(r"[-+]?\d+(?:\.\d+)?(?:\s*/\s*\d+)?", value):
+            return text.strip()
+        bindings[name] = value
+    if not bindings or not terminal:
+        return text.strip()
+    for name, value in bindings.items():
+        terminal = re.sub(rf"\b{re.escape(name)}\b", f"({value})", terminal)
+    return terminal.strip()
+
+
 def _contains_true_shell(text: str) -> bool:
     """Return whether a compound proposition contains a literal ``True`` arm.
 
@@ -412,7 +474,7 @@ def _contains_true_shell(text: str) -> bool:
     follows only top-level logical structure (and a quantifier's body), so an
     identifier or comment containing the letters ``True`` is not enough.
     """
-    value = _strip_outer_parens(text)
+    value = _strip_outer_parens(_let_terminal(text))
     if _normalize_expr(value) == "True":
         return True
     for operator in ("↔", "→", "∨", "∧"):
@@ -491,6 +553,57 @@ def _is_unconstrained_exists(text: str) -> bool:
         return False
     closed = right if left_is_var else left
     return re.search(rf"\b{re.escape(variable)}\b", closed) is None
+
+
+def _is_answer_only_exists(text: str, claimed_answer: str) -> bool:
+    """Recognize witnesses constrained only by closed literal assignments."""
+    answer = _simple_claimed_answer(claimed_answer)
+    value = _strip_outer_parens(_let_terminal(text))
+    if not answer or not value.startswith("∃"):
+        return False
+    payload = value[1:].lstrip()
+    commas = _scan_top_level(payload, ",")
+    if not commas:
+        return False
+    binders, body = payload[:commas[0]], _strip_outer_parens(payload[commas[0] + 1:])
+    variables: list[str] = []
+    for names in re.findall(r"\(([^():]+?)\s*:\s*[^()]+\)", binders):
+        variables.extend(re.findall(r"[A-Za-z_][A-Za-z0-9_']*", names))
+    if not variables:
+        bare = re.match(r"([A-Za-z_][A-Za-z0-9_']*)\s*(?::[^,]+)?$", binders.strip())
+        if bare:
+            variables = [bare.group(1)]
+    if not variables:
+        return False
+    positions = _scan_top_level(body, "∧")
+    atoms: list[str] = []
+    start = 0
+    for position in positions:
+        atoms.append(_strip_outer_parens(body[start:position]))
+        start = position + len("∧")
+    atoms.append(_strip_outer_parens(body[start:]))
+    assigned: set[str] = set()
+    saw_answer = False
+    for atom in atoms:
+        equality = _top_level_equality(atom)
+        if equality is None:
+            return False
+        left, right = equality
+        left_norm, right_norm = _normalize_expr(left), _normalize_expr(right)
+        matched = None
+        closed = ""
+        for variable in variables:
+            if left_norm == variable:
+                matched, closed = variable, right_norm
+                break
+            if right_norm == variable:
+                matched, closed = variable, left_norm
+                break
+        if matched is None or any(re.search(rf"\b{re.escape(var)}\b", closed) for var in variables):
+            return False
+        assigned.add(matched)
+        saw_answer = saw_answer or _contains_answer(closed, claimed_answer)
+    return assigned == set(variables) and saw_answer
 
 
 def _simple_claimed_answer(value: str) -> str:
@@ -664,8 +777,6 @@ def validate_blueprint_fidelity(
     }
     if require_step_bindings:
         for step in contract.steps:
-            if not step.requires_formalization:
-                continue
             if step.step_id not in mapped_steps:
                 issues.append(_issue_for_step(
                     "stepMappingAbsent",
@@ -700,6 +811,7 @@ def validate_blueprint_fidelity(
         if node.kind in {"lemma", "theorem"}:
             conclusion = _node_conclusion(node)
             normalized_conclusion = _normalize_expr(conclusion)
+            zeta_conclusion = _zeta_simple_literal_lets(conclusion)
             pending_match = re.fullmatch(
                 r'PendingBlueprintClaim"((?:\\.|[^"\\])*)"',
                 normalized_conclusion,
@@ -714,12 +826,11 @@ def validate_blueprint_fidelity(
                 if (
                     pending_match is None
                     or pending_name != node.name
-                    or node.name == blueprint.target_theorem
                 ):
                     issues.append(_issue(
                         "malformedPendingClaim",
-                        "PendingBlueprintClaim must be the complete conclusion of a non-root "
-                        "proof node and its string must equal that declaration's name.",
+                        "PendingBlueprintClaim must be the complete conclusion of a proof "
+                        "node and its string must equal that declaration's name.",
                         node=node,
                         contract=contract,
                     ))
@@ -753,10 +864,10 @@ def validate_blueprint_fidelity(
                     node=node,
                     contract=contract,
                 ))
-            if node.name != blueprint.target_theorem and _is_reflexive(conclusion):
+            if node.name != blueprint.target_theorem and _is_reflexive(zeta_conclusion):
                 issues.append(_issue(
                     "reflexiveStep",
-                    "A source assertion was replaced by a reflexive equality.",
+                    "A source assertion was replaced by a reflexive equality or local answer alias.",
                     node=node,
                     contract=contract,
                 ))
@@ -764,6 +875,16 @@ def validate_blueprint_fidelity(
                 issues.append(_issue(
                     "unconstrainedExistsStep",
                     "A source assertion only chooses an unconstrained closed witness.",
+                    node=node,
+                    contract=contract,
+                ))
+            if (
+                node.name != blueprint.target_theorem
+                and _is_answer_only_exists(conclusion, claimed_answer)
+            ):
+                issues.append(_issue(
+                    "unboundAnswerWitnessStep",
+                    "Existential objects are constrained only by closed answer assignments.",
                     node=node,
                     contract=contract,
                 ))
@@ -805,24 +926,11 @@ def validate_blueprint_fidelity(
                     node=node,
                     contract=contract,
                 ))
-    root_proposition = _normalized_proposition(root)
-    for node in blueprint.nodes:
-        if (
-            node.name != root.name
-            and node.kind in {"lemma", "theorem"}
-            and _normalized_proposition(node) == root_proposition
-        ):
-            issues.append(_issue(
-                "duplicateRootConclusion",
-                "A non-root proof node duplicates the complete root proposition.",
-                node=node, category="answerGrounding", contract=contract,
-            ))
-
     root_conclusion = _node_conclusion(root)
-    if _is_reflexive(root_conclusion):
+    if _is_reflexive(_zeta_simple_literal_lets(root_conclusion)):
         issues.append(_issue(
             "reflexiveRoot",
-            "The root is a reflexive equality and no longer states the source problem.",
+            "The root is a reflexive equality or local answer alias and no longer states the source problem.",
             node=root,
             contract=contract,
         ))
@@ -833,7 +941,18 @@ def validate_blueprint_fidelity(
             node=root,
             contract=contract,
         ))
-    if claimed_answer and not _contains_answer(root_conclusion, claimed_answer):
+    if _is_answer_only_exists(root_conclusion, claimed_answer):
+        issues.append(_issue(
+            "unboundAnswerWitnessRoot",
+            "The root existential objects are constrained only by closed answer assignments.",
+            node=root,
+            contract=contract,
+        ))
+    if (
+        claimed_answer
+        and "PendingBlueprintClaim" not in root_conclusion
+        and not _contains_answer(root_conclusion, claimed_answer)
+    ):
         issues.append(_issue(
             "rootMissingClaimedAnswer",
             "The root does not retain the simple claimed final answer.",
@@ -846,7 +965,7 @@ def validate_blueprint_fidelity(
         if (candidate := node_map.get(name)) is not None
         and candidate.kind in {"lemma", "theorem"}
     }
-    substantive_steps = [step for step in contract.steps if step.requires_formalization]
+    substantive_steps = list(contract.steps)
     if substantive_steps and len(substantive_steps) > 1 and not proof_ancestors:
         issues.append(_issue(
             "rootNotGrounded",
@@ -856,104 +975,6 @@ def validate_blueprint_fidelity(
             contract=contract,
         ))
     return issues
-
-
-def semantic_audit_risk_reasons(
-    blueprint: Blueprint,
-    manifest: CotManifest | Any,
-    *,
-    claimed_answer: str = "",
-) -> list[str]:
-    """Return cheap reasons for routing a sample to the optional LLM audit.
-
-    Absence of a reason is not a proof of faithfulness; it only means the local
-    structure and the minimal numeric/relation IR found no ambiguity worth an
-    additional 397B request.
-    """
-    contract = parse_cot_manifest(manifest)
-    steps_by_id = {step.step_id: step for step in contract.steps}
-    nodes_by_step: dict[str, list[BlueprintNode]] = {}
-    for node in blueprint.nodes:
-        base_id = _base_step_id(node.source_step_id)
-        if base_id:
-            nodes_by_step.setdefault(base_id, []).append(node)
-    reasons: set[str] = set()
-    for node in blueprint.nodes:
-        if node.kind != "definition":
-            continue
-        base_id = _base_step_id(node.source_step_id)
-        source_step = steps_by_id.get(base_id)
-        if source_step and source_step.role not in {
-            "setup", "given", "object_definition", "computation",
-        }:
-            reasons.add(
-                "DERIVED_STEP_AS_DEFINITION:"
-                f"step={base_id}:node={node.name}:role={source_step.role}"
-            )
-    relation_tokens = {
-        "eq": "=", "ne": "≠", "le": "≤", "ge": "≥",
-        "lt": "<", "gt": ">", "implication": "→",
-    }
-    for step in contract.steps:
-        if not step.requires_formalization:
-            continue
-        nodes = nodes_by_step.get(step.step_id, [])
-        if len(nodes) > 1:
-            reasons.add(f"MULTI_NODE_STEP:{step.step_id}")
-        lean_text = "\n".join(
-            node.full_declaration() if node.kind == "definition" else node.signature()
-            for node in nodes
-        )
-        normalized = _normalize_expr(lean_text)
-        for number in step.numbers:
-            literal = number.replace(" ", "")
-            if literal and re.search(rf"(?<!\d){re.escape(literal)}(?!\d)", normalized) is None:
-                reasons.add(f"NUMBER_NOT_VISIBLE:{step.step_id}:{number}")
-        for relation in step.relations:
-            token = relation_tokens.get(relation)
-            if token and token not in lean_text:
-                # Lean often spells <=/>= in ASCII.
-                if not (token == "≤" and "<=" in lean_text) and not (
-                    token == "≥" and ">=" in lean_text
-                ):
-                    reasons.add(f"RELATION_NOT_VISIBLE:{step.step_id}:{relation}")
-
-    # Textual COT order is useful provenance, but it is not necessarily the
-    # logical dependency order.  For example, an opening overview can use an
-    # object whose detailed setup appears in the next numbered paragraph.
-    # Such edges are therefore audit-routing signals rather than deterministic
-    # fidelity failures.
-    ordinal_by_id = {step.step_id: step.ordinal for step in contract.steps}
-    node_map = blueprint.nodes_by_name()
-    for node in blueprint.nodes:
-        source_step = _base_step_id(node.source_step_id)
-        source_ordinal = ordinal_by_id.get(source_step, -1)
-        if source_ordinal < 0:
-            continue
-        for dependency_name in node.dependencies:
-            dependency = node_map.get(dependency_name)
-            if dependency is None:
-                continue
-            dependency_step = _base_step_id(dependency.source_step_id)
-            dependency_ordinal = ordinal_by_id.get(dependency_step, -1)
-            if dependency_ordinal > source_ordinal:
-                reasons.add(
-                    "FUTURE_STEP_DEPENDENCY:"
-                    f"node={node.name}:source={source_step}:"
-                    f"dependency={dependency.name}:dependency_source={dependency_step}"
-                )
-    answer = _simple_claimed_answer(claimed_answer)
-    if answer:
-        for node in blueprint.nodes:
-            if node.kind != "definition":
-                continue
-            _prefix, body = _definition_parts(node)
-            if _contains_answer(body, answer):
-                reasons.add(f"ANSWER_IN_DEFINITION:{node.name}")
-    root = blueprint.node_by_name(blueprint.target_theorem)
-    if root is not None and "∃" in _node_conclusion(root):
-        reasons.add("EXISTENTIAL_ROOT")
-    return sorted(reasons)
 
 
 def snapshot_blueprint_semantics(

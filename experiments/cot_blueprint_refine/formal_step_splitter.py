@@ -16,14 +16,14 @@ from typing import Any, Mapping, Sequence
 from openai import AsyncOpenAI
 
 
-SPLITTER_VERSION = "formal-step-boundary-v2"
-PROMPT_VERSION = "formal-step-boundary-v2"
+SPLITTER_VERSION = "formal-step-boundary-v4"
+PROMPT_VERSION = "formal-step-boundary-v4"
 ANCHOR_VERSION = "mechanical-boundary-anchor-v1"
 RESULTS_FILENAME = "formal_step_splits.jsonl"
 SUMMARY_FILENAME = "formal_step_split_summary.json"
-_OPEN = "[[FORMAL_STEPS_V1]]"
-_CLOSE = "[[/FORMAL_STEPS_V1]]"
-_CLOSE_TOLERATED = "[/FORMAL_STEPS_V1]"
+_OPEN = "[[FORMAL_STEPS_V4]]"
+_CLOSE = "[[/FORMAL_STEPS_V4]]"
+_CLOSE_TOLERATED = "[/FORMAL_STEPS_V4]"
 _ANCHOR_RE = re.compile(r"B[0-9]{4,}")
 _FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
 _HEADING_RE = re.compile(r"^\s*(?:#{1,6}\s+|\*\*(?:step|case|part|answer|conclusion)\b)", re.I)
@@ -33,20 +33,24 @@ _SEPARATOR_RE = re.compile(r"^\s*(?:-{3,}|_{3,}|\*{3,})\s*$")
 _FORMAT_ONLY_RE = re.compile(
     r"^(?:\s|\$|\\\[|\\\]|-{3,}|_{3,}|\*{3,}|`{3,}|~{3,})+$"
 )
-_BOXED_ANSWER_RE = re.compile(r"\\boxed\s*\{\s*([^{}]+?)\s*\}")
-_FINAL_FILLER_RE = re.compile(
-    r"(?i)\b(?:therefore|thus|hence|so|the|final|answer|conclusion|is|equals?|we|get|obtain)\b"
-)
-_PREVIOUS_RESULT_SIGNAL_RE = re.compile(
-    r"(?i)\b(?:solv(?:e|ed|ing)|obtain(?:ed)?|get|got|gives?|yields?|found|answer)\b"
-)
 
 
 class FormalStepSplitError(ValueError):
-    def __init__(self, reason: str, raw_content: str = "") -> None:
+    def __init__(
+        self,
+        reason: str,
+        raw_content: str = "",
+        *,
+        forbidden_boundaries: Mapping[str, Sequence[str]] | None = None,
+    ) -> None:
         super().__init__(reason)
         self.reason = reason
         self.raw_content = raw_content
+        self.forbidden_boundaries = {
+            str(kind): [str(boundary) for boundary in boundaries]
+            for kind, boundaries in (forbidden_boundaries or {}).items()
+            if boundaries
+        }
 
 
 @dataclass(frozen=True)
@@ -109,7 +113,6 @@ class FormalStepSplitResult:
     error_type: str | None = None
     cached: bool = False
     formatting_merges: int = 0
-    final_wrapper_merges: int = 0
 
     @property
     def ok(self) -> bool:
@@ -122,6 +125,7 @@ class FormalStepSplitResult:
             "splitter_version": SPLITTER_VERSION,
             "prompt_version": PROMPT_VERSION,
             "anchor_version": ANCHOR_VERSION,
+            "stepCount": len(self.spans),
             "finished_at": datetime.now(timezone.utc).isoformat(),
         })
         return result
@@ -270,7 +274,7 @@ A Step is the smallest semantically coherent reasoning unit that can be represen
 
 Boundary rules:
 - Merge headings, method narration, colon-ended lead-ins, displayed formulas, and their immediate explanation into one Step. None may form a Step alone.
-- Merge an immediate final-answer restatement into the preceding Step when it introduces no new object, transformation, condition, correction, or mathematical claim. The root should perform the final inference; a purely verbal repetition is not a separate Step.
+- A final answer restatement is ordinary source content. It may be a separate final Step, even when it repeats the preceding Step's conclusion, and must never be omitted.
 - Split independent conclusions, independent transformations, new case branches, or changes of mathematical object.
 - Never split a formula from the prose that introduces or interprets it.
 - Do not follow source labels like `Step 1` mechanically.
@@ -281,7 +285,7 @@ Boundary rules:
 
 The COT has approximately {cot_tokens} tokens. A soft prior is {lower}–{upper} Steps, target {target}. Semantic coherence overrides this range; it is not a quota.
 
-Return exactly one {_OPEN} ... {_CLOSE} block. Inside, write only the boundary ID ending each Step, one per line, strictly increasing. The final line must be {final}."""
+Return exactly one {_OPEN} ... {_CLOSE} block. Inside, write only the boundary ID ending each Step, one per line, strictly increasing. The final line must be {final}. Do not write explanations."""
     user = (
         f"Source SHA-256: {_sha256(source)}\n"
         f"Boundary coordinate count: {len(anchors)}\n\n{inventory}"
@@ -289,7 +293,10 @@ Return exactly one {_OPEN} ... {_CLOSE} block. Inside, write only the boundary I
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-def parse_boundaries(content: str, anchors: Sequence[Mapping[str, Any]]) -> list[str]:
+def parse_split_response(
+    content: str,
+    anchors: Sequence[Mapping[str, Any]],
+) -> list[str]:
     raw = str(content or "")
     full_close_count = raw.count(_CLOSE)
     close_count = full_close_count or raw.count(_CLOSE_TOLERATED)
@@ -313,13 +320,34 @@ def parse_boundaries(content: str, anchors: Sequence[Mapping[str, Any]]) -> list
         raise FormalStepSplitError("boundaries must be unique and strictly increasing", raw)
     if values[-1] != ids[-1]:
         raise FormalStepSplitError(f"final boundary must be {ids[-1]}", raw)
+    forbidden_boundaries: dict[str, list[str]] = {
+        "headingOnly": [],
+        "colonLeadIn": [],
+    }
     for value in values[:-1]:
         anchor = anchors[positions[value]]
         if str(anchor.get("kind")) == "heading":
-            raise FormalStepSplitError(f"heading-only boundary is forbidden: {value}", raw)
+            forbidden_boundaries["headingOnly"].append(value)
         if str(anchor.get("source_text") or "").rstrip().endswith(":"):
-            raise FormalStepSplitError(f"colon lead-in boundary is forbidden: {value}", raw)
+            forbidden_boundaries["colonLeadIn"].append(value)
+    forbidden_boundaries = {
+        kind: boundaries for kind, boundaries in forbidden_boundaries.items() if boundaries
+    }
+    if forbidden_boundaries:
+        details = "; ".join(
+            f"{kind}=[{', '.join(boundaries)}]"
+            for kind, boundaries in forbidden_boundaries.items()
+        )
+        raise FormalStepSplitError(
+            f"forbidden Step boundaries: {details}",
+            raw,
+            forbidden_boundaries=forbidden_boundaries,
+        )
     return values
+
+
+def parse_boundaries(content: str, anchors: Sequence[Mapping[str, Any]]) -> list[str]:
+    return parse_split_response(content, anchors)
 
 
 def spans_from_boundaries(
@@ -346,35 +374,11 @@ def _is_formatting_only(text: str) -> bool:
     return bool(text) and _FORMAT_ONLY_RE.fullmatch(text) is not None
 
 
-def _is_repeated_final_wrapper(text: str, previous_text: str) -> bool:
-    """Recognize only a high-confidence final-answer wrapper.
-
-    The answer must be boxed, must already occur in the preceding Step, and
-    removing Markdown/LaTeX punctuation plus fixed conclusion filler must
-    leave only that same closed literal.  General semantic merging remains an
-    LLM decision.
-    """
-    boxes = _BOXED_ANSWER_RE.findall(text)
-    if len(boxes) != 1:
-        return False
-    answer = re.sub(r"\s+", "", boxes[0])
-    if not re.fullmatch(r"[-+]?\d+(?:\.\d+)?(?:/\d+)?", answer):
-        return False
-    if _PREVIOUS_RESULT_SIGNAL_RE.search(previous_text) is None:
-        return False
-    if re.search(rf"(?<!\d){re.escape(answer)}(?!\d)", re.sub(r"\s+", "", previous_text)) is None:
-        return False
-    residue = _BOXED_ANSWER_RE.sub("", text)
-    residue = _FINAL_FILLER_RE.sub("", residue)
-    residue = re.sub(r"[\s#$*_`~:;,.!?=()\[\]{}\\-]", "", residue)
-    return residue == ""
-
-
 def merge_nonsemantic_spans(
     source: str,
     spans: Sequence[tuple[int, int]],
-) -> tuple[list[tuple[int, int]], int, int]:
-    """Merge format-only spans and a narrow repeated final-answer wrapper."""
+) -> tuple[list[tuple[int, int]], int]:
+    """Merge only format-only spans while preserving semantic Step decisions."""
     values = list(spans)
     formatting_merges = 0
     index = 0
@@ -392,18 +396,9 @@ def merge_nonsemantic_spans(
             _next_start, next_end = values[1]
             values[0:2] = [(start, next_end)]
 
-    final_wrapper_merges = 0
-    if len(values) >= 2:
-        previous_start, previous_end = values[-2]
-        final_start, final_end = values[-1]
-        if _is_repeated_final_wrapper(
-            source[final_start:final_end], source[previous_start:previous_end],
-        ):
-            values[-2:] = [(previous_start, final_end)]
-            final_wrapper_merges = 1
     if "".join(source[start:end] for start, end in values) != source:
         raise AssertionError("post-merge Steps do not reconstruct the exact COT")
-    return values, formatting_merges, final_wrapper_merges
+    return values, formatting_merges
 
 
 def _cache_key(source: str, config: FormalStepSplitterConfig, anchors: Sequence[Mapping[str, Any]]) -> str:
@@ -459,19 +454,17 @@ async def _split_one(
     cache_key = _cache_key(source, config, anchors)
     cached = cached_rows.get(row_id)
     if cached and cached.get("status") == "ok" and cached.get("cache_key") == cache_key:
-        boundaries = parse_boundaries(
-            f"{_OPEN}\n" + "\n".join(cached.get("boundaries") or []) + f"\n{_CLOSE}",
+        cached_boundaries = list(cached.get("boundaries") or [])
+        boundaries = parse_split_response(
+            f"{_OPEN}\n" + "\n".join(cached_boundaries) + f"\n{_CLOSE}",
             anchors,
         )
         raw_spans = spans_from_boundaries(source, anchors, boundaries)
-        spans, formatting_merges, final_wrapper_merges = merge_nonsemantic_spans(
-            source, raw_spans,
-        )
+        spans, formatting_merges = merge_nonsemantic_spans(source, raw_spans)
         return FormalStepSplitResult(
             row_id, "ok", _sha256(source), cache_key, target, lower, upper, cot_tokens,
             boundaries=boundaries, anchors=anchors,
             spans=spans, cached=True, formatting_merges=formatting_merges,
-            final_wrapper_merges=final_wrapper_merges,
         )
     base_messages = build_split_messages(source, anchors, config)
     messages = list(base_messages)
@@ -496,11 +489,9 @@ async def _split_one(
             })
             if str(choice.finish_reason or "") == "length":
                 raise FormalStepSplitError("finish_reason=length", content)
-            boundaries = parse_boundaries(content, anchors)
+            boundaries = parse_split_response(content, anchors)
             raw_spans = spans_from_boundaries(source, anchors, boundaries)
-            spans, formatting_merges, final_wrapper_merges = merge_nonsemantic_spans(
-                source, raw_spans,
-            )
+            spans, formatting_merges = merge_nonsemantic_spans(source, raw_spans)
             usage = {}
             for item in attempts:
                 for key, value in item["usage"].items():
@@ -511,23 +502,25 @@ async def _split_one(
                 spans=spans, attempts=attempts,
                 usage=usage, latency_s=time.monotonic() - started,
                 formatting_merges=formatting_merges,
-                final_wrapper_merges=final_wrapper_merges,
             )
         except FormalStepSplitError as exc:
             final_error, final_type = exc.reason, type(exc).__name__
             if attempt < config.max_attempts:
                 correction = f"Rejected: {exc.reason}."
-                if exc.reason.startswith("colon lead-in boundary is forbidden:"):
-                    boundary = exc.reason.rsplit(":", 1)[-1].strip()
+                colon_boundaries = exc.forbidden_boundaries.get("colonLeadIn", [])
+                heading_boundaries = exc.forbidden_boundaries.get("headingOnly", [])
+                if colon_boundaries:
                     correction += (
-                        f" Remove {boundary}; it introduces the material immediately after it. "
-                        "Place that Step boundary only after the attached formula and its "
-                        "immediate interpretation."
+                        f" Remove every colon-ended lead-in boundary listed above "
+                        f"({', '.join(colon_boundaries)}); each introduces the material "
+                        "immediately after it. Place those Step boundaries only after the "
+                        "attached formula and its immediate interpretation."
                     )
-                elif exc.reason.startswith("heading-only boundary is forbidden:"):
-                    boundary = exc.reason.rsplit(":", 1)[-1].strip()
+                if heading_boundaries:
                     correction += (
-                        f" Remove {boundary}; merge that heading with the reasoning below it."
+                        f" Remove every heading-only boundary listed above "
+                        f"({', '.join(heading_boundaries)}); merge each heading with the "
+                        "reasoning below it."
                     )
                 messages = [*base_messages, {"role": "assistant", "content": exc.raw_content}, {
                     "role": "user",
@@ -577,7 +570,6 @@ async def split_formal_step_rows(
         "steps": [len(result.spans) for result in values if result.ok],
         "target_steps": [result.target_steps for result in values],
         "formatting_merges": sum(result.formatting_merges for result in values),
-        "final_wrapper_merges": sum(result.final_wrapper_merges for result in values),
         "usage": {
             key: sum(result.usage.get(key, 0) for result in values)
             for key in ("prompt_tokens", "completion_tokens", "total_tokens")
@@ -594,6 +586,7 @@ __all__ = [
     "ANCHOR_VERSION", "PROMPT_VERSION", "SPLITTER_VERSION",
     "FormalStepSplitError", "FormalStepSplitterConfig", "FormalStepSplitResult",
     "build_split_messages", "make_boundary_anchors", "parse_boundaries",
+    "parse_split_response",
     "merge_nonsemantic_spans", "spans_from_boundaries", "split_formal_step_rows",
     "step_count_prior",
 ]

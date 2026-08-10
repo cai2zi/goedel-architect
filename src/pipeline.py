@@ -321,7 +321,6 @@ def run_phase3(
     semantic_require_step_ids: bool | None = None,
     semantic_static_gate: bool | None = None,
     semantic_freeze_refinement: bool | None = None,
-    semantic_audit_mode: str | None = None,
 ) -> Blueprint:
     state = CheckpointState.load(checkpoint_path)
     if state.status != RunStatus.RUNNING:
@@ -369,11 +368,6 @@ def run_phase3(
                 state.semantic_freeze_refinement
                 if semantic_freeze_refinement is None
                 else semantic_freeze_refinement
-            ),
-            semantic_audit_mode=(
-                state.semantic_audit_mode
-                if semantic_audit_mode is None
-                else semantic_audit_mode
             ),
             baseline_semantic_snapshot=(
                 semantic_snapshot_from_dict(state.semantic_contract_snapshot)

@@ -1,6 +1,6 @@
 input_predictions: /ssd/czx/czx_work/cot_blueprint_refine/subsets/qwen3_8b_original_answer_incorrect/predictions.jsonl
 output_base: /ssd/czx/czx_work/cot_blueprint_refine
-exp_name: qwen3_8b_397b_wrong76_step_v3_phase1_ab_crud_standalone_smoke10
+exp_name: qwen3_8b_397b_wrong76_step_v4_phase1_ab_smoke10
 resume: false
 python_bin: /ssd/miniconda3/envs/lean4-czx/bin/python
 include_ids:
@@ -19,7 +19,7 @@ vllm:
   use_existing: true
 
 step_splitter:
-  prompt_version: formal-step-boundary-v2
+  prompt_version: formal-step-boundary-v3
   concurrency: 10
 
 blueprint:

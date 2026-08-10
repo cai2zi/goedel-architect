@@ -30,12 +30,10 @@ from blueprint import (
     phase2_standalone_contract_errors,
 )
 from kimina_lean_compiler import KiminaInfrastructureError, KiminaLeanCompiler
-from semantic_audit import SemanticAuditFormatError, run_semantic_audit
 from semantic_fidelity import (
     check_semantic_freeze,
     format_semantic_issues,
     parse_cot_manifest,
-    semantic_audit_risk_reasons,
     snapshot_blueprint_semantics,
     validate_blueprint_fidelity,
 )
@@ -173,7 +171,6 @@ def refine_blueprint(
     semantic_require_step_ids: bool = False,
     semantic_static_gate: bool = False,
     semantic_freeze_refinement: bool = False,
-    semantic_audit_mode: str = "none",
     baseline_semantic_snapshot: Any = None,
 ) -> Blueprint:
     """
@@ -192,10 +189,6 @@ def refine_blueprint(
         change strategy or accept a node as an unresolved gap, rather than
         cosmetically re-decomposing the same stuck problem every round.
     """
-    if semantic_audit_mode not in {"none", "risk", "full"}:
-        raise ValueError("semantic_audit_mode must be one of: none, risk, full")
-    if semantic_audit_mode != "none" and not semantic_fidelity_enabled:
-        raise ValueError("semantic audit requires semantic_fidelity_enabled=true")
     client = make_client(model)
     semantic_manifest = (
         parse_cot_manifest(cot_manifest_json) if semantic_fidelity_enabled else None
@@ -371,78 +364,6 @@ def refine_blueprint(
                         finish_reason=getattr(response.choices[0], "finish_reason", None),
                     )
                     continue
-                audit_risk_reasons = (
-                    semantic_audit_risk_reasons(
-                        parsed,
-                        semantic_manifest,
-                        claimed_answer=claimed_answer,
-                    )
-                    if semantic_audit_mode == "risk"
-                    else []
-                )
-                should_audit = (
-                    semantic_audit_mode == "full"
-                    or (semantic_audit_mode == "risk" and bool(audit_risk_reasons))
-                )
-                if semantic_audit_mode == "risk" and not should_audit:
-                    parsed.semantic_gate_results.append({
-                        "stage": "phase3_semantic_audit",
-                        "passed": True,
-                        "mode": "risk",
-                        "routed": False,
-                        "risk_reasons": [],
-                    })
-                if should_audit:
-                    try:
-                        audit = run_semantic_audit(
-                            model,
-                            prompt_proof,
-                            parsed.lean_file,
-                            mode=semantic_audit_mode,
-                            informal_statement=informal_statement,
-                            claimed_answer=claimed_answer,
-                            client=client,
-                            tracer=tracer,
-                            thm_name=thm_name,
-                            phase="phase3_semantic_audit",
-                        )
-                        audit_feedback = audit.diagnostics
-                        audit_passed = audit.passed
-                    except SemanticAuditFormatError as exc:
-                        audit_feedback = f"Audit response format invalid: {exc.reason}"
-                        audit_passed = False
-                    if not audit_passed:
-                        last_error_feedback = (
-                            "The semantic-fidelity audit rejected the revised blueprint:\n\n"
-                            f"{audit_feedback}"
-                        )
-                        feedback = (
-                            f"{last_error_feedback}\n\nRepair only the formal encoding. "
-                            "Restore every original COT Step and Step binding; "
-                            "do not make the mathematics easier."
-                        )
-                        _set_latest_blueprint_retry(
-                            messages,
-                            base_messages,
-                            lean_code,
-                            feedback,
-                            finish_reason=getattr(response.choices[0], "finish_reason", None),
-                        )
-                        continue
-                    parsed.semantic_audit_result = {
-                        "passed": audit.passed,
-                        "flag": audit.flag,
-                        "diagnostics": audit.diagnostics,
-                        "request_id": audit.request_id,
-                        "mode": audit.mode,
-                        "routed": True,
-                        "risk_reasons": audit_risk_reasons,
-                        "total_tokens": audit.total_tokens,
-                    }
-                    parsed.semantic_gate_results.append({
-                        "stage": "phase3_semantic_audit",
-                        **parsed.semantic_audit_result,
-                    })
                 print(f"  [refine] attempt {attempt + 1}/{max_retries}: check_blueprint OK", flush=True)
                 return parsed
             # Compiles, but has zero @[blueprint]-annotated declarations - an

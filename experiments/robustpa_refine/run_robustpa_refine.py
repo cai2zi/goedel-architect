@@ -15,7 +15,7 @@ import traceback
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
-from functools import partial
+from functools import lru_cache, partial
 from pathlib import Path
 from typing import Any
 
@@ -154,6 +154,17 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
     args.split = _as_list(getattr(args, "split", None))
     args.limit = getattr(args, "limit", None)
     args.problem_id = getattr(args, "problem_id", None)
+    include_path = getattr(args, "include_source_ids_path", None)
+    args.include_source_ids_path = (
+        _resolve_path(include_path, original_cwd) if include_path else None
+    )
+    args.include_source_ids = None
+    if args.include_source_ids_path is not None:
+        payload = json.loads(args.include_source_ids_path.read_text(encoding="utf-8"))
+        values = payload.get("include_ids") if isinstance(payload, dict) else payload
+        if not isinstance(values, list) or any(not isinstance(item, str) for item in values):
+            raise ValueError("include_source_ids_path must contain a JSON string list")
+        args.include_source_ids = set(values)
     args.resume = bool(getattr(args, "resume", False))
     args.retry_error_results = bool(getattr(args, "retry_error_results", False))
     if not args.exp_name:
@@ -171,6 +182,23 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
     args.phase1_max_tool_turns = int(args.phase1_max_tool_turns)
     args.phase1_max_tool_calls_per_turn = int(args.phase1_max_tool_calls_per_turn)
     args.phase1_mathlib_search_max_calls = int(args.phase1_mathlib_search_max_calls)
+    args.phase1b_mathlib_search_max_calls_per_round = int(
+        args.phase1b_mathlib_search_max_calls_per_round
+    )
+    args.phase1b_formal_decompiler_max_tokens = int(
+        args.phase1b_formal_decompiler_max_tokens
+    )
+    args.phase1b_strict_comparator_max_tokens = int(
+        args.phase1b_strict_comparator_max_tokens
+    )
+    args.phase1b_semantic_format_max_attempts = int(
+        args.phase1b_semantic_format_max_attempts
+    )
+    seed_root = getattr(args, "phase1b_seed_blueprint_root", None)
+    args.phase1b_seed_blueprint_root = (
+        _resolve_path(seed_root, original_cwd) if seed_root else None
+    )
+    args.phase1b_seed_required = bool(getattr(args, "phase1b_seed_required", False))
     _validate_args(args)
     return args
 
@@ -202,8 +230,18 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("node_max_negation_probe_turns must be non-negative")
     if args.critical_negation_max_turns < 0:
         raise ValueError("critical_negation_max_turns must be non-negative")
-    if args.semantic_audit_mode not in {"none", "risk", "full"}:
-        raise ValueError("semantic_audit_mode must be one of: none, risk, full")
+    if args.phase1b_mathlib_search_max_calls_per_round < 0:
+        raise ValueError("phase1b_mathlib_search_max_calls_per_round must be non-negative")
+    if args.phase1b_formal_decompiler_max_tokens <= 0:
+        raise ValueError("phase1b_formal_decompiler_max_tokens must be positive")
+    if args.phase1b_strict_comparator_max_tokens <= 0:
+        raise ValueError("phase1b_strict_comparator_max_tokens must be positive")
+    if args.phase1b_semantic_format_max_attempts <= 0:
+        raise ValueError("phase1b_semantic_format_max_attempts must be positive")
+    if args.phase1b_seed_required and args.phase1b_seed_blueprint_root is None:
+        raise ValueError(
+            "phase1b_seed_required=true requires phase1b_seed_blueprint_root"
+        )
     if args.semantic_source_mode not in {"step_grounded", "whole_cot"}:
         raise ValueError("semantic_source_mode must be one of: step_grounded, whole_cot")
     if args.semantic_source_mode == "whole_cot" and not args.semantic_fidelity_enabled:
@@ -293,6 +331,8 @@ def _select_records(args: argparse.Namespace) -> list[Record]:
     for subset, split, parquet_path in _iter_parquets(args.data_root, args.subset, args.split):
         for row_index, row in enumerate(_read_parquet_rows(parquet_path), 1):
             record = _make_record(subset, split, parquet_path, row_index, row)
+            if args.include_source_ids is not None and record.source_id not in args.include_source_ids:
+                continue
             if args.problem_id and args.problem_id not in {
                 record.source_id,
                 record.record_id,
@@ -312,6 +352,61 @@ def _record_paths(output_root: Path, record: Record) -> tuple[Path, Path, Path]:
     trace_path = output_root / "traces" / record.subset / record.split / f"{record.record_id}.jsonl"
     blueprint_dir = output_root / "blueprints" / base
     return checkpoint_path, trace_path, blueprint_dir
+
+
+@lru_cache(maxsize=8)
+def _seed_result_rows(results_path: str) -> dict[str, dict[str, Any]]:
+    path = Path(results_path)
+    rows: dict[str, dict[str, Any]] = {}
+    if not path.exists():
+        return rows
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            source_id = str(row.get("source_id") or "")
+            if source_id:
+                rows[source_id] = row
+    return rows
+
+
+def _load_phase1b_seed_blueprint(
+    args: argparse.Namespace,
+    record: Record,
+) -> str:
+    root = args.phase1b_seed_blueprint_root
+    if root is None:
+        return ""
+    seed_path = root / record.subset / record.split / record.record_id / "phase1b_final.lean"
+    metadata_path = root.parent / "results.jsonl"
+    metadata = _seed_result_rows(str(metadata_path)).get(record.source_id)
+    problems: list[str] = []
+    if not seed_path.is_file():
+        problems.append(f"missing seed file: {seed_path}")
+    if metadata is None:
+        problems.append(f"missing seed metadata for source_id={record.source_id}")
+    else:
+        if str(metadata.get("theorem_name") or "") != record.theorem_name:
+            problems.append("theorem name mismatch")
+        if str(metadata.get("claimed_answer") or "") != record.claimed_answer:
+            problems.append("claimed answer mismatch")
+        old_manifest = str(metadata.get("cot_manifest_json") or "")
+        old_hash = hashlib.sha256(old_manifest.encode()).hexdigest()
+        new_hash = hashlib.sha256(record.cot_manifest_json.encode()).hexdigest()
+        if old_hash != new_hash:
+            problems.append(
+                f"COT manifest hash mismatch: seed={old_hash} current={new_hash}"
+            )
+    if problems:
+        if args.phase1b_seed_required:
+            raise BlueprintGenerationError(
+                "Seed Blueprint validation failed: " + "; ".join(problems),
+                diagnostics=problems,
+                failure_stage="seedBlueprintInvalid",
+            )
+        return ""
+    return seed_path.read_text(encoding="utf-8")
 
 
 def _write_blueprint_snapshot(
@@ -495,7 +590,21 @@ def _result_row(
         "semantic_static_gate": bool(args.semantic_static_gate),
         "semantic_minimal_ir": bool(args.semantic_minimal_ir),
         "semantic_freeze_refinement": bool(args.semantic_freeze_refinement),
-        "semantic_audit_mode": str(args.semantic_audit_mode),
+        "phase1b_semantic_audit_enabled": bool(args.phase1b_semantic_audit_enabled),
+        "phase1b_formal_decompiler_max_tokens": (
+            args.phase1b_formal_decompiler_max_tokens
+        ),
+        "phase1b_strict_comparator_max_tokens": (
+            args.phase1b_strict_comparator_max_tokens
+        ),
+        "phase1b_semantic_format_max_attempts": (
+            args.phase1b_semantic_format_max_attempts
+        ),
+        "phase1b_seed_blueprint_root": str(args.phase1b_seed_blueprint_root or ""),
+        "phase1b_seed_required": bool(args.phase1b_seed_required),
+        "phase1b_mathlib_search_max_calls_per_round": (
+            args.phase1b_mathlib_search_max_calls_per_round
+        ),
         "semantic_source_mode": str(args.semantic_source_mode),
         "semantic_status": state.semantic_status if state else "",
         "semantic_gate_results": semantic_gate_results,
@@ -512,6 +621,31 @@ def _result_row(
     if traceback_text:
         row["traceback"] = traceback_text
     return row
+
+
+def _accepted_phase1_status(blueprint: Blueprint) -> str:
+    audit = blueprint.phase1b_validation.get("semanticAudit")
+    if isinstance(audit, dict):
+        classification = str(audit.get("classification") or "")
+        if classification in {"strictAccepted", "acceptedWithJustifiedSideBranches"}:
+            return classification
+    return "phase1_accepted"
+
+
+def _failed_phase1_status(exc: Exception) -> str:
+    if not isinstance(exc, BlueprintGenerationError):
+        return "infraError"
+    if exc.failure_stage == "phase1BSemanticAuditFormat":
+        return "infraError"
+    audit = exc.validation_details.get("semanticAudit")
+    if isinstance(audit, dict):
+        comparator = audit.get("strictComparator") or {}
+        if (
+            comparator.get("passed") is False
+            or audit.get("openObligations")
+        ):
+            return "semanticRejected"
+    return "structuralRejected"
 
 
 def _existing_results(path: Path) -> dict[str, dict[str, Any]]:
@@ -579,6 +713,7 @@ async def _run_record(
     state: CheckpointState | None = None
     phase = "phase1"
     try:
+        phase1b_seed_lean_code = _load_phase1b_seed_blueprint(args, record)
         phase1_tracer = tracer.with_context(phase="phase1", iteration=0)
         async with phase1_sem:
             tqdm.write(f"[phase1-start] {record.unique_id}")
@@ -601,11 +736,26 @@ async def _run_record(
                     semantic_require_step_ids=args.semantic_require_step_ids,
                     semantic_static_gate=args.semantic_static_gate,
                     semantic_minimal_ir=args.semantic_minimal_ir,
-                    semantic_audit_mode=args.semantic_audit_mode,
                     semantic_source_mode=args.semantic_source_mode,
                     phase1_max_tool_turns=args.phase1_max_tool_turns,
                     phase1_max_tool_calls_per_turn=args.phase1_max_tool_calls_per_turn,
                     phase1_mathlib_search_max_calls=args.phase1_mathlib_search_max_calls,
+                    phase1b_mathlib_search_max_calls_per_round=(
+                        args.phase1b_mathlib_search_max_calls_per_round
+                    ),
+                    phase1b_semantic_audit_enabled=(
+                        args.phase1b_semantic_audit_enabled
+                    ),
+                    phase1b_formal_decompiler_max_tokens=(
+                        args.phase1b_formal_decompiler_max_tokens
+                    ),
+                    phase1b_strict_comparator_max_tokens=(
+                        args.phase1b_strict_comparator_max_tokens
+                    ),
+                    phase1b_semantic_format_max_attempts=(
+                        args.phase1b_semantic_format_max_attempts
+                    ),
+                    phase1b_seed_lean_code=phase1b_seed_lean_code,
                 ),
             )
             _write_phase1_candidates(
@@ -622,12 +772,12 @@ async def _run_record(
                 semantic_static_gate=bool(args.semantic_static_gate),
                 semantic_minimal_ir=bool(args.semantic_minimal_ir),
                 semantic_freeze_refinement=bool(args.semantic_freeze_refinement),
-                semantic_audit_mode=str(args.semantic_audit_mode),
                 semantic_source_mode=str(args.semantic_source_mode),
             )
             state.semantic_gate_results = list(blueprint.semantic_gate_results)
             state.semantic_status = (
-                "phase1_accepted" if args.semantic_fidelity_enabled else "disabled"
+                _accepted_phase1_status(blueprint)
+                if args.semantic_fidelity_enabled else "disabled"
             )
             if args.semantic_fidelity_enabled:
                 state.semantic_contract_snapshot = asdict(
@@ -657,7 +807,7 @@ async def _run_record(
             return _result_row(
                 record,
                 output_root,
-                status="phase1_accepted",
+                status=_accepted_phase1_status(blueprint),
                 phase="phase1",
                 blueprint=blueprint,
                 state=state,
@@ -770,7 +920,6 @@ async def _run_record(
                         semantic_require_step_ids=args.semantic_require_step_ids,
                         semantic_static_gate=args.semantic_static_gate,
                         semantic_freeze_refinement=args.semantic_freeze_refinement,
-                        semantic_audit_mode=args.semantic_audit_mode,
                     ),
                 )
                 state = CheckpointState.load(checkpoint_path)
@@ -798,7 +947,7 @@ async def _run_record(
         row = _result_row(
             record,
             output_root,
-            status="error",
+            status=_failed_phase1_status(exc) if phase == "phase1" else "infraError",
             phase=phase,
             blueprint=blueprint,
             state=state,
@@ -841,7 +990,10 @@ async def _run_record(
 def _metric_row(scope: str, rows: list[dict[str, Any]], subset: str = "", split: str = "") -> dict[str, Any]:
     total = len(rows)
     root = sum(1 for row in rows if row.get("root_proved"))
-    phase1_accepted_rows = [row for row in rows if row.get("status") == "phase1_accepted"]
+    accepted_statuses = {
+        "phase1_accepted", "strictAccepted", "acceptedWithJustifiedSideBranches",
+    }
+    phase1_accepted_rows = [row for row in rows if row.get("status") in accepted_statuses]
     return {
         "scope": scope,
         "subset": subset,
@@ -852,8 +1004,18 @@ def _metric_row(scope: str, rows: list[dict[str, Any]], subset: str = "", split:
         "avg_iterations": sum(float(row.get("iterations") or 0) for row in rows) / total if total else 0.0,
         "avg_total_nodes": sum(float(row.get("total_nodes") or 0) for row in rows) / total if total else 0.0,
         "avg_proved_ratio": sum(float(row.get("proved_ratio") or 0) for row in rows) / total if total else 0.0,
-        "phase1_failed": sum(1 for row in rows if row.get("status") == "error" and row.get("phase") == "phase1"),
-        "phase1_accepted": sum(1 for row in rows if row.get("status") == "phase1_accepted"),
+        "phase1_failed": sum(
+            1 for row in rows
+            if row.get("status") in {"error", "semanticRejected", "structuralRejected", "infraError"}
+            and row.get("phase") == "phase1"
+        ),
+        "phase1_accepted": len(phase1_accepted_rows),
+        "strict_accepted": sum(1 for row in rows if row.get("status") == "strictAccepted"),
+        "accepted_with_justified_side_branches": sum(
+            1 for row in rows if row.get("status") == "acceptedWithJustifiedSideBranches"
+        ),
+        "semantic_rejected": sum(1 for row in rows if row.get("status") == "semanticRejected"),
+        "structural_rejected": sum(1 for row in rows if row.get("status") == "structuralRejected"),
         "phase1_accepted_with_warnings": sum(
             1 for row in phase1_accepted_rows if row.get("semantic_warning_codes")
         ),
@@ -1070,10 +1232,13 @@ def _should_skip_existing(row: dict[str, Any] | None, args: argparse.Namespace) 
     if not args.resume or row is None:
         return False
     if row.get("root_proved") is True or row.get("status") in {
-        "exhausted", "phase1_accepted",
+        "exhausted", "phase1_accepted", "strictAccepted",
+        "acceptedWithJustifiedSideBranches",
     }:
         return True
-    return row.get("status") == "error" and not args.retry_error_results
+    return row.get("status") in {
+        "error", "semanticRejected", "structuralRejected", "infraError",
+    } and not args.retry_error_results
 
 
 async def _run_experiment(
