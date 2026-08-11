@@ -65,7 +65,7 @@ def preflight_kimina(config: DictConfig) -> None:
         batch_size=1,
     )
     try:
-        result = compiler.check("import Mathlib\nexample : True := by trivial\n")
+        result = compiler.check("import GoedelArch\nexample : True := by trivial\n")
     finally:
         compiler.close()
     if not result.success:
@@ -87,8 +87,8 @@ def preflight_model(model: str, base_url: str, api_key: str = "dummy") -> None:
 def _blueprint_result_is_terminal(row: dict[str, Any], *, retry_error_results: bool) -> bool:
     status = str(row.get("status") or "")
     if bool(row.get("root_proved")) or status in {
-        "solved", "exhausted", "phase1_accepted", "strictAccepted",
-        "acceptedWithJustifiedSideBranches",
+        "solved", "exhausted", "phase1_accepted", "phase1aReady", "strictAccepted",
+        "acceptedWithJustifiedSideBranches", "acceptedWithWarnings",
     }:
         return True
     return status in {
@@ -186,6 +186,16 @@ def run_blueprint(
         f"execution_mode={blueprint.get('execution_mode', 'full')}",
         f"blueprint_max_retries={blueprint.blueprint_max_retries}",
         f"phase1_max_tool_turns={int(blueprint.get('phase1_max_tool_turns', 3))}",
+        f"phase1a_max_tool_turns={int(blueprint.get('phase1a_max_tool_turns', blueprint.get('phase1_max_tool_turns', 3)))}",
+        f"phase1a_enable_thinking={str(bool(blueprint.get('phase1a_enable_thinking', False))).lower()}",
+        f"phase1a_temperature={float(blueprint.get('phase1a_temperature', 0.0))}",
+        f"phase1a_top_p={float(blueprint.get('phase1a_top_p', 1.0))}",
+        f"phase1a_top_k={int(blueprint.get('phase1a_top_k', 0))}",
+        f"phase1a_min_p={float(blueprint.get('phase1a_min_p', 0.0))}",
+        f"phase1a_presence_penalty={float(blueprint.get('phase1a_presence_penalty', 0.0))}",
+        f"phase1a_repetition_penalty={float(blueprint.get('phase1a_repetition_penalty', 1.0))}",
+        f"phase1a_max_tokens={int(blueprint.get('phase1a_max_tokens', 16384))}",
+        f"phase1b_max_turns={int(blueprint.get('phase1b_max_turns', blueprint.get('phase1_max_tool_turns', 3)))}",
         f"phase1_max_tool_calls_per_turn={int(blueprint.get('phase1_max_tool_calls_per_turn', 3))}",
         f"phase1_mathlib_search_max_calls={int(blueprint.get('phase1_mathlib_search_max_calls', 3))}",
         f"node_max_prove_turns={blueprint.node_max_prove_turns}",
@@ -202,6 +212,17 @@ def run_blueprint(
         f"phase1b_semantic_format_max_attempts={int(blueprint.get('phase1b_semantic_format_max_attempts', 2))}",
         f"phase1b_repair_strategy={blueprint.get('phase1b_repair_strategy', 'directEdit')}",
         f"phase1b_editor_attempts_per_turn={int(blueprint.get('phase1b_editor_attempts_per_turn', 3))}",
+        f"phase1b_flow={blueprint.get('phase1b_flow', 'mixed')}",
+        f"phase1b_deterministic_max_turns={int(blueprint.get('phase1b_deterministic_max_turns', 4))}",
+        f"phase1b_semantic_max_turns={int(blueprint.get('phase1b_semantic_max_turns', 8))}",
+        f"phase1b_editor_enable_thinking={str(bool(blueprint.get('phase1b_editor_enable_thinking', False))).lower()}",
+        f"phase1b_editor_temperature={float(blueprint.get('phase1b_editor_temperature', 0.0))}",
+        f"phase1b_editor_top_p={float(blueprint.get('phase1b_editor_top_p', 1.0))}",
+        f"phase1b_editor_top_k={int(blueprint.get('phase1b_editor_top_k', 0))}",
+        f"phase1b_editor_min_p={float(blueprint.get('phase1b_editor_min_p', 0.0))}",
+        f"phase1b_editor_presence_penalty={float(blueprint.get('phase1b_editor_presence_penalty', 0.0))}",
+        f"phase1b_editor_repetition_penalty={float(blueprint.get('phase1b_editor_repetition_penalty', 1.0))}",
+        f"phase1b_editor_max_tokens={int(blueprint.get('phase1b_editor_max_tokens', 16384))}",
         f"phase1b_plan_max_tokens={int(blueprint.get('phase1b_plan_max_tokens', 768))}",
         f"phase1b_plan_format_attempts={int(blueprint.get('phase1b_plan_format_attempts', 2))}",
         f"phase1b_plan_max_chars={int(blueprint.get('phase1b_plan_max_chars', 600))}",
@@ -213,6 +234,16 @@ def run_blueprint(
         f"phase1b_seed_blueprint_root={blueprint.get('phase1b_seed_blueprint_root', 'null') or 'null'}",
         f"phase1b_seed_filename={blueprint.get('phase1b_seed_filename', 'phase1b_final.lean')}",
         f"phase1b_seed_required={str(bool(blueprint.get('phase1b_seed_required', False))).lower()}",
+        f"phase1d_max_turns={int(blueprint.get('phase1d_max_turns', 8))}",
+        f"phase1d_enable_thinking={str(bool(blueprint.get('phase1d_enable_thinking', True))).lower()}",
+        f"phase1d_temperature={float(blueprint.get('phase1d_temperature', 0.6))}",
+        f"phase1d_top_p={float(blueprint.get('phase1d_top_p', 0.95))}",
+        f"phase1d_top_k={int(blueprint.get('phase1d_top_k', 20))}",
+        f"phase1d_min_p={float(blueprint.get('phase1d_min_p', 0.0))}",
+        f"phase1d_presence_penalty={float(blueprint.get('phase1d_presence_penalty', 0.0))}",
+        f"phase1d_repetition_penalty={float(blueprint.get('phase1d_repetition_penalty', 1.0))}",
+        f"phase1d_model_max_context={int(blueprint.get('phase1d_model_max_context', 40960))}",
+        f"phase1d_context_safety_margin={int(blueprint.get('phase1d_context_safety_margin', 512))}",
         f"semantic_source_mode={blueprint.get('semantic_source_mode', 'step_grounded')}",
         f"proof_policy={blueprint.get('proof_policy', 'full')}",
         f"critical_negation_max_turns={int(blueprint.get('critical_negation_max_turns', 0))}",

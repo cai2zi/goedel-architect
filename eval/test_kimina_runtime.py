@@ -55,6 +55,24 @@ def config(root: Path):
 
 
 class PersistentKiminaRuntimeTest(unittest.TestCase):
+    def test_external_attach_is_health_checked_and_never_destroyed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cfg = config(Path(temporary))
+            cfg.kimina.use_existing = True
+            cfg.kimina.auto_start = False
+            cfg.kimina.auto_destroy = False
+            runtime = PersistentKiminaRuntime(cfg)
+            with (
+                patch.object(runtime, "_port_in_use", return_value=True),
+                patch.object(runtime, "_fetch_json", return_value={"status": "ok"}),
+                patch("cot_blueprint_refine.kimina_runtime.os.killpg") as killpg,
+            ):
+                runtime.ensure("blueprint")
+                runtime.stop()
+            killpg.assert_not_called()
+            self.assertIn('"external": true', runtime.session_path.read_text())
+            self.assertIn('"status": "detached_external"', runtime.session_path.read_text())
+
     def test_owned_process_gets_exact_environment_and_is_destroyed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             runtime = PersistentKiminaRuntime(config(Path(temporary)))

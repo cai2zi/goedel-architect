@@ -15,6 +15,7 @@ vllm:
   cuda_visible_devices: 0,1,2,3,4,5,6,7
 
 kimina:
+  use_existing: false
   auto_start: true
   auto_destroy: true
   root: /ssd/czx/kimina-lean-server
@@ -87,6 +88,26 @@ blueprint:
   max_refinement_iterations: 4
   blueprint_max_retries: 4
   phase1_max_tool_turns: 3
+  phase1a_max_tool_turns: 3
+  phase1a_enable_thinking: false
+  phase1a_temperature: 0.0
+  phase1a_top_p: 1.0
+  phase1a_top_k: 0
+  phase1a_min_p: 0.0
+  phase1a_presence_penalty: 0.0
+  phase1a_repetition_penalty: 1.0
+  phase1a_max_tokens: 16384
+  phase1d_max_turns: 8
+  phase1d_enable_thinking: true
+  phase1d_temperature: 0.6
+  phase1d_top_p: 0.95
+  phase1d_top_k: 20
+  phase1d_min_p: 0.0
+  phase1d_presence_penalty: 0.0
+  phase1d_repetition_penalty: 1.0
+  phase1d_model_max_context: 40960
+  phase1d_context_safety_margin: 512
+  phase1b_max_turns: 3
   phase1_max_tool_calls_per_turn: 3
   phase1_mathlib_search_max_calls: 3
   phase1b_semantic_audit_enabled: false
@@ -95,6 +116,17 @@ blueprint:
   phase1b_semantic_format_max_attempts: 2
   phase1b_repair_strategy: directEdit
   phase1b_editor_attempts_per_turn: 3
+  phase1b_flow: mixed
+  phase1b_deterministic_max_turns: 4
+  phase1b_semantic_max_turns: 8
+  phase1b_editor_enable_thinking: false
+  phase1b_editor_temperature: 0.0
+  phase1b_editor_top_p: 1.0
+  phase1b_editor_top_k: 0
+  phase1b_editor_min_p: 0.0
+  phase1b_editor_presence_penalty: 0.0
+  phase1b_editor_repetition_penalty: 1.0
+  phase1b_editor_max_tokens: 16384
   phase1b_plan_max_tokens: 768
   phase1b_plan_format_attempts: 2
   phase1b_plan_max_chars: 600

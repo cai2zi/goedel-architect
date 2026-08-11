@@ -63,12 +63,22 @@ theorem root : True := by sorry_using []
                 thm_name="sample", attempt=1, max_tool_turns=1,
                 max_tool_calls_per_turn=3, mathlib_search_max_calls=3,
                 tool_cache={}, search_state={"count": 0},
+                enable_thinking=True, temperature=0.6, top_p=0.95,
+                top_k=20, min_p=0.0, presence_penalty=0.0,
+                repetition_penalty=1.0, max_tokens=16384,
             )
         self.assertEqual(result.successful_lean_code, code)
         self.assertEqual(requests[0]["tool_choice"], "required")
         self.assertEqual([tool["function"]["name"] for tool in requests[0]["tools"]], [
             "lean_compile",
         ])
+        self.assertEqual(requests[0]["temperature"], 0.6)
+        self.assertEqual(requests[0]["top_p"], 0.95)
+        self.assertTrue(
+            requests[0]["extra_body"]["chat_template_kwargs"]["enable_thinking"]
+        )
+        self.assertEqual(requests[0]["extra_body"]["top_k"], 20)
+        self.assertIsInstance(requests[0]["seed"], int)
 
     def test_search_budget_is_shared_and_latest_exchange_is_bounded(self) -> None:
         code = '''import Mathlib

@@ -814,6 +814,29 @@ def _stable_gate(
     }
 
 
+def _two_stage_deterministic_stable(
+    debt_before: dict[str, Any],
+    debt_after: dict[str, Any],
+) -> dict[str, Any]:
+    errors: list[str] = []
+    for label in (
+        "semanticErrors", "structuralErrors", "standaloneErrors", "pendingNodes",
+    ):
+        added = sorted(set(debt_after[label]) - set(debt_before[label]))
+        if added:
+            errors.append(f"new{label[0].upper() + label[1:]}:" + ",".join(added))
+    decreased = int(debt_after["count"]) < int(debt_before["count"])
+    if not decreased:
+        errors.append("deterministicDebtNotReduced")
+    return {
+        "passed": not errors,
+        "errors": errors,
+        "baselineDebt": debt_before,
+        "candidateDebt": debt_after,
+        "deterministicDebtDecreased": decreased,
+    }
+
+
 def _source_step_hash(semantic_manifest, step_id: str) -> str:
     if not semantic_manifest or not step_id:
         return ""
@@ -1254,6 +1277,14 @@ def _call_editor(
     search_max_queries: int = 0,
     search_max_results: int = 5,
     search_policy: str = "leanErrorsOnly",
+    enable_thinking: bool = False,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
+    min_p: float = 0.0,
+    presence_penalty: float = 0.0,
+    repetition_penalty: float = 1.0,
+    max_tokens: int = 16384,
 ):
     search_eligibility = _mathlib_search_eligibility(
         validation,
@@ -1302,12 +1333,33 @@ def _call_editor(
         tools = [EDIT_SUBGRAPH_TOOL]
         if not edit_only and current_payload["mathlib_search"]["available"]:
             tools.append(MATHLIB_SEARCH_TOOL)
+        stable_seed = int.from_bytes(hashlib.sha256(
+            f"{thm_name}|{round_index}|{attempt}".encode()
+        ).digest()[:4], "big")
+        sampling = {
+            "enableThinking": enable_thinking, "temperature": temperature,
+            "topP": top_p, "topK": top_k, "minP": min_p,
+            "presencePenalty": presence_penalty,
+            "repetitionPenalty": repetition_penalty,
+            "maxTokens": max_tokens, "seed": stable_seed,
+        }
+        if tracer:
+            tracer.emit(TraceEvent(
+                kind="phase1BEditorSampling", thm_name=thm_name,
+                turn=round_index, args={"attempt": attempt, **sampling},
+            ))
         response = chat_completion_with_retry(
             client, tracer=tracer, thm_name=thm_name, phase="phase1B",
             model_id=model, operation=operation, model=model,
             messages=messages, tools=tools, tool_choice="required",
-            temperature=0, max_completion_tokens=16384,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            temperature=temperature, top_p=top_p,
+            presence_penalty=presence_penalty, seed=stable_seed,
+            max_completion_tokens=max_tokens,
+            extra_body={
+                "top_k": top_k, "min_p": min_p,
+                "repetition_penalty": repetition_penalty,
+                "chat_template_kwargs": {"enable_thinking": enable_thinking},
+            },
         )
         _emit_usage(tracer, thm_name, "phase1B", model, response)
         _emit_llm_response(
@@ -1767,7 +1819,20 @@ def run_phase1b_patch_session(
     mathlib_search_policy: str = "leanErrorsOnly",
     mathlib_search_max_queries_per_turn: int = 0,
     mathlib_search_max_results_per_query: int = 5,
+    flow: str = "mixed",
+    deterministic_max_rounds: int = 4,
+    semantic_max_rounds: int = 8,
+    editor_enable_thinking: bool = False,
+    editor_temperature: float = 0.0,
+    editor_top_p: float = 1.0,
+    editor_top_k: int = 0,
+    editor_min_p: float = 0.0,
+    editor_presence_penalty: float = 0.0,
+    editor_repetition_penalty: float = 1.0,
+    editor_max_tokens: int = 16384,
 ) -> Blueprint:
+    if flow not in {"mixed", "twoStage"}:
+        raise ValueError("phase1b_flow must be mixed or twoStage")
     if repair_strategy not in REPAIR_STRATEGIES:
         raise ValueError(
             "phase1b_repair_strategy must be one of: "
@@ -1796,6 +1861,10 @@ def run_phase1b_patch_session(
     edit_history: list[dict[str, Any]] = []
     previous_turn: dict[str, Any] | None = None
     foundation_debt_open = False
+    two_stage = flow == "twoStage"
+    current_stage = "deterministic" if two_stage else "mixed"
+    deterministic_turns_used = 0
+    semantic_turns_used = 0
 
     validation = validate_candidate(
         committed, compiler=compiler, semantic_manifest=semantic_manifest,
@@ -1806,7 +1875,7 @@ def run_phase1b_patch_session(
         standalone_concurrency=phase2_contract_check_concurrency,
         standalone_cache=standalone_cache, tracer=tracer, thm_name=thm_name,
         round_index=0, attempt=0, skip_pending=True,
-        semantic_audit_required=semantic_audit_enabled,
+        semantic_audit_required=(semantic_audit_enabled and not two_stage),
     )
     try:
         validation = _audit_candidate(
@@ -1832,9 +1901,37 @@ def run_phase1b_patch_session(
     )
 
     for round_index in range(1, max_rounds + 1):
+        if two_stage and current_stage == "deterministic" and validation.base_passed:
+            current_stage = "semantic"
+            validation.semantic_audit_required = semantic_audit_enabled
+            if tracer:
+                tracer.emit(TraceEvent(
+                    kind="phase1BStageTransition", thm_name=thm_name,
+                    turn=round_index, args={"from": "deterministic", "to": "semantic",
+                                            "deterministicTurnsUsed": deterministic_turns_used},
+                ))
+            validation = _audit_candidate(
+                validation, committed, ledger=ledger, client=client, model=model,
+                informal_statement=informal_statement, claimed_answer=claimed_answer,
+                semantic_manifest=semantic_manifest,
+                formal_decompiler_max_tokens=formal_decompiler_max_tokens,
+                strict_comparator_max_tokens=strict_comparator_max_tokens,
+                semantic_format_max_attempts=semantic_format_max_attempts,
+                decompiler_cache=decompiler_cache, comparator_cache=comparator_cache,
+                tracer=tracer, thm_name=thm_name, round_index=round_index - 1,
+            )
+        if two_stage:
+            if current_stage == "deterministic":
+                if deterministic_turns_used >= deterministic_max_rounds:
+                    break
+                deterministic_turns_used += 1
+            else:
+                if semantic_turns_used >= semantic_max_rounds:
+                    break
+                semantic_turns_used += 1
         if validation.passed:
             break
-        closure_mode = closure_rounds > 0 and round_index > max_rounds - closure_rounds
+        closure_mode = (not two_stage) and closure_rounds > 0 and round_index > max_rounds - closure_rounds
         if closure_mode and tracer:
             tracer.emit(TraceEvent(
                 kind="phase1BClosureModeStart", thm_name=thm_name,
@@ -1896,7 +1993,7 @@ def run_phase1b_patch_session(
                     kind="phase1BEditorAttemptStart", thm_name=thm_name,
                     turn=round_index, span_id=span_id,
                     args={"round": round_index, "attempt": attempt,
-                          "strategy": repair_strategy},
+                          "strategy": repair_strategy, "stage": current_stage},
                 ))
             response = _call_editor(
                 client, model, blueprint=baseline, plan=plan,
@@ -1909,6 +2006,12 @@ def run_phase1b_patch_session(
                 search_max_queries=mathlib_search_max_queries_per_turn,
                 search_max_results=mathlib_search_max_results_per_query,
                 search_policy=mathlib_search_policy,
+                enable_thinking=editor_enable_thinking,
+                temperature=editor_temperature, top_p=editor_top_p,
+                top_k=editor_top_k, min_p=editor_min_p,
+                presence_penalty=editor_presence_penalty,
+                repetition_penalty=editor_repetition_penalty,
+                max_tokens=editor_max_tokens,
             )
             if tracer:
                 tracer.emit(TraceEvent(
@@ -1983,12 +2086,18 @@ def run_phase1b_patch_session(
                 standalone_concurrency=phase2_contract_check_concurrency,
                 standalone_cache=standalone_cache, tracer=tracer,
                 thm_name=thm_name, round_index=round_index, attempt=attempt,
-                skip_pending=True, semantic_audit_required=semantic_audit_enabled,
+                skip_pending=True, semantic_audit_required=(
+                    semantic_audit_enabled and current_stage != "deterministic"
+                ),
             )
             stable = _stable_gate(
                 baseline_validation, candidate_validation,
                 changed_nodes=hard["effectiveNodes"],
             )
+            if two_stage and current_stage == "deterministic":
+                debt_before = _deterministic_debt(baseline_validation)
+                debt_after = _deterministic_debt(candidate_validation)
+                stable = _two_stage_deterministic_stable(debt_before, debt_after)
             if tracer:
                 tracer.emit(TraceEvent(
                     kind="phase1BStableGate", thm_name=thm_name,
@@ -2060,6 +2169,34 @@ def run_phase1b_patch_session(
                 semantic_manifest=semantic_manifest, closure_mode=closure_mode,
                 foundation_debt_open=foundation_debt_open,
             )
+            if two_stage and current_stage == "deterministic":
+                before_debt = _deterministic_debt(baseline_validation)["count"]
+                after_debt = _deterministic_debt(candidate_validation)["count"]
+                assessment["passed"] = bool(stable["passed"] and after_debt < before_debt)
+                assessment["reason"] = (
+                    "deterministicDebtReduced" if assessment["passed"]
+                    else "deterministicDebtNotReduced"
+                )
+                assessment["errors"] = [] if assessment["passed"] else [assessment["reason"]]
+            elif two_stage:
+                before_norm = set(_normalized_obligations(baseline_validation, semantic_manifest))
+                after_norm = set(_normalized_obligations(candidate_validation, semantic_manifest))
+                critical = _critical_semantic_regressions(
+                    baseline_validation, candidate_validation,
+                    root_name=candidate.target_theorem,
+                )
+                changed = hashlib.sha256(baseline.lean_file.encode()).hexdigest() != candidate_hash
+                assessment["passed"] = bool(
+                    stable["passed"] and changed and not (after_norm - before_norm)
+                    and not critical
+                )
+                assessment["reason"] = (
+                    "semanticCandidateAdvanced" if assessment["passed"]
+                    else "semanticCandidateRegressed"
+                )
+                assessment["errors"] = list(critical) + [
+                    "newNormalizedObligations:" + ",".join(sorted(after_norm - before_norm))
+                ] if after_norm - before_norm else list(critical)
             attempt_row["commitAssessment"] = assessment
             if tracer:
                 tracer.emit(TraceEvent(
@@ -2170,7 +2307,7 @@ def run_phase1b_patch_session(
 
         turn_row = {
             "round": round_index, "strategy": repair_strategy,
-            "closureMode": closure_mode,
+            "closureMode": closure_mode, "stage": current_stage,
             "plan": plan.text if plan else "",
             "planHash": plan.stable_hash() if plan else "",
             "targetObligations": list(plan.target_obligations) if plan else [],

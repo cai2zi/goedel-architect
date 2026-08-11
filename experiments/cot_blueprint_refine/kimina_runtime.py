@@ -42,6 +42,7 @@ class PersistentKiminaRuntime:
         self.attached_stages: list[str] = []
         self._metrics_stop = threading.Event()
         self._metrics_thread: threading.Thread | None = None
+        self.external = bool(self.service.get("use_existing", False))
 
     @property
     def base_url(self) -> str:
@@ -96,6 +97,7 @@ class PersistentKiminaRuntime:
             "stopped_at": self.stopped_at,
             "stop_reason": self.stop_reason,
             "forced_kill": self.forced_kill,
+            "external": self.external,
             "attached_stages": self.attached_stages,
             "settings": {
                 "max_repl_mem": str(self.service.max_repl_mem),
@@ -158,6 +160,21 @@ class PersistentKiminaRuntime:
     def start(self) -> None:
         if self.process is not None:
             return
+        if self.external:
+            if not self._port_in_use():
+                raise RuntimeError(
+                    f"kimina.use_existing=true but {self.service.host}:{self.service.port} is not listening"
+                )
+            try:
+                if self._fetch_json("/health").get("status") != "ok":
+                    raise RuntimeError("external Kimina health status is not ok")
+            except Exception as exc:
+                raise RuntimeError(f"external Kimina health check failed: {exc}") from exc
+            self.started_at = _utc_now()
+            self.ready_at = self.started_at
+            self._write_metadata("attached_external")
+            print(f"[kimina-existing-ready] base_url={self.base_url}", flush=True)
+            return
         if not bool(self.service.auto_start):
             raise RuntimeError("This experiment requires kimina.auto_start=true")
         if self._port_in_use():
@@ -195,6 +212,14 @@ class PersistentKiminaRuntime:
         print(f"[kimina-ready] pid={self.process.pid} base_url={self.base_url}", flush=True)
 
     def ensure(self, stage: str) -> None:
+        if self.external:
+            self.start()
+            if self._fetch_json("/health").get("status") != "ok":
+                raise RuntimeError(f"external Kimina is unhealthy for stage {stage}")
+            if stage not in self.attached_stages:
+                self.attached_stages.append(stage)
+                self._write_metadata("attached_external")
+            return
         if self.process is None:
             self.start()
         if self.process is None or self.process.poll() is not None:
@@ -204,6 +229,11 @@ class PersistentKiminaRuntime:
             self._write_metadata("ready")
 
     def stop(self, *, force: bool = False) -> None:
+        if self.external:
+            self.stopped_at = _utc_now()
+            self.stop_reason = self.stop_reason or "detached_external"
+            self._write_metadata("detached_external")
+            return
         self._metrics_stop.set()
         if self._metrics_thread is not None:
             self._metrics_thread.join(timeout=10)

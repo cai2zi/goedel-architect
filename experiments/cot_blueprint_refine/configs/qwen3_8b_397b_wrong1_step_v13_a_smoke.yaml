@@ -1,0 +1,27 @@
+output_base: /ssd/czx/czx_work/cot_blueprint_refine
+exp_name: qwen3_8b_397b_wrong1_step_v13_a_smoke
+resume: true
+vllm: {use_existing: true}
+kimina: {use_existing: true, auto_start: false, auto_destroy: false}
+blueprint:
+  execution_mode: phase1_only
+  phase1b_seed_blueprint_root: /ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong1_step_v13_shared_phase1a_smoke/robustpa/blueprint/blueprints
+  phase1b_seed_prepared_data_root: /ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong1_step_v13_shared_phase1a_smoke/prepared/data
+  phase1b_seed_filename: phase1a_canonical.lean
+  phase1b_seed_required: true
+  phase1b_repair_strategy: directEdit
+  phase1b_flow: mixed
+  phase1b_max_turns: 8
+  phase1b_closure_rounds: 2
+  phase1b_editor_attempts_per_turn: 2
+  phase1b_editor_enable_thinking: false
+  phase1b_editor_temperature: 0.0
+  phase1b_mathlib_search_max_queries_per_turn: 0
+  phase1b_semantic_audit_enabled: true
+  semantic_fidelity_enabled: true
+  semantic_require_step_ids: true
+  semantic_static_gate: true
+  phase1_concurrency: 1
+  phase2_contract_check_concurrency: 8
+  max_refinement_iterations: 0
+judge: {enabled: false}

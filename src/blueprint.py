@@ -461,6 +461,18 @@ def _emit_llm_response(
         return
     choice = response.choices[0]
     msg = choice.message
+    message_extra = getattr(msg, "model_extra", None) or {}
+    reasoning = (
+        getattr(msg, "reasoning_content", None)
+        or message_extra.get("reasoning_content")
+        or message_extra.get("reasoning")
+        or ""
+    )
+    usage = getattr(response, "usage", None)
+    completion_tokens = getattr(usage, "completion_tokens", None)
+    reasoning_tokens = getattr(
+        getattr(usage, "completion_tokens_details", None), "reasoning_tokens", None,
+    )
     tracer.emit(TraceEvent(
         kind="llm_response",
         thm_name=thm_name,
@@ -472,6 +484,15 @@ def _emit_llm_response(
             "attempt": attempt,
             "finish_reason": getattr(choice, "finish_reason", None),
             "tool_calls": _tool_calls_payload(msg),
+            "reasoning_content": reasoning,
+            "reasoning_characters": len(reasoning),
+            "completion_tokens": completion_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "tool_call_tokens": (
+                completion_tokens - reasoning_tokens
+                if isinstance(completion_tokens, int) and isinstance(reasoning_tokens, int)
+                else None
+            ),
         },
     ))
 
@@ -995,6 +1016,14 @@ def _run_phase1_tool_session(
     semantic_static_gate: bool = False,
     allow_pending_claims: bool = False,
     trace_phase: str = "phase1A",
+    enable_thinking: bool = False,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
+    min_p: float = 0.0,
+    presence_penalty: float = 0.0,
+    repetition_penalty: float = 1.0,
+    max_tokens: int = 16384,
 ) -> _Phase1ToolSessionResult:
     """Run one bounded Phase-1 tool conversation with compact rolling history."""
     messages = [dict(message) for message in base_messages]
@@ -1004,6 +1033,21 @@ def _run_phase1_tool_session(
         tools = [_PHASE1_LEAN_COMPILE_TOOL] if final_turn else [
             _PHASE1_LEAN_COMPILE_TOOL, _PHASE1_MATHLIB_SEARCH_TOOL,
         ]
+        stable_seed = int.from_bytes(hashlib.sha256(
+            f"phase1A|{thm_name}|{attempt}|{turn}".encode()
+        ).digest()[:4], "big")
+        if tracer is not None:
+            tracer.emit(TraceEvent(
+                kind="phase1ASampling", thm_name=thm_name, turn=turn,
+                args={
+                    "attempt": attempt, "enableThinking": enable_thinking,
+                    "temperature": temperature, "topP": top_p,
+                    "topK": top_k, "minP": min_p,
+                    "presencePenalty": presence_penalty,
+                    "repetitionPenalty": repetition_penalty,
+                    "maxTokens": max_tokens, "seed": stable_seed,
+                },
+            ))
         response = chat_completion_with_retry(
             client,
             tracer=tracer,
@@ -1017,7 +1061,14 @@ def _run_phase1_tool_session(
             tools=tools,
             tool_choice="required",
             parallel_tool_calls=not final_turn,
-            max_completion_tokens=phase1_request_max_tokens(messages),
+            temperature=temperature, top_p=top_p,
+            presence_penalty=presence_penalty, seed=stable_seed,
+            max_completion_tokens=min(max_tokens, phase1_request_max_tokens(messages)),
+            extra_body={
+                "top_k": top_k, "min_p": min_p,
+                "repetition_penalty": repetition_penalty,
+                "chat_template_kwargs": {"enable_thinking": enable_thinking},
+            },
             **_reasoning_kwargs(model),
         )
         _emit_usage(tracer, thm_name, trace_phase, model, response)
@@ -1340,6 +1391,10 @@ def _safe_phase2_header(lean_code: str) -> str:
             continue
         if stripped.startswith("import "):
             imports.append(stripped)
+            continue
+        if stripped.startswith("def PendingBlueprintClaim "):
+            # The canonical helper is regenerated separately.  It may appear
+            # between imports and safe environment commands emitted by the LLM.
             continue
         if stripped.startswith("open ") or stripped.startswith("open scoped "):
             other.append(stripped)
@@ -2043,6 +2098,16 @@ def generate_blueprint_from_informal(
     semantic_minimal_ir: bool = False,
     semantic_source_mode: str = "step_grounded",
     phase1_max_tool_turns: int = 3,
+    phase1a_enable_thinking: bool = False,
+    phase1a_temperature: float = 0.0,
+    phase1a_top_p: float = 1.0,
+    phase1a_top_k: int = 0,
+    phase1a_min_p: float = 0.0,
+    phase1a_presence_penalty: float = 0.0,
+    phase1a_repetition_penalty: float = 1.0,
+    phase1a_max_tokens: int = 16384,
+    phase1b_max_turns: int | None = None,
+    phase1a_only: bool = False,
     phase1_max_tool_calls_per_turn: int = 3,
     phase1_mathlib_search_max_calls: int = 3,
     phase1b_semantic_audit_enabled: bool = False,
@@ -2052,6 +2117,17 @@ def generate_blueprint_from_informal(
     phase1b_seed_lean_code: str = "",
     phase1b_repair_strategy: str = "directEdit",
     phase1b_editor_attempts_per_turn: int = 3,
+    phase1b_flow: str = "mixed",
+    phase1b_deterministic_max_turns: int = 4,
+    phase1b_semantic_max_turns: int = 8,
+    phase1b_editor_enable_thinking: bool = False,
+    phase1b_editor_temperature: float = 0.0,
+    phase1b_editor_top_p: float = 1.0,
+    phase1b_editor_top_k: int = 0,
+    phase1b_editor_min_p: float = 0.0,
+    phase1b_editor_presence_penalty: float = 0.0,
+    phase1b_editor_repetition_penalty: float = 1.0,
+    phase1b_editor_max_tokens: int = 16384,
     phase1b_plan_max_tokens: int = 768,
     phase1b_plan_format_attempts: int = 2,
     phase1b_plan_max_chars: int = 600,
@@ -2082,7 +2158,8 @@ def generate_blueprint_from_informal(
         raise ValueError("Phase-1B subgraph edit limit must be positive")
     if phase1b_editor_attempts_per_turn <= 0:
         raise ValueError("Phase-1B Editor attempts per turn must be positive")
-    if phase1b_closure_rounds < 0 or phase1b_closure_rounds > phase1_max_tool_turns:
+    phase1b_max_turns = phase1_max_tool_turns if phase1b_max_turns is None else phase1b_max_turns
+    if phase1b_closure_rounds < 0 or phase1b_closure_rounds > phase1b_max_turns:
         raise ValueError(
             "Phase-1B closure rounds must be between 0 and phase1_max_tool_turns"
         )
@@ -2207,6 +2284,14 @@ def generate_blueprint_from_informal(
             semantic_static_gate=semantic_static_gate,
             allow_pending_claims=True,
             trace_phase="phase1A",
+            enable_thinking=phase1a_enable_thinking,
+            temperature=phase1a_temperature,
+            top_p=phase1a_top_p,
+            top_k=phase1a_top_k,
+            min_p=phase1a_min_p,
+            presence_penalty=phase1a_presence_penalty,
+            repetition_penalty=phase1a_repetition_penalty,
+            max_tokens=phase1a_max_tokens,
         )
         lean_code = session.successful_lean_code or session.lean_code
         last_candidate = lean_code
@@ -2387,6 +2472,14 @@ def generate_blueprint_from_informal(
             candidate_labels=candidate_labels,
         )
 
+    # The fixed label is the stable seed interface used by shared Phase 1A runs.
+    candidate_history.append(phase1a_blueprint.lean_file)
+    candidate_labels.append("phase1a_canonical")
+    if phase1a_only:
+        phase1a_blueprint.candidate_history = candidate_history
+        phase1a_blueprint.candidate_labels = candidate_labels
+        return phase1a_blueprint
+
     from phase1b import run_phase1b_patch_session
 
     final = run_phase1b_patch_session(
@@ -2399,7 +2492,18 @@ def generate_blueprint_from_informal(
         semantic_fidelity_enabled=semantic_fidelity_enabled,
         semantic_require_step_ids=semantic_require_step_ids,
         semantic_static_gate=semantic_static_gate,
-        max_rounds=phase1_max_tool_turns,
+        max_rounds=phase1b_max_turns,
+        flow=phase1b_flow,
+        deterministic_max_rounds=phase1b_deterministic_max_turns,
+        semantic_max_rounds=phase1b_semantic_max_turns,
+        editor_enable_thinking=phase1b_editor_enable_thinking,
+        editor_temperature=phase1b_editor_temperature,
+        editor_top_p=phase1b_editor_top_p,
+        editor_top_k=phase1b_editor_top_k,
+        editor_min_p=phase1b_editor_min_p,
+        editor_presence_penalty=phase1b_editor_presence_penalty,
+        editor_repetition_penalty=phase1b_editor_repetition_penalty,
+        editor_max_tokens=phase1b_editor_max_tokens,
         semantic_audit_enabled=phase1b_semantic_audit_enabled,
         formal_decompiler_max_tokens=phase1b_formal_decompiler_max_tokens,
         strict_comparator_max_tokens=phase1b_strict_comparator_max_tokens,

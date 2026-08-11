@@ -11,7 +11,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "experiments"), str(ROOT / "src")]
 
-from blueprint import _node_hash, _parse_blueprint  # noqa: E402
+from blueprint import _node_hash, _parse_blueprint, _safe_phase2_header  # noqa: E402
 from kimina_lean_compiler import CompilerResult  # noqa: E402
 from phase1b import (  # noqa: E402
     Phase1BPlan,
@@ -22,6 +22,7 @@ from phase1b import (  # noqa: E402
     _mathlib_search_eligibility,
     _normalized_obligation_signature,
     _stable_gate,
+    _two_stage_deterministic_stable,
     run_phase1b_patch_session,
 )
 from semantic_audit import (  # noqa: E402
@@ -159,6 +160,30 @@ class Phase1BV11MathlibSearchTest(unittest.TestCase):
     def setUp(self) -> None:
         _FakeRetrieval.calls = 0
 
+    def test_two_stage_stable_result_preserves_commit_assessment_contract(self) -> None:
+        before = {
+            "count": 2, "semanticErrors": ["old"], "structuralErrors": [],
+            "standaloneErrors": [], "pendingNodes": ["root"], "leanSuccess": False,
+        }
+        after = {
+            "count": 1, "semanticErrors": ["old"], "structuralErrors": [],
+            "standaloneErrors": [], "pendingNodes": [], "leanSuccess": False,
+        }
+        result = _two_stage_deterministic_stable(before, after)
+        self.assertTrue(result["passed"])
+        self.assertTrue(result["deterministicDebtDecreased"])
+
+    def test_canonical_header_preserves_safe_commands_after_pending_helper(self) -> None:
+        header = _safe_phase2_header(
+            "import Mathlib\nimport Architect\n\n"
+            "def PendingBlueprintClaim (_nodeId : String) : Prop := True\n\n"
+            "open Classical\nset_option pp.universes false\n\n"
+            "@[blueprint] theorem root : True := by trivial\n"
+        )
+        self.assertIn("open Classical", header)
+        self.assertIn("set_option pp.universes false", header)
+        self.assertNotIn("PendingBlueprintClaim", header)
+
     def test_batched_search_validates_inventory_bounds_and_caches(self) -> None:
         blueprint = _blueprint()
         call = _search_response().choices[0].message.tool_calls[0]
@@ -215,6 +240,27 @@ class Phase1BV11MathlibSearchTest(unittest.TestCase):
             second_payload["mathlib_search"]["results_for_this_turn"][0]["results"][0]["name"],
             "Finset.card_image_iff",
         )
+
+    def test_v13_editor_thinking_sampling_is_scoped_to_editor_request(self) -> None:
+        blueprint = _blueprint()
+        response = _editor_response(blueprint, 1)
+        with patch("phase1b.chat_completion_with_retry", return_value=response) as completion:
+            _call_editor(
+                object(), "model", blueprint=blueprint, plan=None,
+                informal_statement="p", prompt_proof="steps", claimed_answer="1",
+                validation=_validation(audit=False), retry_feedback=None,
+                round_index=2, attempt=1, tracer=None, thm_name="sample",
+                enable_thinking=True, temperature=0.6, top_p=0.95,
+                top_k=20, min_p=0.0, presence_penalty=0.0,
+                repetition_penalty=1.0, max_tokens=16384,
+            )
+        kwargs = completion.call_args.kwargs
+        self.assertEqual(kwargs["temperature"], 0.6)
+        self.assertEqual(kwargs["top_p"], 0.95)
+        self.assertEqual(kwargs["max_completion_tokens"], 16384)
+        self.assertTrue(kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"])
+        self.assertEqual(kwargs["extra_body"]["top_k"], 20)
+        self.assertIsInstance(kwargs["seed"], int)
 
     def test_search_is_closed_without_specific_lean_api_error(self) -> None:
         blueprint = _blueprint()
