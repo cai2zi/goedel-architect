@@ -199,13 +199,17 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
     args.phase1b_plan_max_tokens = int(args.phase1b_plan_max_tokens)
     args.phase1b_plan_format_attempts = int(args.phase1b_plan_format_attempts)
     args.phase1b_plan_max_chars = int(args.phase1b_plan_max_chars)
-    args.phase1b_progress_controller_max_tokens = int(
-        args.phase1b_progress_controller_max_tokens
-    )
-    args.phase1b_progress_controller_format_attempts = int(
-        args.phase1b_progress_controller_format_attempts
-    )
     args.phase1b_subgraph_max_edits = int(args.phase1b_subgraph_max_edits)
+    args.phase1b_closure_rounds = int(args.phase1b_closure_rounds)
+    args.phase1b_mathlib_search_policy = str(
+        args.phase1b_mathlib_search_policy
+    )
+    args.phase1b_mathlib_search_max_queries_per_turn = int(
+        args.phase1b_mathlib_search_max_queries_per_turn
+    )
+    args.phase1b_mathlib_search_max_results_per_query = int(
+        args.phase1b_mathlib_search_max_results_per_query
+    )
     seed_root = getattr(args, "phase1b_seed_blueprint_root", None)
     args.phase1b_seed_blueprint_root = (
         _resolve_path(seed_root, original_cwd) if seed_root else None
@@ -253,11 +257,9 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("phase1b_semantic_format_max_attempts must be positive")
     if args.phase1b_plan_max_tokens <= 0:
         raise ValueError("phase1b_plan_max_tokens must be positive")
-    if args.phase1b_repair_strategy not in {
-        "progressController", "planDirect", "directEdit",
-    }:
+    if args.phase1b_repair_strategy not in {"planDirect", "directEdit"}:
         raise ValueError(
-            "phase1b_repair_strategy must be progressController, planDirect, or directEdit"
+            "phase1b_repair_strategy must be planDirect or directEdit"
         )
     if args.phase1b_editor_attempts_per_turn <= 0:
         raise ValueError("phase1b_editor_attempts_per_turn must be positive")
@@ -267,11 +269,23 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("phase1b_plan_max_chars must be positive")
     if args.phase1b_subgraph_max_edits <= 0:
         raise ValueError("phase1b_subgraph_max_edits must be positive")
-    if args.phase1b_progress_controller_max_tokens <= 0:
-        raise ValueError("phase1b_progress_controller_max_tokens must be positive")
-    if args.phase1b_progress_controller_format_attempts <= 0:
+    if args.phase1b_closure_rounds < 0:
+        raise ValueError("phase1b_closure_rounds must be non-negative")
+    if args.phase1b_closure_rounds > args.phase1_max_tool_turns:
         raise ValueError(
-            "phase1b_progress_controller_format_attempts must be positive"
+            "phase1b_closure_rounds cannot exceed phase1_max_tool_turns"
+        )
+    if args.phase1b_mathlib_search_max_queries_per_turn < 0:
+        raise ValueError(
+            "phase1b_mathlib_search_max_queries_per_turn must be non-negative"
+        )
+    if args.phase1b_mathlib_search_policy != "leanErrorsOnly":
+        raise ValueError(
+            "phase1b_mathlib_search_policy must be leanErrorsOnly"
+        )
+    if args.phase1b_mathlib_search_max_results_per_query <= 0:
+        raise ValueError(
+            "phase1b_mathlib_search_max_results_per_query must be positive"
         )
     if args.phase1b_seed_required and args.phase1b_seed_blueprint_root is None:
         raise ValueError(
@@ -642,13 +656,15 @@ def _result_row(
         "phase1b_plan_max_tokens": args.phase1b_plan_max_tokens,
         "phase1b_plan_format_attempts": args.phase1b_plan_format_attempts,
         "phase1b_plan_max_chars": args.phase1b_plan_max_chars,
-        "phase1b_progress_controller_max_tokens": (
-            args.phase1b_progress_controller_max_tokens
-        ),
-        "phase1b_progress_controller_format_attempts": (
-            args.phase1b_progress_controller_format_attempts
-        ),
         "phase1b_subgraph_max_edits": args.phase1b_subgraph_max_edits,
+        "phase1b_closure_rounds": args.phase1b_closure_rounds,
+        "phase1b_mathlib_search_max_queries_per_turn": (
+            args.phase1b_mathlib_search_max_queries_per_turn
+        ),
+        "phase1b_mathlib_search_policy": args.phase1b_mathlib_search_policy,
+        "phase1b_mathlib_search_max_results_per_query": (
+            args.phase1b_mathlib_search_max_results_per_query
+        ),
         "phase1b_seed_blueprint_root": str(args.phase1b_seed_blueprint_root or ""),
         "phase1b_seed_required": bool(args.phase1b_seed_required),
         "semantic_source_mode": str(args.semantic_source_mode),
@@ -682,7 +698,7 @@ def _failed_phase1_status(exc: Exception) -> str:
     if not isinstance(exc, BlueprintGenerationError):
         return "infraError"
     if exc.failure_stage in {
-        "phase1BSemanticAuditFormat", "phase1BProgressControllerFormat",
+        "phase1BSemanticAuditFormat",
     }:
         return "infraError"
     audit = exc.validation_details.get("semanticAudit")
@@ -809,13 +825,17 @@ async def _run_record(
                         args.phase1b_plan_format_attempts
                     ),
                     phase1b_plan_max_chars=args.phase1b_plan_max_chars,
-                    phase1b_progress_controller_max_tokens=(
-                        args.phase1b_progress_controller_max_tokens
-                    ),
-                    phase1b_progress_controller_format_attempts=(
-                        args.phase1b_progress_controller_format_attempts
-                    ),
                     phase1b_subgraph_max_edits=args.phase1b_subgraph_max_edits,
+                    phase1b_closure_rounds=args.phase1b_closure_rounds,
+                    phase1b_mathlib_search_max_queries_per_turn=(
+                        args.phase1b_mathlib_search_max_queries_per_turn
+                    ),
+                    phase1b_mathlib_search_policy=(
+                        args.phase1b_mathlib_search_policy
+                    ),
+                    phase1b_mathlib_search_max_results_per_query=(
+                        args.phase1b_mathlib_search_max_results_per_query
+                    ),
                     phase1b_seed_lean_code=phase1b_seed_lean_code,
                 ),
             )

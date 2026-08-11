@@ -34,10 +34,8 @@ from blueprint import (  # noqa: E402
 from phase1b import (  # noqa: E402
     Phase1BPlan,
     Phase1BPlanFormatError,
-    ProgressDecisionFormatError,
     _apply_hard_checked_edit,
     parse_phase1b_plan,
-    parse_progress_decision,
 )
 from kimina_lean_compiler import CompilerResult  # noqa: E402
 from checkpoint import CheckpointState  # noqa: E402
@@ -649,19 +647,6 @@ Bind the shared source object and repair the setup relation."""
                 known_obligation_ids=["semantic:missing:x"],
                 known_node_names=["setup", "root"], max_nodes=8, max_chars=600,
             )
-
-    def test_progress_decision_is_strict_and_binary(self) -> None:
-        parsed = parse_progress_decision(
-            "DECISION: RETRY_EDIT\nREASON:\nThe new relation is disconnected from root."
-        )
-        self.assertEqual(parsed.decision, "RETRY_EDIT")
-        same_line = parse_progress_decision(
-            "DECISION: COMMIT\nREASON: useful shared object" + "x" * 500
-        )
-        self.assertEqual(same_line.decision, "COMMIT")
-        self.assertGreater(len(same_line.reason), 500)
-        with self.assertRaises(ProgressDecisionFormatError):
-            parse_progress_decision("DECISION: MAYBE\nREASON:\nuncertain")
 
     @staticmethod
     def subgraph_response(edits):

@@ -2055,9 +2055,11 @@ def generate_blueprint_from_informal(
     phase1b_plan_max_tokens: int = 768,
     phase1b_plan_format_attempts: int = 2,
     phase1b_plan_max_chars: int = 600,
-    phase1b_progress_controller_max_tokens: int = 2048,
-    phase1b_progress_controller_format_attempts: int = 2,
     phase1b_subgraph_max_edits: int = 8,
+    phase1b_closure_rounds: int = 0,
+    phase1b_mathlib_search_policy: str = "leanErrorsOnly",
+    phase1b_mathlib_search_max_queries_per_turn: int = 0,
+    phase1b_mathlib_search_max_results_per_query: int = 5,
 ) -> Blueprint:
     """Generate a Phase-1A draft, then edit its nodes and DAG in Phase 1B."""
     if phase1_max_tool_turns <= 0 or phase1_max_tool_calls_per_turn <= 0:
@@ -2080,10 +2082,16 @@ def generate_blueprint_from_informal(
         raise ValueError("Phase-1B subgraph edit limit must be positive")
     if phase1b_editor_attempts_per_turn <= 0:
         raise ValueError("Phase-1B Editor attempts per turn must be positive")
-    if phase1b_progress_controller_max_tokens <= 0:
-        raise ValueError("Phase-1B Progress Controller max tokens must be positive")
-    if phase1b_progress_controller_format_attempts <= 0:
-        raise ValueError("Phase-1B Progress Controller format attempts must be positive")
+    if phase1b_closure_rounds < 0 or phase1b_closure_rounds > phase1_max_tool_turns:
+        raise ValueError(
+            "Phase-1B closure rounds must be between 0 and phase1_max_tool_turns"
+        )
+    if phase1b_mathlib_search_max_queries_per_turn < 0:
+        raise ValueError("Phase-1B Mathlib search query limit must be non-negative")
+    if phase1b_mathlib_search_policy != "leanErrorsOnly":
+        raise ValueError("phase1b_mathlib_search_policy must be leanErrorsOnly")
+    if phase1b_mathlib_search_max_results_per_query <= 0:
+        raise ValueError("Phase-1B Mathlib search result limit must be positive")
     from phase1b import REPAIR_STRATEGIES
     if phase1b_repair_strategy not in REPAIR_STRATEGIES:
         raise ValueError(
@@ -2401,11 +2409,15 @@ def generate_blueprint_from_informal(
         plan_max_tokens=phase1b_plan_max_tokens,
         plan_format_attempts=phase1b_plan_format_attempts,
         plan_max_chars=phase1b_plan_max_chars,
-        progress_controller_max_tokens=phase1b_progress_controller_max_tokens,
-        progress_controller_format_attempts=(
-            phase1b_progress_controller_format_attempts
-        ),
         subgraph_max_edits=phase1b_subgraph_max_edits,
+        closure_rounds=phase1b_closure_rounds,
+        mathlib_search_policy=phase1b_mathlib_search_policy,
+        mathlib_search_max_queries_per_turn=(
+            phase1b_mathlib_search_max_queries_per_turn
+        ),
+        mathlib_search_max_results_per_query=(
+            phase1b_mathlib_search_max_results_per_query
+        ),
         phase2_contract_check_concurrency=phase2_contract_check_concurrency,
         tracer=tracer,
         thm_name=thm_name,

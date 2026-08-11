@@ -1,11 +1,11 @@
 input_predictions: /ssd/czx/czx_work/cot_blueprint_refine/subsets/qwen3_8b_original_answer_incorrect/predictions.jsonl
 output_base: /ssd/czx/czx_work/cot_blueprint_refine
-exp_name: qwen3_8b_397b_wrong10_step_v9_direct_edit
+exp_name: qwen3_8b_397b_wrong76_step_v11_direct_edit_search_turn16
 resume: false
 python_bin: /ssd/miniconda3/envs/lean4-czx/bin/python
 include_ids: []
 vllm: {use_existing: true}
-step_splitter: {prompt_version: formal-step-boundary-v4, concurrency: 10}
+step_splitter: {prompt_version: formal-step-boundary-v4, concurrency: 76}
 blueprint:
   execution_mode: phase1_only
   retry_error_results: false
@@ -15,7 +15,7 @@ blueprint:
   phase1_max_output_cap: 16384
   phase1_min_output_tokens: 512
   blueprint_max_retries: 2
-  phase1_max_tool_turns: 8
+  phase1_max_tool_turns: 16
   phase1_max_tool_calls_per_turn: 32
   phase1_mathlib_search_max_calls: 16
   phase1b_semantic_audit_enabled: true
@@ -28,17 +28,17 @@ blueprint:
   phase1b_plan_format_attempts: 2
   phase1b_plan_max_chars: 600
   phase1b_subgraph_max_edits: 8
-  phase1b_seed_blueprint_root: /ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong22_step_v6_phase1b_repair/robustpa/blueprint/blueprints
-  phase1b_seed_filename: phase1b_seed.lean
-  phase1b_seed_required: true
-  phase1b_seed_prepared_data_root: /ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong76_step_v5_phase1_ab_semantic_judge/prepared/data
-  phase1b_seed_include_ids_path: /ssd/czx/goedel-architect/experiments/cot_blueprint_refine/configs/qwen3_8b_397b_wrong10_step_v9_manifest.json
+  phase1b_closure_rounds: 4
+  phase1b_mathlib_search_max_queries_per_turn: 3
+  phase1b_mathlib_search_max_results_per_query: 5
+  phase1b_seed_blueprint_root: null
+  phase1b_seed_required: false
   max_refinement_iterations: 0
   node_max_prove_turns: 1
   node_max_negation_probe_turns: 0
-  phase1_concurrency: 10
-  phase2_blueprint_concurrency: 10
-  phase2_node_concurrency: 10
+  phase1_concurrency: 76
+  phase2_blueprint_concurrency: 76
+  phase2_node_concurrency: 76
   refine_concurrency: 1
   phase2_contract_check_concurrency: 32
   lean_max_inflight_snippets: 48

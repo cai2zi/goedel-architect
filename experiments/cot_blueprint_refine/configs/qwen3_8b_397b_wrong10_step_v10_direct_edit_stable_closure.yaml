@@ -1,6 +1,6 @@
 input_predictions: /ssd/czx/czx_work/cot_blueprint_refine/subsets/qwen3_8b_original_answer_incorrect/predictions.jsonl
 output_base: /ssd/czx/czx_work/cot_blueprint_refine
-exp_name: qwen3_8b_397b_wrong10_step_v9_direct_edit
+exp_name: qwen3_8b_397b_wrong10_step_v10_direct_edit_stable_closure
 resume: false
 python_bin: /ssd/miniconda3/envs/lean4-czx/bin/python
 include_ids: []
@@ -28,11 +28,14 @@ blueprint:
   phase1b_plan_format_attempts: 2
   phase1b_plan_max_chars: 600
   phase1b_subgraph_max_edits: 8
+  phase1b_closure_rounds: 2
+  phase1b_mathlib_search_max_queries_per_turn: 0
+  phase1b_mathlib_search_max_results_per_query: 5
   phase1b_seed_blueprint_root: /ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong22_step_v6_phase1b_repair/robustpa/blueprint/blueprints
   phase1b_seed_filename: phase1b_seed.lean
   phase1b_seed_required: true
   phase1b_seed_prepared_data_root: /ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong76_step_v5_phase1_ab_semantic_judge/prepared/data
-  phase1b_seed_include_ids_path: /ssd/czx/goedel-architect/experiments/cot_blueprint_refine/configs/qwen3_8b_397b_wrong10_step_v9_manifest.json
+  phase1b_seed_include_ids_path: /ssd/czx/goedel-architect/experiments/cot_blueprint_refine/configs/qwen3_8b_397b_wrong10_step_v10_manifest.json
   max_refinement_iterations: 0
   node_max_prove_turns: 1
   node_max_negation_probe_turns: 0

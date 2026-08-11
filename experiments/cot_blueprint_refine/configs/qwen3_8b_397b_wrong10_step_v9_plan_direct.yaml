@@ -27,8 +27,6 @@ blueprint:
   phase1b_plan_max_tokens: 768
   phase1b_plan_format_attempts: 2
   phase1b_plan_max_chars: 600
-  phase1b_progress_controller_max_tokens: 2048
-  phase1b_progress_controller_format_attempts: 2
   phase1b_subgraph_max_edits: 8
   phase1b_seed_blueprint_root: /ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong22_step_v6_phase1b_repair/robustpa/blueprint/blueprints
   phase1b_seed_filename: phase1b_seed.lean

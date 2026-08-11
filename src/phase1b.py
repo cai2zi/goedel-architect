@@ -6,6 +6,7 @@ responsible for Phase 1A generation and the shared Blueprint data model.
 from __future__ import annotations
 
 import copy
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 import difflib
 import hashlib
@@ -35,6 +36,7 @@ from blueprint import (
 )
 from kimina_lean_compiler import CompilerResult, KiminaInfrastructureError, KiminaLeanCompiler
 from llm_client import chat_completion_with_retry
+from mathlib_retrieval import MathlibRetrieval
 from semantic_audit import (
     FormalDecompilerResult,
     SemanticAuditFormatError,
@@ -47,10 +49,18 @@ from semantic_audit import (
     strict_comparator_messages,
 )
 from semantic_fidelity import SemanticIssue, validate_blueprint_fidelity
+from semantic_fidelity import effective_blueprint_dependencies
 from tracer import TraceEvent
 
 
-REPAIR_STRATEGIES = {"progressController", "planDirect", "directEdit"}
+REPAIR_STRATEGIES = {"planDirect", "directEdit"}
+OBJECT_OBLIGATION_CATEGORIES = {
+    "unbound_objects", "rootTargetObject", "rootAnswerGrounding",
+}
+CRITICAL_ROOT_REGRESSION_CODES = {
+    "vacuousTrueRoot", "vacuousPropRoot", "vacuousTrueShellRoot",
+    "reflexiveRoot", "unboundAnswerWitnessRoot", "unconstrainedExistsRoot",
+}
 
 
 def _phase1_semantic_issues(
@@ -126,6 +136,40 @@ EDIT_SUBGRAPH_TOOL = {
     },
 }
 
+MATHLIB_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "mathlib_search",
+        "description": (
+            "Search Mathlib once for exact names, type signatures, or existing "
+            "formal constructions needed by the planned Blueprint edit."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "queries": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "target_node_names": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "required": ["query", "target_node_names"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["queries"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 
 @dataclass(frozen=True)
 class Phase1BPlan:
@@ -149,21 +193,6 @@ class Phase1BPlan:
 
 
 class Phase1BPlanFormatError(ValueError):
-    def __init__(self, reason: str, *, attempts: Sequence[dict[str, Any]] = ()) -> None:
-        super().__init__(reason)
-        self.reason = reason
-        self.attempts = tuple(attempts)
-
-
-@dataclass(frozen=True)
-class ProgressDecision:
-    decision: str
-    reason: str
-    raw_content: str = ""
-    attempts: tuple[dict[str, Any], ...] = ()
-
-
-class ProgressDecisionFormatError(ValueError):
     def __init__(self, reason: str, *, attempts: Sequence[dict[str, Any]] = ()) -> None:
         super().__init__(reason)
         self.reason = reason
@@ -212,6 +241,11 @@ Create one short repair plan for the supplied Lean Blueprint. Preserve the COT
 even if its mathematics is wrong. Focus on formal object binding, exact clauses,
 relation direction, and dependency paths. Do not emit Lean or call tools.
 
+The later Editor has access to one batched Mathlib search call. When exact
+Mathlib names, types, or constructions are uncertain, PLAN may mention the
+concept that the Editor should look up. Do not output search queries, tool calls,
+or guessed theorem names; semantic repair remains the purpose of this Plan.
+
 Return exactly these headings and no Markdown fence:
 
 TARGET_OBLIGATIONS:
@@ -231,8 +265,11 @@ any subset of these nodes and may add at most two other helper declarations.
 
 
 EDITOR_PROMPT = r"""
-Edit a Lean Blueprint by calling `editBlueprintSubgraph` exactly once. You are
-translating the supplied COT faithfully, not repairing its mathematics.
+Translate the supplied COT faithfully, not its mathematical correctness. When
+search is available, either call `mathlib_search` once or call
+`editBlueprintSubgraph` exactly once. Search only for exact Mathlib names,
+types, or existing constructions; it cannot replace object or relation modeling.
+After search results are returned, call `editBlueprintSubgraph` exactly once.
 
 Each edit is add, replace, or delete. Use the current hash for replace/delete
 and an empty hash for add. A replacement contains exactly one complete
@@ -245,27 +282,8 @@ When a Plan is supplied, you may edit any subset of its nodes and add at most
 two additional helper nodes, but may not modify an unplanned existing node.
 Comments do not constitute a semantic repair. Rebuild shared formal objects,
 relations, Step claims, and root dependencies in the declaration types/bodies.
-"""
-
-
-CONTROLLER_PROMPT = r"""
-Judge whether the candidate is a useful implementation of the fixed repair
-Plan. COMMIT means it is worth using as the next repair-turn baseline; it need
-not already pass Lean or all final checks. RETRY_EDIT means the candidate does
-not genuinely implement the Plan and the Editor should retry from the original
-turn baseline. Do not judge whether the source COT is mathematically correct.
-
-Prefer RETRY_EDIT for comment-only changes, reflexive claims, answer-only
-witnesses, disconnected nodes, wrong target objects, or diagnostics caused by
-an incomplete mechanical implementation that can be fixed under the same Plan.
-Allow COMMIT for a real reusable object/relation/dependency improvement even if
-some explicit Lean, binder, standalone, or semantic diagnostics remain.
-
-Return exactly:
-
-DECISION: COMMIT | RETRY_EDIT
-REASON:
-<specific reason; keep it concise>
+Mathlib names may be used in formal types and definition bodies, but
+`sorry_using [...]` may contain Blueprint node names only.
 """
 
 
@@ -344,22 +362,6 @@ def parse_phase1b_plan(
     return Phase1BPlan(
         obligations, tuple(existing), tuple(new), text, raw_content=content,
     )
-
-
-def parse_progress_decision(content: str) -> ProgressDecision:
-    match = re.fullmatch(
-        r"\s*DECISION:\s*(COMMIT|RETRY_EDIT)\s*\n\s*REASON:\s*(?P<reason>.*?)\s*",
-        content,
-        re.DOTALL,
-    )
-    if match is None:
-        raise ProgressDecisionFormatError("expected DECISION and REASON headings")
-    reason = match.group("reason").strip()
-    if not reason:
-        raise ProgressDecisionFormatError("REASON must be non-empty")
-    # The API request bounds the response to the configured token budget.  Do
-    # not impose a second, character-based limit on a valid control decision.
-    return ProgressDecision(match.group(1), reason, raw_content=content)
 
 
 def validation_details(validation: Phase1BValidation) -> dict[str, Any]:
@@ -719,6 +721,370 @@ def _semantic_delta(
     }
 
 
+def _semantic_issue_fingerprints(validation: Phase1BValidation) -> set[str]:
+    return {
+        f"{issue.code}|{issue.node_name}|{issue.step_id}"
+        for issue in validation.semantic_issues if issue.severity == "error"
+    }
+
+
+def _standalone_issue_fingerprints(validation: Phase1BValidation) -> set[str]:
+    values: set[str] = set()
+    for issue in validation.standalone_report.issues:
+        row = issue.to_dict() if hasattr(issue, "to_dict") else dict(issue)
+        values.add(
+            f"{row.get('code', '')}|{row.get('nodeName', '')}|"
+            f"{row.get('stepId', '')}"
+        )
+    return values
+
+
+def _structural_issue_fingerprints(validation: Phase1BValidation) -> set[str]:
+    """Normalize diagnostics so wording and source locations are not debt."""
+    values: set[str] = set()
+    for raw in validation.structural_errors:
+        text = str(raw)
+        code = text.split(":", 1)[0].strip()
+        node_match = re.search(r"node\s+`([^`]+)`", text)
+        step_match = re.search(r"(?:Step|step)\s+`?([A-Za-z0-9_.-]+)`?", text)
+        values.add(
+            f"{code}|{node_match.group(1) if node_match else ''}|"
+            f"{step_match.group(1) if step_match else ''}"
+        )
+    return values
+
+
+def _standalone_failed_nodes(validation: Phase1BValidation) -> set[str]:
+    nodes: set[str] = set()
+    for issue in validation.standalone_report.issues:
+        row = issue.to_dict() if hasattr(issue, "to_dict") else dict(issue)
+        if row.get("nodeName"):
+            nodes.add(str(row["nodeName"]))
+    return nodes
+
+
+def _deterministic_debt(validation: Phase1BValidation) -> dict[str, Any]:
+    semantic = _semantic_issue_fingerprints(validation)
+    structural = _structural_issue_fingerprints(validation)
+    standalone = _standalone_issue_fingerprints(validation)
+    pending = set(validation.pending_node_names)
+    return {
+        "leanSuccess": validation.lean_result.success,
+        "semanticErrors": sorted(semantic),
+        "structuralErrors": sorted(structural),
+        "standaloneErrors": sorted(standalone),
+        "pendingNodes": sorted(pending),
+        "count": (
+            (0 if validation.lean_result.success else 1)
+            + len(semantic) + len(structural) + len(standalone) + len(pending)
+        ),
+    }
+
+
+def _stable_gate(
+    baseline: Phase1BValidation,
+    candidate: Phase1BValidation,
+    *,
+    changed_nodes: Sequence[str],
+) -> dict[str, Any]:
+    before = _deterministic_debt(baseline)
+    after = _deterministic_debt(candidate)
+    errors: list[str] = []
+    if not candidate.lean_result.success:
+        errors.append("wholeFileLeanFailed")
+    for label in ("semanticErrors", "structuralErrors", "standaloneErrors", "pendingNodes"):
+        added = sorted(set(after[label]) - set(before[label]))
+        if added:
+            errors.append(f"new{label[0].upper() + label[1:]}:" + ",".join(added))
+    pending = set(candidate.pending_node_names)
+    changed_concrete = set(changed_nodes) - pending
+    changed_standalone_failures = sorted(
+        changed_concrete & _standalone_failed_nodes(candidate)
+    )
+    if changed_standalone_failures:
+        errors.append(
+            "changedConcreteStandaloneFailed:" + ",".join(changed_standalone_failures)
+        )
+    return {
+        "passed": not errors,
+        "errors": errors,
+        "baselineDebt": before,
+        "candidateDebt": after,
+        "deterministicDebtDecreased": int(after["count"]) < int(before["count"]),
+    }
+
+
+def _source_step_hash(semantic_manifest, step_id: str) -> str:
+    if not semantic_manifest or not step_id:
+        return ""
+    base = step_id.split(".", 1)[0]
+    step = getattr(semantic_manifest, "by_id", {}).get(base)
+    return str(getattr(step, "source_sha256", "") or "") if step else ""
+
+
+def _normalized_obligation_signature(item: dict[str, Any], semantic_manifest) -> str:
+    category = str(item.get("category") or "semanticDefect")
+    step_id = str(item.get("step_id") or "").split(".", 1)[0]
+    if category in {"rootTargetObject", "rootAnswerGrounding"}:
+        return f"{category}|<root>|<global>"
+    source_hash = _source_step_hash(semantic_manifest, step_id)
+    if not source_hash:
+        source_hash = hashlib.sha256(
+            str(item.get("requirement") or "").encode()
+        ).hexdigest()[:20]
+    return f"{category}|{step_id or '<root>'}|{source_hash}"
+
+
+def _normalized_obligations(
+    validation: Phase1BValidation,
+    semantic_manifest,
+) -> dict[str, list[str]]:
+    grouped: dict[str, list[str]] = {}
+    for item in validation.open_semantic_obligations:
+        signature = _normalized_obligation_signature(item, semantic_manifest)
+        grouped.setdefault(signature, []).append(str(item.get("obligation_id") or ""))
+    return {key: sorted(values) for key, values in sorted(grouped.items())}
+
+
+def _strict_defect_count(validation: Phase1BValidation) -> int:
+    count = int(_deterministic_debt(validation)["count"])
+    if validation.formal_decompiler_result is not None:
+        count += len(validation.formal_decompiler_result.vacuous_nodes)
+    if validation.strict_comparator_result is not None:
+        count += len(comparator_defects(validation.strict_comparator_result))
+    return count
+
+
+def _formal_reference_consumers(
+    blueprint: Blueprint,
+    foundation_nodes: Sequence[str],
+    changed_nodes: Sequence[str],
+) -> tuple[dict[str, list[str]], set[str]]:
+    view = build_formal_view(blueprint)
+    declarations = {node.node_name: node.declaration for node in view.nodes}
+    node_map = blueprint.nodes_by_name()
+    root_closure: set[str] = set()
+    stack = [blueprint.target_theorem]
+    while stack:
+        name = stack.pop()
+        if name in root_closure or name not in node_map:
+            continue
+        root_closure.add(name)
+        stack.extend(effective_blueprint_dependencies(node_map[name], node_map))
+    changed = set(changed_nodes)
+    consumers: dict[str, list[str]] = {}
+    for foundation in foundation_nodes:
+        matches: list[str] = []
+        for name, declaration in declarations.items():
+            if name == foundation or name not in root_closure or name not in changed:
+                continue
+            identifiers = set(re.findall(r"[A-Za-z_][A-Za-z0-9_']*", declaration))
+            if foundation in identifiers:
+                matches.append(name)
+        consumers[foundation] = sorted(matches)
+    return consumers, root_closure
+
+
+def _foundation_nodes(
+    baseline: Blueprint,
+    candidate: Blueprint,
+    hard_result: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    actions = {
+        str(item.get("nodeName") or ""): str(item.get("action") or "")
+        for item in hard_result.get("edits") or ()
+    }
+    added = sorted(name for name, action in actions.items() if action == "add")
+    foundations = set(added)
+    for name in hard_result.get("effectiveNodes") or ():
+        before = baseline.node_by_name(name)
+        after = candidate.node_by_name(name)
+        if before is not None and after is not None and after.kind == "definition":
+            foundations.add(name)
+    return sorted(foundations), added
+
+
+def _critical_semantic_regressions(
+    baseline: Phase1BValidation,
+    candidate: Phase1BValidation,
+    *,
+    root_name: str,
+) -> list[str]:
+    before = _semantic_snapshot(baseline)
+    after = _semantic_snapshot(candidate)
+    errors: list[str] = []
+    for field in ("rootTargetObject", "rootAnswerGrounding"):
+        if before.get(field) is True and after.get(field) is False:
+            errors.append(field + "Regressed")
+    if int(after.get("requiredPathDisconnections") or 0) > int(
+        before.get("requiredPathDisconnections") or 0
+    ):
+        errors.append("requiredPathDisconnectionsIncreased")
+    before_issues = {
+        (issue.code, issue.node_name)
+        for issue in baseline.semantic_issues if issue.severity == "error"
+    }
+    for issue in candidate.semantic_issues:
+        if (
+            issue.severity == "error"
+            and issue.node_name == root_name
+            and issue.code in CRITICAL_ROOT_REGRESSION_CODES
+            and (issue.code, issue.node_name) not in before_issues
+        ):
+            errors.append("newCriticalRootError:" + issue.code)
+    before_vacuous = set(
+        baseline.formal_decompiler_result.vacuous_nodes
+        if baseline.formal_decompiler_result else ()
+    )
+    after_vacuous = set(
+        candidate.formal_decompiler_result.vacuous_nodes
+        if candidate.formal_decompiler_result else ()
+    )
+    if root_name in after_vacuous - before_vacuous:
+        errors.append("rootBecameVacuous")
+    return errors
+
+
+def _commit_assessment(
+    baseline_blueprint: Blueprint,
+    candidate_blueprint: Blueprint,
+    baseline: Phase1BValidation,
+    candidate: Phase1BValidation,
+    *,
+    stable: dict[str, Any],
+    hard_result: dict[str, Any],
+    plan: Phase1BPlan | None,
+    semantic_manifest,
+    closure_mode: bool,
+    foundation_debt_open: bool,
+) -> dict[str, Any]:
+    before_snapshot = _semantic_snapshot(baseline)
+    after_snapshot = _semantic_snapshot(candidate)
+    before_raw = {str(x.get("obligation_id") or "") for x in baseline.open_semantic_obligations}
+    after_raw = {str(x.get("obligation_id") or "") for x in candidate.open_semantic_obligations}
+    before_normalized = _normalized_obligations(baseline, semantic_manifest)
+    after_normalized = _normalized_obligations(candidate, semantic_manifest)
+    before_signatures = set(before_normalized)
+    after_signatures = set(after_normalized)
+    resolved_normalized = sorted(before_signatures - after_signatures)
+    new_normalized = sorted(after_signatures - before_signatures)
+    target_ids = set(plan.target_obligations if plan else ()) - {"none"}
+    resolved_targets = sorted(target_ids - after_raw)
+    strict_before = _strict_defect_count(baseline)
+    strict_after = _strict_defect_count(candidate)
+    root_improved = any(
+        before_snapshot.get(field) is False and after_snapshot.get(field) is True
+        for field in ("rootTargetObject", "rootAnswerGrounding")
+    )
+    path_improved = int(after_snapshot.get("requiredPathDisconnections") or 0) < int(
+        before_snapshot.get("requiredPathDisconnections") or 0
+    )
+    progress_flags = {
+        "deterministicDebtDecreased": bool(stable["deterministicDebtDecreased"]),
+        "targetObligationResolved": bool(resolved_targets),
+        "openObligationCountDecreased": len(after_signatures) < len(before_signatures),
+        "strictDefectCountDecreased": strict_after < strict_before,
+        "rootImproved": root_improved,
+        "requiredPathImproved": path_improved,
+    }
+    ordinary_progress = any(progress_flags.values())
+    foundations, added = _foundation_nodes(
+        baseline_blueprint, candidate_blueprint, hard_result,
+    )
+    consumers, root_closure = _formal_reference_consumers(
+        candidate_blueprint, foundations, hard_result.get("effectiveNodes") or (),
+    )
+    vacuous = set(
+        candidate.formal_decompiler_result.vacuous_nodes
+        if candidate.formal_decompiler_result else ()
+    )
+    foundation_integrated = bool(foundations) and all(
+        consumers.get(name) and name not in vacuous for name in foundations
+    )
+    foundation_only = bool(foundations) and not ordinary_progress
+    critical = _critical_semantic_regressions(
+        baseline, candidate, root_name=candidate_blueprint.target_theorem,
+    )
+    object_before = {
+        str(item.get("obligation_id") or "")
+        for item in baseline.open_semantic_obligations
+        if item.get("category") in OBJECT_OBLIGATION_CATEGORIES
+    }
+    object_after = {
+        str(item.get("obligation_id") or "")
+        for item in candidate.open_semantic_obligations
+        if item.get("category") in OBJECT_OBLIGATION_CATEGORIES
+    }
+    resolved_object_obligations = sorted(object_before - object_after)
+    closure_auxiliary_allowed = (
+        bool(added)
+        and bool(resolved_object_obligations)
+        and all(consumers.get(name) and name not in vacuous for name in added)
+        and not new_normalized
+        and (
+            len(after_signatures) < len(before_signatures)
+            or strict_after < strict_before
+        )
+    )
+
+    errors = list(critical)
+    reason = "semanticProgress"
+    if not candidate.semantic_audit_required:
+        reason = "semanticAuditDisabled"
+    elif closure_mode:
+        if foundation_only:
+            errors.append("foundationOnlyNotAllowedInClosure")
+        if new_normalized:
+            errors.append("newObligationsInClosure:" + ",".join(new_normalized))
+        if not (
+            len(after_signatures) < len(before_signatures)
+            or strict_after < strict_before
+        ):
+            errors.append("closureRequiresStrictProgress")
+        if added and not closure_auxiliary_allowed:
+            errors.append("closureAuxiliaryNodeNotJustified:" + ",".join(added))
+        reason = "closureProgress"
+    elif not ordinary_progress:
+        if not foundation_only:
+            errors.append("noSemanticProgress")
+        elif foundation_debt_open:
+            errors.append("consecutiveFoundationOnlyCommit")
+        elif not foundation_integrated:
+            errors.append("foundationNotIntegrated")
+        else:
+            reason = "integratedFoundation"
+
+    passed = not errors
+    return {
+        "passed": passed,
+        "reason": reason if passed else errors[0],
+        "errors": errors,
+        "closureMode": closure_mode,
+        "baselineDebt": stable["baselineDebt"],
+        "candidateDebt": stable["candidateDebt"],
+        "strictDefectBefore": strict_before,
+        "strictDefectAfter": strict_after,
+        "rawOpenBefore": sorted(before_raw),
+        "rawOpenAfter": sorted(after_raw),
+        "normalizedOpenBefore": before_normalized,
+        "normalizedOpenAfter": after_normalized,
+        "resolvedNormalizedObligations": resolved_normalized,
+        "newNormalizedObligations": new_normalized,
+        "resolvedTargetObligations": resolved_targets,
+        "progressFlags": progress_flags,
+        "criticalRegressions": critical,
+        "foundationNodes": foundations,
+        "addedNodes": added,
+        "foundationConsumers": consumers,
+        "rootClosure": sorted(root_closure),
+        "foundationOnly": foundation_only,
+        "foundationIntegrated": foundation_integrated,
+        "foundationDebtBefore": foundation_debt_open,
+        "resolvedObjectObligations": resolved_object_obligations,
+        "closureAuxiliaryAllowed": closure_auxiliary_allowed,
+    }
+
+
 def _compact_validation(validation: Phase1BValidation) -> dict[str, Any]:
     details = validation_details(validation)
     comparator = validation.strict_comparator_result
@@ -883,7 +1249,18 @@ def _call_editor(
     informal_statement: str, prompt_proof: str, claimed_answer: str,
     validation: Phase1BValidation, retry_feedback: dict[str, Any] | None,
     round_index: int, attempt: int, tracer, thm_name: str,
+    search_state: dict[str, Any] | None = None,
+    search_cache: dict[str, list[dict[str, str]]] | None = None,
+    search_max_queries: int = 0,
+    search_max_results: int = 5,
+    search_policy: str = "leanErrorsOnly",
 ):
+    search_eligibility = _mathlib_search_eligibility(
+        validation,
+        retry_feedback=retry_feedback,
+        blueprint_node_names=tuple(blueprint.nodes_by_name()),
+        policy=search_policy,
+    )
     payload: dict[str, Any] = {
         "problem": informal_statement,
         "claimed_answer": claimed_answer,
@@ -898,24 +1275,348 @@ def _call_editor(
         "current_blueprint": blueprint.lean_file,
         "diagnostics": _compact_validation(validation),
         "retry_feedback": retry_feedback,
+        "mathlib_search": {
+            "available": bool(
+                search_max_queries > 0
+                and search_state is not None
+                and not search_state.get("used")
+                and search_eligibility["eligible"]
+            ),
+            "policy": search_policy,
+            "eligibility_reasons": search_eligibility["reasons"],
+            "maximum_queries": search_max_queries,
+            "maximum_results_per_query": search_max_results,
+            "results_for_this_turn": (
+                list(search_state.get("results") or ()) if search_state else []
+            ),
+        },
     }
-    messages = [
-        {"role": "system", "content": EDITOR_PROMPT},
-        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+
+    def request(*, edit_only: bool, operation: str):
+        current_payload = dict(payload)
+        current_payload["mode"] = "EDIT ONLY" if edit_only else "SEARCH OR EDIT"
+        messages = [
+            {"role": "system", "content": EDITOR_PROMPT},
+            {"role": "user", "content": json.dumps(current_payload, ensure_ascii=False)},
+        ]
+        tools = [EDIT_SUBGRAPH_TOOL]
+        if not edit_only and current_payload["mathlib_search"]["available"]:
+            tools.append(MATHLIB_SEARCH_TOOL)
+        response = chat_completion_with_retry(
+            client, tracer=tracer, thm_name=thm_name, phase="phase1B",
+            model_id=model, operation=operation, model=model,
+            messages=messages, tools=tools, tool_choice="required",
+            temperature=0, max_completion_tokens=16384,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        )
+        _emit_usage(tracer, thm_name, "phase1B", model, response)
+        _emit_llm_response(
+            tracer, thm_name=thm_name, phase="phase1B", model=model,
+            response=response, attempt=attempt, turn=round_index,
+        )
+        return response
+
+    can_search = bool(
+        search_max_queries > 0
+        and search_state is not None
+        and not search_state.get("used")
+        and search_eligibility["eligible"]
+    )
+    if tracer:
+        tracer.emit(TraceEvent(
+            kind="phase1BMathlibSearchEligibility",
+            thm_name=thm_name,
+            turn=round_index,
+            args={
+                "round": round_index,
+                "attempt": attempt,
+                "policy": search_policy,
+                "configured": search_max_queries > 0,
+                "eligible": bool(search_eligibility["eligible"]),
+                "reasons": list(search_eligibility["reasons"]),
+                "alreadyUsed": bool(search_state and search_state.get("used")),
+            },
+            ok=True,
+        ))
+    response = request(edit_only=not can_search, operation="phase1b_subgraph_edit")
+    if not can_search:
+        return response
+    calls = list(response.choices[0].message.tool_calls or ())
+    search_calls = [
+        call for call in calls if str(call.function.name) == "mathlib_search"
     ]
-    response = chat_completion_with_retry(
-        client, tracer=tracer, thm_name=thm_name, phase="phase1B",
-        model_id=model, operation="phase1b_v9_subgraph_edit", model=model,
-        messages=messages, tools=[EDIT_SUBGRAPH_TOOL], tool_choice="required",
-        temperature=0, max_completion_tokens=16384,
-        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    if not search_calls:
+        return response
+
+    assert search_state is not None
+    search_state["used"] = True
+    search_rows = _execute_phase1b_mathlib_search(
+        search_calls,
+        blueprint=blueprint,
+        plan=plan,
+        max_queries=search_max_queries,
+        max_results=search_max_results,
+        cache=search_cache if search_cache is not None else {},
+        tracer=tracer,
+        thm_name=thm_name,
+        round_index=round_index,
+        attempt=attempt,
     )
-    _emit_usage(tracer, thm_name, "phase1B", model, response)
-    _emit_llm_response(
-        tracer, thm_name=thm_name, phase="phase1B", model=model,
-        response=response, attempt=attempt, turn=round_index,
+    search_state["results"] = search_rows
+    payload["mathlib_search"] = {
+        "available": False,
+        "maximum_queries": search_max_queries,
+        "maximum_results_per_query": search_max_results,
+        "results_for_this_turn": search_rows,
+    }
+    if any(str(call.function.name) == "editBlueprintSubgraph" for call in calls):
+        if tracer:
+            tracer.emit(TraceEvent(
+                kind="phase1BEditDeferredUntilAfterSearch",
+                thm_name=thm_name,
+                turn=round_index,
+                args={"round": round_index, "attempt": attempt},
+            ))
+    return request(edit_only=True, operation="phase1b_subgraph_edit_after_search")
+
+
+_SEARCHABLE_LEAN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("unknownIdentifier", re.compile(r"Unknown identifier", re.I)),
+    ("unknownConstant", re.compile(r"Unknown constant", re.I)),
+    ("invalidFieldNotation", re.compile(r"Invalid field notation", re.I)),
+    ("synthesisFailure", re.compile(r"failed to synthesize", re.I)),
+)
+
+
+def _mathlib_search_eligibility(
+    validation: Phase1BValidation,
+    *,
+    retry_feedback: dict[str, Any] | None,
+    blueprint_node_names: Sequence[str],
+    policy: str,
+) -> dict[str, Any]:
+    """Return high-confidence Mathlib/API lookup reasons for one Editor attempt.
+
+    Unknown identifiers that are already Blueprint nodes are dependency/modeling
+    errors, not Mathlib lookup problems, and therefore do not unlock search.
+    """
+    if policy != "leanErrorsOnly":
+        raise ValueError("phase1b_mathlib_search_policy must be leanErrorsOnly")
+    node_names = set(blueprint_node_names)
+    reasons: list[str] = []
+
+    def add_diagnostic(origin: str, diagnostic: str) -> None:
+        text = str(diagnostic or "")
+        for code, pattern in _SEARCHABLE_LEAN_PATTERNS:
+            if not pattern.search(text):
+                continue
+            identifiers = set(re.findall(
+                r"Unknown (?:identifier|constant) [`']([^`']+)[`']", text,
+                flags=re.I,
+            ))
+            if code in {"unknownIdentifier", "unknownConstant"} and identifiers:
+                external = sorted(identifiers - node_names)
+                if not external:
+                    continue
+                reasons.append(f"{origin}:{code}:" + ",".join(external))
+            else:
+                reasons.append(f"{origin}:{code}")
+
+    for diagnostic in validation.lean_result.diagnostics:
+        add_diagnostic("committedLean", diagnostic)
+    for issue in validation.standalone_report.issues:
+        external = sorted(set(issue.identifiers) - node_names)
+        if issue.error_kind in {"unknownIdentifier", "unknownConstant"}:
+            if external or not issue.identifiers:
+                suffix = ":" + ",".join(external) if external else ""
+                reasons.append(f"committedStandalone:{issue.error_kind}{suffix}")
+        elif issue.error_kind == "synthesisFailure":
+            reasons.append("committedStandalone:synthesisFailure")
+        elif issue.error_kind == "typeMismatch" and re.search(
+            r"Invalid field notation", issue.diagnostic, re.I
+        ):
+            reasons.append("committedStandalone:invalidFieldNotation")
+
+    diagnostics = (
+        retry_feedback.get("deterministic_diagnostics")
+        if isinstance(retry_feedback, dict) else None
     )
-    return response
+    if isinstance(diagnostics, dict):
+        for diagnostic in diagnostics.get("lean_errors") or ():
+            add_diagnostic("retryLean", str(diagnostic))
+        for issue in diagnostics.get("standalone_errors") or ():
+            if not isinstance(issue, dict):
+                continue
+            kind = str(issue.get("errorKind") or "")
+            identifiers = set(str(x) for x in issue.get("identifiers") or ())
+            external = sorted(identifiers - node_names)
+            diagnostic = str(issue.get("diagnostic") or "")
+            if kind in {"unknownIdentifier", "unknownConstant"}:
+                if external or not identifiers:
+                    suffix = ":" + ",".join(external) if external else ""
+                    reasons.append(f"retryStandalone:{kind}{suffix}")
+            elif kind == "synthesisFailure":
+                reasons.append("retryStandalone:synthesisFailure")
+            elif kind == "typeMismatch" and re.search(
+                r"Invalid field notation", diagnostic, re.I
+            ):
+                reasons.append("retryStandalone:invalidFieldNotation")
+
+    unique = tuple(dict.fromkeys(reasons))
+    return {"eligible": bool(unique), "reasons": list(unique)}
+
+
+def _execute_phase1b_mathlib_search(
+    calls: Sequence[Any],
+    *,
+    blueprint: Blueprint,
+    plan: Phase1BPlan | None,
+    max_queries: int,
+    max_results: int,
+    cache: dict[str, list[dict[str, str]]],
+    tracer,
+    thm_name: str,
+    round_index: int,
+    attempt: int,
+) -> list[dict[str, Any]]:
+    """Execute one batched search call and return bounded current-turn context."""
+    span_id = uuid.uuid4().hex
+    started_ns = time.monotonic_ns()
+    protocol_errors: list[str] = []
+    queries: list[dict[str, Any]] = []
+    if len(calls) != 1:
+        protocol_errors.append("multipleMathlibSearchCalls")
+    call = calls[0]
+    try:
+        args = json.loads(call.function.arguments or "{}")
+        raw_queries = args.get("queries") if isinstance(args, dict) else None
+        if set(args) != {"queries"} or not isinstance(raw_queries, list):
+            raise ValueError("invalidSearchSchema")
+        if not 1 <= len(raw_queries) <= max_queries:
+            raise ValueError(f"search queries must contain 1..{max_queries} items")
+        known_nodes = set(blueprint.nodes_by_name()) | set(plan.new_nodes if plan else ())
+        seen: set[str] = set()
+        for item in raw_queries:
+            if not isinstance(item, dict) or set(item) != {"query", "target_node_names"}:
+                raise ValueError("invalidSearchQuerySchema")
+            query = str(item.get("query") or "").strip()
+            targets = item.get("target_node_names")
+            if not query or not isinstance(targets, list) or not all(
+                isinstance(name, str) and name for name in targets
+            ):
+                raise ValueError("invalidSearchQuery")
+            unknown = sorted(set(targets) - known_nodes)
+            if unknown:
+                raise ValueError("unknownSearchTarget:" + ",".join(unknown))
+            key = " ".join(query.casefold().split())
+            if key in seen:
+                continue
+            seen.add(key)
+            queries.append({"query": query, "target_node_names": list(dict.fromkeys(targets)), "cache_key": key})
+        if not queries:
+            raise ValueError("noUniqueSearchQueries")
+    except (json.JSONDecodeError, ValueError) as exc:
+        protocol_errors.append(str(exc))
+        queries = []
+
+    if tracer:
+        tracer.emit(TraceEvent(
+            kind="phase1BMathlibSearchStart",
+            thm_name=thm_name,
+            turn=round_index,
+            span_id=span_id,
+            args={
+                "round": round_index,
+                "attempt": attempt,
+                "queryCount": len(queries),
+                "protocolErrors": protocol_errors,
+            },
+        ))
+
+    def fetch(item: dict[str, Any]) -> tuple[list[dict[str, str]], bool]:
+        key = f"{item['cache_key']}|{max_results}"
+        if key in cache:
+            return cache[key], True
+        try:
+            with MathlibRetrieval() as retrieval:
+                hits = retrieval.search(item["query"], max_results)
+            seen_names: set[str] = set()
+            rows: list[dict[str, str]] = []
+            for hit in hits:
+                if not hit.name or hit.name in seen_names:
+                    continue
+                seen_names.add(hit.name)
+                rows.append({
+                    "name": hit.name,
+                    "type_signature": str(hit.type_sig or "")[:800],
+                    "docstring": str(hit.docstring or "")[:240],
+                })
+                if len(rows) >= max_results:
+                    break
+        except Exception as exc:  # Search failure is diagnostic, not infrastructure.
+            rows = [{"name": "", "type_signature": "", "docstring": f"Search failed: {exc}"}]
+        cache[key] = rows
+        return rows, False
+
+    fetched: list[tuple[list[dict[str, str]], bool]] = []
+    if queries:
+        with ThreadPoolExecutor(max_workers=len(queries)) as executor:
+            fetched = list(executor.map(fetch, queries))
+
+    rendered: list[dict[str, Any]] = []
+    character_budget = 4096
+    used_chars = 0
+    for item, (results, cache_hit) in zip(queries, fetched, strict=True):
+        row = {
+            "query": item["query"],
+            "target_node_names": item["target_node_names"],
+            "cache_hit": cache_hit,
+            "results": results,
+        }
+        encoded = json.dumps(row, ensure_ascii=False)
+        if used_chars + len(encoded) > character_budget:
+            row["results"] = []
+            row["truncated"] = True
+            encoded = json.dumps(row, ensure_ascii=False)
+        used_chars += len(encoded)
+        rendered.append(row)
+        if tracer:
+            tracer.emit(TraceEvent(
+                kind="phase1BMathlibSearchResult",
+                thm_name=thm_name,
+                turn=round_index,
+                span_id=span_id,
+                args={
+                    "round": round_index,
+                    "attempt": attempt,
+                    "query": item["query"],
+                    "targetNodeNames": item["target_node_names"],
+                    "cacheHit": cache_hit,
+                    "resultCount": len(row["results"]),
+                    "truncated": bool(row.get("truncated")),
+                },
+                result=json.dumps(row["results"], ensure_ascii=False),
+                ok=True,
+            ))
+    if protocol_errors:
+        rendered.append({"protocol_errors": protocol_errors, "results": []})
+    if tracer:
+        tracer.emit(TraceEvent(
+            kind="phase1BMathlibSearchEnd",
+            thm_name=thm_name,
+            turn=round_index,
+            span_id=span_id,
+            args={
+                "round": round_index,
+                "attempt": attempt,
+                "queryCount": len(queries),
+                "protocolErrors": protocol_errors,
+                "outputCharacters": used_chars,
+            },
+            ok=not protocol_errors,
+            duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
+        ))
+    return rendered
 
 
 def _apply_hard_checked_edit(
@@ -999,118 +1700,6 @@ def _apply_hard_checked_edit(
         return None, result
 
 
-def _controller_messages(
-    *, informal_statement: str, claimed_answer: str, prompt_proof: str,
-    plan: Phase1BPlan, committed: Blueprint, candidate: Blueprint,
-    baseline_validation: Phase1BValidation,
-    candidate_validation: Phase1BValidation,
-    hard_result: dict[str, Any], semantic_delta: dict[str, Any],
-    previous_reason: str,
-) -> list[dict[str, str]]:
-    relevant_nodes = list(dict.fromkeys([
-        *plan.edit_nodes, *plan.new_nodes, *hard_result.get("actualNodes", ()),
-        committed.target_theorem,
-    ]))
-    payload = {
-        "problem": informal_statement,
-        "claimed_answer": claimed_answer,
-        "cot_steps": prompt_proof,
-        "plan": {
-            "target_obligations": list(plan.target_obligations),
-            "edit_nodes": list(plan.edit_nodes), "new_nodes": list(plan.new_nodes),
-            "text": plan.text,
-        },
-        "baseline_formal_view": _relevant_view(committed, relevant_nodes),
-        "candidate_formal_view": _relevant_view(candidate, relevant_nodes),
-        "formal_diff": _formal_diff(committed, candidate),
-        "actual_edits": hard_result.get("edits", []),
-        "no_op_nodes": hard_result.get("noOpNodes", []),
-        "baseline_diagnostics": _compact_validation(baseline_validation),
-        "candidate_diagnostics": _compact_validation(candidate_validation),
-        "semantic_delta": semantic_delta,
-        "previous_controller_reason": previous_reason,
-    }
-    return [
-        {"role": "system", "content": CONTROLLER_PROMPT},
-        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-    ]
-
-
-def run_progress_controller(
-    client, model: str, messages: list[dict[str, str]], *,
-    max_tokens: int, max_attempts: int, round_index: int, attempt_index: int,
-    tracer, thm_name: str,
-) -> ProgressDecision:
-    base = list(messages)
-    attempts: list[dict[str, Any]] = []
-    span_id = uuid.uuid4().hex
-    started = time.monotonic_ns()
-    if tracer:
-        tracer.emit(TraceEvent(
-            kind="phase1BProgressControllerStart", thm_name=thm_name,
-            turn=round_index, span_id=span_id,
-            args={"round": round_index, "attempt": attempt_index},
-        ))
-    for format_attempt in range(1, max_attempts + 1):
-        response = chat_completion_with_retry(
-            client, tracer=tracer, thm_name=thm_name,
-            phase="phase1BProgressController", model_id=model,
-            operation="phase1b_progress_controller", model=model,
-            messages=messages, temperature=0, max_completion_tokens=max_tokens,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-        )
-        _emit_usage(tracer, thm_name, "phase1BProgressController", model, response)
-        _emit_llm_response(
-            tracer, thm_name=thm_name, phase="phase1BProgressController",
-            model=model, response=response, attempt=format_attempt,
-            turn=round_index,
-        )
-        choice = response.choices[0]
-        content = str(choice.message.content or "")
-        record = {"attempt": format_attempt, "rawContent": content,
-                  "finishReason": getattr(choice, "finish_reason", None)}
-        try:
-            if str(record["finishReason"] or "").lower() == "length":
-                raise ProgressDecisionFormatError("controller response truncated")
-            decision = parse_progress_decision(content)
-        except ProgressDecisionFormatError as exc:
-            record["error"] = exc.reason
-            attempts.append(record)
-            if format_attempt == max_attempts:
-                if tracer:
-                    tracer.emit(TraceEvent(
-                        kind="phase1BProgressControllerEnd", thm_name=thm_name,
-                        turn=round_index, span_id=span_id, ok=False,
-                        result=exc.reason,
-                        duration_ms=(time.monotonic_ns() - started) / 1_000_000,
-                    ))
-                raise ProgressDecisionFormatError(exc.reason, attempts=attempts) from exc
-            messages = [*base, {"role": "user", "content": (
-                f"Rejected: {exc.reason}. Return only DECISION and REASON; "
-                "DECISION must be COMMIT or RETRY_EDIT."
-            )}]
-            continue
-        attempts.append(record)
-        decision = ProgressDecision(
-            decision.decision, decision.reason, raw_content=content,
-            attempts=tuple(attempts),
-        )
-        if tracer:
-            tracer.emit(TraceEvent(
-                kind="phase1BProgressControllerResult", thm_name=thm_name,
-                turn=round_index, span_id=span_id, result=content, ok=True,
-                args={"round": round_index, "attempt": attempt_index,
-                      "decision": decision.decision, "reason": decision.reason},
-            ))
-            tracer.emit(TraceEvent(
-                kind="phase1BProgressControllerEnd", thm_name=thm_name,
-                turn=round_index, span_id=span_id, ok=True,
-                duration_ms=(time.monotonic_ns() - started) / 1_000_000,
-            ))
-        return decision
-    raise AssertionError("unreachable")
-
-
 def _feedback(validation: Phase1BValidation) -> str:
     return json.dumps(_compact_validation(validation), ensure_ascii=False)
 
@@ -1173,15 +1762,25 @@ def run_phase1b_patch_session(
     plan_max_tokens: int = 768,
     plan_format_attempts: int = 2,
     plan_max_chars: int = 600,
-    progress_controller_max_tokens: int = 2048,
-    progress_controller_format_attempts: int = 2,
     subgraph_max_edits: int = 8,
+    closure_rounds: int = 0,
+    mathlib_search_policy: str = "leanErrorsOnly",
+    mathlib_search_max_queries_per_turn: int = 0,
+    mathlib_search_max_results_per_query: int = 5,
 ) -> Blueprint:
     if repair_strategy not in REPAIR_STRATEGIES:
         raise ValueError(
             "phase1b_repair_strategy must be one of: "
             + ", ".join(sorted(REPAIR_STRATEGIES))
         )
+    if closure_rounds < 0 or closure_rounds > max_rounds:
+        raise ValueError("phase1b_closure_rounds must be between 0 and max_rounds")
+    if mathlib_search_max_queries_per_turn < 0:
+        raise ValueError("Phase-1B Mathlib search query limit must be non-negative")
+    if mathlib_search_policy != "leanErrorsOnly":
+        raise ValueError("phase1b_mathlib_search_policy must be leanErrorsOnly")
+    if mathlib_search_max_results_per_query <= 0:
+        raise ValueError("Phase-1B Mathlib search result limit must be positive")
     committed = blueprint
     initial_pending_names = tuple(
         node.name for node in committed.nodes
@@ -1191,10 +1790,12 @@ def run_phase1b_patch_session(
     standalone_cache: dict[str, CompilerResult] = {}
     decompiler_cache: dict[str, FormalDecompilerResult] = {}
     comparator_cache: dict[str, StrictComparatorResult] = {}
+    mathlib_search_cache: dict[str, list[dict[str, str]]] = {}
     ledger: dict[str, dict[str, Any]] = {}
     rejected_candidate_hashes: set[str] = set()
     edit_history: list[dict[str, Any]] = []
     previous_turn: dict[str, Any] | None = None
+    foundation_debt_open = False
 
     validation = validate_candidate(
         committed, compiler=compiler, semantic_manifest=semantic_manifest,
@@ -1233,6 +1834,15 @@ def run_phase1b_patch_session(
     for round_index in range(1, max_rounds + 1):
         if validation.passed:
             break
+        closure_mode = closure_rounds > 0 and round_index > max_rounds - closure_rounds
+        if closure_mode and tracer:
+            tracer.emit(TraceEvent(
+                kind="phase1BClosureModeStart", thm_name=thm_name,
+                turn=round_index, args={
+                    "round": round_index, "maxRounds": max_rounds,
+                    "closureRounds": closure_rounds,
+                },
+            ))
         plan: Phase1BPlan | None = None
         if repair_strategy != "directEdit":
             try:
@@ -1275,6 +1885,7 @@ def run_phase1b_patch_session(
         baseline_validation = validation
         semantic_before = _semantic_snapshot(baseline_validation)
         retry_feedback: dict[str, Any] | None = None
+        search_state: dict[str, Any] = {"used": False, "results": []}
         attempt_rows: list[dict[str, Any]] = []
         committed_this_turn = False
         for attempt in range(1, editor_attempts_per_turn + 1):
@@ -1293,6 +1904,11 @@ def run_phase1b_patch_session(
                 claimed_answer=claimed_answer, validation=baseline_validation,
                 retry_feedback=retry_feedback, round_index=round_index,
                 attempt=attempt, tracer=tracer, thm_name=thm_name,
+                search_state=search_state,
+                search_cache=mathlib_search_cache,
+                search_max_queries=mathlib_search_max_queries_per_turn,
+                search_max_results=mathlib_search_max_results_per_query,
+                search_policy=mathlib_search_policy,
             )
             if tracer:
                 tracer.emit(TraceEvent(
@@ -1334,8 +1950,9 @@ def run_phase1b_patch_session(
                 "attempt": attempt, "actualNodes": hard["actualNodes"],
                 "effectiveNodes": hard["effectiveNodes"],
                 "noOpNodes": hard["noOpNodes"], "hardErrors": hard["hardErrors"],
-                "candidateHash": candidate_hash, "controllerDecision": None,
-                "controllerReason": "", "softDiagnostics": None,
+                "candidateHash": candidate_hash, "softDiagnostics": None,
+                "mathlibSearchUsed": bool(search_state["used"]),
+                "mathlibSearchResults": list(search_state["results"]),
             }
             if not hard_ok:
                 retry_feedback = {
@@ -1368,6 +1985,38 @@ def run_phase1b_patch_session(
                 thm_name=thm_name, round_index=round_index, attempt=attempt,
                 skip_pending=True, semantic_audit_required=semantic_audit_enabled,
             )
+            stable = _stable_gate(
+                baseline_validation, candidate_validation,
+                changed_nodes=hard["effectiveNodes"],
+            )
+            if tracer:
+                tracer.emit(TraceEvent(
+                    kind="phase1BStableGate", thm_name=thm_name,
+                    turn=round_index, span_id=span_id,
+                    args={
+                        "round": round_index, "attempt": attempt,
+                        "closureMode": closure_mode, **stable,
+                    }, ok=bool(stable["passed"]),
+                ))
+            attempt_row["stableGate"] = stable
+            if not stable["passed"]:
+                rejected_candidate_hashes.add(candidate_hash)
+                retry_feedback = {
+                    "kind": "stableGate", "errors": stable["errors"],
+                    "actual_nodes": hard["actualNodes"],
+                    "effective_nodes": hard["effectiveNodes"],
+                    "deterministic_diagnostics": _compact_validation(candidate_validation),
+                }
+                attempt_rows.append(attempt_row)
+                if tracer:
+                    tracer.emit(TraceEvent(
+                        kind="phase1BEditorAttemptEnd", thm_name=thm_name,
+                        turn=round_index, span_id=span_id, ok=False,
+                        args={"round": round_index, "attempt": attempt,
+                              "outcome": "stableRetry", "errors": stable["errors"]},
+                        duration_ms=(time.monotonic_ns() - started) / 1_000_000,
+                    ))
+                continue
             candidate_ledger = copy.deepcopy(ledger)
             try:
                 candidate_validation = _audit_candidate(
@@ -1405,52 +2054,72 @@ def run_phase1b_patch_session(
             )
             attempt_row["softDiagnostics"] = _compact_validation(candidate_validation)
             attempt_row["semanticDelta"] = delta
-
-            decision = "COMMIT"
-            reason = "hard-valid candidate committed by simple strategy"
-            if repair_strategy == "progressController" and not candidate_validation.passed:
-                assert plan is not None
-                try:
-                    progress = run_progress_controller(
-                        client, model,
-                        _controller_messages(
-                            informal_statement=informal_statement,
-                            claimed_answer=claimed_answer, prompt_proof=prompt_proof,
-                            plan=plan, committed=baseline, candidate=candidate,
-                            baseline_validation=baseline_validation,
-                            candidate_validation=candidate_validation,
-                            hard_result=hard, semantic_delta=delta,
-                            previous_reason=(retry_feedback or {}).get("reason", ""),
-                        ),
-                        max_tokens=progress_controller_max_tokens,
-                        max_attempts=progress_controller_format_attempts,
-                        round_index=round_index, attempt_index=attempt,
-                        tracer=tracer, thm_name=thm_name,
-                    )
-                except ProgressDecisionFormatError as exc:
-                    raise BlueprintGenerationError(
-                        "Phase 1B Progress Controller response was invalid: "
-                        + exc.reason,
-                        last_candidate=baseline.lean_file,
-                        diagnostics=[exc.reason],
-                        failure_stage="phase1BProgressControllerFormat",
-                        candidate_history=candidate_history,
-                        candidate_labels=candidate_labels,
-                        node_edit_rounds=edit_history,
-                    ) from exc
-                decision, reason = progress.decision, progress.reason
-            elif candidate_validation.passed:
-                reason = "candidate satisfies the final strict gate"
-            attempt_row["controllerDecision"] = decision
-            attempt_row["controllerReason"] = reason
+            assessment = _commit_assessment(
+                baseline, candidate, baseline_validation, candidate_validation,
+                stable=stable, hard_result=hard, plan=plan,
+                semantic_manifest=semantic_manifest, closure_mode=closure_mode,
+                foundation_debt_open=foundation_debt_open,
+            )
+            attempt_row["commitAssessment"] = assessment
+            if tracer:
+                tracer.emit(TraceEvent(
+                    kind="phase1BSemanticProgressGate", thm_name=thm_name,
+                    turn=round_index, span_id=span_id,
+                    args={"round": round_index, "attempt": attempt, **assessment},
+                    ok=bool(assessment["passed"]),
+                ))
+                if assessment["foundationNodes"]:
+                    tracer.emit(TraceEvent(
+                        kind="phase1BFoundationDetected", thm_name=thm_name,
+                        turn=round_index, span_id=span_id,
+                        args={"round": round_index, "attempt": attempt,
+                              **{key: assessment[key] for key in (
+                                  "foundationNodes", "foundationConsumers",
+                                  "foundationOnly", "foundationIntegrated",
+                                  "foundationDebtBefore",
+                              )}},
+                        ok=bool(assessment["foundationIntegrated"]),
+                    ))
+                if closure_mode and assessment["addedNodes"]:
+                    tracer.emit(TraceEvent(
+                        kind="phase1BClosureAuxiliaryValidation",
+                        thm_name=thm_name, turn=round_index, span_id=span_id,
+                        args={"round": round_index, "attempt": attempt,
+                              **{key: assessment[key] for key in (
+                                  "addedNodes", "resolvedObjectObligations",
+                                  "foundationConsumers", "closureAuxiliaryAllowed",
+                              )}},
+                        ok=bool(assessment["closureAuxiliaryAllowed"]),
+                    ))
+                tracer.emit(TraceEvent(
+                    kind="phase1BCommitAssessment", thm_name=thm_name,
+                    turn=round_index, span_id=span_id,
+                    args={"round": round_index, "attempt": attempt, **assessment},
+                    ok=bool(assessment["passed"]),
+                ))
             attempt_rows.append(attempt_row)
-            if decision == "COMMIT":
+            if assessment["passed"]:
                 committed = candidate
                 validation = candidate_validation
                 ledger = candidate_ledger
                 previous_turn = None
                 rejected_candidate_hashes.clear()
                 committed_this_turn = True
+                foundation_debt_before = foundation_debt_open
+                if assessment["foundationOnly"]:
+                    foundation_debt_open = True
+                elif any(assessment["progressFlags"].values()):
+                    foundation_debt_open = False
+                if tracer and foundation_debt_before != foundation_debt_open:
+                    tracer.emit(TraceEvent(
+                        kind="phase1BFoundationDebtUpdated", thm_name=thm_name,
+                        turn=round_index, args={
+                            "round": round_index, "attempt": attempt,
+                            "before": foundation_debt_before,
+                            "after": foundation_debt_open,
+                            "reason": assessment["reason"],
+                        },
+                    ))
                 if tracer:
                     tracer.emit(TraceEvent(
                         kind="phase1BTurnCommit", thm_name=thm_name,
@@ -1461,7 +2130,9 @@ def run_phase1b_patch_session(
                                 baseline.lean_file.encode()
                             ).hexdigest(),
                             "committedHashAfter": candidate_hash,
-                            "semanticDelta": delta, "reason": reason,
+                            "semanticDelta": delta,
+                            "commitAssessment": assessment,
+                            "reason": assessment["reason"],
                         }, ok=True,
                     ))
                 if tracer:
@@ -1476,25 +2147,30 @@ def run_phase1b_patch_session(
 
             rejected_candidate_hashes.add(candidate_hash)
             retry_feedback = {
-                "kind": "progressController", "reason": reason,
+                "kind": "semanticProgressGate",
+                "reason": assessment["reason"],
+                "errors": assessment["errors"],
                 "candidate_formal_diff": _formal_diff(baseline, candidate, limit=10000),
                 "actual_nodes": hard["actualNodes"],
                 "effective_nodes": hard["effectiveNodes"],
                 "no_op_nodes": hard["noOpNodes"],
                 "soft_diagnostics": _compact_validation(candidate_validation),
                 "semantic_delta": delta,
+                "commit_assessment": assessment,
             }
             if tracer:
                 tracer.emit(TraceEvent(
                     kind="phase1BEditorAttemptEnd", thm_name=thm_name,
                     turn=round_index, span_id=span_id, ok=False,
                     args={"round": round_index, "attempt": attempt,
-                          "outcome": "controllerRetry", "reason": reason},
+                          "outcome": "semanticRetry",
+                          "reason": assessment["reason"]},
                     duration_ms=(time.monotonic_ns() - started) / 1_000_000,
                 ))
 
         turn_row = {
             "round": round_index, "strategy": repair_strategy,
+            "closureMode": closure_mode,
             "plan": plan.text if plan else "",
             "planHash": plan.stable_hash() if plan else "",
             "targetObligations": list(plan.target_obligations) if plan else [],

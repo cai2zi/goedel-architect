@@ -28,9 +28,11 @@ phase1b_editor_attempts_per_turn: 3
 phase1b_plan_max_tokens: 768
 phase1b_plan_format_attempts: 2
 phase1b_plan_max_chars: 600
-phase1b_progress_controller_max_tokens: 2048
-phase1b_progress_controller_format_attempts: 2
 phase1b_subgraph_max_edits: 8
+phase1b_closure_rounds: 0
+phase1b_mathlib_search_policy: leanErrorsOnly
+phase1b_mathlib_search_max_queries_per_turn: 0
+phase1b_mathlib_search_max_results_per_query: 5
 phase1b_seed_blueprint_root: null
 phase1b_seed_filename: phase1b_final.lean
 phase1b_seed_required: false
