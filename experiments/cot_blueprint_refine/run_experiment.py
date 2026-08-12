@@ -22,20 +22,18 @@ from cot_blueprint_refine.common import latest_rows, load_config, output_root, p
 from cot_blueprint_refine.evaluate import evaluate  # noqa: E402
 from cot_blueprint_refine.export_blueprint_contexts import export_contexts  # noqa: E402
 from cot_blueprint_refine.prepare_inputs import DATASET_SUBSET, prepare  # noqa: E402
-from cot_blueprint_refine.run_cot_split import run_cot_split  # noqa: E402
 from cot_blueprint_refine.run_cot_refinement import refine  # noqa: E402
 from cot_blueprint_refine.vllm_runtime import PersistentVLLMRuntime  # noqa: E402
 from cot_blueprint_refine.kimina_runtime import PersistentKiminaRuntime  # noqa: E402
 from kimina_lean_compiler import KiminaLeanCompiler  # noqa: E402
 
 
-STAGES = ("prepare", "split", "blueprint", "export", "refine", "evaluate")
+STAGES = ("prepare", "blueprint", "export", "refine", "evaluate")
 STAGE_SEQUENCES = {
     "all": STAGES,
-    "cot-to-blueprint": ("prepare", "split", "blueprint", "export"),
-    "blueprint-refine": ("prepare", "split", "blueprint", "export", "refine"),
-    "phase1-only": ("prepare", "split", "blueprint"),
-    "whole-cot-phase1-only": ("prepare", "blueprint"),
+    "cot-to-blueprint": ("prepare", "blueprint", "export"),
+    "blueprint-refine": ("prepare", "blueprint", "export", "refine"),
+    "phase1-only": ("prepare", "blueprint"),
     "phase2-only": ("blueprint",),
 }
 
@@ -49,8 +47,8 @@ def parse_args() -> argparse.Namespace:
         default="all",
         help=(
             "A single stage, all stages, cot-to-blueprint "
-            "(prepare+split+blueprint+export), or blueprint-refine "
-            "(prepare+split+blueprint+export+refine)"
+            "(prepare+blueprint+export), or blueprint-refine "
+            "(prepare+blueprint+export+refine)"
         ),
     )
     parser.add_argument("override", nargs="*", help="OmegaConf dot-list overrides")
@@ -94,7 +92,7 @@ def _blueprint_result_is_terminal(row: dict[str, Any], *, retry_error_results: b
     }:
         return True
     return status in {
-        "error", "semanticRejected", "structuralRejected", "infraError",
+        "error", "semanticRejected", "semanticAuditError", "structuralRejected", "infraError",
     } and not retry_error_results
 
 
@@ -112,30 +110,17 @@ def blueprint_results_complete(config: DictConfig) -> bool:
     execution_mode = str(config.blueprint.get("execution_mode", "full"))
     missing_count = 0
     nonterminal_count = 0
-    manifest_mismatches: list[str] = []
     for generation in generation_rows:
         source_id = str(generation.get("name") or "")
         result = result_rows.get(source_id)
         if result is None:
             missing_count += 1
-        elif (
-            "cot_manifest_json" in result
-            and str(result.get("cot_manifest_json") or "")
-            != str(generation.get("cot_manifest_json") or "")
-        ):
-            manifest_mismatches.append(source_id)
         elif execution_mode == "phase2_only" and str(result.get("status") or "") in {
             "strictAccepted", "acceptedWithWarnings",
         }:
             nonterminal_count += 1
         elif not _blueprint_result_is_terminal(result, retry_error_results=retry_error_results):
             nonterminal_count += 1
-    if manifest_mismatches:
-        preview = ", ".join(manifest_mismatches[:10])
-        raise RuntimeError(
-            "Refusing to resume RobustPA with changed COT manifests; use a new exp_name. "
-            f"mismatched={len(manifest_mismatches)} ids={preview}"
-        )
     complete = missing_count == 0 and nonterminal_count == 0
     if complete:
         print(
@@ -211,7 +196,7 @@ def run_blueprint(
         f"phase1_seed_root={phase1_seed_root or 'null'}",
         f"phase1_source_results_path={phase1_source_results_path or 'null'}",
         f"phase1_source_experiment_root={phase1_source_root or 'null'}",
-        f"source_grounding_mode={blueprint.get('source_grounding_mode', 'formal_steps')}",
+        f"generation_prompt_profile={blueprint.get('generation_prompt_profile', 'whole_cot_minimal')}",
         f"max_refinement_iterations={blueprint.max_refinement_iterations}",
         f"refinement_max_retries={blueprint.refinement_max_retries}",
         f"generation_max_turns={blueprint.generation_max_turns}",
@@ -314,20 +299,6 @@ def run_stage(
             return run_stage(stage, config, runtime, owned_kimina)
     if stage == "prepare":
         return prepare(config)
-    if stage == "split":
-        splitter = config.step_splitter
-        runtime.ensure(
-            stage="formal_step_split",
-            client_model=str(splitter.model),
-            base_url=str(splitter.openai_base_url),
-            service=splitter.vllm,
-        )
-        preflight_model(
-            str(splitter.model),
-            str(splitter.openai_base_url),
-            str(splitter.get("api_key", "dummy")),
-        )
-        return run_cot_split(config)
     if stage == "blueprint":
         return run_blueprint(config, runtime, kimina_runtime)
     if stage == "export":
@@ -408,15 +379,6 @@ class ExperimentLock:
 def main() -> None:
     args = parse_args()
     config = load_config(args.profile, args.override)
-    source_mode = str(config.blueprint.get("source_grounding_mode", "formal_steps"))
-    if source_mode not in {"formal_steps", "whole_cot"}:
-        raise ValueError("blueprint.source_grounding_mode must be formal_steps or whole_cot")
-    if args.stage == "whole-cot-phase1-only" and source_mode != "whole_cot":
-        raise ValueError("whole-cot-phase1-only requires source_grounding_mode=whole_cot")
-    if args.stage == "phase1-only" and source_mode != "formal_steps":
-        raise ValueError("phase1-only requires source_grounding_mode=formal_steps")
-    if args.stage == "split" and source_mode == "whole_cot":
-        raise ValueError("the split stage is forbidden in whole_cot mode")
     if (
         args.stage == "phase2-only"
         and str(config.blueprint.get("execution_mode", "full")) != "phase2_only"

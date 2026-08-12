@@ -39,14 +39,13 @@ theorem root : (1 + 1 : Nat) = 2 := by sorry_using []
             output_root = root / "output"
             record = Record(
                 "subset__split__record", "record", "source/id", "subset", "split",
-                root / "data.parquet", 1, "root", "problem", "cot", "", "formal_steps", "2",
+                root / "data.parquet", 1, "root", "problem", "cot", "2",
             )
             checkpoint_path, _trace, blueprint_dir = _record_paths(seed_root, record)
             state = CheckpointState(
                 informal_statement="problem", informal_proof="cot", claimed_answer="2",
                 model="model", status=RunStatus.SOLVED, semantic_fidelity_enabled=True,
-                semantic_require_step_ids=True, semantic_static_gate=True,
-                semantic_source_mode="step_grounded", semantic_status="strictAccepted",
+                semantic_static_gate=False, semantic_status="strictAccepted",
                 node_results={"root": {"signal": "PROVED", "proof_body": "by omega", "lean_errors": []}},
             )
             from blueprint import _parse_blueprint

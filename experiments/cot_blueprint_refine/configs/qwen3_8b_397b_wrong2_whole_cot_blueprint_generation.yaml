@@ -10,7 +10,7 @@ shared_vllm_397b: {reasoning_parser: qwen3}
 kimina: {use_existing: true, auto_start: false, auto_destroy: false}
 
 blueprint:
-  source_grounding_mode: whole_cot
+  generation_prompt_profile: whole_cot_minimal
   execution_mode: phase1_only
   generation_max_turns: 8
   generation_enable_thinking: true

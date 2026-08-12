@@ -5,10 +5,8 @@ resume: true
 vllm: {use_existing: true}
 shared_vllm_397b: {reasoning_parser: qwen3}
 kimina: {use_existing: true, auto_start: false, auto_destroy: false}
-step_splitter: {prompt_version: formal-step-boundary-v4, concurrency: 76}
-
 blueprint:
-  source_grounding_mode: formal_steps
+  generation_prompt_profile: whole_cot_minimal
   execution_mode: phase1_only
   generation_max_turns: 8
   generation_enable_thinking: true

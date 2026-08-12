@@ -39,19 +39,8 @@ def _reasoning_kwargs(model: str) -> dict:
     return {}
 
 ROBUSTPA_BLUEPRINT_SYSTEM_PROMPT = load("robustpa_blueprint_system")
+ROBUSTPA_BLUEPRINT_MINIMAL_SYSTEM_PROMPT = load("robustpa_blueprint_system_minimal")
 ROBUSTPA_BLUEPRINT_USER_TEMPLATE = load("robustpa_blueprint_user")
-
-
-
-def _render_step_grounded_proof(cot_manifest_json: str, *, include_ir: bool) -> str:
-    from cot_blueprint_refine.formal_steps import decode_formal_step_manifest
-    del include_ir
-    manifest = decode_formal_step_manifest(cot_manifest_json)
-    return "\n\n".join(
-        f"[COT_STEP {step['step_id']}]\n{step['source_text']}\n[/COT_STEP {step['step_id']}]"
-        for step in manifest["steps"]
-    )
-
 
 def _enabled_semantic_issues(
     issues: list[SemanticIssue],
@@ -463,11 +452,6 @@ class BlueprintNode:
     proof_sketch: str
     dependencies: list[str] = field(default_factory=list)
     lean_declaration: str = ""
-    # LeanArchitect already persists ``title`` as part of the native
-    # ``@[blueprint]`` attribute.  Semantic-fidelity experiments encode the
-    # immutable source binding as ``title := \"COT_STEP:S001\"`` so the
-    # mapping survives parsing, checkpointing, and export without inventing a
-    # custom Lean attribute.
     title: str = ""
     source_step_id: str = ""
     lean_start_line: int = 0
@@ -1055,7 +1039,7 @@ def _parse_blueprint(lean_code: str, target_theorem: str) -> Blueprint:
     nodes: list[BlueprintNode] = []
     # Match @[blueprint ...] blocks followed by a declaration
     pattern = re.compile(
-        rf"@\[blueprint\s*(.*?)\]\s*\n\s*({_BLUEPRINT_DECL_KW})\s+"
+        rf"@\[blueprint\s*(.*?)\]\s*({_BLUEPRINT_DECL_KW})\s+"
         rf"(\w+)(.*?)(?=@\[blueprint|\Z)",
         re.DOTALL,
     )
@@ -1070,8 +1054,6 @@ def _parse_blueprint(lean_code: str, target_theorem: str) -> Blueprint:
         statement = _extract_attr(attrs_block, "statement")
         proof_sketch = _extract_attr(attrs_block, "proof")
         title = _extract_string_attr(attrs_block, "title")
-        source_match = re.fullmatch(r"COT_STEP:(S\d{3,})", title.strip())
-        source_step_id = source_match.group(1) if source_match else ""
 
         # Extract sorry_using [...] dependencies
         dep_match = re.search(r"sorry_using\s*\[([^\]]*)\]", rest)
@@ -1085,7 +1067,7 @@ def _parse_blueprint(lean_code: str, target_theorem: str) -> Blueprint:
             dependencies=deps,
             lean_declaration=m.group(0),
             title=title,
-            source_step_id=source_step_id,
+            source_step_id="",
             lean_start_line=lean_code.count("\n", 0, m.start()) + 1,
             lean_end_line=lean_code.count("\n", 0, m.end()) + 1,
         ))

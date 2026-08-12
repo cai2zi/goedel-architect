@@ -21,7 +21,6 @@ environment:
 
 blueprint:
   execution_mode: phase2_only
-  source_grounding_mode: formal_steps
   phase1_input_experiment_root: /ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong76_blueprint_generation
   retry_error_results: false
   max_refinement_iterations: 0

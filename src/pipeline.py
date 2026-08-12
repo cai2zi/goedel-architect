@@ -25,7 +25,6 @@ from prover import ProofSignal, ProverResult
 from refinement import SemanticRefinementError, refine_blueprint
 from semantic_fidelity import (
     format_semantic_issues,
-    parse_cot_manifest,
     semantic_snapshot_from_dict,
     snapshot_blueprint_semantics,
     validate_blueprint_fidelity,
@@ -133,11 +132,9 @@ async def run_phase2_async(
         semantic_issues = _enabled_semantic_issues(
             validate_blueprint_fidelity(
                 blueprint,
-                parse_cot_manifest(state.cot_manifest_json),
                 claimed_answer=state.claimed_answer,
-                require_step_bindings=state.semantic_require_step_ids,
             ),
-            require_step_ids=state.semantic_require_step_ids,
+            require_step_ids=False,
             static_gate=state.semantic_static_gate,
         )
         _emit_semantic_check(
@@ -273,7 +270,6 @@ def run_phase3(
     blueprint_max_retries: int | None = None,
     phase2_contract_check_concurrency: int = 1,
     semantic_fidelity_enabled: bool | None = None,
-    semantic_require_step_ids: bool | None = None,
     semantic_static_gate: bool | None = None,
     semantic_freeze_refinement: bool | None = None,
 ) -> Blueprint:
@@ -302,17 +298,11 @@ def run_phase3(
             phase2_contract_check_concurrency=phase2_contract_check_concurrency,
             informal_statement=state.informal_statement,
             informal_proof=state.informal_proof,
-            cot_manifest_json=state.cot_manifest_json,
             claimed_answer=state.claimed_answer,
             semantic_fidelity_enabled=(
                 state.semantic_fidelity_enabled
                 if semantic_fidelity_enabled is None
                 else semantic_fidelity_enabled
-            ),
-            semantic_require_step_ids=(
-                state.semantic_require_step_ids
-                if semantic_require_step_ids is None
-                else semantic_require_step_ids
             ),
             semantic_static_gate=(
                 state.semantic_static_gate

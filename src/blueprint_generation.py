@@ -17,6 +17,7 @@ from blueprint import (
     Blueprint,
     BlueprintGenerationError,
     Phase2StandaloneReport,
+    ROBUSTPA_BLUEPRINT_MINIMAL_SYSTEM_PROMPT,
     ROBUSTPA_BLUEPRINT_SYSTEM_PROMPT,
     ROBUSTPA_BLUEPRINT_USER_TEMPLATE,
     LEAN_COMPILE_TOOL,
@@ -26,7 +27,6 @@ from blueprint import (
     _load_phase1_tokenizer,
     _parse_blueprint,
     canonicalize_blueprint,
-    _render_step_grounded_proof,
     _unannotated_local_declaration_errors,
     phase2_contract_errors,
     phase2_standalone_contract_report,
@@ -40,52 +40,18 @@ from kimina_lean_compiler import (
 from llm_client import chat_completion_with_retry, make_client
 from semantic_audit import (
     FormalDecompilerResult,
-    StrictComparatorResult,
     WholeCotComparatorResult,
     WHOLE_COT_PROMPT_VERSION,
     build_formal_view,
-    comparator_defects,
     run_formal_decompiler,
-    run_strict_comparator,
     run_whole_cot_comparator,
     semantic_audit_cache_key,
-    strict_comparator_messages,
     whole_cot_comparator_defects,
     whole_cot_comparator_messages,
 )
-from semantic_fidelity import (
-    SemanticIssue,
-    parse_cot_manifest,
-    validate_blueprint_fidelity,
-)
+from semantic_fidelity import SemanticIssue, validate_blueprint_fidelity
 from tracer import TraceEvent
 
-
-GENERATION_SYSTEM_SUFFIX = r"""
-
-## Complete Blueprint generation contract
-
-Return a complete replacement Blueprint on every round.  Do not emit or refer
-to `PendingBlueprintClaim`: every definition body and every lemma/theorem
-proposition must be concrete Lean.  Proof bodies remain exactly
-`:= by sorry_using [...]`.  The supplied diagnostics describe the previous
-complete candidate; repair all deterministic errors, semantic translation
-errors, and warnings while preserving the COT even when the COT is wrong.
-
-Every `@[blueprint]` declaration must include
-`(title := "COT_STEP:Snnn")` for exactly one supplied Step and a non-empty
-`statement` doc comment.  Every lemma/theorem must additionally include a
-non-empty `proof` doc comment.  Cover every supplied Step with at least one
-node, and map the root theorem to the final Step.  For example:
-
-    @[blueprint (title := "COT_STEP:S003")
-      (statement := /-- Exact formal content of this source Step. -/)
-      (proof := /-- Derivation from the named Blueprint parents. -/)]
-    lemma derived_relation : P := by sorry_using [problem_model]
-
-Call `lean_compile` exactly once with the entire replacement file.  Do not
-return prose or a partial declaration.
-"""
 
 WHOLE_COT_GENERATION_SYSTEM_SUFFIX = r"""
 
@@ -99,10 +65,9 @@ when it is mathematically wrong. Preserve shared objects, relation directions,
 quantifiers, dependencies, and the final target. Do not use `COT_STEP` titles;
 Blueprint `title` metadata is optional and carries no semantic credit.
 
-Every declaration must have a non-empty `statement` doc comment, and every
-lemma/theorem must also have a non-empty `proof` doc comment. Call
-`lean_compile` exactly once with the entire replacement file. Do not return
-prose or a partial declaration.
+`title`, `statement`, and `proof` metadata are optional. Call `lean_compile`
+exactly once with the entire replacement file. Do not return prose or a partial
+declaration.
 """
 
 
@@ -136,20 +101,33 @@ class BlueprintValidation:
     semantic_issues: list[SemanticIssue]
     structural_errors: list[str]
     standalone_report: Phase2StandaloneReport
+    canonical_lean_result: CompilerResult | None = None
+    mechanical_stage_reached: str = "parse_basic"
+    mechanical_failure_stage: str | None = None
+    semantic_audit_invoked: bool = False
     formal_decompiler_result: FormalDecompilerResult | None = None
-    strict_comparator_result: StrictComparatorResult | WholeCotComparatorResult | None = None
-    semantic_audit_protocol: str = "blueprint-semantic-audit-v1"
+    strict_comparator_result: WholeCotComparatorResult | None = None
+    semantic_audit_protocol: str = WHOLE_COT_PROMPT_VERSION
 
     @property
     def passed(self) -> bool:
         return (
             self.lean_result.success
-            and not any(issue.severity == "error" for issue in self.semantic_issues)
+            and self.canonical_lean_result is not None
+            and self.canonical_lean_result.success
             and not self.structural_errors
             and not self.standalone_report.issues
             and self.strict_comparator_result is not None
             and self.strict_comparator_result.passed
         )
+
+
+class SemanticAuditExecutionError(RuntimeError):
+    """Terminal Decompiler/Comparator failure after its schema retry budget."""
+
+    def __init__(self, message: str, validation: BlueprintValidation):
+        super().__init__(message)
+        self.validation = validation
 
 
 def validation_details(validation: BlueprintValidation) -> dict[str, Any]:
@@ -161,24 +139,33 @@ def validation_details(validation: BlueprintValidation) -> dict[str, Any]:
             "protocol": validation.semantic_audit_protocol,
             "classification": "strictAccepted" if validation.passed else "semanticRejected",
         }
-        comparator_key = (
-            "wholeCotComparator"
-            if validation.semantic_audit_protocol == WHOLE_COT_PROMPT_VERSION
-            else "strictComparator"
-        )
-        audit[comparator_key] = validation.strict_comparator_result.to_dict()
+        audit["wholeCotComparator"] = validation.strict_comparator_result.to_dict()
+    static_errors = [
+        issue.to_dict() for issue in validation.semantic_issues
+        if issue.severity == "error"
+    ]
+    static_warnings = [
+        issue.to_dict() for issue in validation.semantic_issues
+        if issue.severity == "warning"
+    ]
     return {
         "passed": validation.passed,
+        "mechanicalStageReached": validation.mechanical_stage_reached,
+        "mechanicalFailureStage": validation.mechanical_failure_stage,
+        "mechanicalPassed": validation.mechanical_failure_stage is None,
         "wholeFileLeanSuccess": validation.lean_result.success,
         "leanErrors": list(validation.lean_result.diagnostics),
-        "semanticErrors": [
-            issue.to_dict() for issue in validation.semantic_issues
-            if issue.severity == "error"
-        ],
-        "semanticWarnings": [
-            issue.to_dict() for issue in validation.semantic_issues
-            if issue.severity == "warning"
-        ],
+        "canonicalLeanSuccess": (
+            validation.canonical_lean_result.success
+            if validation.canonical_lean_result is not None else None
+        ),
+        "canonicalLeanErrors": (
+            list(validation.canonical_lean_result.diagnostics)
+            if validation.canonical_lean_result is not None else []
+        ),
+        "staticShadowErrors": static_errors,
+        "staticShadowWarnings": static_warnings,
+        "staticShadowWouldReject": bool(static_errors),
         "phase2StructuralErrors": list(validation.structural_errors),
         "phase2StandaloneErrors": [
             issue.to_dict() for issue in standalone.issues
@@ -190,22 +177,9 @@ def validation_details(validation: BlueprintValidation) -> dict[str, Any]:
             "notRunReason": standalone.not_run_reason,
             "durationMs": standalone.duration_ms,
         },
+        "semanticAuditInvoked": validation.semantic_audit_invoked,
         "semanticAudit": audit,
     }
-
-
-def _semantic_audit_eligible(validation: BlueprintValidation) -> bool:
-    blocking_codes = {
-        "emptyCotManifest", "missingRoot", "missingStepMapping",
-        "multipleStepMappings", "malformedStepMapping", "unknownStepMapping",
-        "rootNotFinalStep", "stepMappingAbsent",
-    }
-    return (
-        not any(
-            issue.severity == "error" and issue.code in blocking_codes
-            for issue in validation.semantic_issues
-        )
-    )
 
 
 def _with_semantic_audit(
@@ -217,8 +191,6 @@ def _with_semantic_audit(
     informal_statement: str,
     informal_proof: str,
     claimed_answer: str,
-    semantic_manifest: Any,
-    source_grounding_mode: str,
     formal_decompiler_max_tokens: int,
     strict_comparator_max_tokens: int,
     format_max_attempts: int,
@@ -235,8 +207,7 @@ def _with_semantic_audit(
     thm_name: str,
     round_index: int,
 ) -> BlueprintValidation:
-    whole_cot = source_grounding_mode == "whole_cot"
-    view = build_formal_view(blueprint, include_step_ids=not whole_cot)
+    view = build_formal_view(blueprint, include_step_ids=False)
     decompiler = decompiler_cache.get(view.sha256)
     if decompiler is None:
         decompiler = run_formal_decompiler(
@@ -257,63 +228,42 @@ def _with_semantic_audit(
             round_index=round_index,
         )
         decompiler_cache[view.sha256] = decompiler
-    if whole_cot:
-        messages = whole_cot_comparator_messages(
-            informal_statement, informal_proof, claimed_answer, view, decompiler,
-        )
-        cache_key = semantic_audit_cache_key(
-            model, messages, version=WHOLE_COT_PROMPT_VERSION,
-        )
-    else:
-        messages = strict_comparator_messages(
-            informal_statement, claimed_answer, semantic_manifest, view, decompiler, (),
-        )
-        cache_key = semantic_audit_cache_key(model, messages)
+    messages = whole_cot_comparator_messages(
+        informal_statement, informal_proof, claimed_answer, view, decompiler,
+    )
+    cache_key = semantic_audit_cache_key(
+        model, messages, version=WHOLE_COT_PROMPT_VERSION,
+    )
     comparator = comparator_cache.get(cache_key)
     if comparator is None:
-        if whole_cot:
-            comparator = run_whole_cot_comparator(
-                client, model, informal_statement=informal_statement,
-                informal_proof=informal_proof, claimed_answer=claimed_answer,
-                view=view, decompiler=decompiler,
-                max_tokens=strict_comparator_max_tokens,
-                max_attempts=format_max_attempts, tracer=tracer,
-                enable_thinking=semantic_audit_enable_thinking,
-                temperature=semantic_audit_temperature,
-                top_p=semantic_audit_top_p,
-                top_k=semantic_audit_top_k,
-                min_p=semantic_audit_min_p,
-                presence_penalty=semantic_audit_presence_penalty,
-                repetition_penalty=semantic_audit_repetition_penalty,
-                thm_name=thm_name, round_index=round_index,
-            )
-        else:
-            comparator = run_strict_comparator(
-                client, model, informal_statement=informal_statement,
-                claimed_answer=claimed_answer, manifest=semantic_manifest,
-                view=view, decompiler=decompiler, open_obligations=(),
-                max_tokens=strict_comparator_max_tokens,
-                max_attempts=format_max_attempts, tracer=tracer,
-                enable_thinking=semantic_audit_enable_thinking,
-                temperature=semantic_audit_temperature,
-                top_p=semantic_audit_top_p,
-                top_k=semantic_audit_top_k,
-                min_p=semantic_audit_min_p,
-                presence_penalty=semantic_audit_presence_penalty,
-                repetition_penalty=semantic_audit_repetition_penalty,
-                thm_name=thm_name, round_index=round_index,
-            )
+        comparator = run_whole_cot_comparator(
+            client, model, informal_statement=informal_statement,
+            informal_proof=informal_proof, claimed_answer=claimed_answer,
+            view=view, decompiler=decompiler,
+            max_tokens=strict_comparator_max_tokens,
+            max_attempts=format_max_attempts, tracer=tracer,
+            enable_thinking=semantic_audit_enable_thinking,
+            temperature=semantic_audit_temperature,
+            top_p=semantic_audit_top_p,
+            top_k=semantic_audit_top_k,
+            min_p=semantic_audit_min_p,
+            presence_penalty=semantic_audit_presence_penalty,
+            repetition_penalty=semantic_audit_repetition_penalty,
+            thm_name=thm_name, round_index=round_index,
+        )
         comparator_cache[cache_key] = comparator
     return BlueprintValidation(
         lean_result=validation.lean_result,
         semantic_issues=validation.semantic_issues,
         structural_errors=validation.structural_errors,
         standalone_report=validation.standalone_report,
+        canonical_lean_result=validation.canonical_lean_result,
+        mechanical_stage_reached=validation.mechanical_stage_reached,
+        mechanical_failure_stage=validation.mechanical_failure_stage,
+        semantic_audit_invoked=True,
         formal_decompiler_result=decompiler,
         strict_comparator_result=comparator,
-        semantic_audit_protocol=(
-            WHOLE_COT_PROMPT_VERSION if whole_cot else "blueprint-semantic-audit-v1"
-        ),
+        semantic_audit_protocol=WHOLE_COT_PROMPT_VERSION,
     )
 
 
@@ -355,8 +305,7 @@ def generation_round_classification(
         return "structuralRejected" if round_index >= max_turns else None
     if semantic_error_count:
         return "semanticRejected" if round_index >= max_turns else None
-    if warning_count:
-        return "acceptedWithWarnings" if round_index >= max_turns else None
+    del warning_count
     return "strictAccepted"
 
 
@@ -369,15 +318,20 @@ def _issue(
     code: str,
     message: Any,
     *,
+    stage: str,
     node_name: str = "",
-    step_id: str = "",
 ) -> dict[str, Any]:
-    return {
+    normalized = _normalized_message(message)
+    result = {
+        "stage": stage,
         "code": code,
         "nodeName": node_name,
-        "stepId": step_id,
-        "message": _normalized_message(message),
+        "message": normalized,
     }
+    result["diagnosticFingerprint"] = hashlib.sha256(
+        "\x00".join((stage, code, node_name, normalized)).encode()
+    ).hexdigest()
+    return result
 
 
 def _deduplicate(items: Sequence[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
@@ -385,9 +339,9 @@ def _deduplicate(items: Sequence[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
     seen: set[str] = set()
     for item in items:
         fingerprint = "|".join((
+            str(item.get("stage") or ""),
             str(item.get("code") or ""),
             str(item.get("nodeName") or ""),
-            str(item.get("stepId") or ""),
             str(item.get("message") or ""),
         ))
         if fingerprint in seen:
@@ -438,11 +392,11 @@ def _feedback(
     semantic: Sequence[dict[str, Any]],
     warnings: Sequence[dict[str, Any]],
 ) -> str:
+    del warnings
     sections: list[str] = []
     for title, values in (
         ("DETERMINISTIC_ERRORS", deterministic),
         ("SEMANTIC_ERRORS", semantic),
-        ("WARNINGS", warnings),
     ):
         lines = [title]
         if not values:
@@ -450,8 +404,8 @@ def _feedback(
         else:
             for item in values:
                 lines.append(
-                    f"- {item.get('code')} node={item.get('nodeName') or '<none>'} "
-                    f"step={item.get('stepId') or '<none>'}: {item.get('message')}"
+                    f"- [{item.get('stage')}] {item.get('code')} "
+                    f"node={item.get('nodeName') or '<none>'}: {item.get('message')}"
                 )
         sections.append("\n".join(lines))
     return "\n\n".join(sections)
@@ -465,7 +419,7 @@ def _messages(
     claimed_answer: str,
     previous_blueprint: str,
     previous_feedback: str,
-    source_grounding_mode: str = "formal_steps",
+    prompt_profile: str = "whole_cot_minimal",
 ) -> list[dict[str, str]]:
     user = render(
         ROBUSTPA_BLUEPRINT_USER_TEMPLATE,
@@ -486,10 +440,10 @@ def _messages(
             + previous_feedback
         )
     return [
-        {"role": "system", "content": ROBUSTPA_BLUEPRINT_SYSTEM_PROMPT + (
-            WHOLE_COT_GENERATION_SYSTEM_SUFFIX
-            if source_grounding_mode == "whole_cot"
-            else GENERATION_SYSTEM_SUFFIX
+        {"role": "system", "content": (
+            ROBUSTPA_BLUEPRINT_MINIMAL_SYSTEM_PROMPT
+            if prompt_profile == "whole_cot_minimal"
+            else ROBUSTPA_BLUEPRINT_SYSTEM_PROMPT + WHOLE_COT_GENERATION_SYSTEM_SUFFIX
         )},
         {"role": "user", "content": user},
     ]
@@ -503,67 +457,92 @@ def _submitted_code(response: Any) -> tuple[str, list[dict[str, Any]]]:
         problems.append(_issue(
             "phase1ToolCallCount",
             f"expected exactly one lean_compile call, received {len(calls)}",
+            stage="parse_basic",
         ))
         return "", problems
     call = calls[0]
     if str(call.function.name) != "lean_compile":
         problems.append(_issue(
             "phase1WrongTool", f"expected lean_compile, received {call.function.name}",
+            stage="parse_basic",
         ))
         return "", problems
     try:
         arguments = json.loads(call.function.arguments or "{}")
     except json.JSONDecodeError as exc:
-        problems.append(_issue("phase1ToolArguments", str(exc)))
+        problems.append(_issue("phase1ToolArguments", str(exc), stage="parse_basic"))
         return "", problems
     code = arguments.get("lean_code") if isinstance(arguments, dict) else None
     if not isinstance(code, str) or not code.strip():
-        problems.append(_issue("phase1ToolArguments", "lean_code must be a non-empty string"))
+        problems.append(_issue(
+            "phase1ToolArguments", "lean_code must be a non-empty string",
+            stage="parse_basic",
+        ))
         return "", problems
     return code.strip() + "\n", problems
 
 
-def _contract_errors(
-    blueprint: Blueprint, target_name: str, *, source_grounding_mode: str = "formal_steps",
-) -> list[dict[str, Any]]:
+def _contract_errors(blueprint: Blueprint, target_name: str) -> list[dict[str, Any]]:
     errors: list[dict[str, Any]] = []
     if not blueprint.nodes:
-        errors.append(_issue("noBlueprintNodes", "no annotated declarations were parsed"))
+        errors.append(_issue(
+            "noBlueprintNodes", "no annotated declarations were parsed", stage="parse_basic",
+        ))
         return errors
     if _extract_target_name(blueprint.lean_file, "") != target_name:
-        errors.append(_issue("missingOrWrongRoot", f"root theorem must be named {target_name}"))
+        errors.append(_issue(
+            "missingOrWrongRoot", f"root theorem must be named {target_name}",
+            stage="parse_basic",
+        ))
     if "PendingBlueprintClaim" in blueprint.lean_file:
         errors.append(_issue(
             "forbiddenPendingClaim", "Phase 1 forbids PendingBlueprintClaim everywhere",
+            stage="parse_basic",
         ))
     for raw in _unannotated_local_declaration_errors(blueprint):
-        errors.append(_issue(raw.split(":", 1)[0], raw))
-    for raw in phase2_contract_errors(blueprint):
-        errors.append(_issue(raw.split(":", 1)[0], raw))
-    for node in blueprint.nodes:
-        if not node.statement.strip():
-            errors.append(_issue(
-                "missingStatementMetadata", "statement metadata is empty",
-                node_name=node.name,
-                step_id=node.source_step_id if source_grounding_mode == "formal_steps" else "",
-            ))
-        if node.kind in {"lemma", "theorem"} and not node.proof_sketch.strip():
-            errors.append(_issue(
-                "missingProofMetadata", "proof metadata is empty",
-                node_name=node.name,
-                step_id=node.source_step_id if source_grounding_mode == "formal_steps" else "",
-            ))
+        errors.append(_issue(raw.split(":", 1)[0], raw, stage="parse_basic"))
     return errors
 
 
-def _non_sorry_warnings(values: Sequence[str], code: str) -> list[dict[str, Any]]:
+def _non_sorry_warnings(
+    values: Sequence[str], code: str, *, stage: str,
+) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for value in values:
         lowered = value.lower()
         if "declaration uses" in lowered and ("sorry" in lowered or "admit" in lowered):
             continue
-        result.append(_issue(code, value))
+        result.append(_issue(code, value, stage=stage))
     return result
+
+
+def _not_run_report(reason: str) -> Phase2StandaloneReport:
+    return Phase2StandaloneReport((), 0, 0, 0.0, reason)
+
+
+def _failed_compile(message: str = "not run") -> CompilerResult:
+    return CompilerResult(False, errors=[message], failure_kind="assembly")
+
+
+def _mechanical_validation(
+    *,
+    whole_result: CompilerResult,
+    stage_reached: str,
+    failure_stage: str | None,
+    canonical_result: CompilerResult | None = None,
+    structural: Sequence[str] = (),
+    standalone: Phase2StandaloneReport | None = None,
+    static_issues: Sequence[SemanticIssue] = (),
+) -> BlueprintValidation:
+    return BlueprintValidation(
+        lean_result=whole_result,
+        semantic_issues=list(static_issues),
+        structural_errors=list(structural),
+        standalone_report=standalone or _not_run_report(failure_stage or "notRun"),
+        canonical_lean_result=canonical_result,
+        mechanical_stage_reached=stage_reached,
+        mechanical_failure_stage=failure_stage,
+    )
 
 
 def _validate_round(
@@ -571,11 +550,9 @@ def _validate_round(
     *,
     target_name: str,
     compiler: KiminaLeanCompiler,
-    semantic_manifest,
     informal_statement: str,
     informal_proof: str,
     claimed_answer: str,
-    source_grounding_mode: str,
     standalone_concurrency: int,
     client: Any,
     model: str,
@@ -596,87 +573,105 @@ def _validate_round(
     decompiler_cache: dict[str, Any],
     comparator_cache: dict[str, Any],
 ) -> tuple[Blueprint, BlueprintValidation, tuple[dict[str, Any], ...], tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
+    """Validate one candidate with strict mechanical short-circuiting."""
     candidate = _parse_blueprint(code, target_name)
-    deterministic: list[dict[str, Any]] = _contract_errors(
-        candidate, target_name, source_grounding_mode=source_grounding_mode,
-    )
+    deterministic: list[dict[str, Any]] = _contract_errors(candidate, target_name)
+    warnings: list[dict[str, Any]] = []
+    if deterministic:
+        validation = _mechanical_validation(
+            whole_result=_failed_compile("whole_file_lean not run"),
+            stage_reached="parse_basic", failure_stage="parse_basic",
+        )
+        return candidate, validation, _deduplicate(deterministic), (), ()
+
     lean_result = compiler.check_blueprint(code, target_name)
     if lean_result.failure_kind == "infra":
         raise KiminaInfrastructureError(
             "\n".join(lean_result.diagnostics) or lean_result.raw_output[-2000:]
         )
-    deterministic.extend(_issue("wholeFileLean", value) for value in lean_result.diagnostics)
-    warnings: list[dict[str, Any]] = _non_sorry_warnings(lean_result.warnings, "leanWarning")
-
-    semantic_issues = validate_blueprint_fidelity(
-        candidate,
-        semantic_manifest,
-        claimed_answer=claimed_answer,
-        require_step_bindings=source_grounding_mode == "formal_steps",
-    ) if candidate.nodes else []
-    for issue in semantic_issues:
-        row = _issue(
-            issue.code, issue.message, node_name=issue.node_name,
-            step_id=issue.step_id if source_grounding_mode == "formal_steps" else "",
+    warnings.extend(_non_sorry_warnings(
+        lean_result.warnings, "leanWarning", stage="whole_file_lean",
+    ))
+    if not lean_result.success:
+        deterministic.extend(
+            _issue("wholeFileLean", value, stage="whole_file_lean")
+            for value in lean_result.diagnostics
         )
-        if issue.severity == "error":
-            deterministic.append(row)
-        elif issue.severity == "warning":
-            warnings.append(row)
-
-    formal_blueprint = candidate
-    canonical_result = None
-    if candidate.nodes:
-        try:
-            formal_blueprint = canonicalize_blueprint(candidate, list(candidate.nodes))
-        except ValueError as exc:
-            deterministic.append(_issue("canonicalRebuild", str(exc)))
-        else:
-            canonical_result = compiler.check_blueprint(formal_blueprint.lean_file, target_name)
-            if canonical_result.failure_kind == "infra":
-                raise KiminaInfrastructureError(
-                    "\n".join(canonical_result.diagnostics)
-                    or canonical_result.raw_output[-2000:]
-                )
-            deterministic.extend(
-                _issue("canonicalLean", value) for value in canonical_result.diagnostics
-            )
-            warnings.extend(_non_sorry_warnings(canonical_result.warnings, "canonicalLeanWarning"))
-
-    structural = phase2_contract_errors(formal_blueprint) if formal_blueprint.nodes else []
-    if canonical_result is not None and canonical_result.success and not structural:
-        standalone = phase2_standalone_contract_report(
-            formal_blueprint,
-            compiler,
-            concurrency=standalone_concurrency,
-            cache=standalone_cache,
-            tracer=tracer,
-            thm_name=thm_name,
-            round_index=round_index,
+        validation = _mechanical_validation(
+            whole_result=lean_result, stage_reached="whole_file_lean",
+            failure_stage="whole_file_lean",
         )
-    else:
-        standalone = Phase2StandaloneReport((), 0, 0, 0.0, "deterministicErrors")
+        return candidate, validation, _deduplicate(deterministic), (), _deduplicate(warnings)
+
+    try:
+        formal_blueprint = canonicalize_blueprint(candidate, list(candidate.nodes))
+    except ValueError as exc:
+        deterministic.append(_issue("canonicalRebuild", str(exc), stage="canonical_rebuild"))
+        validation = _mechanical_validation(
+            whole_result=lean_result, stage_reached="canonical_rebuild",
+            failure_stage="canonical_rebuild",
+        )
+        return candidate, validation, _deduplicate(deterministic), (), _deduplicate(warnings)
+
+    structural = phase2_contract_errors(formal_blueprint)
     for raw in structural:
-        deterministic.append(_issue("phase2Structural", raw))
+        deterministic.append(_issue(
+            raw.split(":", 1)[0], raw, stage="phase2_contract",
+        ))
+    if structural:
+        validation = _mechanical_validation(
+            whole_result=lean_result, stage_reached="phase2_contract",
+            failure_stage="phase2_contract", structural=structural,
+        )
+        return formal_blueprint, validation, _deduplicate(deterministic), (), _deduplicate(warnings)
+
+    canonical_result = compiler.check_blueprint(formal_blueprint.lean_file, target_name)
+    if canonical_result.failure_kind == "infra":
+        raise KiminaInfrastructureError(
+            "\n".join(canonical_result.diagnostics) or canonical_result.raw_output[-2000:]
+        )
+    warnings.extend(_non_sorry_warnings(
+        canonical_result.warnings, "canonicalLeanWarning", stage="canonical_lean",
+    ))
+    if not canonical_result.success:
+        deterministic.extend(
+            _issue("canonicalLean", value, stage="canonical_lean")
+            for value in canonical_result.diagnostics
+        )
+        validation = _mechanical_validation(
+            whole_result=lean_result, canonical_result=canonical_result,
+            stage_reached="canonical_lean", failure_stage="canonical_lean",
+        )
+        return formal_blueprint, validation, _deduplicate(deterministic), (), _deduplicate(warnings)
+
+    standalone = phase2_standalone_contract_report(
+        formal_blueprint, compiler, concurrency=standalone_concurrency,
+        cache=standalone_cache, tracer=tracer, thm_name=thm_name,
+        round_index=round_index,
+    )
     for item in standalone.issues:
         deterministic.append(_issue(
-            "phase2Standalone",
-            item.diagnostic,
-            node_name=item.node_name,
-            step_id=(
-                getattr(item, "step_id", "")
-                if source_grounding_mode == "formal_steps" else ""
-            ),
+            item.code or "phase2Standalone", item.diagnostic,
+            stage="phase2_standalone", node_name=item.node_name,
         ))
+    if standalone.issues:
+        validation = _mechanical_validation(
+            whole_result=lean_result, canonical_result=canonical_result,
+            stage_reached="phase2_standalone", failure_stage="phase2_standalone",
+            structural=structural, standalone=standalone,
+        )
+        return formal_blueprint, validation, _deduplicate(deterministic), (), _deduplicate(warnings)
 
-    validation = BlueprintValidation(
-        lean_result=lean_result,
-        semantic_issues=semantic_issues,
-        structural_errors=structural,
-        standalone_report=standalone,
+    semantic_issues = validate_blueprint_fidelity(
+        formal_blueprint, claimed_answer=claimed_answer,
+    )
+    validation = _mechanical_validation(
+        whole_result=lean_result, canonical_result=canonical_result,
+        stage_reached="static_shadow", failure_stage=None,
+        structural=structural, standalone=standalone, static_issues=semantic_issues,
     )
     semantic: list[dict[str, Any]] = []
-    if formal_blueprint.nodes and _semantic_audit_eligible(validation):
+    try:
         validation = _with_semantic_audit(
             validation,
             formal_blueprint,
@@ -685,8 +680,6 @@ def _validate_round(
             informal_statement=informal_statement,
             informal_proof=informal_proof,
             claimed_answer=claimed_answer,
-            semantic_manifest=semantic_manifest,
-            source_grounding_mode=source_grounding_mode,
             formal_decompiler_max_tokens=decompiler_max_tokens,
             strict_comparator_max_tokens=comparator_max_tokens,
             format_max_attempts=semantic_format_attempts,
@@ -703,61 +696,41 @@ def _validate_round(
             thm_name=thm_name,
             round_index=round_index,
         )
-        decompiler = validation.formal_decompiler_result
-        comparator = validation.strict_comparator_result
-        if decompiler is not None:
-            for node_name in decompiler.vacuous_nodes:
-                node = formal_blueprint.node_by_name(node_name)
-                semantic.append(_issue(
-                    "vacuousFormalNode",
-                    "Formal Decompiler classified this node as vacuous",
-                    node_name=node_name,
-                    step_id=(
-                        node.source_step_id
-                        if node and source_grounding_mode == "formal_steps" else ""
-                    ),
+    except Exception as exc:
+        validation.semantic_audit_invoked = True
+        validation.mechanical_stage_reached = "formal_decompiler_or_comparator"
+        raise SemanticAuditExecutionError(str(exc), validation) from exc
+
+    decompiler = validation.formal_decompiler_result
+    comparator = validation.strict_comparator_result
+    if decompiler is not None:
+        for node_name in decompiler.vacuous_nodes:
+            semantic.append(_issue(
+                "vacuousFormalNode",
+                "Formal Decompiler classified this node as vacuous",
+                stage="formal_decompiler", node_name=node_name,
+            ))
+    if comparator is not None:
+        for defect in whole_cot_comparator_defects(comparator):
+            names = list(defect.get("node_names") or ())
+            semantic.append(_issue(
+                str(defect.get("category") or "semanticDefect"),
+                f"{defect.get('requirement')} Reason: {defect.get('reason')}",
+                stage="whole_cot_comparator", node_name=",".join(names),
+            ))
+        if not comparator.passed and not semantic:
+            semantic.append(_issue(
+                "semanticComparatorRejected",
+                "The Whole-COT semantic comparator rejected the candidate.",
+                stage="whole_cot_comparator",
+            ))
+        for item in comparator.unreachable_nodes:
+            if item.get("justified_side_branch"):
+                warnings.append(_issue(
+                    "justifiedSideBranch", item.get("reason"),
+                    stage="whole_cot_comparator",
+                    node_name=str(item.get("node_name") or ""),
                 ))
-        if comparator is not None:
-            defects = (
-                whole_cot_comparator_defects(comparator)
-                if source_grounding_mode == "whole_cot"
-                else comparator_defects(comparator)
-            )
-            for defect in defects:
-                names = list(defect.get("node_names") or ())
-                semantic.append(_issue(
-                    str(defect.get("category") or "semanticDefect"),
-                    f"{defect.get('requirement')} Reason: {defect.get('reason')}",
-                    node_name=",".join(names),
-                    step_id=(
-                        "" if source_grounding_mode == "whole_cot"
-                        else str(defect.get("step_id") or "")
-                    ),
-                ))
-            if not comparator.passed and not defects:
-                semantic.append(_issue(
-                    "semanticComparatorRejected",
-                    "The strict semantic comparator rejected the candidate.",
-                ))
-            unreachable_items = (
-                comparator.unreachable_nodes
-                if source_grounding_mode == "whole_cot"
-                else comparator.unreachable_steps
-            )
-            for item in unreachable_items:
-                if item.get("justified_side_branch"):
-                    warnings.append(_issue(
-                        "justifiedSideBranch",
-                        item.get("reason"),
-                        node_name=(
-                            str(item.get("node_name") or "")
-                            if source_grounding_mode == "whole_cot" else ""
-                        ),
-                        step_id=(
-                            "" if source_grounding_mode == "whole_cot"
-                            else str(item.get("step_id") or "")
-                        ),
-                    ))
 
     return (
         formal_blueprint,
@@ -772,7 +745,6 @@ def generate_blueprint(
     *,
     informal_statement: str,
     informal_proof: str,
-    cot_manifest_json: str,
     claimed_answer: str,
     target_name: str,
     model: str,
@@ -801,19 +773,12 @@ def generate_blueprint(
     semantic_audit_min_p: float = 0.0,
     semantic_audit_presence_penalty: float = 0.0,
     semantic_audit_repetition_penalty: float = 1.0,
-    source_grounding_mode: str = "formal_steps",
+    prompt_profile: str = "whole_cot_minimal",
 ) -> Blueprint:
     if max_turns <= 0:
         raise ValueError("generation max_turns must be positive")
-    if source_grounding_mode not in {"formal_steps", "whole_cot"}:
-        raise ValueError("source_grounding_mode must be formal_steps or whole_cot")
-    semantic_manifest = (
-        parse_cot_manifest(cot_manifest_json)
-        if source_grounding_mode == "formal_steps" else None
-    )
-    source_proof = informal_proof
-    if source_grounding_mode == "formal_steps":
-        source_proof = _render_step_grounded_proof(cot_manifest_json, include_ir=False)
+    if prompt_profile not in {"whole_cot_minimal", "standard"}:
+        raise ValueError("prompt_profile must be whole_cot_minimal or standard")
     client = make_client(model)
     previous_code = ""
     previous_feedback = ""
@@ -833,11 +798,11 @@ def generate_blueprint(
         messages = _messages(
             target_name=target_name,
             informal_statement=informal_statement,
-            informal_proof=source_proof,
+            informal_proof=informal_proof,
             claimed_answer=claimed_answer,
             previous_blueprint=previous_code,
             previous_feedback=previous_feedback,
-            source_grounding_mode=source_grounding_mode,
+            prompt_profile=prompt_profile,
         )
         input_tokens, completion_budget = generation_request_budget(
             messages,
@@ -870,8 +835,7 @@ def generate_blueprint(
                 span_id=span_id,
                 args={
                     "round": round_index,
-                    "sourceGroundingMode": source_grounding_mode,
-                    "splitterInvoked": source_grounding_mode == "formal_steps",
+                    "promptProfile": prompt_profile,
                     "inputTokens": input_tokens,
                     "maxCompletionTokens": completion_budget,
                     "enableThinking": enable_thinking,
@@ -935,41 +899,77 @@ def generate_blueprint(
             previous_code = code
             candidates.append(code)
             labels.append(f"generation_round_{round_index}")
-            (
-                latest_blueprint,
-                latest_validation,
-                latest_deterministic,
-                latest_semantic,
-                latest_warnings,
-            ) = _validate_round(
-                code,
-                target_name=target_name,
-                compiler=compiler,
-                semantic_manifest=semantic_manifest,
-                informal_statement=informal_statement,
-                informal_proof=informal_proof,
-                claimed_answer=claimed_answer,
-                source_grounding_mode=source_grounding_mode,
-                standalone_concurrency=standalone_concurrency,
-                client=client,
-                model=model,
-                decompiler_max_tokens=decompiler_max_tokens,
-                comparator_max_tokens=comparator_max_tokens,
-                semantic_format_attempts=semantic_format_attempts,
-                semantic_audit_enable_thinking=semantic_audit_enable_thinking,
-                semantic_audit_temperature=semantic_audit_temperature,
-                semantic_audit_top_p=semantic_audit_top_p,
-                semantic_audit_top_k=semantic_audit_top_k,
-                semantic_audit_min_p=semantic_audit_min_p,
-                semantic_audit_presence_penalty=semantic_audit_presence_penalty,
-                semantic_audit_repetition_penalty=semantic_audit_repetition_penalty,
-                tracer=tracer,
-                thm_name=thm_name,
-                round_index=round_index,
-                standalone_cache=standalone_cache,
-                decompiler_cache=decompiler_cache,
-                comparator_cache=comparator_cache,
-            )
+            try:
+                (
+                    latest_blueprint,
+                    latest_validation,
+                    latest_deterministic,
+                    latest_semantic,
+                    latest_warnings,
+                ) = _validate_round(
+                    code, target_name=target_name, compiler=compiler,
+                    informal_statement=informal_statement,
+                    informal_proof=informal_proof, claimed_answer=claimed_answer,
+                    standalone_concurrency=standalone_concurrency, client=client,
+                    model=model, decompiler_max_tokens=decompiler_max_tokens,
+                    comparator_max_tokens=comparator_max_tokens,
+                    semantic_format_attempts=semantic_format_attempts,
+                    semantic_audit_enable_thinking=semantic_audit_enable_thinking,
+                    semantic_audit_temperature=semantic_audit_temperature,
+                    semantic_audit_top_p=semantic_audit_top_p,
+                    semantic_audit_top_k=semantic_audit_top_k,
+                    semantic_audit_min_p=semantic_audit_min_p,
+                    semantic_audit_presence_penalty=semantic_audit_presence_penalty,
+                    semantic_audit_repetition_penalty=semantic_audit_repetition_penalty,
+                    tracer=tracer, thm_name=thm_name, round_index=round_index,
+                    standalone_cache=standalone_cache,
+                    decompiler_cache=decompiler_cache,
+                    comparator_cache=comparator_cache,
+                )
+            except SemanticAuditExecutionError as exc:
+                latest_blueprint = _parse_blueprint(code, target_name)
+                latest_validation = exc.validation
+                details = validation_details(latest_validation)
+                audit_error = _issue(
+                    "semanticAuditError", exc,
+                    stage="formal_decompiler_or_comparator",
+                )
+                failed_round = GenerationRound(
+                    round_index=round_index,
+                    candidate_hash=hashlib.sha256(code.encode()).hexdigest(),
+                    input_tokens=input_tokens,
+                    max_completion_tokens=completion_budget,
+                    deterministic_errors=(),
+                    semantic_errors=(),
+                    warnings=(),
+                    validation={**details, "semanticAuditError": audit_error},
+                )
+                rounds.append(failed_round)
+                details.update({
+                    "classification": "semanticAuditError",
+                    "terminalCategory": "semanticAuditError",
+                    "semanticAuditError": audit_error,
+                    "generationRounds": [item.to_dict() for item in rounds],
+                })
+                if tracer:
+                    tracer.emit(TraceEvent(
+                        kind="phase1FinalClassification",
+                        thm_name=thm_name,
+                        turn=round_index,
+                        args={
+                            "classification": "semanticAuditError",
+                            "error": audit_error,
+                        },
+                        ok=False,
+                    ))
+                raise BlueprintGenerationError(
+                    "Phase 1 semantic audit exhausted its request/schema retries.",
+                    last_candidate=code, diagnostics=[str(exc)], attempt=round_index,
+                    failure_stage="phase1SemanticAuditError",
+                    candidate_history=candidates, candidate_labels=labels,
+                    validation_details=details,
+                    generation_history=[item.to_dict() for item in rounds],
+                ) from exc
             previous_feedback = _feedback(
                 latest_deterministic, latest_semantic, latest_warnings,
             )
@@ -987,9 +987,16 @@ def generate_blueprint(
             details,
         )
         rounds.append(round_row)
+        semantic_invoked = bool(
+            latest_validation and latest_validation.semantic_audit_invoked
+        )
         for kind, inventory, ok in (
             ("phase1DeterministicValidation", latest_deterministic, not latest_deterministic),
-            ("phase1SemanticAudit", latest_semantic, not latest_semantic),
+            (
+                "phase1SemanticAudit" if semantic_invoked else "phase1SemanticAuditSkipped",
+                latest_semantic,
+                not latest_semantic if semantic_invoked else True,
+            ),
             ("phase1WarningInventory", latest_warnings, not latest_warnings),
         ):
             if tracer:
@@ -997,7 +1004,10 @@ def generate_blueprint(
                     kind=kind,
                     thm_name=thm_name,
                     turn=round_index,
-                    args={"round": round_index, "count": len(inventory), "issues": list(inventory)},
+                    args={
+                        "round": round_index, "invoked": semantic_invoked,
+                        "count": len(inventory), "issues": list(inventory),
+                    },
                     ok=ok,
                 ))
         if tracer:
@@ -1046,8 +1056,8 @@ def generate_blueprint(
                 semantic_errors=latest_semantic,
                 warnings=latest_warnings,
             )
-            final_details["sourceGroundingMode"] = source_grounding_mode
-            final_details["splitterInvoked"] = source_grounding_mode == "formal_steps"
+            final_details["staticGateMode"] = "shadow"
+            final_details["semanticStaticGate"] = False
             latest_blueprint.generation_validation = final_details
             latest_blueprint.generation_history = [item.to_dict() for item in rounds]
             latest_blueprint.candidate_history = list(candidates)
@@ -1081,9 +1091,14 @@ def generate_blueprint(
     )
     final_details = validation_details(latest_validation) if latest_validation else {}
     final_details.update({
-        "sourceGroundingMode": source_grounding_mode,
-        "splitterInvoked": source_grounding_mode == "formal_steps",
         "classification": "structuralRejected" if deterministic_failed else "semanticRejected",
+        "terminalCategory": "mechanicalRejected" if deterministic_failed else "semanticRejected",
+        "terminalMechanicalStage": (
+            latest_validation.mechanical_failure_stage
+            if deterministic_failed and latest_validation else None
+        ),
+        "staticGateMode": "shadow",
+        "semanticStaticGate": False,
         "finalErrorKinds": [
             name for name, present in (
                 ("deterministic", deterministic_failed), ("semantic", semantic_failed),

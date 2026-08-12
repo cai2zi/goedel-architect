@@ -46,27 +46,10 @@ shared_vllm_397b:
   enable_auto_tool_choice: true
   extra_args: []
 
-step_splitter:
-  model: ${shared_vllm_397b.served_model_name}
-  openai_base_url: http://127.0.0.1:8001/v1
-  api_key: dummy
-  vllm: ${shared_vllm_397b}
-  tokenizer_path: ${shared_vllm_397b.model_path}
-  temperature: 0.0
-  max_tokens: 2048
-  concurrency: 24
-  timeout_s: 600
-  max_attempts: 2
-  enable_thinking: false
-  target_tokens_per_step: 100
-  min_target_steps: 5
-  max_target_steps: 16
-  prompt_version: formal-step-boundary-v4
-
 blueprint:
   problem_id: null
   execution_mode: full
-  source_grounding_mode: formal_steps
+  generation_prompt_profile: whole_cot_minimal
   phase1_input_experiment_root: null
   model: Qwen3.5-397B-A17B-FP8
   openai_base_url: http://127.0.0.1:8001/v1

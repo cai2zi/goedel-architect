@@ -13,14 +13,19 @@ sys.path[:0] = [str(ROOT / "experiments"), str(ROOT / "src")]
 
 from blueprint import _parse_blueprint  # noqa: E402
 from blueprint_generation import (  # noqa: E402
+    BlueprintValidation,
     GenerationRound,
     _accepted_validation_details,
     _contract_errors,
     _messages,
     _submitted_code,
+    _validate_round,
     generation_request_budget,
     generation_round_classification,
 )
+from blueprint import Phase2StandaloneReport  # noqa: E402
+from kimina_lean_compiler import CompilerResult  # noqa: E402
+from semantic_fidelity import SemanticIssue  # noqa: E402
 
 
 class _Tokenizer:
@@ -30,6 +35,12 @@ class _Tokenizer:
 
 
 class BlueprintGenerationTest(unittest.TestCase):
+    MINIMAL = '''import Mathlib
+import Architect
+@[blueprint] def model : Nat := 1
+@[blueprint] theorem root : model = 1 := by sorry_using [model]
+'''
+
     def test_accepted_terminal_details_are_json_serializable(self) -> None:
         details = {"semanticAudit": {"strictComparator": {"passed": True}}}
         current_round = GenerationRound(
@@ -72,6 +83,45 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
         codes = {item["code"] for item in _contract_errors(blueprint, "root")}
         self.assertIn("forbiddenPendingClaim", codes)
 
+    def test_minimal_metadata_is_not_required(self) -> None:
+        blueprint = _parse_blueprint(self.MINIMAL, "root")
+        self.assertEqual(_contract_errors(blueprint, "root"), [])
+
+    def test_static_shadow_errors_do_not_block_acceptance(self) -> None:
+        comparator = SimpleNamespace(passed=True)
+        validation = BlueprintValidation(
+            lean_result=CompilerResult(True),
+            canonical_lean_result=CompilerResult(True),
+            semantic_issues=[SemanticIssue("vacuous", "shadow only")],
+            structural_errors=[],
+            standalone_report=Phase2StandaloneReport((), 2, 0, 1.0),
+            strict_comparator_result=comparator,
+        )
+        self.assertTrue(validation.passed)
+
+    def test_whole_file_failure_short_circuits_semantic_audit(self) -> None:
+        compiler = SimpleNamespace(check_blueprint=lambda *_: CompilerResult(
+            False, errors=["bad syntax"], failure_kind="lean"
+        ))
+        with patch("blueprint_generation._with_semantic_audit") as audit:
+            _blueprint, validation, deterministic, semantic, _warnings = _validate_round(
+                self.MINIMAL, target_name="root", compiler=compiler,
+                informal_statement="problem", informal_proof="cot", claimed_answer="1",
+                standalone_concurrency=1, client=object(), model="model",
+                decompiler_max_tokens=16, comparator_max_tokens=16,
+                semantic_format_attempts=2, semantic_audit_enable_thinking=True,
+                semantic_audit_temperature=0.6, semantic_audit_top_p=0.95,
+                semantic_audit_top_k=20, semantic_audit_min_p=0.0,
+                semantic_audit_presence_penalty=0.0,
+                semantic_audit_repetition_penalty=1.0, tracer=None,
+                thm_name="id", round_index=1, standalone_cache={},
+                decompiler_cache={}, comparator_cache={},
+            )
+        audit.assert_not_called()
+        self.assertEqual(validation.mechanical_failure_stage, "whole_file_lean")
+        self.assertTrue(deterministic)
+        self.assertFalse(semantic)
+
     def test_submission_requires_one_full_lean_compile_call(self) -> None:
         call = SimpleNamespace(function=SimpleNamespace(
             name="lean_compile", arguments=json.dumps({"lean_code": "theorem root : True := by trivial"}),
@@ -83,15 +133,15 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
         self.assertFalse(errors)
         self.assertTrue(code.endswith("\n"))
 
-    def test_warning_only_waits_until_last_round(self) -> None:
-        self.assertIsNone(generation_round_classification(
+    def test_warning_only_is_immediately_accepted(self) -> None:
+        self.assertEqual(generation_round_classification(
             round_index=7, max_turns=8, deterministic_error_count=0,
             semantic_error_count=0, warning_count=1,
-        ))
+        ), "strictAccepted")
         self.assertEqual(generation_round_classification(
             round_index=8, max_turns=8, deterministic_error_count=0,
             semantic_error_count=0, warning_count=1,
-        ), "acceptedWithWarnings")
+        ), "strictAccepted")
 
     def test_error_precedence_and_strict_early_exit(self) -> None:
         self.assertEqual(generation_round_classification(
@@ -112,12 +162,12 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
             target_name="root", informal_statement="problem",
             informal_proof="raw complete cot", claimed_answer="6",
             previous_blueprint="", previous_feedback="",
-            source_grounding_mode="whole_cot",
+            prompt_profile="whole_cot_minimal",
         )
         rendered = "\n".join(item["content"] for item in messages)
         self.assertIn("raw complete cot", rendered)
         self.assertNotIn("COT_STEP:Snnn", rendered)
-        self.assertIn("title` metadata is optional", rendered)
+        self.assertIn("metadata are optional", rendered)
 
 
 if __name__ == "__main__":

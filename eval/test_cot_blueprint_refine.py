@@ -58,10 +58,6 @@ from cot_blueprint_refine.prepare_inputs import make_generation_row, prepare  # 
 from cot_blueprint_refine.extract_original_incorrect_subset import (  # noqa: E402
     extract_incorrect_rows,
 )
-from cot_blueprint_refine.formal_steps import (  # noqa: E402
-    encode_formal_step_manifest,
-    make_formal_step_manifest,
-)
 from cot_blueprint_refine.run_cot_refinement import (  # noqa: E402
     _call_one,
     build_messages,
@@ -202,15 +198,15 @@ class PrepareInputsTest(unittest.TestCase):
     def test_composite_stage_sequences(self) -> None:
         self.assertEqual(
             STAGE_SEQUENCES["cot-to-blueprint"],
-            ("prepare", "split", "blueprint", "export"),
+            ("prepare", "blueprint", "export"),
         )
         self.assertEqual(
             STAGE_SEQUENCES["blueprint-refine"],
-            ("prepare", "split", "blueprint", "export", "refine"),
+            ("prepare", "blueprint", "export", "refine"),
         )
         self.assertEqual(
             STAGE_SEQUENCES["phase1-only"],
-            ("prepare", "split", "blueprint"),
+            ("prepare", "blueprint"),
         )
 
     def test_filters_length_and_does_not_put_gold_in_generation_data(self) -> None:
@@ -326,17 +322,15 @@ theorem target : True := by sorry_using [checked_step]
         self.assertEqual(prompt_signal("protocol_error"), "NOT_PROVED")
         self.assertEqual(prompt_signal("solved", proved=True), "PROVED")
 
-    def test_source_step_is_exported_and_definition_is_not_called_proved(self) -> None:
+    def test_definition_is_not_called_proved(self) -> None:
         code = """import Mathlib
 import Architect
 
 @[blueprint
-  (title := "COT_STEP:S001")
   (statement := /-- The source value. -/)]
 def source_value : Nat := 7
 
 @[blueprint
-  (title := "COT_STEP:S002")
   (statement := /-- The target. -/)
   (proof := /-- Use the source value. -/)]
 theorem target : source_value = 7 := by sorry_using [source_value]
@@ -352,15 +346,11 @@ theorem target : source_value = 7 := by sorry_using [source_value]
         context, nodes, infra = render_blueprint_context(blueprint, state)
 
         self.assertFalse(infra)
-        self.assertIn("COT_BLUEPRINT_SOURCE_STEP: S001", context)
-        self.assertIn("COT_BLUEPRINT_SOURCE_STEP: S002", context)
         self.assertIn("COT_BLUEPRINT_NODE_STATUS: DEFINITION", context)
         self.assertIn("not a proof", context)
         self.assertNotIn("COT_BLUEPRINT_NODE_STATUS: PROVED\ndef source_value", context)
-        self.assertEqual(nodes[0]["source_step_id"], "S001")
         self.assertEqual(nodes[0]["prompt_signal"], "DEFINITION")
         self.assertEqual(nodes[0]["raw_signal"], "solved")
-        self.assertEqual(nodes[1]["source_step_id"], "S002")
 
     def test_blueprint_refine_prompt_explains_definition_and_source_mapping(self) -> None:
         messages = build_messages(
@@ -1965,7 +1955,7 @@ class BlueprintResumeTest(unittest.TestCase):
             config.blueprint.execution_mode = "phase2_only"
             self.assertFalse(blueprint_results_complete(config))
 
-    def test_resume_rejects_changed_cot_manifest(self) -> None:
+    def test_resume_ignores_removed_legacy_manifest_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             output_root = root / "out" / "unit"
@@ -1987,8 +1977,7 @@ class BlueprintResumeTest(unittest.TestCase):
                 "blueprint": {"retry_error_results": False},
             })
 
-            with self.assertRaisesRegex(RuntimeError, "changed COT manifests"):
-                blueprint_results_complete(config)
+            self.assertTrue(blueprint_results_complete(config))
 
     def test_run_all_uses_stage_environment_variable(self) -> None:
         script = (REPO_ROOT / "experiments/cot_blueprint_refine/run_all.sh").read_text(

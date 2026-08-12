@@ -1,12 +1,18 @@
-# Full Qwen3-8B evaluation input: 660 raw rows, of which 646 have
-# finish_reason=stop and are eligible for the existing prepare stage.
-input_predictions: /ssd/czx/czx_work/math_verify_eval/qwen3_8b_math_verify/predictions.jsonl
+input_predictions: /ssd/czx/czx_work/cot_blueprint_refine/subsets/qwen3_8b_original_answer_incorrect/predictions.jsonl
 output_base: /ssd/czx/czx_work/cot_blueprint_refine
-exp_name: qwen3_8b_397b_all646_blueprint_generation
-resume: true
-vllm: {use_existing: true}
+exp_name: qwen3_8b_397b_wrong2_whole_cot_subtractive_v1
+resume: false
+include_ids:
+  - MATH-500/test/counting_and_probability/765.json
+  - MATH-500/test/precalculus/1056.json
+
+vllm:
+  use_existing: false
+  auto_start: true
+  auto_destroy: true
 shared_vllm_397b: {reasoning_parser: qwen3}
 kimina: {use_existing: true, auto_start: false, auto_destroy: false}
+
 blueprint:
   generation_prompt_profile: whole_cot_minimal
   execution_mode: phase1_only
@@ -20,10 +26,19 @@ blueprint:
   generation_repetition_penalty: 1.0
   generation_model_max_context: 40960
   generation_context_safety_margin: 512
-  formal_decompiler_max_tokens: 4096
-  strict_comparator_max_tokens: 4096
+
+  semantic_audit_enable_thinking: true
+  semantic_audit_temperature: 0.6
+  semantic_audit_top_p: 0.95
+  semantic_audit_top_k: 20
+  semantic_audit_min_p: 0.0
+  semantic_audit_presence_penalty: 0.0
+  semantic_audit_repetition_penalty: 1.0
+  formal_decompiler_max_tokens: 16384
+  strict_comparator_max_tokens: 16384
   semantic_format_max_attempts: 2
-  phase1_concurrency: 512
+
+  phase1_concurrency: 2
   phase2_contract_check_concurrency: 32
   lean_max_inflight_snippets: 48
   lean_batch_size: 8

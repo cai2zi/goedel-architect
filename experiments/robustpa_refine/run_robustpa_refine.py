@@ -45,7 +45,7 @@ from robustpa_refine.runtime import (  # noqa: E402
 from mathlib_retrieval import MathlibRetrieval  # noqa: E402
 from orchestrator import active_node_names  # noqa: E402
 from pipeline import run_phase2_async, run_phase3  # noqa: E402
-from semantic_fidelity import parse_cot_manifest, snapshot_blueprint_semantics  # noqa: E402
+from semantic_fidelity import snapshot_blueprint_semantics  # noqa: E402
 from tracer import JsonlTracer, TraceEvent  # noqa: E402
 
 
@@ -115,8 +115,6 @@ class Record:
     theorem_name: str
     informal_statement: str
     informal_proof: str
-    cot_manifest_json: str
-    source_grounding_mode: str
     claimed_answer: str
 
 
@@ -189,7 +187,7 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
     args.critical_negation_max_turns = int(args.critical_negation_max_turns)
     args.max_tool_calls_per_turn = int(args.max_tool_calls_per_turn)
     args.generation_max_turns = int(args.generation_max_turns)
-    args.source_grounding_mode = str(args.source_grounding_mode)
+    args.generation_prompt_profile = str(args.generation_prompt_profile)
     args.generation_enable_thinking = bool(args.generation_enable_thinking)
     for name in (
         "generation_temperature", "generation_top_p", "generation_min_p",
@@ -231,8 +229,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "execution_mode must be one of: full, phase1_only, phase2_only"
         )
-    if args.source_grounding_mode not in {"formal_steps", "whole_cot"}:
-        raise ValueError("source_grounding_mode must be formal_steps or whole_cot")
+    if args.generation_prompt_profile not in {"whole_cot_minimal", "standard"}:
+        raise ValueError("generation_prompt_profile must be whole_cot_minimal or standard")
     for name in (
         "phase1_concurrency",
         "phase2_blueprint_concurrency",
@@ -332,13 +330,6 @@ def _make_record(subset: str, split: str, parquet_path: Path, row_index: int, ro
     unique_id = f"{subset}__{split}__{record_id}"
     informal_statement = str(row.get("informal_statement") or "")
     informal_proof = str(row.get("informal_proof") or "")
-    cot_manifest_json = str(row.get("cot_manifest_json") or "")
-    source_grounding_mode = str(row.get("source_grounding_mode") or "formal_steps")
-    if source_grounding_mode not in {"formal_steps", "whole_cot"}:
-        raise ValueError(
-            f"invalid source_grounding_mode at {parquet_path}:{row_index}: "
-            f"{source_grounding_mode}"
-        )
     claimed_answer = str(row.get("claimed_answer") or "")
     if not informal_statement:
         raise ValueError(f"row has no informal_statement: {parquet_path}:{row_index}")
@@ -353,8 +344,6 @@ def _make_record(subset: str, split: str, parquet_path: Path, row_index: int, ro
         theorem_name=theorem_name,
         informal_statement=informal_statement,
         informal_proof=informal_proof,
-        cot_manifest_json=cot_manifest_json,
-        source_grounding_mode=source_grounding_mode,
         claimed_answer=claimed_answer,
     )
 
@@ -366,11 +355,6 @@ def _select_records(args: argparse.Namespace) -> list[Record]:
     for subset, split, parquet_path in _iter_parquets(args.data_root, args.subset, args.split):
         for row_index, row in enumerate(_read_parquet_rows(parquet_path), 1):
             record = _make_record(subset, split, parquet_path, row_index, row)
-            if record.source_grounding_mode != args.source_grounding_mode:
-                raise ValueError(
-                    f"prepared source mode {record.source_grounding_mode} does not match "
-                    f"configured mode {args.source_grounding_mode}: {record.source_id}"
-                )
             if args.include_source_ids is not None and record.source_id not in args.include_source_ids:
                 continue
             if args.problem_id and args.problem_id not in {
@@ -555,9 +539,7 @@ def _result_row(
         "parquet_path": str(record.parquet_path),
         "theorem_name": record.theorem_name,
         "claimed_answer": record.claimed_answer,
-        "cot_manifest_json": record.cot_manifest_json,
-        "source_grounding_mode": record.source_grounding_mode,
-        "splitter_invoked": record.source_grounding_mode == "formal_steps",
+        "generation_prompt_profile": args.generation_prompt_profile,
         "status": status,
         "phase": phase,
         "success": bool(score["root_proved"]),
@@ -632,6 +614,8 @@ def _failed_phase1_status(exc: Exception) -> str:
         return "infraError"
     if exc.failure_stage == "phase1Semantic":
         return "semanticRejected"
+    if exc.failure_stage == "phase1SemanticAuditError":
+        return "semanticAuditError"
     if exc.failure_stage in {
         "phase1Deterministic", "phase1DeterministicAndSemantic",
         "phase1ContextBudgetExceeded",
@@ -769,13 +753,6 @@ def _validate_phase1_seed(
         mismatches.append("informal_statement")
     if state.informal_proof != record.informal_proof:
         mismatches.append("informal_proof")
-    if state.cot_manifest_json != record.cot_manifest_json:
-        mismatches.append("cot_manifest_json")
-    expected_source_mode = (
-        "whole_cot" if record.source_grounding_mode == "whole_cot" else "step_grounded"
-    )
-    if state.semantic_source_mode != expected_source_mode:
-        mismatches.append("source_grounding_mode")
     if state.claimed_answer != record.claimed_answer:
         mismatches.append("claimed_answer")
     if blueprint is not None and blueprint.target_theorem != record.theorem_name:
@@ -876,7 +853,6 @@ async def _run_record(
                     "sourceBlueprintHash": blueprint_hash,
                     "outputCheckpoint": str(checkpoint_path),
                     "resumed": resumed,
-                    "sourceGroundingMode": record.source_grounding_mode,
                     "nodeCount": len(blueprint.nodes),
                 },
                 ok=True,
@@ -895,7 +871,6 @@ async def _run_record(
                         generate_blueprint,
                         informal_statement=record.informal_statement,
                         informal_proof=record.informal_proof,
-                        cot_manifest_json=record.cot_manifest_json,
                         claimed_answer=record.claimed_answer,
                         target_name=record.theorem_name,
                         model=args.model,
@@ -924,7 +899,7 @@ async def _run_record(
                         semantic_audit_min_p=args.semantic_audit_min_p,
                         semantic_audit_presence_penalty=args.semantic_audit_presence_penalty,
                         semantic_audit_repetition_penalty=args.semantic_audit_repetition_penalty,
-                        source_grounding_mode=record.source_grounding_mode,
+                        prompt_profile=args.generation_prompt_profile,
                     ),
                 )
                 _write_phase1_candidates(
@@ -933,27 +908,17 @@ async def _run_record(
                 state = CheckpointState(
                     informal_statement=record.informal_statement,
                     informal_proof=record.informal_proof,
-                    cot_manifest_json=record.cot_manifest_json,
                     claimed_answer=record.claimed_answer,
                     model=args.model,
                     semantic_fidelity_enabled=True,
-                    semantic_require_step_ids=record.source_grounding_mode == "formal_steps",
-                    semantic_static_gate=True,
+                    semantic_static_gate=False,
                     semantic_minimal_ir=False,
                     semantic_freeze_refinement=False,
-                    semantic_source_mode=(
-                        "whole_cot"
-                        if record.source_grounding_mode == "whole_cot"
-                        else "step_grounded"
-                    ),
                 )
                 state.semantic_gate_results = list(blueprint.semantic_gate_results)
                 state.semantic_status = _accepted_phase1_status(blueprint)
                 state.semantic_contract_snapshot = asdict(
-                    snapshot_blueprint_semantics(
-                        blueprint,
-                        parse_cot_manifest(record.cot_manifest_json),
-                    ),
+                    snapshot_blueprint_semantics(blueprint),
                 )
                 state.set_blueprint(blueprint)
                 state.save(checkpoint_path)
@@ -1089,8 +1054,7 @@ async def _run_record(
                         blueprint_max_retries=args.refinement_max_retries,
                         phase2_contract_check_concurrency=args.phase2_contract_check_concurrency,
                         semantic_fidelity_enabled=True,
-                        semantic_require_step_ids=True,
-                        semantic_static_gate=True,
+                        semantic_static_gate=False,
                         semantic_freeze_refinement=False,
                     ),
                 )
@@ -1182,7 +1146,7 @@ def _metric_row(scope: str, rows: list[dict[str, Any]], subset: str = "", split:
         "avg_proved_ratio": sum(float(row.get("proved_ratio") or 0) for row in rows) / total if total else 0.0,
         "phase1_failed": sum(
             1 for row in rows
-            if row.get("status") in {"error", "semanticRejected", "structuralRejected", "infraError"}
+            if row.get("status") in {"error", "semanticRejected", "semanticAuditError", "structuralRejected", "infraError"}
             and row.get("phase") == "phase1"
         ),
         "phase1_ineligible": sum(
@@ -1465,7 +1429,7 @@ def _should_skip_existing(row: dict[str, Any] | None, args: argparse.Namespace) 
         if status in {"solved", "exhausted", "phase1Ineligible"}:
             return True
         if status in {
-            "error", "infraError", "structuralRejected", "semanticRejected",
+            "error", "infraError", "structuralRejected", "semanticRejected", "semanticAuditError",
         }:
             return not args.retry_error_results
         return False
@@ -1475,7 +1439,7 @@ def _should_skip_existing(row: dict[str, Any] | None, args: argparse.Namespace) 
     }:
         return True
     return row.get("status") in {
-        "error", "semanticRejected", "structuralRejected", "infraError",
+        "error", "semanticRejected", "semanticAuditError", "structuralRejected", "infraError",
     } and not args.retry_error_results
 
 
@@ -1591,7 +1555,7 @@ async def _run_experiment(
             retry_ids = {
                 record.unique_id for record in pending
                 if str((existing.get(record.unique_id) or {}).get("status") or "") in {
-                    "error", "infraError", "structuralRejected", "semanticRejected",
+                    "error", "infraError", "structuralRejected", "semanticRejected", "semanticAuditError",
                 }
             }
             _remove_jsonl_rows(results_path, pending_ids)
@@ -1628,7 +1592,7 @@ async def _run_experiment(
         f"max_tool_calls_per_turn={args.max_tool_calls_per_turn} "
         f"proof_policy={args.proof_policy} "
         "blueprint_generation=full_regeneration "
-        "semantic_static_gate=true semantic_strict_comparator=true",
+        "semantic_static_gate=false static_gate_mode=shadow semantic_strict_comparator=true",
         flush=True,
     )
 

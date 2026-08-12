@@ -715,54 +715,13 @@ def _normalized_proposition(node: BlueprintNode) -> str:
 
 def validate_blueprint_fidelity(
     blueprint: Blueprint,
-    manifest: CotManifest | Any = None,
     *,
     claimed_answer: str = "",
-    require_step_bindings: bool = False,
 ) -> list[SemanticIssue]:
-    """Return deterministic provenance and high-confidence degeneration issues."""
-    contract = parse_cot_manifest(manifest)
+    """Return conservative, shadow-only anti-degeneration issues."""
+    contract = None
     issues: list[SemanticIssue] = []
-    valid_ids = contract.by_id
     root = blueprint.node_by_name(blueprint.target_theorem)
-
-    if require_step_bindings and not contract.steps:
-        issues.append(SemanticIssue(
-            "emptyCotManifest",
-            "Claim bindings were required but the source COT manifest is empty.",
-            category="binding",
-        ))
-
-    for node in blueprint.nodes:
-        title_count = len(re.findall(r"\(title\s*:=", node.lean_declaration))
-        if require_step_bindings and title_count != 1:
-            issues.append(_issue(
-                "missingStepMapping" if title_count == 0 else "multipleStepMappings",
-                f"Node must have exactly one source-Step title; found {title_count}.",
-                node=node,
-                category="binding",
-                contract=contract,
-            ))
-            continue
-        if require_step_bindings and not node.source_step_id:
-            issues.append(_issue(
-                "malformedStepMapping",
-                "Node title must be exactly COT_STEP:SNNN.",
-                node=node,
-                category="binding",
-                contract=contract,
-            ))
-            continue
-        if require_step_bindings and node.source_step_id:
-            base_id = _base_step_id(node.source_step_id)
-            if base_id not in valid_ids:
-                issues.append(_issue(
-                    "unknownStepMapping",
-                    f"Node refers to source Step {base_id}, which is not in the manifest.",
-                    node=node,
-                    category="binding",
-                    contract=contract,
-                ))
 
     if root is None:
         issues.append(SemanticIssue(
@@ -770,46 +729,8 @@ def validate_blueprint_fidelity(
         ))
         return issues
 
-    if require_step_bindings and contract.final_step_id:
-        if _base_step_id(root.source_step_id) != contract.final_step_id:
-            issues.append(_issue(
-                "rootNotFinalStep",
-                f"Root must map to final source Step {contract.final_step_id}.",
-                node=root,
-                category="binding",
-                contract=contract,
-            ))
-
     reachable = _root_reachable_names(blueprint)
     node_map = blueprint.nodes_by_name()
-    reachable_steps = {
-        _base_step_id(node.source_step_id)
-        for node in blueprint.nodes
-        if node.name in reachable and node.source_step_id
-    }
-    mapped_steps = {
-        _base_step_id(node.source_step_id)
-        for node in blueprint.nodes
-        if node.source_step_id
-    }
-    if require_step_bindings:
-        for step in contract.steps:
-            if step.step_id not in mapped_steps:
-                issues.append(_issue_for_step(
-                    "stepMappingAbsent",
-                    "No node in the blueprint maps to this source step.",
-                    step,
-                    category="binding",
-                ))
-            elif step.step_id not in reachable_steps:
-                issues.append(_issue_for_step(
-                    "stepNotRootReachable",
-                    "A node maps to this source Step, but no mapped node is in the root "
-                    "dependency closure.",
-                    step,
-                    category="binding",
-                    severity="warning",
-                ))
     for node in blueprint.nodes:
         if node.name not in reachable:
             issues.append(_issue(
@@ -954,15 +875,7 @@ def validate_blueprint_fidelity(
         if (candidate := node_map.get(name)) is not None
         and candidate.kind in {"lemma", "theorem"}
     }
-    substantive_steps = list(contract.steps)
-    if substantive_steps and len(substantive_steps) > 1 and not proof_ancestors:
-        issues.append(_issue(
-            "rootNotGrounded",
-            "The root has no proof-step ancestor from the multi-step source COT.",
-            node=root,
-            category="answerGrounding",
-            contract=contract,
-        ))
+    del proof_ancestors
     return issues
 
 

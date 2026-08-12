@@ -19,17 +19,10 @@ from cot_blueprint_refine.common import (
     write_json,
     write_jsonl,
 )
-from cot_blueprint_refine.formal_steps import (
-    encode_formal_step_manifest,
-    make_formal_step_manifest,
-)
-
-
 DATASET_SUBSET = "qwen3_8b_math_verify"
 PARQUET_FIELDS = [
     "name", "source", "row_index", "problem", "claimed_answer",
     "post_think_cot", "informal_statement", "informal_proof",
-    "cot_manifest_json", "source_grounding_mode",
 ]
 
 
@@ -39,17 +32,9 @@ def _safe_filename(value: str) -> str:
 
 
 def make_generation_row(
-    row: dict[str, Any], post_think: str, answer: str, *,
-    source_grounding_mode: str = "formal_steps",
+    row: dict[str, Any], post_think: str, answer: str,
 ) -> dict[str, Any]:
     problem = str(row.get("problem") or "").strip()
-    # Prepare installs a one-Step exact placeholder. The mandatory split stage
-    # replaces it atomically with the 397B formalization-aware partition.
-    cot_manifest_json = ""
-    if source_grounding_mode == "formal_steps":
-        cot_manifest_json = encode_formal_step_manifest(
-            make_formal_step_manifest(post_think, [(0, len(post_think))])
-        )
     informal_statement = (
         "Original problem:\n"
         f"{problem}\n\n"
@@ -65,11 +50,8 @@ def make_generation_row(
         "claimed_answer": answer,
         "post_think_cot": post_think,
         "informal_statement": informal_statement,
-        # Keep the source proof byte-for-byte unchanged.  The numbered step
-        # manifest travels beside it and is rendered only at prompt time.
+        # Keep the complete source COT byte-for-byte unchanged.
         "informal_proof": post_think,
-        "cot_manifest_json": cot_manifest_json,
-        "source_grounding_mode": source_grounding_mode,
     }
 
 
@@ -90,9 +72,8 @@ def _reject_row(row: dict[str, Any], reason: str) -> dict[str, Any]:
 def write_generation_artifacts(config: DictConfig, rows: list[dict[str, Any]]) -> None:
     """Atomically keep prepared JSONL and parquet manifests in sync.
 
-    The LLM boundary stage rewrites only ``cot_manifest_json`` after every row
-    has passed exact-coverage validation.  Writing through temporary files keeps
-    a failed/interrupted split from leaving RobustPA with a mixed manifest set.
+    Writing through temporary files keeps an interrupted preparation from
+    leaving RobustPA with a mixed manifest set.
     """
     root = prepared_dir(config)
     data_root = root / "data" / DATASET_SUBSET
@@ -124,14 +105,6 @@ def write_generation_artifacts(config: DictConfig, rows: list[dict[str, Any]]) -
 
 
 def prepare(config: DictConfig) -> dict[str, Any]:
-    blueprint_config = config.get("blueprint") or {}
-    source_grounding_mode = str(
-        blueprint_config.get("source_grounding_mode", "formal_steps")
-    )
-    if source_grounding_mode not in {"formal_steps", "whole_cot"}:
-        raise ValueError(
-            "blueprint.source_grounding_mode must be formal_steps or whole_cot"
-        )
     input_path = Path(str(config.input_predictions)).expanduser()
     raw_rows = latest_rows(input_path, "ID")
     requested_ids = [str(value) for value in (config.include_ids or [])]
@@ -176,10 +149,7 @@ def prepare(config: DictConfig) -> dict[str, Any]:
                 if not answer:
                     reason = "missing_post_think_boxed_answer"
                 else:
-                    eligible_all.append(make_generation_row(
-                        row, post_think, answer,
-                        source_grounding_mode=source_grounding_mode,
-                    ))
+                    eligible_all.append(make_generation_row(row, post_think, answer))
                     stats["eligible_rows"] += 1
                     continue
         stats[f"rejected_{reason}"] += 1
@@ -209,7 +179,6 @@ def prepare(config: DictConfig) -> dict[str, Any]:
         "data_root": str(root / "data"),
         "dataset_subset": DATASET_SUBSET,
         "requested_ids": requested_ids,
-        "source_grounding_mode": source_grounding_mode,
     }
     write_generation_artifacts(config, selected)
     write_jsonl(root / "rejections.jsonl", rejections)

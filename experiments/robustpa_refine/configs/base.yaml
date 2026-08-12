@@ -16,7 +16,7 @@ retry_error_results: false
 # stops after Blueprint generation. phase2_only resumes accepted Phase 1
 # checkpoints, proves their nodes once, and requires zero refinement rounds.
 execution_mode: full
-source_grounding_mode: formal_steps
+generation_prompt_profile: whole_cot_minimal
 phase1_seed_root: null
 phase1_source_results_path: null
 phase1_source_experiment_root: null

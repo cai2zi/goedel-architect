@@ -22,7 +22,6 @@ from blueprint import (
     _extract_lean_code,
     _parse_blueprint,
     _reasoning_kwargs,
-    _render_step_grounded_proof,
     _set_latest_refinement_retry,
     format_phase2_contract_errors,
     phase2_contract_errors,
@@ -32,7 +31,6 @@ from kimina_lean_compiler import KiminaInfrastructureError, KiminaLeanCompiler
 from semantic_fidelity import (
     check_semantic_freeze,
     format_semantic_issues,
-    parse_cot_manifest,
     snapshot_blueprint_semantics,
     validate_blueprint_fidelity,
 )
@@ -48,15 +46,13 @@ _SEMANTIC_REFINEMENT_SYSTEM_SUFFIX = r"""
 
 ## Semantic-fidelity refinement mode
 
-The COT-Step-to-mathematics translation is immutable in this mode. A failed
-Lean proof is evidence about the corresponding source step; it is not
+The Whole-COT-to-mathematics translation is immutable in this mode. A failed
+Lean proof is evidence about the corresponding source assertion; it is not
 permission to repair the source solution. Preserve every source Step clause,
 number, relation, quantifier, negation, object, and claimed final answer even
 when it is false.
 
-Every node must retain exactly one native `(title := "COT_STEP:SNNN")` binding.
-Several connected nodes may map to the same Step. Do not delete a source Step,
-move the root away from the final Step,
+Do not delete a source assertion, move the root away from the final task,
 replace a proposition with `True`/a reflexive equality/an unconstrained
 existential, introduce an answer as an assumption, or hide an asserted step in
 an executable definition. You may fix Lean types, casts, library names,
@@ -164,10 +160,8 @@ def refine_blueprint(
     phase2_contract_check_concurrency: int = 1,
     informal_statement: str = "",
     informal_proof: str = "",
-    cot_manifest_json: str = "",
     claimed_answer: str = "",
     semantic_fidelity_enabled: bool = False,
-    semantic_require_step_ids: bool = False,
     semantic_static_gate: bool = False,
     semantic_freeze_refinement: bool = False,
     baseline_semantic_snapshot: Any = None,
@@ -189,16 +183,13 @@ def refine_blueprint(
         cosmetically re-decomposing the same stuck problem every round.
     """
     client = make_client(model)
-    semantic_manifest = (
-        parse_cot_manifest(cot_manifest_json) if semantic_fidelity_enabled else None
-    )
     baseline_semantics = baseline_semantic_snapshot
     if (
         baseline_semantics is None
         and semantic_fidelity_enabled
         and semantic_freeze_refinement
     ):
-        baseline_semantics = snapshot_blueprint_semantics(blueprint, semantic_manifest)
+        baseline_semantics = snapshot_blueprint_semantics(blueprint)
 
     annotated_lean = _annotate_with_verdicts(blueprint, orch_result)
     if history is not None:
@@ -215,8 +206,6 @@ def refine_blueprint(
         dropped_rounds_summary = ""
 
     prompt_proof = informal_proof
-    if semantic_fidelity_enabled and cot_manifest_json:
-        prompt_proof = _render_step_grounded_proof(cot_manifest_json, include_ir=True)
     messages = [
         {
             "role": "system",
@@ -259,11 +248,9 @@ def refine_blueprint(
                 semantic_issues = _enabled_semantic_issues(
                     validate_blueprint_fidelity(
                         candidate,
-                        semantic_manifest,
                         claimed_answer=claimed_answer,
-                        require_step_bindings=semantic_require_step_ids,
                     ),
-                    require_step_ids=semantic_require_step_ids,
+                    require_step_ids=False,
                     static_gate=semantic_static_gate,
                 )
                 if semantic_freeze_refinement and baseline_semantics is not None:
@@ -271,7 +258,6 @@ def refine_blueprint(
                         check_semantic_freeze(
                             baseline_semantics,
                             candidate,
-                            semantic_manifest,
                         )
                     )
                 semantic_errors = [
