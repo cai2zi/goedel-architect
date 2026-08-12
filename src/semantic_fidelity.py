@@ -112,6 +112,8 @@ def parse_cot_manifest(value: Any) -> CotManifest:
     """Parse the sole lossless formal-Step manifest."""
     if isinstance(value, CotManifest):
         return value
+    if value is None or value == "":
+        return CotManifest()
     from cot_blueprint_refine.formal_steps import decode_formal_step_manifest
 
     manifest = decode_formal_step_manifest(value)
@@ -751,7 +753,7 @@ def validate_blueprint_fidelity(
                 contract=contract,
             ))
             continue
-        if node.source_step_id:
+        if require_step_bindings and node.source_step_id:
             base_id = _base_step_id(node.source_step_id)
             if base_id not in valid_ids:
                 issues.append(_issue(
@@ -808,17 +810,17 @@ def validate_blueprint_fidelity(
                     category="binding",
                     severity="warning",
                 ))
-        for node in blueprint.nodes:
-            if node.name not in reachable:
-                issues.append(_issue(
-                    "nodeNotRootReachable",
-                    "Every Blueprint node must be in the root's transitive semantic "
-                    "dependency closure.",
-                    node=node,
-                    category="binding",
-                    contract=contract,
-                    severity="warning",
-                ))
+    for node in blueprint.nodes:
+        if node.name not in reachable:
+            issues.append(_issue(
+                "nodeNotRootReachable",
+                "Every Blueprint node must be in the root's transitive semantic "
+                "dependency closure.",
+                node=node,
+                category="binding",
+                contract=contract,
+                severity="warning",
+            ))
 
     # High-confidence anti-degeneration checks operate on parsed declarations,
     # never on docstrings or raw prompt text.

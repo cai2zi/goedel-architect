@@ -1304,6 +1304,25 @@ class JudgeTest(unittest.TestCase):
 
 
 class AblationConfigurationTest(unittest.TestCase):
+    def test_whole_cot_thinking_judge_matches_generation_sampling(self) -> None:
+        config = load_config(
+            "qwen3_8b_397b_wrong76_whole_cot_blueprint_generation_thinking_judge",
+            [],
+        )
+        blueprint = config.blueprint
+        self.assertTrue(blueprint.semantic_audit_enable_thinking)
+        for generation_key, audit_key in (
+            ("generation_temperature", "semantic_audit_temperature"),
+            ("generation_top_p", "semantic_audit_top_p"),
+            ("generation_top_k", "semantic_audit_top_k"),
+            ("generation_min_p", "semantic_audit_min_p"),
+            ("generation_presence_penalty", "semantic_audit_presence_penalty"),
+            ("generation_repetition_penalty", "semantic_audit_repetition_penalty"),
+        ):
+            self.assertEqual(blueprint[generation_key], blueprint[audit_key])
+        self.assertEqual(blueprint.formal_decompiler_max_tokens, 16384)
+        self.assertEqual(blueprint.strict_comparator_max_tokens, 16384)
+
     def test_generation_profile_exposes_only_full_regeneration_controls(self) -> None:
         config = load_config("qwen3_8b_397b_wrong76_blueprint_generation", [])
         self.assertEqual(config.blueprint.execution_mode, "phase1_only")

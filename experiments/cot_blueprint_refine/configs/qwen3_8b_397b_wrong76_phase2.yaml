@@ -1,8 +1,9 @@
-# Phase 2-only continuation of qwen3_8b_397b_wrong76_blueprint_generation.
-# It intentionally reuses that experiment's checkpoints and results.jsonl.
+# Independent Phase 2 output seeded read-only from the accepted Phase 1 run.
 input_predictions: /ssd/czx/czx_work/cot_blueprint_refine/subsets/qwen3_8b_original_answer_incorrect/predictions.jsonl
 output_base: /ssd/czx/czx_work/cot_blueprint_refine
-exp_name: qwen3_8b_397b_wrong76_blueprint_generation
+exp_name: qwen3_8b_397b_wrong76_phase2
+# false: discard this Phase 2 output and restart from the immutable Phase 1 seed.
+# true: resume/skip results only under this Phase 2 exp_name.
 resume: true
 vllm: {use_existing: true}
 shared_vllm_397b: {reasoning_parser: qwen3}
@@ -20,13 +21,15 @@ environment:
 
 blueprint:
   execution_mode: phase2_only
+  source_grounding_mode: formal_steps
+  phase1_input_experiment_root: /ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong76_blueprint_generation
   retry_error_results: false
   max_refinement_iterations: 0
 
   # Phase 2 prover budget.
-  node_max_prove_turns: 4
+  node_max_prove_turns: 16
   node_max_negation_probe_turns: 4
-  max_tool_calls_per_turn: 3
+  max_tool_calls_per_turn: 4
   proof_policy: full
   critical_negation_max_turns: 0
 

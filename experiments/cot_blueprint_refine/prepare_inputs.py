@@ -29,7 +29,7 @@ DATASET_SUBSET = "qwen3_8b_math_verify"
 PARQUET_FIELDS = [
     "name", "source", "row_index", "problem", "claimed_answer",
     "post_think_cot", "informal_statement", "informal_proof",
-    "cot_manifest_json",
+    "cot_manifest_json", "source_grounding_mode",
 ]
 
 
@@ -38,13 +38,18 @@ def _safe_filename(value: str) -> str:
     return text or "unknown"
 
 
-def make_generation_row(row: dict[str, Any], post_think: str, answer: str) -> dict[str, Any]:
+def make_generation_row(
+    row: dict[str, Any], post_think: str, answer: str, *,
+    source_grounding_mode: str = "formal_steps",
+) -> dict[str, Any]:
     problem = str(row.get("problem") or "").strip()
     # Prepare installs a one-Step exact placeholder. The mandatory split stage
     # replaces it atomically with the 397B formalization-aware partition.
-    cot_manifest_json = encode_formal_step_manifest(
-        make_formal_step_manifest(post_think, [(0, len(post_think))])
-    )
+    cot_manifest_json = ""
+    if source_grounding_mode == "formal_steps":
+        cot_manifest_json = encode_formal_step_manifest(
+            make_formal_step_manifest(post_think, [(0, len(post_think))])
+        )
     informal_statement = (
         "Original problem:\n"
         f"{problem}\n\n"
@@ -64,6 +69,7 @@ def make_generation_row(row: dict[str, Any], post_think: str, answer: str) -> di
         # manifest travels beside it and is rendered only at prompt time.
         "informal_proof": post_think,
         "cot_manifest_json": cot_manifest_json,
+        "source_grounding_mode": source_grounding_mode,
     }
 
 
@@ -118,6 +124,14 @@ def write_generation_artifacts(config: DictConfig, rows: list[dict[str, Any]]) -
 
 
 def prepare(config: DictConfig) -> dict[str, Any]:
+    blueprint_config = config.get("blueprint") or {}
+    source_grounding_mode = str(
+        blueprint_config.get("source_grounding_mode", "formal_steps")
+    )
+    if source_grounding_mode not in {"formal_steps", "whole_cot"}:
+        raise ValueError(
+            "blueprint.source_grounding_mode must be formal_steps or whole_cot"
+        )
     input_path = Path(str(config.input_predictions)).expanduser()
     raw_rows = latest_rows(input_path, "ID")
     requested_ids = [str(value) for value in (config.include_ids or [])]
@@ -162,7 +176,10 @@ def prepare(config: DictConfig) -> dict[str, Any]:
                 if not answer:
                     reason = "missing_post_think_boxed_answer"
                 else:
-                    eligible_all.append(make_generation_row(row, post_think, answer))
+                    eligible_all.append(make_generation_row(
+                        row, post_think, answer,
+                        source_grounding_mode=source_grounding_mode,
+                    ))
                     stats["eligible_rows"] += 1
                     continue
         stats[f"rejected_{reason}"] += 1
@@ -192,6 +209,7 @@ def prepare(config: DictConfig) -> dict[str, Any]:
         "data_root": str(root / "data"),
         "dataset_subset": DATASET_SUBSET,
         "requested_ids": requested_ids,
+        "source_grounding_mode": source_grounding_mode,
     }
     write_generation_artifacts(config, selected)
     write_jsonl(root / "rejections.jsonl", rejections)

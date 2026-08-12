@@ -31,6 +31,7 @@ sys.path.insert(0, str(REPO_ROOT / "experiments"))
 from blueprint import (  # noqa: E402
     Blueprint,
     BlueprintGenerationError,
+    _parse_blueprint,
 )
 from blueprint_generation import generate_blueprint  # noqa: E402
 from blueprint_review_viewer.review_schema import index_entry, write_review_artifact  # noqa: E402
@@ -45,7 +46,7 @@ from mathlib_retrieval import MathlibRetrieval  # noqa: E402
 from orchestrator import active_node_names  # noqa: E402
 from pipeline import run_phase2_async, run_phase3  # noqa: E402
 from semantic_fidelity import parse_cot_manifest, snapshot_blueprint_semantics  # noqa: E402
-from tracer import JsonlTracer  # noqa: E402
+from tracer import JsonlTracer, TraceEvent  # noqa: E402
 
 
 DEFAULT_DATA_ROOT = REPO_ROOT.parent / "czx_work" / "RobustPABench"
@@ -115,6 +116,7 @@ class Record:
     informal_statement: str
     informal_proof: str
     cot_manifest_json: str
+    source_grounding_mode: str
     claimed_answer: str
 
 
@@ -167,6 +169,12 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
             raise ValueError("include_source_ids_path must contain a JSON string list")
         args.include_source_ids = set(values)
     args.resume = bool(getattr(args, "resume", False))
+    for name in (
+        "phase1_seed_root", "phase1_source_results_path",
+        "phase1_source_experiment_root",
+    ):
+        value = getattr(args, name, None)
+        setattr(args, name, _resolve_path(value, original_cwd) if value else None)
     args.retry_error_results = bool(getattr(args, "retry_error_results", False))
     if not args.exp_name:
         args.exp_name = default_exp_name(args.model, args.split, args.subset)
@@ -181,6 +189,7 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
     args.critical_negation_max_turns = int(args.critical_negation_max_turns)
     args.max_tool_calls_per_turn = int(args.max_tool_calls_per_turn)
     args.generation_max_turns = int(args.generation_max_turns)
+    args.source_grounding_mode = str(args.source_grounding_mode)
     args.generation_enable_thinking = bool(args.generation_enable_thinking)
     for name in (
         "generation_temperature", "generation_top_p", "generation_min_p",
@@ -202,6 +211,16 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
     args.semantic_format_max_attempts = int(
         args.semantic_format_max_attempts
     )
+    args.semantic_audit_enable_thinking = bool(
+        args.semantic_audit_enable_thinking
+    )
+    for name in (
+        "semantic_audit_temperature", "semantic_audit_top_p",
+        "semantic_audit_min_p", "semantic_audit_presence_penalty",
+        "semantic_audit_repetition_penalty",
+    ):
+        setattr(args, name, float(getattr(args, name)))
+    args.semantic_audit_top_k = int(args.semantic_audit_top_k)
     args.refinement_max_retries = int(args.refinement_max_retries)
     _validate_args(args)
     return args
@@ -212,6 +231,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "execution_mode must be one of: full, phase1_only, phase2_only"
         )
+    if args.source_grounding_mode not in {"formal_steps", "whole_cot"}:
+        raise ValueError("source_grounding_mode must be formal_steps or whole_cot")
     for name in (
         "phase1_concurrency",
         "phase2_blueprint_concurrency",
@@ -233,12 +254,16 @@ def _validate_args(args: argparse.Namespace) -> None:
     if args.max_refinement_iterations < 0:
         raise ValueError("max_refinement_iterations must be non-negative")
     if args.execution_mode == "phase2_only":
-        if not args.resume:
-            raise ValueError("phase2_only requires resume=true")
         if args.max_refinement_iterations != 0:
             raise ValueError(
                 "phase2_only requires max_refinement_iterations=0"
             )
+        for name in (
+            "phase1_seed_root", "phase1_source_results_path",
+            "phase1_source_experiment_root",
+        ):
+            if getattr(args, name) is None:
+                raise ValueError(f"phase2_only requires {name}")
     if args.node_max_negation_probe_turns < 0:
         raise ValueError("node_max_negation_probe_turns must be non-negative")
     if args.critical_negation_max_turns < 0:
@@ -308,6 +333,12 @@ def _make_record(subset: str, split: str, parquet_path: Path, row_index: int, ro
     informal_statement = str(row.get("informal_statement") or "")
     informal_proof = str(row.get("informal_proof") or "")
     cot_manifest_json = str(row.get("cot_manifest_json") or "")
+    source_grounding_mode = str(row.get("source_grounding_mode") or "formal_steps")
+    if source_grounding_mode not in {"formal_steps", "whole_cot"}:
+        raise ValueError(
+            f"invalid source_grounding_mode at {parquet_path}:{row_index}: "
+            f"{source_grounding_mode}"
+        )
     claimed_answer = str(row.get("claimed_answer") or "")
     if not informal_statement:
         raise ValueError(f"row has no informal_statement: {parquet_path}:{row_index}")
@@ -323,6 +354,7 @@ def _make_record(subset: str, split: str, parquet_path: Path, row_index: int, ro
         informal_statement=informal_statement,
         informal_proof=informal_proof,
         cot_manifest_json=cot_manifest_json,
+        source_grounding_mode=source_grounding_mode,
         claimed_answer=claimed_answer,
     )
 
@@ -334,6 +366,11 @@ def _select_records(args: argparse.Namespace) -> list[Record]:
     for subset, split, parquet_path in _iter_parquets(args.data_root, args.subset, args.split):
         for row_index, row in enumerate(_read_parquet_rows(parquet_path), 1):
             record = _make_record(subset, split, parquet_path, row_index, row)
+            if record.source_grounding_mode != args.source_grounding_mode:
+                raise ValueError(
+                    f"prepared source mode {record.source_grounding_mode} does not match "
+                    f"configured mode {args.source_grounding_mode}: {record.source_id}"
+                )
             if args.include_source_ids is not None and record.source_id not in args.include_source_ids:
                 continue
             if args.problem_id and args.problem_id not in {
@@ -519,6 +556,8 @@ def _result_row(
         "theorem_name": record.theorem_name,
         "claimed_answer": record.claimed_answer,
         "cot_manifest_json": record.cot_manifest_json,
+        "source_grounding_mode": record.source_grounding_mode,
+        "splitter_invoked": record.source_grounding_mode == "formal_steps",
         "status": status,
         "phase": phase,
         "success": bool(score["root_proved"]),
@@ -546,7 +585,21 @@ def _result_row(
         "formal_decompiler_max_tokens": args.formal_decompiler_max_tokens,
         "strict_comparator_max_tokens": args.strict_comparator_max_tokens,
         "semantic_format_max_attempts": args.semantic_format_max_attempts,
+        "semantic_audit_sampling": {
+            "enable_thinking": args.semantic_audit_enable_thinking,
+            "temperature": args.semantic_audit_temperature,
+            "top_p": args.semantic_audit_top_p,
+            "top_k": args.semantic_audit_top_k,
+            "min_p": args.semantic_audit_min_p,
+            "presence_penalty": args.semantic_audit_presence_penalty,
+            "repetition_penalty": args.semantic_audit_repetition_penalty,
+        },
         "semantic_status": state.semantic_status if state else "",
+        "phase1_seed_hash": state.phase1_seed_hash if state else "",
+        "phase1_blueprint_hash": state.phase1_blueprint_hash if state else "",
+        "phase1_source_root": state.phase1_source_root if state else "",
+        "phase2_resumed": state.phase2_last_launch_resumed if state else False,
+        "phase2_resume_count": state.phase2_resume_count if state else 0,
         "semantic_gate_results": semantic_gate_results,
         "semantic_warning_codes": semantic_warning_codes,
         "semantic_warning_count": len(semantic_warnings),
@@ -635,6 +688,153 @@ def _clear_record_outputs(output_root: Path, record: Record) -> None:
         shutil.rmtree(blueprint_dir)
 
 
+def _phase1_seed_checkpoint_path(args: argparse.Namespace, record: Record) -> Path:
+    assert args.phase1_seed_root is not None
+    relative = Path(record.subset) / record.split / f"{record.record_id}.json"
+    immutable = args.phase1_seed_root / "phase1_seeds" / "checkpoints" / relative
+    return immutable if immutable.is_file() else _record_paths(args.phase1_seed_root, record)[0]
+
+
+def _phase1_seed_snapshot_path(output_root: Path, record: Record) -> Path:
+    relative = Path(record.subset) / record.split / f"{record.record_id}.json"
+    return output_root / "phase1_seeds" / "checkpoints" / relative
+
+
+def _reset_to_pristine_phase1(
+    state: CheckpointState, blueprint: Blueprint,
+) -> CheckpointState:
+    state.status = RunStatus.RUNNING
+    state.iteration = 0
+    state.proved_cache = {}
+    state.proof_cache_keys = {}
+    state.node_results = {}
+    state.refinement_history = []
+    state.final_lean_file = ""
+    state.final_lean_errors = []
+    state.phase1_seed_hash = ""
+    state.phase1_blueprint_hash = ""
+    state.phase1_source_root = ""
+    state.phase2_run_initialized = False
+    state.phase2_last_launch_resumed = False
+    state.phase2_resume_count = 0
+    state.set_blueprint(blueprint)
+    return state
+
+
+def _phase1_seed_provenance(
+    args: argparse.Namespace, record: Record,
+) -> tuple[Path, str, str, CheckpointState, Blueprint]:
+    seed_path = _phase1_seed_checkpoint_path(args, record)
+    if not seed_path.is_file():
+        raise FileNotFoundError(f"Phase 1 seed checkpoint is missing: {seed_path}")
+    seed_state = CheckpointState.load(seed_path)
+    blueprint = seed_state.get_blueprint()
+    if blueprint is None:
+        raise RuntimeError(f"Phase 1 seed has no Blueprint: {seed_path}")
+    immutable_seed = "phase1_seeds" in seed_path.parts
+    if not immutable_seed:
+        source_blueprint_dir = _record_paths(args.phase1_seed_root, record)[2]
+        phase1_snapshot = source_blueprint_dir / "round_00_phase1.lean"
+        if not phase1_snapshot.is_file():
+            raise RuntimeError(
+                "Legacy Phase 1 checkpoint contains no immutable seed and its "
+                f"round_00_phase1.lean is missing: {phase1_snapshot}"
+            )
+        blueprint = _parse_blueprint(
+            phase1_snapshot.read_text(encoding="utf-8"), record.theorem_name,
+        )
+        seed_state = _reset_to_pristine_phase1(seed_state, blueprint)
+    blueprint_hash = hashlib.sha256(blueprint.lean_file.encode("utf-8")).hexdigest()
+    seed_payload = json.dumps(
+        asdict(seed_state), ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    seed_hash = hashlib.sha256(seed_payload.encode("utf-8")).hexdigest()
+    return seed_path, seed_hash, blueprint_hash, seed_state, blueprint
+
+
+def _validate_phase1_seed(
+    state: CheckpointState, record: Record, seed_path: Path,
+) -> Blueprint:
+    blueprint = state.get_blueprint()
+    mismatches: list[str] = []
+    if blueprint is None:
+        mismatches.append("blueprint")
+    if state.status != RunStatus.RUNNING:
+        mismatches.append(f"status={state.status.value}")
+    if state.iteration != 0:
+        mismatches.append(f"iteration={state.iteration}")
+    if state.node_results or state.proved_cache or state.proof_cache_keys:
+        mismatches.append("phase2MutableState")
+    if state.informal_statement != record.informal_statement:
+        mismatches.append("informal_statement")
+    if state.informal_proof != record.informal_proof:
+        mismatches.append("informal_proof")
+    if state.cot_manifest_json != record.cot_manifest_json:
+        mismatches.append("cot_manifest_json")
+    expected_source_mode = (
+        "whole_cot" if record.source_grounding_mode == "whole_cot" else "step_grounded"
+    )
+    if state.semantic_source_mode != expected_source_mode:
+        mismatches.append("source_grounding_mode")
+    if state.claimed_answer != record.claimed_answer:
+        mismatches.append("claimed_answer")
+    if blueprint is not None and blueprint.target_theorem != record.theorem_name:
+        mismatches.append("target_theorem")
+    if state.semantic_status not in {"strictAccepted", "acceptedWithWarnings"}:
+        mismatches.append(f"semantic_status={state.semantic_status}")
+    if mismatches:
+        raise RuntimeError(
+            f"Invalid immutable Phase 1 seed {seed_path}: " + ", ".join(mismatches)
+        )
+    assert blueprint is not None
+    return blueprint
+
+
+def _load_or_initialize_phase2_checkpoint(
+    args: argparse.Namespace,
+    record: Record,
+    output_checkpoint_path: Path,
+) -> tuple[CheckpointState, Blueprint, bool, str, str, Path]:
+    (
+        seed_path, seed_hash, blueprint_hash, pristine_state, pristine_blueprint,
+    ) = _phase1_seed_provenance(args, record)
+    source_root = str(args.phase1_source_experiment_root.resolve())
+    if output_checkpoint_path.exists():
+        state = CheckpointState.load(output_checkpoint_path)
+        blueprint = state.get_blueprint()
+        if blueprint is None:
+            raise RuntimeError(f"Phase 2 checkpoint has no Blueprint: {output_checkpoint_path}")
+        mismatches = []
+        if state.phase1_seed_hash != seed_hash:
+            mismatches.append("phase1_seed_hash")
+        if state.phase1_blueprint_hash != blueprint_hash:
+            mismatches.append("phase1_blueprint_hash")
+        if state.phase1_source_root != source_root:
+            mismatches.append("phase1_source_root")
+        if not state.phase2_run_initialized:
+            mismatches.append("phase2_run_initialized")
+        if mismatches:
+            raise RuntimeError(
+                "Phase 2 checkpoint provenance does not match configured Phase 1 seed: "
+                + ", ".join(mismatches)
+            )
+        state.phase2_last_launch_resumed = True
+        state.phase2_resume_count += 1
+        state.save(output_checkpoint_path)
+        return state, blueprint, True, seed_hash, blueprint_hash, seed_path
+
+    state = pristine_state
+    blueprint = _validate_phase1_seed(state, record, seed_path)
+    state.phase1_seed_hash = seed_hash
+    state.phase1_blueprint_hash = blueprint_hash
+    state.phase1_source_root = source_root
+    state.phase2_run_initialized = True
+    state.phase2_last_launch_resumed = False
+    state.phase2_resume_count = 0
+    state.save(output_checkpoint_path)
+    return state, blueprint, False, seed_hash, blueprint_hash, seed_path
+
+
 async def _run_record(
     record: Record,
     *,
@@ -661,29 +861,29 @@ async def _run_record(
     try:
         if args.execution_mode == "phase2_only":
             phase = "phase2"
-            state = CheckpointState.load(checkpoint_path)
-            blueprint = state.get_blueprint()
-            if blueprint is None:
-                raise RuntimeError(f"No Phase 1 Blueprint in checkpoint {checkpoint_path}")
-            mismatches = []
-            if state.informal_statement != record.informal_statement:
-                mismatches.append("informal_statement")
-            if state.informal_proof != record.informal_proof:
-                mismatches.append("informal_proof")
-            if state.cot_manifest_json != record.cot_manifest_json:
-                mismatches.append("cot_manifest_json")
-            if state.claimed_answer != record.claimed_answer:
-                mismatches.append("claimed_answer")
-            if blueprint.target_theorem != record.theorem_name:
-                mismatches.append("target_theorem")
-            if mismatches:
-                raise RuntimeError(
-                    "Phase 2 checkpoint does not match the prepared record: "
-                    + ", ".join(mismatches)
-                )
+            (
+                state, blueprint, resumed, seed_hash, blueprint_hash, seed_path,
+            ) = _load_or_initialize_phase2_checkpoint(args, record, checkpoint_path)
+            _write_blueprint_snapshot(
+                output_root, record, iteration=0, label="phase1_seed", blueprint=blueprint,
+            )
+            tracer.emit(TraceEvent(
+                kind="phase2SeedLoaded",
+                thm_name=record.unique_id,
+                args={
+                    "sourceCheckpoint": str(seed_path),
+                    "sourceSeedHash": seed_hash,
+                    "sourceBlueprintHash": blueprint_hash,
+                    "outputCheckpoint": str(checkpoint_path),
+                    "resumed": resumed,
+                    "sourceGroundingMode": record.source_grounding_mode,
+                    "nodeCount": len(blueprint.nodes),
+                },
+                ok=True,
+            ))
             tqdm.write(
-                f"[phase2-resume] {record.unique_id} nodes={len(blueprint.nodes)} "
-                f"iteration={state.iteration}"
+                f"[phase2-{'resume' if resumed else 'seed'}] {record.unique_id} "
+                f"nodes={len(blueprint.nodes)} iteration={state.iteration}"
             )
         else:
             phase1_tracer = tracer.with_context(phase="phase1", iteration=0)
@@ -717,6 +917,14 @@ async def _run_record(
                         decompiler_max_tokens=args.formal_decompiler_max_tokens,
                         comparator_max_tokens=args.strict_comparator_max_tokens,
                         semantic_format_attempts=args.semantic_format_max_attempts,
+                        semantic_audit_enable_thinking=args.semantic_audit_enable_thinking,
+                        semantic_audit_temperature=args.semantic_audit_temperature,
+                        semantic_audit_top_p=args.semantic_audit_top_p,
+                        semantic_audit_top_k=args.semantic_audit_top_k,
+                        semantic_audit_min_p=args.semantic_audit_min_p,
+                        semantic_audit_presence_penalty=args.semantic_audit_presence_penalty,
+                        semantic_audit_repetition_penalty=args.semantic_audit_repetition_penalty,
+                        source_grounding_mode=record.source_grounding_mode,
                     ),
                 )
                 _write_phase1_candidates(
@@ -729,11 +937,15 @@ async def _run_record(
                     claimed_answer=record.claimed_answer,
                     model=args.model,
                     semantic_fidelity_enabled=True,
-                    semantic_require_step_ids=True,
+                    semantic_require_step_ids=record.source_grounding_mode == "formal_steps",
                     semantic_static_gate=True,
                     semantic_minimal_ir=False,
                     semantic_freeze_refinement=False,
-                    semantic_source_mode="step_grounded",
+                    semantic_source_mode=(
+                        "whole_cot"
+                        if record.source_grounding_mode == "whole_cot"
+                        else "step_grounded"
+                    ),
                 )
                 state.semantic_gate_results = list(blueprint.semantic_gate_results)
                 state.semantic_status = _accepted_phase1_status(blueprint)
@@ -745,6 +957,9 @@ async def _run_record(
                 )
                 state.set_blueprint(blueprint)
                 state.save(checkpoint_path)
+                # Preserve an immutable Phase 1 seed before any Phase 2 node
+                # result can mutate the working checkpoint.
+                state.save(_phase1_seed_snapshot_path(output_root, record))
                 path = _write_blueprint_snapshot(
                     output_root, record, iteration=0, label="phase1", blueprint=blueprint
                 )
@@ -969,6 +1184,12 @@ def _metric_row(scope: str, rows: list[dict[str, Any]], subset: str = "", split:
             1 for row in rows
             if row.get("status") in {"error", "semanticRejected", "structuralRejected", "infraError"}
             and row.get("phase") == "phase1"
+        ),
+        "phase1_ineligible": sum(
+            1 for row in rows if row.get("status") == "phase1Ineligible"
+        ),
+        "phase2_eligible": sum(
+            1 for row in rows if row.get("status") != "phase1Ineligible"
         ),
         "blueprint_accepted": len(accepted_rows),
         "strict_accepted": sum(1 for row in rows if row.get("status") == "strictAccepted"),
@@ -1240,9 +1461,14 @@ def _should_skip_existing(row: dict[str, Any] | None, args: argparse.Namespace) 
     if not args.resume or row is None:
         return False
     if getattr(args, "execution_mode", "full") == "phase2_only":
-        # Only accepted Phase 1 rows are eligible seeds. Phase 1 rejects and
-        # already-terminal Phase 2 rows remain untouched in results.jsonl.
-        return row.get("status") not in {"strictAccepted", "acceptedWithWarnings"}
+        status = str(row.get("status") or "")
+        if status in {"solved", "exhausted", "phase1Ineligible"}:
+            return True
+        if status in {
+            "error", "infraError", "structuralRejected", "semanticRejected",
+        }:
+            return not args.retry_error_results
+        return False
     if row.get("root_proved") is True or row.get("status") in {
         "exhausted", "strictAccepted",
         "acceptedWithWarnings",
@@ -1251,6 +1477,56 @@ def _should_skip_existing(row: dict[str, Any] | None, args: argparse.Namespace) 
     return row.get("status") in {
         "error", "semanticRejected", "structuralRejected", "infraError",
     } and not args.retry_error_results
+
+
+def _phase1_source_results(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
+    assert args.phase1_source_results_path is not None
+    rows: dict[str, dict[str, Any]] = {}
+    with args.phase1_source_results_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                row = json.loads(line)
+                source_id = str(row.get("source_id") or "")
+                status = str(row.get("status") or "")
+                if (
+                    str(row.get("phase") or "") == "phase1"
+                    and status in {"strictAccepted", "acceptedWithWarnings"}
+                ):
+                    # Preserve the accepted Phase 1 record even when a legacy
+                    # in-place Phase 2 later appended solved/exhausted rows.
+                    rows[source_id] = row
+                elif source_id not in rows:
+                    rows[source_id] = row
+    return rows
+
+
+def _phase1_ineligible_result(
+    record: Record,
+    args: argparse.Namespace,
+    source_result: dict[str, Any] | None,
+) -> dict[str, Any]:
+    source_status = str((source_result or {}).get("status") or "missing")
+    return {
+        "id": record.unique_id,
+        "record_id": record.record_id,
+        "source_id": record.source_id,
+        "subset": record.subset,
+        "split": record.split,
+        "row_index": record.row_index,
+        "theorem_name": record.theorem_name,
+        "status": "phase1Ineligible",
+        "phase": "phase1Seed",
+        "success": False,
+        "root_proved": False,
+        "error": "Phase 1 result is not accepted for Phase 2.",
+        "phase1_source_status": source_status,
+        "phase1_source_root": str(args.phase1_source_experiment_root),
+        "phase1_source_phase": str((source_result or {}).get("phase") or ""),
+        "phase1_source_error": str((source_result or {}).get("error") or ""),
+        "phase1_source_checkpoint": str(
+            (source_result or {}).get("checkpoint_path") or ""
+        ),
+    }
 
 
 async def _run_experiment(
@@ -1269,9 +1545,37 @@ async def _run_experiment(
             unlink_if_exists(path)
 
     existing = _existing_results(results_path)
+    phase1_results = (
+        _phase1_source_results(args) if args.execution_mode == "phase2_only" else {}
+    )
+    eligible_records: list[Record] = []
+    ineligible_rows: list[dict[str, Any]] = []
+    for record in records:
+        source_result = phase1_results.get(record.source_id)
+        if (
+            args.execution_mode == "phase2_only"
+            and str((source_result or {}).get("status") or "")
+            not in {"strictAccepted", "acceptedWithWarnings"}
+        ):
+            ineligible_rows.append(_phase1_ineligible_result(record, args, source_result))
+        else:
+            eligible_records.append(record)
+
+    if args.execution_mode == "phase2_only":
+        ineligible_ids = {row["id"] for row in ineligible_rows}
+        _remove_jsonl_rows(results_path, ineligible_ids)
+        for row in ineligible_rows:
+            append_jsonl(results_path, row)
+            existing[row["id"]] = row
+        print(
+            f"[phase2-input] total={len(records)} eligible={len(eligible_records)} "
+            f"phase1Ineligible={len(ineligible_rows)} source={args.phase1_source_experiment_root}",
+            flush=True,
+        )
+
     pending: list[Record] = []
     skipped = 0
-    for record in records:
+    for record in eligible_records:
         row = existing.get(record.unique_id)
         if _should_skip_existing(row, args):
             skipped += 1
@@ -1283,9 +1587,24 @@ async def _run_experiment(
         if args.execution_mode != "phase2_only":
             _remove_jsonl_rows(results_path, pending_ids)
             _remove_jsonl_rows(rounds_path, pending_ids)
+        else:
+            retry_ids = {
+                record.unique_id for record in pending
+                if str((existing.get(record.unique_id) or {}).get("status") or "") in {
+                    "error", "infraError", "structuralRejected", "semanticRejected",
+                }
+            }
+            _remove_jsonl_rows(results_path, pending_ids)
+            for record in pending:
+                if record.unique_id in retry_ids:
+                    _clear_record_outputs(output_root, record)
+            _remove_jsonl_rows(rounds_path, retry_ids)
         for record_id in pending_ids:
             existing.pop(record_id, None)
-    if args.execution_mode != "phase2_only":
+    if not args.resume:
+        for record in eligible_records:
+            _clear_record_outputs(output_root, record)
+    elif args.execution_mode != "phase2_only":
         for record in pending:
             _clear_record_outputs(output_root, record)
 

@@ -5,6 +5,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +19,9 @@ from semantic_audit import (  # noqa: E402
     build_formal_view,
     parse_formal_decompiler,
     parse_strict_comparator,
+    parse_whole_cot_comparator,
+    run_formal_decompiler,
+    whole_cot_comparator_messages,
 )
 
 
@@ -155,6 +159,80 @@ class SemanticAuditTest(unittest.TestCase):
         self.assertIn("Give no credit to ex-falso", COMPARATOR_SYSTEM_PROMPT)
         self.assertIn("Track object identity across Steps", COMPARATOR_SYSTEM_PROMPT)
         self.assertIn("root must mention the shared target object", COMPARATOR_SYSTEM_PROMPT)
+
+    def test_whole_cot_formal_view_and_comparator_have_no_step_inventory(self) -> None:
+        view = build_formal_view(_parse_blueprint(LEAN, "root"), include_step_ids=False)
+        decompiler = _decompiler(view)
+        payload = {
+            "cot": {
+                "combined_formal_translation": "Defines and uses sourceValue.",
+                "missing_clauses": [], "weakened_clauses": [],
+                "unbound_objects": [], "wrong_relations": [], "added_clauses": [],
+            },
+            "root": {
+                "translation": "sourceValue equals six.",
+                "target_object_preserved": True, "answer_grounded": True,
+                "reasons": [],
+            },
+            "unreachable_nodes": [], "dependency_issues": [],
+        }
+        parsed = parse_whole_cot_comparator(
+            json.dumps(payload), view=view, decompiler=decompiler,
+        )
+        self.assertTrue(parsed[-1])
+        serialized = json.dumps(view.to_dict())
+        messages = json.dumps(whole_cot_comparator_messages(
+            "problem", "raw cot", "6", view, decompiler,
+        ))
+        self.assertNotIn("step_id", serialized)
+        self.assertNotIn("COT_STEP", messages)
+
+    def test_whole_cot_comparator_rejects_missing_clause(self) -> None:
+        view = build_formal_view(_parse_blueprint(LEAN, "root"), include_step_ids=False)
+        decompiler = _decompiler(view)
+        issue = {"clause": "bind original object", "node_names": ["root"], "reason": "replaced"}
+        payload = {
+            "cot": {
+                "combined_formal_translation": "Only the answer.",
+                "missing_clauses": [issue], "weakened_clauses": [],
+                "unbound_objects": [], "wrong_relations": [], "added_clauses": [],
+            },
+            "root": {"translation": "six", "target_object_preserved": False,
+                     "answer_grounded": False, "reasons": ["object replaced"]},
+            "unreachable_nodes": [], "dependency_issues": [],
+        }
+        self.assertFalse(parse_whole_cot_comparator(
+            json.dumps(payload), view=view, decompiler=decompiler,
+        )[-1])
+
+    def test_semantic_audit_forwards_thinking_sampling(self) -> None:
+        raw = _decompiler(self.view).raw_content
+        response = SimpleNamespace(
+            id="request",
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content=raw, reasoning_content="reasoning"),
+                finish_reason="stop",
+            )],
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=20, total_tokens=30),
+        )
+        with patch("semantic_audit.chat_completion_with_retry", return_value=response) as chat:
+            run_formal_decompiler(
+                object(), "model", view=self.view, max_tokens=16384, max_attempts=1,
+                enable_thinking=True, temperature=0.6, top_p=0.95,
+                top_k=20, min_p=0.0, presence_penalty=0.0,
+                repetition_penalty=1.0,
+            )
+        kwargs = chat.call_args.kwargs
+        self.assertEqual(kwargs["temperature"], 0.6)
+        self.assertEqual(kwargs["top_p"], 0.95)
+        self.assertEqual(kwargs["presence_penalty"], 0.0)
+        self.assertEqual(kwargs["max_completion_tokens"], 16384)
+        self.assertEqual(kwargs["extra_body"], {
+            "top_k": 20,
+            "min_p": 0.0,
+            "repetition_penalty": 1.0,
+            "chat_template_kwargs": {"enable_thinking": True},
+        })
 
 
 if __name__ == "__main__":

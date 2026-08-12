@@ -1,14 +1,13 @@
 input_predictions: /ssd/czx/czx_work/cot_blueprint_refine/subsets/qwen3_8b_original_answer_incorrect/predictions.jsonl
 output_base: /ssd/czx/czx_work/cot_blueprint_refine
-exp_name: qwen3_8b_397b_wrong76_blueprint_generation
+exp_name: qwen3_8b_397b_wrong76_whole_cot_blueprint_generation
 resume: true
 vllm: {use_existing: true}
 shared_vllm_397b: {reasoning_parser: qwen3}
 kimina: {use_existing: true, auto_start: false, auto_destroy: false}
-step_splitter: {prompt_version: formal-step-boundary-v4, concurrency: 76}
 
 blueprint:
-  source_grounding_mode: formal_steps
+  source_grounding_mode: whole_cot
   execution_mode: phase1_only
   generation_max_turns: 8
   generation_enable_thinking: true

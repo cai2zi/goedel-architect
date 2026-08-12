@@ -14,7 +14,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from kimina_lean_compiler import CompilerResult  # noqa: E402
-from prover import LEAN_COMPILE_TOOL, GoedelProver, ProofSignal, ProverResult  # noqa: E402
+from prover import (  # noqa: E402
+    LEAN_COMPILE_TOOL,
+    NORMAL_TOOLS,
+    GoedelProver,
+    ProofSignal,
+    ProverResult,
+)
 
 
 NODE_DECL = "theorem root : True := by sorry_using []"
@@ -97,7 +103,7 @@ class ProverToolProtocolTest(unittest.TestCase):
     def prepare(self, prover, calls, limit=3, allowed=None):
         return prover._prepare_calls(
             calls,
-            allowed or {"lean_compile", "step_lean_compile", "mathlib_search"},
+            allowed or {"lean_compile", "mathlib_search"},
             limit,
             "prove",
             NODE_DECL,
@@ -215,13 +221,12 @@ class ProverToolProtocolTest(unittest.TestCase):
         prover = self.make_prover()
         prepared, dropped = self.prepare(prover, [
             ToolCall("missing", "lean_compile", {}),
-            ToolCall("wrong", "step_lean_compile", {"lean_code": 12}),
             ToolCall("bad-k", "mathlib_search", {"query": "True", "k": 0}),
             ToolCall("valid", "lean_compile", {"proof_body": "by trivial"}),
         ])
         self.assertEqual([item.call.id for item in prepared], ["valid"])
         self.assertEqual([item["reason"] for item in dropped], [
-            "invalid_arguments", "invalid_arguments", "invalid_arguments",
+            "invalid_arguments", "invalid_arguments",
         ])
         self.assertTrue(all(len(item["hash"]) == 64 for item in dropped))
 
@@ -264,15 +269,14 @@ class ProverToolProtocolTest(unittest.TestCase):
         compiler = RecordingCompiler(delay=0.15)
         calls, _ = self.prepare(prover, [
             ToolCall("a", "lean_compile", {"proof_body": "by trivial"}),
-            ToolCall("b", "step_lean_compile", {"lean_code": "import Mathlib\nexample : True := by trivial"}),
-            ToolCall("c", "mathlib_search", {"query": "True"}),
+            ToolCall("b", "mathlib_search", {"query": "True"}),
         ])
         started = time.monotonic()
         outcomes = prover._execute_calls(calls, compiler, NODE_DECL, "", "import Mathlib")
         elapsed = time.monotonic() - started
         self.assertLess(elapsed, 0.27)
-        self.assertEqual([item.call.call.id for item in outcomes], ["a", "b", "c"])
-        self.assertEqual(len(compiler.requests[0]), 2)
+        self.assertEqual([item.call.call.id for item in outcomes], ["a", "b"])
+        self.assertEqual(len(compiler.requests[0]), 1)
 
     def test_parallel_tool_spans_use_each_tools_actual_duration(self) -> None:
         tracer = RecordingTracer()
@@ -310,26 +314,18 @@ class ProverToolProtocolTest(unittest.TestCase):
             {event.span_id for event in tracer.events if event.kind == "tool_result"},
         )
 
-    def test_step_success_does_not_solve_and_history_has_exact_pairs(self) -> None:
+    def test_normal_tools_expose_only_node_compile_and_mathlib_search(self) -> None:
         prover = self.make_prover()
-        compiler = RecordingCompiler([CompilerResult(True)])
-        messages = []
-        turn = prover._process_response(
-            response=response([ToolCall("step", "step_lean_compile", {"lean_code": "import Mathlib\nexample : True := by trivial"})]),
-            messages=messages,
-            compiler=compiler,
-            node_name="root",
-            node_decl=NODE_DECL,
-            parent_lemma_decls="",
-            header="import Mathlib",
-            turn=1,
-            stage="prove",
-            limit=3,
-            allowed_names={"lean_compile", "step_lean_compile", "mathlib_search"},
+        self.assertEqual(
+            [tool["function"]["name"] for tool in NORMAL_TOOLS],
+            ["lean_compile", "mathlib_search"],
         )
-        self.assertEqual(turn.solved_proof, "")
-        self.assertEqual([message["role"] for message in messages], ["assistant", "tool"])
-        self.assertEqual(len(messages[0]["tool_calls"]), 1)
+        prepared, dropped = self.prepare(
+            prover,
+            [ToolCall("unknown", "standalone_compile", {"lean_code": "import Mathlib"})],
+        )
+        self.assertEqual(prepared, [])
+        self.assertEqual(dropped[0]["reason"], "not_allowed")
 
     def test_earliest_successful_canonical_call_wins(self) -> None:
         prover = self.make_prover()
@@ -358,7 +354,7 @@ class ProverToolProtocolTest(unittest.TestCase):
         prepared, dropped = self.prepare(
             prover,
             [
-                ToolCall("step", "step_lean_compile", {"lean_code": "import Mathlib"}),
+                ToolCall("unknown", "standalone_compile", {"lean_code": "import Mathlib"}),
                 ToolCall("one", "lean_compile", {"proof_body": "by trivial"}),
                 ToolCall("two", "lean_compile", {"proof_body": "by exact True.intro"}),
             ],

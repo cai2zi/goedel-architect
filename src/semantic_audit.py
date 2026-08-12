@@ -17,6 +17,7 @@ from tracer import TraceEvent
 
 
 PROMPT_VERSION = "blueprint-semantic-audit-v1"
+WHOLE_COT_PROMPT_VERSION = "whole-cot-comparator-v1"
 SEMANTIC_EFFECTS = {"objectDefinition", "proposition", "vacuous"}
 
 
@@ -145,6 +146,33 @@ open.
 """
 
 
+WHOLE_COT_COMPARATOR_SYSTEM_PROMPT = r"""You are a strict semantic-translation
+comparator, not a truth judge. Compare the complete original chain-of-thought
+with frozen literal translations of sanitized Lean declarations. A faithful
+formalization of a mathematically wrong COT must pass. Reject only omissions,
+weakenings, added claims, object replacement, unbound objects, wrong relation
+or direction, answer hard-coding, dependency breaks, and an unrelated root.
+Names and comments carry no semantic credit.
+
+Audit every relation and target object mechanically. In particular, an
+equality describing a boundary or surface does not formalize an enclosed
+region, solid, volume, or interior, which normally requires a membership or
+inequality constraint. The root must preserve the target object requested by
+the original problem, not merely repeat a final equation from the COT. Root
+`reasons` list defects only and must be empty when both root booleans are true.
+
+Return one JSON object with exactly `cot`, `root`, `unreachable_nodes`, and
+`dependency_issues`. `cot` has exactly `combined_formal_translation`,
+`missing_clauses`, `weakened_clauses`, `unbound_objects`, `wrong_relations`,
+and `added_clauses`. Each clause issue has exactly `clause`, `node_names`, and
+`reason`. `root` has exactly `translation`, `target_object_preserved`,
+`answer_grounded`, and `reasons`. Copy the supplied unreachable-node inventory
+exactly and in order; each item has `node_name`, `justified_side_branch`, and
+`reason`. Each dependency issue has exactly `node_name` and `reason`. Use only
+supplied node names. Return JSON only, no Markdown or extra keys. Be terse.
+"""
+
+
 @dataclass(frozen=True)
 class FormalNodeView:
     node_name: str
@@ -162,9 +190,21 @@ class FormalView:
     root_name: str
     root_closure: tuple[str, ...]
     sha256: str
+    includes_step_ids: bool = True
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        nodes = []
+        for node in self.nodes:
+            item = asdict(node)
+            if not self.includes_step_ids:
+                item.pop("step_id", None)
+            nodes.append(item)
+        return {
+            "nodes": nodes,
+            "root_name": self.root_name,
+            "root_closure": list(self.root_closure),
+            "sha256": self.sha256,
+        }
 
 
 @dataclass(frozen=True)
@@ -204,6 +244,26 @@ class StrictComparatorResult:
     unreachable_steps: tuple[dict[str, Any], ...]
     dependency_issues: tuple[dict[str, Any], ...]
     obligation_results: tuple[dict[str, Any], ...]
+    passed: bool
+    raw_content: str
+    reasoning_content: str
+    finish_reason: str | None
+    request_id: str
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    attempts: tuple[dict[str, Any], ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class WholeCotComparatorResult:
+    cot: dict[str, Any]
+    root: dict[str, Any]
+    unreachable_nodes: tuple[dict[str, Any], ...]
+    dependency_issues: tuple[dict[str, Any], ...]
     passed: bool
     raw_content: str
     reasoning_content: str
@@ -290,7 +350,7 @@ def _base_step_id(value: str) -> str:
     return str(value or "").split(".", 1)[0]
 
 
-def build_formal_view(blueprint: Any) -> FormalView:
+def build_formal_view(blueprint: Any, *, include_step_ids: bool = True) -> FormalView:
     node_names = {node.name for node in blueprint.nodes}
     declarations: dict[str, str] = {}
     effective: dict[str, tuple[str, ...]] = {}
@@ -318,8 +378,14 @@ def build_formal_view(blueprint: Any) -> FormalView:
         node.name == blueprint.target_theorem,
         node.name in closure,
     ) for node in blueprint.nodes)
+    payload_nodes = []
+    for node in views:
+        item = asdict(node)
+        if not include_step_ids:
+            item.pop("step_id", None)
+        payload_nodes.append(item)
     payload = json.dumps(
-        {"root": blueprint.target_theorem, "nodes": [asdict(node) for node in views]},
+        {"root": blueprint.target_theorem, "nodes": payload_nodes},
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -329,19 +395,24 @@ def build_formal_view(blueprint: Any) -> FormalView:
         blueprint.target_theorem,
         tuple(node.node_name for node in views if node.in_root_closure),
         hashlib.sha256(payload.encode()).hexdigest(),
+        include_step_ids,
     )
 
 
 def formal_decompiler_messages(view: FormalView) -> list[dict[str, str]]:
-    inventory = [{
-        "node_name": node.node_name,
-        "kind": node.kind,
-        "step_id": node.step_id,
-        "dependencies": list(node.dependencies),
-        "is_root": node.is_root,
-        "in_root_closure": node.in_root_closure,
-        "sanitized_formal_lean": node.declaration,
-    } for node in view.nodes]
+    inventory = []
+    for node in view.nodes:
+        item = {
+            "node_name": node.node_name,
+            "kind": node.kind,
+            "dependencies": list(node.dependencies),
+            "is_root": node.is_root,
+            "in_root_closure": node.in_root_closure,
+            "sanitized_formal_lean": node.declaration,
+        }
+        if view.includes_step_ids:
+            item["step_id"] = node.step_id
+        inventory.append(item)
     return [
         {"role": "system", "content": DECOMPILER_SYSTEM_PROMPT},
         {"role": "user", "content": (
@@ -657,9 +728,149 @@ def parse_strict_comparator(
     )
 
 
-def semantic_audit_cache_key(model: str, messages: Sequence[Mapping[str, Any]]) -> str:
+_WHOLE_COT_KEYS = {
+    "combined_formal_translation", "missing_clauses", "weakened_clauses",
+    "unbound_objects", "wrong_relations", "added_clauses",
+}
+
+
+def whole_cot_comparator_messages(
+    informal_statement: str,
+    informal_proof: str,
+    claimed_answer: str,
+    view: FormalView,
+    decompiler: FormalDecompilerResult,
+) -> list[dict[str, str]]:
+    unreachable = [node.node_name for node in view.nodes if not node.in_root_closure]
+    payload = {
+        "problem": informal_statement,
+        "claimed_answer": claimed_answer,
+        "complete_original_cot": informal_proof,
+        "formal_view": view.to_dict(),
+        "frozen_node_translations": [asdict(node) for node in decompiler.nodes],
+        "required_unreachable_node_names": unreachable,
+        "required_output_shape": {
+            "cot": {
+                "combined_formal_translation": "...",
+                "missing_clauses": [], "weakened_clauses": [],
+                "unbound_objects": [], "wrong_relations": [], "added_clauses": [],
+            },
+            "root": {
+                "translation": "...", "target_object_preserved": True,
+                "answer_grounded": True, "reasons": [],
+            },
+            "unreachable_nodes": [{
+                "node_name": "n", "justified_side_branch": False, "reason": "...",
+            }],
+            "dependency_issues": [{"node_name": "n", "reason": "..."}],
+        },
+    }
+    return [
+        {"role": "system", "content": WHOLE_COT_COMPARATOR_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ]
+
+
+def parse_whole_cot_comparator(
+    content: str,
+    *,
+    view: FormalView,
+    decompiler: FormalDecompilerResult,
+) -> tuple[dict[str, Any], dict[str, Any], tuple[dict[str, Any], ...], tuple[dict[str, Any], ...], bool]:
+    value = _json_object(content)
+    if set(value) != {"cot", "root", "unreachable_nodes", "dependency_issues"}:
+        raise SemanticAuditFormatError("invalid whole-COT comparator top-level keys", raw_content=content)
+    known_nodes = {node.node_name for node in view.nodes}
+    cot = value["cot"]
+    if not isinstance(cot, dict) or set(cot) != _WHOLE_COT_KEYS:
+        raise SemanticAuditFormatError("cot has invalid keys", raw_content=content)
+    parsed_cot: dict[str, Any] = {
+        "combined_formal_translation": _string(
+            cot["combined_formal_translation"], "cot.combined_formal_translation", content,
+        ),
+    }
+    for key in (
+        "missing_clauses", "weakened_clauses", "unbound_objects",
+        "wrong_relations", "added_clauses",
+    ):
+        parsed_cot[key] = _parse_step_issues(
+            cot[key], label=f"cot.{key}", known_nodes=known_nodes, raw=content,
+        )
+
+    root = value["root"]
+    if not isinstance(root, dict) or set(root) != {
+        "translation", "target_object_preserved", "answer_grounded", "reasons",
+    }:
+        raise SemanticAuditFormatError("root has invalid keys", raw_content=content)
+    if not isinstance(root["target_object_preserved"], bool) or not isinstance(root["answer_grounded"], bool):
+        raise SemanticAuditFormatError("root verdicts must be booleans", raw_content=content)
+    parsed_root = {
+        "translation": _string(root["translation"], "root.translation", content),
+        "target_object_preserved": root["target_object_preserved"],
+        "answer_grounded": root["answer_grounded"],
+        "reasons": list(_strings(root["reasons"], "root.reasons", content)),
+    }
+
+    expected_unreachable = [node.node_name for node in view.nodes if not node.in_root_closure]
+    raw_unreachable = value["unreachable_nodes"]
+    if not isinstance(raw_unreachable, list):
+        raise SemanticAuditFormatError("unreachable_nodes must be an array", raw_content=content)
+    unreachable = []
+    for item in raw_unreachable:
+        if not isinstance(item, dict) or set(item) != {
+            "node_name", "justified_side_branch", "reason",
+        }:
+            raise SemanticAuditFormatError("unreachable node has invalid keys", raw_content=content)
+        if not isinstance(item["justified_side_branch"], bool):
+            raise SemanticAuditFormatError("justified_side_branch must be boolean", raw_content=content)
+        unreachable.append({
+            "node_name": _string(item["node_name"], "unreachable node_name", content),
+            "justified_side_branch": item["justified_side_branch"],
+            "reason": _string(item["reason"], "unreachable reason", content),
+        })
+    if [item["node_name"] for item in unreachable] != expected_unreachable:
+        raise SemanticAuditFormatError(
+            "unreachable node inventory is incomplete or reordered", raw_content=content,
+        )
+
+    raw_dependencies = value["dependency_issues"]
+    if not isinstance(raw_dependencies, list):
+        raise SemanticAuditFormatError("dependency_issues must be an array", raw_content=content)
+    dependencies = []
+    for item in raw_dependencies:
+        if not isinstance(item, dict) or set(item) != {"node_name", "reason"}:
+            raise SemanticAuditFormatError("dependency issue has invalid keys", raw_content=content)
+        node_name = _string(item["node_name"], "dependency node", content)
+        if node_name not in known_nodes:
+            raise SemanticAuditFormatError("dependency issue has unknown node", raw_content=content)
+        dependencies.append({
+            "node_name": node_name,
+            "reason": _string(item["reason"], "dependency reason", content),
+        })
+
+    passed = (
+        not any(parsed_cot[key] for key in (
+            "missing_clauses", "weakened_clauses", "unbound_objects",
+            "wrong_relations", "added_clauses",
+        ))
+        and parsed_root["target_object_preserved"]
+        and parsed_root["answer_grounded"]
+        and not parsed_root["reasons"]
+        and all(item["justified_side_branch"] for item in unreachable)
+        and not dependencies
+        and not decompiler.vacuous_nodes
+    )
+    return parsed_cot, parsed_root, tuple(unreachable), tuple(dependencies), passed
+
+
+def semantic_audit_cache_key(
+    model: str,
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    version: str = PROMPT_VERSION,
+) -> str:
     payload = json.dumps(
-        {"version": PROMPT_VERSION, "model": model, "messages": list(messages)},
+        {"version": version, "model": model, "messages": list(messages)},
         ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode()).hexdigest()
@@ -694,6 +905,13 @@ def _run_stage(
     round_index: int,
     phase: str,
     operation: str,
+    enable_thinking: bool = False,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = -1,
+    min_p: float = 0.0,
+    presence_penalty: float = 0.0,
+    repetition_penalty: float = 1.0,
 ) -> tuple[Any, str, str, str | None, str, tuple[dict[str, Any], ...], tuple[int, int, int]]:
     base_messages = list(messages)
     attempts: list[dict[str, Any]] = []
@@ -701,10 +919,23 @@ def _run_stage(
         response = chat_completion_with_retry(
             client, tracer=tracer, thm_name=thm_name, phase=phase,
             model_id=model, operation=operation,
-            trace_args={"round": round_index, "attempt": attempt},
-            model=model, messages=messages, temperature=0,
+            trace_args={
+                "round": round_index, "attempt": attempt,
+                "enable_thinking": enable_thinking,
+                "temperature": temperature, "top_p": top_p,
+                "top_k": top_k, "min_p": min_p,
+                "presence_penalty": presence_penalty,
+                "repetition_penalty": repetition_penalty,
+            },
+            model=model, messages=messages, temperature=temperature,
+            top_p=top_p, presence_penalty=presence_penalty,
             max_completion_tokens=max_tokens,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            extra_body={
+                "top_k": top_k,
+                "min_p": min_p,
+                "repetition_penalty": repetition_penalty,
+                "chat_template_kwargs": {"enable_thinking": enable_thinking},
+            },
         )
         content, reasoning, finish_reason, request_id, usage = _response_parts(response)
         truncated = str(finish_reason or "").lower() == "length"
@@ -728,6 +959,13 @@ def _run_stage(
                     "Every nodes item must have exactly node_name, kind, translation, "
                     "semantic_effect, introduced_objects, and referenced_objects. "
                     "Copy the required node inventory exactly in the supplied order."
+                )
+            elif operation == "whole_cot_comparator":
+                schema_guidance = (
+                    "Top-level keys are exactly cot, root, unreachable_nodes, and "
+                    "dependency_issues. Every COT clause issue is exactly "
+                    "{clause,node_names,reason}; copy the required unreachable node "
+                    "inventory exactly and use no Step IDs."
                 )
             else:
                 schema_guidance = (
@@ -764,6 +1002,13 @@ def run_formal_decompiler(
     view: FormalView,
     max_tokens: int,
     max_attempts: int,
+    enable_thinking: bool = False,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = -1,
+    min_p: float = 0.0,
+    presence_penalty: float = 0.0,
+    repetition_penalty: float = 1.0,
     tracer=None,
     thm_name: str = "",
     round_index: int = 0,
@@ -779,6 +1024,10 @@ def run_formal_decompiler(
         max_tokens=max_tokens, max_attempts=max_attempts, tracer=tracer,
         thm_name=thm_name, round_index=round_index,
         phase="formalDecompiler", operation="formal_decompiler",
+        enable_thinking=enable_thinking, temperature=temperature,
+        top_p=top_p, top_k=top_k, min_p=min_p,
+        presence_penalty=presence_penalty,
+        repetition_penalty=repetition_penalty,
     )
     result = FormalDecompilerResult(
         parsed, content, reasoning, finish, request_id,
@@ -813,6 +1062,13 @@ def run_strict_comparator(
     open_obligations: Sequence[Mapping[str, Any]],
     max_tokens: int,
     max_attempts: int,
+    enable_thinking: bool = False,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = -1,
+    min_p: float = 0.0,
+    presence_penalty: float = 0.0,
+    repetition_penalty: float = 1.0,
     tracer=None,
     thm_name: str = "",
     round_index: int = 0,
@@ -837,6 +1093,10 @@ def run_strict_comparator(
         max_tokens=max_tokens, max_attempts=max_attempts, tracer=tracer,
         thm_name=thm_name, round_index=round_index,
         phase="strictComparator", operation="strict_comparator",
+        enable_thinking=enable_thinking, temperature=temperature,
+        top_p=top_p, top_k=top_k, min_p=min_p,
+        presence_penalty=presence_penalty,
+        repetition_penalty=repetition_penalty,
     )
     steps, root, unreachable, dependencies, obligation_results, passed = parsed
     result = StrictComparatorResult(
@@ -856,6 +1116,71 @@ def run_strict_comparator(
                   "promptTokens": usage[0], "completionTokens": usage[1],
                   "totalTokens": usage[2], "requestId": request_id},
             ok=passed,
+        ))
+    return result
+
+
+def run_whole_cot_comparator(
+    client: Any,
+    model: str,
+    *,
+    informal_statement: str,
+    informal_proof: str,
+    claimed_answer: str,
+    view: FormalView,
+    decompiler: FormalDecompilerResult,
+    max_tokens: int,
+    max_attempts: int,
+    enable_thinking: bool = False,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = -1,
+    min_p: float = 0.0,
+    presence_penalty: float = 0.0,
+    repetition_penalty: float = 1.0,
+    tracer=None,
+    thm_name: str = "",
+    round_index: int = 0,
+) -> WholeCotComparatorResult:
+    messages = whole_cot_comparator_messages(
+        informal_statement, informal_proof, claimed_answer, view, decompiler,
+    )
+    cache_key = semantic_audit_cache_key(model, messages, version=WHOLE_COT_PROMPT_VERSION)
+    if tracer is not None:
+        tracer.emit(TraceEvent(
+            kind="wholeCotCompareStart", thm_name=thm_name, turn=round_index,
+            args={"round": round_index, "formalViewHash": view.sha256,
+                  "cacheKey": cache_key, "protocol": WHOLE_COT_PROMPT_VERSION},
+        ))
+    parsed, content, reasoning, finish, request_id, attempts, usage = _run_stage(
+        client, model, messages=messages, parser=parse_whole_cot_comparator,
+        parser_kwargs={"view": view, "decompiler": decompiler},
+        max_tokens=max_tokens, max_attempts=max_attempts, tracer=tracer,
+        thm_name=thm_name, round_index=round_index,
+        phase="wholeCotComparator", operation="whole_cot_comparator",
+        enable_thinking=enable_thinking, temperature=temperature,
+        top_p=top_p, top_k=top_k, min_p=min_p,
+        presence_penalty=presence_penalty,
+        repetition_penalty=repetition_penalty,
+    )
+    cot, root, unreachable, dependencies, passed = parsed
+    result = WholeCotComparatorResult(
+        cot, root, unreachable, dependencies, passed, content, reasoning, finish,
+        request_id, usage[0], usage[1], usage[2], attempts,
+    )
+    if tracer is not None:
+        tracer.emit(TraceEvent(
+            kind="wholeCotCompareResult", thm_name=thm_name, turn=round_index,
+            args={"round": round_index, "formalViewHash": view.sha256,
+                  "cacheKey": cache_key, "protocol": WHOLE_COT_PROMPT_VERSION,
+                  "passed": passed, "result": result.to_dict()}, ok=passed,
+        ))
+        tracer.emit(TraceEvent(
+            kind="wholeCotCompareEnd", thm_name=thm_name, turn=round_index,
+            args={"round": round_index, "passed": passed,
+                  "attemptCount": len(attempts), "promptTokens": usage[0],
+                  "completionTokens": usage[1], "totalTokens": usage[2],
+                  "requestId": request_id}, ok=passed,
         ))
     return result
 
@@ -901,6 +1226,53 @@ def comparator_defects(result: StrictComparatorResult) -> list[dict[str, Any]]:
     return defects
 
 
+def whole_cot_comparator_defects(result: WholeCotComparatorResult) -> list[dict[str, Any]]:
+    defects: list[dict[str, Any]] = []
+    for category in (
+        "missing_clauses", "weakened_clauses", "unbound_objects",
+        "wrong_relations", "added_clauses",
+    ):
+        for item in result.cot[category]:
+            defects.append({
+                "category": category,
+                "node_names": list(item["node_names"]),
+                "requirement": item["clause"],
+                "reason": item["reason"],
+            })
+    if not result.root["target_object_preserved"]:
+        defects.append({
+            "category": "rootTargetObject", "node_names": [],
+            "requirement": "Preserve the source target object in root.",
+            "reason": "; ".join(result.root["reasons"]) or "Root target object changed.",
+        })
+    if not result.root["answer_grounded"]:
+        defects.append({
+            "category": "rootAnswerGrounding", "node_names": [],
+            "requirement": "Ground the answer in the source object.",
+            "reason": "; ".join(result.root["reasons"]) or "Answer is ungrounded.",
+        })
+    if result.root["reasons"]:
+        defects.append({
+            "category": "rootSemanticReasons", "node_names": [],
+            "requirement": "Resolve every root semantic defect and return no pass rationale.",
+            "reason": "; ".join(result.root["reasons"]),
+        })
+    for item in result.unreachable_nodes:
+        if not item["justified_side_branch"]:
+            defects.append({
+                "category": "dagDisconnected", "node_names": [item["node_name"]],
+                "requirement": "Connect this required node to root.",
+                "reason": item["reason"],
+            })
+    for item in result.dependency_issues:
+        defects.append({
+            "category": "dependencyFidelity", "node_names": [item["node_name"]],
+            "requirement": "Repair the source use-chain dependency.",
+            "reason": item["reason"],
+        })
+    return defects
+
+
 def format_semantic_audit_feedback(
     decompiler: FormalDecompilerResult,
     comparator: StrictComparatorResult,
@@ -930,9 +1302,12 @@ def format_semantic_audit_feedback(
 
 
 __all__ = [
-    "PROMPT_VERSION", "FormalDecompilerResult", "FormalView",
-    "SemanticAuditFormatError", "StrictComparatorResult", "build_formal_view",
+    "PROMPT_VERSION", "WHOLE_COT_PROMPT_VERSION", "FormalDecompilerResult", "FormalView",
+    "SemanticAuditFormatError", "StrictComparatorResult", "WholeCotComparatorResult",
+    "build_formal_view",
     "comparator_defects", "formal_decompiler_messages", "format_semantic_audit_feedback",
     "parse_formal_decompiler", "parse_strict_comparator", "run_formal_decompiler",
-    "run_strict_comparator", "semantic_audit_cache_key", "strict_comparator_messages",
+    "parse_whole_cot_comparator", "run_strict_comparator", "run_whole_cot_comparator",
+    "semantic_audit_cache_key", "strict_comparator_messages",
+    "whole_cot_comparator_defects", "whole_cot_comparator_messages",
 ]

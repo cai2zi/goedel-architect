@@ -41,12 +41,17 @@ from llm_client import chat_completion_with_retry, make_client
 from semantic_audit import (
     FormalDecompilerResult,
     StrictComparatorResult,
+    WholeCotComparatorResult,
+    WHOLE_COT_PROMPT_VERSION,
     build_formal_view,
     comparator_defects,
     run_formal_decompiler,
     run_strict_comparator,
+    run_whole_cot_comparator,
     semantic_audit_cache_key,
     strict_comparator_messages,
+    whole_cot_comparator_defects,
+    whole_cot_comparator_messages,
 )
 from semantic_fidelity import (
     SemanticIssue,
@@ -82,6 +87,24 @@ Call `lean_compile` exactly once with the entire replacement file.  Do not
 return prose or a partial declaration.
 """
 
+WHOLE_COT_GENERATION_SYSTEM_SUFFIX = r"""
+
+## Complete Whole-COT Blueprint generation contract
+
+Return a complete replacement Blueprint on every round. Do not emit or refer
+to `PendingBlueprintClaim`: every definition body and every lemma/theorem
+proposition must be concrete Lean. Proof bodies remain exactly
+`:= by sorry_using [...]`. Faithfully formalize the complete supplied COT even
+when it is mathematically wrong. Preserve shared objects, relation directions,
+quantifiers, dependencies, and the final target. Do not use `COT_STEP` titles;
+Blueprint `title` metadata is optional and carries no semantic credit.
+
+Every declaration must have a non-empty `statement` doc comment, and every
+lemma/theorem must also have a non-empty `proof` doc comment. Call
+`lean_compile` exactly once with the entire replacement file. Do not return
+prose or a partial declaration.
+"""
+
 
 @dataclass(frozen=True)
 class GenerationRound:
@@ -114,7 +137,8 @@ class BlueprintValidation:
     structural_errors: list[str]
     standalone_report: Phase2StandaloneReport
     formal_decompiler_result: FormalDecompilerResult | None = None
-    strict_comparator_result: StrictComparatorResult | None = None
+    strict_comparator_result: StrictComparatorResult | WholeCotComparatorResult | None = None
+    semantic_audit_protocol: str = "blueprint-semantic-audit-v1"
 
     @property
     def passed(self) -> bool:
@@ -134,9 +158,15 @@ def validation_details(validation: BlueprintValidation) -> dict[str, Any]:
     if validation.formal_decompiler_result and validation.strict_comparator_result:
         audit = {
             "formalDecompiler": validation.formal_decompiler_result.to_dict(),
-            "strictComparator": validation.strict_comparator_result.to_dict(),
+            "protocol": validation.semantic_audit_protocol,
             "classification": "strictAccepted" if validation.passed else "semanticRejected",
         }
+        comparator_key = (
+            "wholeCotComparator"
+            if validation.semantic_audit_protocol == WHOLE_COT_PROMPT_VERSION
+            else "strictComparator"
+        )
+        audit[comparator_key] = validation.strict_comparator_result.to_dict()
     return {
         "passed": validation.passed,
         "wholeFileLeanSuccess": validation.lean_result.success,
@@ -185,18 +215,28 @@ def _with_semantic_audit(
     client: Any,
     model: str,
     informal_statement: str,
+    informal_proof: str,
     claimed_answer: str,
     semantic_manifest: Any,
+    source_grounding_mode: str,
     formal_decompiler_max_tokens: int,
     strict_comparator_max_tokens: int,
     format_max_attempts: int,
+    semantic_audit_enable_thinking: bool,
+    semantic_audit_temperature: float,
+    semantic_audit_top_p: float,
+    semantic_audit_top_k: int,
+    semantic_audit_min_p: float,
+    semantic_audit_presence_penalty: float,
+    semantic_audit_repetition_penalty: float,
     decompiler_cache: dict[str, FormalDecompilerResult],
-    comparator_cache: dict[str, StrictComparatorResult],
+    comparator_cache: dict[str, Any],
     tracer: Any,
     thm_name: str,
     round_index: int,
 ) -> BlueprintValidation:
-    view = build_formal_view(blueprint)
+    whole_cot = source_grounding_mode == "whole_cot"
+    view = build_formal_view(blueprint, include_step_ids=not whole_cot)
     decompiler = decompiler_cache.get(view.sha256)
     if decompiler is None:
         decompiler = run_formal_decompiler(
@@ -205,37 +245,64 @@ def _with_semantic_audit(
             view=view,
             max_tokens=formal_decompiler_max_tokens,
             max_attempts=format_max_attempts,
+            enable_thinking=semantic_audit_enable_thinking,
+            temperature=semantic_audit_temperature,
+            top_p=semantic_audit_top_p,
+            top_k=semantic_audit_top_k,
+            min_p=semantic_audit_min_p,
+            presence_penalty=semantic_audit_presence_penalty,
+            repetition_penalty=semantic_audit_repetition_penalty,
             tracer=tracer,
             thm_name=thm_name,
             round_index=round_index,
         )
         decompiler_cache[view.sha256] = decompiler
-    messages = strict_comparator_messages(
-        informal_statement,
-        claimed_answer,
-        semantic_manifest,
-        view,
-        decompiler,
-        (),
-    )
-    cache_key = semantic_audit_cache_key(model, messages)
+    if whole_cot:
+        messages = whole_cot_comparator_messages(
+            informal_statement, informal_proof, claimed_answer, view, decompiler,
+        )
+        cache_key = semantic_audit_cache_key(
+            model, messages, version=WHOLE_COT_PROMPT_VERSION,
+        )
+    else:
+        messages = strict_comparator_messages(
+            informal_statement, claimed_answer, semantic_manifest, view, decompiler, (),
+        )
+        cache_key = semantic_audit_cache_key(model, messages)
     comparator = comparator_cache.get(cache_key)
     if comparator is None:
-        comparator = run_strict_comparator(
-            client,
-            model,
-            informal_statement=informal_statement,
-            claimed_answer=claimed_answer,
-            manifest=semantic_manifest,
-            view=view,
-            decompiler=decompiler,
-            open_obligations=(),
-            max_tokens=strict_comparator_max_tokens,
-            max_attempts=format_max_attempts,
-            tracer=tracer,
-            thm_name=thm_name,
-            round_index=round_index,
-        )
+        if whole_cot:
+            comparator = run_whole_cot_comparator(
+                client, model, informal_statement=informal_statement,
+                informal_proof=informal_proof, claimed_answer=claimed_answer,
+                view=view, decompiler=decompiler,
+                max_tokens=strict_comparator_max_tokens,
+                max_attempts=format_max_attempts, tracer=tracer,
+                enable_thinking=semantic_audit_enable_thinking,
+                temperature=semantic_audit_temperature,
+                top_p=semantic_audit_top_p,
+                top_k=semantic_audit_top_k,
+                min_p=semantic_audit_min_p,
+                presence_penalty=semantic_audit_presence_penalty,
+                repetition_penalty=semantic_audit_repetition_penalty,
+                thm_name=thm_name, round_index=round_index,
+            )
+        else:
+            comparator = run_strict_comparator(
+                client, model, informal_statement=informal_statement,
+                claimed_answer=claimed_answer, manifest=semantic_manifest,
+                view=view, decompiler=decompiler, open_obligations=(),
+                max_tokens=strict_comparator_max_tokens,
+                max_attempts=format_max_attempts, tracer=tracer,
+                enable_thinking=semantic_audit_enable_thinking,
+                temperature=semantic_audit_temperature,
+                top_p=semantic_audit_top_p,
+                top_k=semantic_audit_top_k,
+                min_p=semantic_audit_min_p,
+                presence_penalty=semantic_audit_presence_penalty,
+                repetition_penalty=semantic_audit_repetition_penalty,
+                thm_name=thm_name, round_index=round_index,
+            )
         comparator_cache[cache_key] = comparator
     return BlueprintValidation(
         lean_result=validation.lean_result,
@@ -244,6 +311,9 @@ def _with_semantic_audit(
         standalone_report=validation.standalone_report,
         formal_decompiler_result=decompiler,
         strict_comparator_result=comparator,
+        semantic_audit_protocol=(
+            WHOLE_COT_PROMPT_VERSION if whole_cot else "blueprint-semantic-audit-v1"
+        ),
     )
 
 
@@ -395,6 +465,7 @@ def _messages(
     claimed_answer: str,
     previous_blueprint: str,
     previous_feedback: str,
+    source_grounding_mode: str = "formal_steps",
 ) -> list[dict[str, str]]:
     user = render(
         ROBUSTPA_BLUEPRINT_USER_TEMPLATE,
@@ -415,7 +486,11 @@ def _messages(
             + previous_feedback
         )
     return [
-        {"role": "system", "content": ROBUSTPA_BLUEPRINT_SYSTEM_PROMPT + GENERATION_SYSTEM_SUFFIX},
+        {"role": "system", "content": ROBUSTPA_BLUEPRINT_SYSTEM_PROMPT + (
+            WHOLE_COT_GENERATION_SYSTEM_SUFFIX
+            if source_grounding_mode == "whole_cot"
+            else GENERATION_SYSTEM_SUFFIX
+        )},
         {"role": "user", "content": user},
     ]
 
@@ -448,7 +523,9 @@ def _submitted_code(response: Any) -> tuple[str, list[dict[str, Any]]]:
     return code.strip() + "\n", problems
 
 
-def _contract_errors(blueprint: Blueprint, target_name: str) -> list[dict[str, Any]]:
+def _contract_errors(
+    blueprint: Blueprint, target_name: str, *, source_grounding_mode: str = "formal_steps",
+) -> list[dict[str, Any]]:
     errors: list[dict[str, Any]] = []
     if not blueprint.nodes:
         errors.append(_issue("noBlueprintNodes", "no annotated declarations were parsed"))
@@ -467,12 +544,14 @@ def _contract_errors(blueprint: Blueprint, target_name: str) -> list[dict[str, A
         if not node.statement.strip():
             errors.append(_issue(
                 "missingStatementMetadata", "statement metadata is empty",
-                node_name=node.name, step_id=node.source_step_id,
+                node_name=node.name,
+                step_id=node.source_step_id if source_grounding_mode == "formal_steps" else "",
             ))
         if node.kind in {"lemma", "theorem"} and not node.proof_sketch.strip():
             errors.append(_issue(
                 "missingProofMetadata", "proof metadata is empty",
-                node_name=node.name, step_id=node.source_step_id,
+                node_name=node.name,
+                step_id=node.source_step_id if source_grounding_mode == "formal_steps" else "",
             ))
     return errors
 
@@ -494,13 +573,22 @@ def _validate_round(
     compiler: KiminaLeanCompiler,
     semantic_manifest,
     informal_statement: str,
+    informal_proof: str,
     claimed_answer: str,
+    source_grounding_mode: str,
     standalone_concurrency: int,
     client: Any,
     model: str,
     decompiler_max_tokens: int,
     comparator_max_tokens: int,
     semantic_format_attempts: int,
+    semantic_audit_enable_thinking: bool,
+    semantic_audit_temperature: float,
+    semantic_audit_top_p: float,
+    semantic_audit_top_k: int,
+    semantic_audit_min_p: float,
+    semantic_audit_presence_penalty: float,
+    semantic_audit_repetition_penalty: float,
     tracer,
     thm_name: str,
     round_index: int,
@@ -509,7 +597,9 @@ def _validate_round(
     comparator_cache: dict[str, Any],
 ) -> tuple[Blueprint, BlueprintValidation, tuple[dict[str, Any], ...], tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
     candidate = _parse_blueprint(code, target_name)
-    deterministic: list[dict[str, Any]] = _contract_errors(candidate, target_name)
+    deterministic: list[dict[str, Any]] = _contract_errors(
+        candidate, target_name, source_grounding_mode=source_grounding_mode,
+    )
     lean_result = compiler.check_blueprint(code, target_name)
     if lean_result.failure_kind == "infra":
         raise KiminaInfrastructureError(
@@ -522,11 +612,12 @@ def _validate_round(
         candidate,
         semantic_manifest,
         claimed_answer=claimed_answer,
-        require_step_bindings=True,
+        require_step_bindings=source_grounding_mode == "formal_steps",
     ) if candidate.nodes else []
     for issue in semantic_issues:
         row = _issue(
-            issue.code, issue.message, node_name=issue.node_name, step_id=issue.step_id,
+            issue.code, issue.message, node_name=issue.node_name,
+            step_id=issue.step_id if source_grounding_mode == "formal_steps" else "",
         )
         if issue.severity == "error":
             deterministic.append(row)
@@ -572,7 +663,10 @@ def _validate_round(
             "phase2Standalone",
             item.diagnostic,
             node_name=item.node_name,
-            step_id=getattr(item, "step_id", ""),
+            step_id=(
+                getattr(item, "step_id", "")
+                if source_grounding_mode == "formal_steps" else ""
+            ),
         ))
 
     validation = BlueprintValidation(
@@ -589,11 +683,20 @@ def _validate_round(
             client=client,
             model=model,
             informal_statement=informal_statement,
+            informal_proof=informal_proof,
             claimed_answer=claimed_answer,
             semantic_manifest=semantic_manifest,
+            source_grounding_mode=source_grounding_mode,
             formal_decompiler_max_tokens=decompiler_max_tokens,
             strict_comparator_max_tokens=comparator_max_tokens,
             format_max_attempts=semantic_format_attempts,
+            semantic_audit_enable_thinking=semantic_audit_enable_thinking,
+            semantic_audit_temperature=semantic_audit_temperature,
+            semantic_audit_top_p=semantic_audit_top_p,
+            semantic_audit_top_k=semantic_audit_top_k,
+            semantic_audit_min_p=semantic_audit_min_p,
+            semantic_audit_presence_penalty=semantic_audit_presence_penalty,
+            semantic_audit_repetition_penalty=semantic_audit_repetition_penalty,
             decompiler_cache=decompiler_cache,
             comparator_cache=comparator_cache,
             tracer=tracer,
@@ -609,23 +712,51 @@ def _validate_round(
                     "vacuousFormalNode",
                     "Formal Decompiler classified this node as vacuous",
                     node_name=node_name,
-                    step_id=node.source_step_id if node else "",
+                    step_id=(
+                        node.source_step_id
+                        if node and source_grounding_mode == "formal_steps" else ""
+                    ),
                 ))
         if comparator is not None:
-            for defect in comparator_defects(comparator):
+            defects = (
+                whole_cot_comparator_defects(comparator)
+                if source_grounding_mode == "whole_cot"
+                else comparator_defects(comparator)
+            )
+            for defect in defects:
                 names = list(defect.get("node_names") or ())
                 semantic.append(_issue(
                     str(defect.get("category") or "semanticDefect"),
                     f"{defect.get('requirement')} Reason: {defect.get('reason')}",
                     node_name=",".join(names),
-                    step_id=str(defect.get("step_id") or ""),
+                    step_id=(
+                        "" if source_grounding_mode == "whole_cot"
+                        else str(defect.get("step_id") or "")
+                    ),
                 ))
-            for item in comparator.unreachable_steps:
+            if not comparator.passed and not defects:
+                semantic.append(_issue(
+                    "semanticComparatorRejected",
+                    "The strict semantic comparator rejected the candidate.",
+                ))
+            unreachable_items = (
+                comparator.unreachable_nodes
+                if source_grounding_mode == "whole_cot"
+                else comparator.unreachable_steps
+            )
+            for item in unreachable_items:
                 if item.get("justified_side_branch"):
                     warnings.append(_issue(
                         "justifiedSideBranch",
                         item.get("reason"),
-                        step_id=str(item.get("step_id") or ""),
+                        node_name=(
+                            str(item.get("node_name") or "")
+                            if source_grounding_mode == "whole_cot" else ""
+                        ),
+                        step_id=(
+                            "" if source_grounding_mode == "whole_cot"
+                            else str(item.get("step_id") or "")
+                        ),
                     ))
 
     return (
@@ -663,13 +794,26 @@ def generate_blueprint(
     decompiler_max_tokens: int,
     comparator_max_tokens: int,
     semantic_format_attempts: int,
+    semantic_audit_enable_thinking: bool = False,
+    semantic_audit_temperature: float = 0.0,
+    semantic_audit_top_p: float = 1.0,
+    semantic_audit_top_k: int = -1,
+    semantic_audit_min_p: float = 0.0,
+    semantic_audit_presence_penalty: float = 0.0,
+    semantic_audit_repetition_penalty: float = 1.0,
+    source_grounding_mode: str = "formal_steps",
 ) -> Blueprint:
     if max_turns <= 0:
         raise ValueError("generation max_turns must be positive")
-    semantic_manifest = parse_cot_manifest(cot_manifest_json)
-    step_grounded_proof = _render_step_grounded_proof(
-        cot_manifest_json, include_ir=False,
+    if source_grounding_mode not in {"formal_steps", "whole_cot"}:
+        raise ValueError("source_grounding_mode must be formal_steps or whole_cot")
+    semantic_manifest = (
+        parse_cot_manifest(cot_manifest_json)
+        if source_grounding_mode == "formal_steps" else None
     )
+    source_proof = informal_proof
+    if source_grounding_mode == "formal_steps":
+        source_proof = _render_step_grounded_proof(cot_manifest_json, include_ir=False)
     client = make_client(model)
     previous_code = ""
     previous_feedback = ""
@@ -689,10 +833,11 @@ def generate_blueprint(
         messages = _messages(
             target_name=target_name,
             informal_statement=informal_statement,
-            informal_proof=step_grounded_proof or informal_proof,
+            informal_proof=source_proof,
             claimed_answer=claimed_answer,
             previous_blueprint=previous_code,
             previous_feedback=previous_feedback,
+            source_grounding_mode=source_grounding_mode,
         )
         input_tokens, completion_budget = generation_request_budget(
             messages,
@@ -725,6 +870,8 @@ def generate_blueprint(
                 span_id=span_id,
                 args={
                     "round": round_index,
+                    "sourceGroundingMode": source_grounding_mode,
+                    "splitterInvoked": source_grounding_mode == "formal_steps",
                     "inputTokens": input_tokens,
                     "maxCompletionTokens": completion_budget,
                     "enableThinking": enable_thinking,
@@ -800,13 +947,22 @@ def generate_blueprint(
                 compiler=compiler,
                 semantic_manifest=semantic_manifest,
                 informal_statement=informal_statement,
+                informal_proof=informal_proof,
                 claimed_answer=claimed_answer,
+                source_grounding_mode=source_grounding_mode,
                 standalone_concurrency=standalone_concurrency,
                 client=client,
                 model=model,
                 decompiler_max_tokens=decompiler_max_tokens,
                 comparator_max_tokens=comparator_max_tokens,
                 semantic_format_attempts=semantic_format_attempts,
+                semantic_audit_enable_thinking=semantic_audit_enable_thinking,
+                semantic_audit_temperature=semantic_audit_temperature,
+                semantic_audit_top_p=semantic_audit_top_p,
+                semantic_audit_top_k=semantic_audit_top_k,
+                semantic_audit_min_p=semantic_audit_min_p,
+                semantic_audit_presence_penalty=semantic_audit_presence_penalty,
+                semantic_audit_repetition_penalty=semantic_audit_repetition_penalty,
                 tracer=tracer,
                 thm_name=thm_name,
                 round_index=round_index,
@@ -890,6 +1046,8 @@ def generate_blueprint(
                 semantic_errors=latest_semantic,
                 warnings=latest_warnings,
             )
+            final_details["sourceGroundingMode"] = source_grounding_mode
+            final_details["splitterInvoked"] = source_grounding_mode == "formal_steps"
             latest_blueprint.generation_validation = final_details
             latest_blueprint.generation_history = [item.to_dict() for item in rounds]
             latest_blueprint.candidate_history = list(candidates)
@@ -923,6 +1081,8 @@ def generate_blueprint(
     )
     final_details = validation_details(latest_validation) if latest_validation else {}
     final_details.update({
+        "sourceGroundingMode": source_grounding_mode,
+        "splitterInvoked": source_grounding_mode == "formal_steps",
         "classification": "structuralRejected" if deterministic_failed else "semanticRejected",
         "finalErrorKinds": [
             name for name, present in (

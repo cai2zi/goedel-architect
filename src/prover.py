@@ -179,22 +179,6 @@ LEAN_COMPILE_TOOL = {
     },
 }
 
-STEP_LEAN_COMPILE_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "step_lean_compile",
-        "description": (
-            "Exploratory compile of a complete standalone Lean file. Include all imports and "
-            "the complete theorem yourself. Success does not solve the current node."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {"lean_code": {"type": "string"}},
-            "required": ["lean_code"],
-        },
-    },
-}
-
 MATHLIB_SEARCH_TOOL = {
     "type": "function",
     "function": {
@@ -211,16 +195,15 @@ MATHLIB_SEARCH_TOOL = {
     },
 }
 
-NORMAL_TOOLS = [LEAN_COMPILE_TOOL, STEP_LEAN_COMPILE_TOOL, MATHLIB_SEARCH_TOOL]
+NORMAL_TOOLS = [LEAN_COMPILE_TOOL, MATHLIB_SEARCH_TOOL]
 
 SYSTEM_SUFFIX = """
 ## Tool-first workflow
 
-Use lean_compile for the current node, step_lean_compile for isolated experiments,
-and mathlib_search when you do not know a Mathlib lemma name. A successful
-lean_compile call is the only way to solve the node. step_lean_compile must contain
-a complete file including imports and never solves the node. Submit at most
-{{max_tool_calls}} tool calls per turn; excess and duplicate calls are discarded.
+Use lean_compile for the current node and mathlib_search when you do not know a
+Mathlib lemma name. A successful lean_compile call is the only way to solve the
+node. Submit at most {{max_tool_calls}} tool calls per turn; excess and duplicate
+calls are discarded.
 The final turn exposes only lean_compile, so use earlier turns for exploration.
 """
 
@@ -385,7 +368,7 @@ class GoedelProver:
                 turn=turn,
                 limit=1 if final_turn else self.max_tool_calls_per_turn,
                 allowed_names={"lean_compile"} if final_turn else {
-                    "lean_compile", "step_lean_compile", "mathlib_search",
+                    "lean_compile", "mathlib_search",
                 },
             )
             if outcome.solved_proof:
@@ -739,13 +722,10 @@ class GoedelProver:
                 search_calls.append(call)
                 continue
             try:
-                if call.name == "lean_compile":
-                    proof = _normalize_node_proof_body(str(call.args["proof_body"]))
-                    code = assemble_node_attempt(
-                        node_decl, parent_lemma_decls, proof, header,
-                    )
-                else:
-                    code = str(call.args["lean_code"])
+                proof = _normalize_node_proof_body(str(call.args["proof_body"]))
+                code = assemble_node_attempt(
+                    node_decl, parent_lemma_decls, proof, header,
+                )
                 compile_calls.append(call)
                 compile_requests.append(CompileRequest(code, request_id=call.call_hash))
             except (KeyError, ValueError) as exc:
@@ -771,10 +751,7 @@ class GoedelProver:
                     for _call in compile_calls
                 ]
             for call, result in zip(compile_calls, results, strict=True):
-                proof = (
-                    _normalize_node_proof_body(str(call.args["proof_body"]))
-                    if call.name == "lean_compile" else ""
-                )
+                proof = _normalize_node_proof_body(str(call.args["proof_body"]))
                 outcome = _compiler_outcome(result, proof)
                 outcomes[call.index] = (outcome, False)
                 self._tool_cache[call.call_hash] = outcome
@@ -992,7 +969,6 @@ def _normalize_node_proof_body(proof_body: str) -> str:
 def _tool_argument_error(name: str, args: dict[str, Any]) -> str | None:
     required_string = {
         "lean_compile": "proof_body",
-        "step_lean_compile": "lean_code",
         "mathlib_search": "query",
     }.get(name)
     if required_string is not None:

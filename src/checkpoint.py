@@ -53,6 +53,13 @@ class CheckpointState:
     semantic_contract_snapshot: dict = field(default_factory=dict)
     semantic_gate_results: list[dict] = field(default_factory=list)
     semantic_status: str = ""
+    # Immutable provenance for an independently executed Phase 2 run.
+    phase1_seed_hash: str = ""
+    phase1_blueprint_hash: str = ""
+    phase1_source_root: str = ""
+    phase2_run_initialized: bool = False
+    phase2_last_launch_resumed: bool = False
+    phase2_resume_count: int = 0
 
     def __post_init__(self) -> None:
         self.status = RunStatus(self.status)

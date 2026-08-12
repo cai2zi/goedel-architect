@@ -16,6 +16,7 @@ from blueprint_generation import (  # noqa: E402
     GenerationRound,
     _accepted_validation_details,
     _contract_errors,
+    _messages,
     _submitted_code,
     generation_request_budget,
     generation_round_classification,
@@ -105,6 +106,18 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
             round_index=8, max_turns=8, deterministic_error_count=0,
             semantic_error_count=2, warning_count=0,
         ), "semanticRejected")
+
+    def test_whole_cot_prompt_uses_raw_cot_without_step_contract(self) -> None:
+        messages = _messages(
+            target_name="root", informal_statement="problem",
+            informal_proof="raw complete cot", claimed_answer="6",
+            previous_blueprint="", previous_feedback="",
+            source_grounding_mode="whole_cot",
+        )
+        rendered = "\n".join(item["content"] for item in messages)
+        self.assertIn("raw complete cot", rendered)
+        self.assertNotIn("COT_STEP:Snnn", rendered)
+        self.assertIn("title` metadata is optional", rendered)
 
 
 if __name__ == "__main__":

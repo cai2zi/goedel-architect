@@ -30,6 +30,28 @@ def manifest() -> str:
 
 
 class StepSemanticFidelityTest(unittest.TestCase):
+    def test_whole_cot_mode_accepts_no_title_and_ignores_accidental_step_title(self) -> None:
+        no_title = '''import Mathlib
+import Architect
+@[blueprint (statement := /-- result -/) (proof := /-- arithmetic -/)]
+theorem root : (1 + 1 : Nat) = 2 := by sorry_using []
+'''
+        self.assertEqual(validate_blueprint_fidelity(
+            _parse_blueprint(no_title, "root"), None, claimed_answer="2",
+            require_step_bindings=False,
+        ), [])
+        accidental = no_title.replace(
+            "@[blueprint (statement", '@[blueprint (title := "COT_STEP:S999") (statement',
+        )
+        codes = {issue.code for issue in validate_blueprint_fidelity(
+            _parse_blueprint(accidental, "root"), None, claimed_answer="2",
+            require_step_bindings=False,
+        )}
+        self.assertFalse(codes & {
+            "unknownStepMapping", "missingStepMapping", "rootNotFinalStep",
+            "stepMappingAbsent", "stepNotRootReachable",
+        })
+
     def test_render_contains_only_steps(self) -> None:
         rendered = _render_step_grounded_proof(manifest(), include_ir=False)
         self.assertIn("[COT_STEP S001]", rendered)

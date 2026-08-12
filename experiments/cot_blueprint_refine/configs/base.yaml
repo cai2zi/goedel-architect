@@ -66,6 +66,8 @@ step_splitter:
 blueprint:
   problem_id: null
   execution_mode: full
+  source_grounding_mode: formal_steps
+  phase1_input_experiment_root: null
   model: Qwen3.5-397B-A17B-FP8
   openai_base_url: http://127.0.0.1:8001/v1
   vllm: ${shared_vllm_397b}
@@ -84,6 +86,13 @@ blueprint:
   formal_decompiler_max_tokens: 4096
   strict_comparator_max_tokens: 4096
   semantic_format_max_attempts: 2
+  semantic_audit_enable_thinking: false
+  semantic_audit_temperature: 0.0
+  semantic_audit_top_p: 1.0
+  semantic_audit_top_k: -1
+  semantic_audit_min_p: 0.0
+  semantic_audit_presence_penalty: 0.0
+  semantic_audit_repetition_penalty: 1.0
 
   refinement_max_tokens: 16384
   refinement_max_retries: 4

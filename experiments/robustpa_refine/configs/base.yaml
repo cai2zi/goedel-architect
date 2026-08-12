@@ -16,6 +16,10 @@ retry_error_results: false
 # stops after Blueprint generation. phase2_only resumes accepted Phase 1
 # checkpoints, proves their nodes once, and requires zero refinement rounds.
 execution_mode: full
+source_grounding_mode: formal_steps
+phase1_seed_root: null
+phase1_source_results_path: null
+phase1_source_experiment_root: null
 max_refinement_iterations: 4
 refinement_max_retries: 4
 
@@ -32,6 +36,13 @@ generation_context_safety_margin: 512
 formal_decompiler_max_tokens: 4096
 strict_comparator_max_tokens: 4096
 semantic_format_max_attempts: 2
+semantic_audit_enable_thinking: false
+semantic_audit_temperature: 0.0
+semantic_audit_top_p: 1.0
+semantic_audit_top_k: -1
+semantic_audit_min_p: 0.0
+semantic_audit_presence_penalty: 0.0
+semantic_audit_repetition_penalty: 1.0
 
 node_max_prove_turns: 8
 node_max_negation_probe_turns: 1

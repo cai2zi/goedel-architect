@@ -35,6 +35,8 @@ STAGE_SEQUENCES = {
     "cot-to-blueprint": ("prepare", "split", "blueprint", "export"),
     "blueprint-refine": ("prepare", "split", "blueprint", "export", "refine"),
     "phase1-only": ("prepare", "split", "blueprint"),
+    "whole-cot-phase1-only": ("prepare", "blueprint"),
+    "phase2-only": ("blueprint",),
 }
 
 
@@ -157,7 +159,8 @@ def run_blueprint(
     runtime: PersistentVLLMRuntime,
     kimina_runtime: PersistentKiminaRuntime,
 ) -> None:
-    if blueprint_results_complete(config):
+    execution_mode = str(config.blueprint.get("execution_mode", "full"))
+    if execution_mode != "phase2_only" and blueprint_results_complete(config):
         return
     blueprint = config.blueprint
     runtime.ensure(
@@ -171,7 +174,26 @@ def run_blueprint(
     preflight_kimina(config)
     root = output_root(config)
     robustpa_output_base = root / "robustpa"
-    robustpa_data_root = prepared_dir(config) / "data"
+    phase1_source_root = None
+    phase1_seed_root = None
+    phase1_source_results_path = None
+    if execution_mode == "phase2_only":
+        raw_source_root = str(
+            blueprint.get("phase1_input_experiment_root", "") or ""
+        ).strip()
+        if not raw_source_root:
+            raise ValueError(
+                "phase2_only requires blueprint.phase1_input_experiment_root"
+            )
+        phase1_source_root = Path(raw_source_root).expanduser().resolve()
+        robustpa_data_root = phase1_source_root / "prepared" / "data"
+        phase1_seed_root = phase1_source_root / "robustpa" / "blueprint"
+        phase1_source_results_path = phase1_seed_root / "results.jsonl"
+        for required in (robustpa_data_root, phase1_seed_root, phase1_source_results_path):
+            if not required.exists():
+                raise FileNotFoundError(f"Phase 1 input artifact is missing: {required}")
+    else:
+        robustpa_data_root = prepared_dir(config) / "data"
     overrides = [
         "exp_name=blueprint",
         f"data_root={robustpa_data_root}",
@@ -186,6 +208,10 @@ def run_blueprint(
         f"resume={str(bool(config.resume)).lower()}",
         f"retry_error_results={str(bool(blueprint.get('retry_error_results', False))).lower()}",
         f"execution_mode={blueprint.get('execution_mode', 'full')}",
+        f"phase1_seed_root={phase1_seed_root or 'null'}",
+        f"phase1_source_results_path={phase1_source_results_path or 'null'}",
+        f"phase1_source_experiment_root={phase1_source_root or 'null'}",
+        f"source_grounding_mode={blueprint.get('source_grounding_mode', 'formal_steps')}",
         f"max_refinement_iterations={blueprint.max_refinement_iterations}",
         f"refinement_max_retries={blueprint.refinement_max_retries}",
         f"generation_max_turns={blueprint.generation_max_turns}",
@@ -201,6 +227,13 @@ def run_blueprint(
         f"formal_decompiler_max_tokens={blueprint.formal_decompiler_max_tokens}",
         f"strict_comparator_max_tokens={blueprint.strict_comparator_max_tokens}",
         f"semantic_format_max_attempts={blueprint.semantic_format_max_attempts}",
+        f"semantic_audit_enable_thinking={str(bool(blueprint.semantic_audit_enable_thinking)).lower()}",
+        f"semantic_audit_temperature={blueprint.semantic_audit_temperature}",
+        f"semantic_audit_top_p={blueprint.semantic_audit_top_p}",
+        f"semantic_audit_top_k={blueprint.semantic_audit_top_k}",
+        f"semantic_audit_min_p={blueprint.semantic_audit_min_p}",
+        f"semantic_audit_presence_penalty={blueprint.semantic_audit_presence_penalty}",
+        f"semantic_audit_repetition_penalty={blueprint.semantic_audit_repetition_penalty}",
         f"node_max_prove_turns={blueprint.node_max_prove_turns}",
         f"node_max_negation_probe_turns={blueprint.node_max_negation_probe_turns}",
         f"max_tool_calls_per_turn={blueprint.max_tool_calls_per_turn}",
@@ -375,6 +408,20 @@ class ExperimentLock:
 def main() -> None:
     args = parse_args()
     config = load_config(args.profile, args.override)
+    source_mode = str(config.blueprint.get("source_grounding_mode", "formal_steps"))
+    if source_mode not in {"formal_steps", "whole_cot"}:
+        raise ValueError("blueprint.source_grounding_mode must be formal_steps or whole_cot")
+    if args.stage == "whole-cot-phase1-only" and source_mode != "whole_cot":
+        raise ValueError("whole-cot-phase1-only requires source_grounding_mode=whole_cot")
+    if args.stage == "phase1-only" and source_mode != "formal_steps":
+        raise ValueError("phase1-only requires source_grounding_mode=formal_steps")
+    if args.stage == "split" and source_mode == "whole_cot":
+        raise ValueError("the split stage is forbidden in whole_cot mode")
+    if (
+        args.stage == "phase2-only"
+        and str(config.blueprint.get("execution_mode", "full")) != "phase2_only"
+    ):
+        raise ValueError("phase2-only stage requires execution_mode=phase2_only")
     root = output_root(config)
     root.mkdir(parents=True, exist_ok=True)
     previous_handlers: dict[signal.Signals, Any] = {}
