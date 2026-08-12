@@ -4,14 +4,12 @@ The checks in this module are deliberately conservative and local.  They do
 not try to decide whether the source COT is mathematically correct.  Instead,
 they reject a small set of high-confidence ways in which a Lean blueprint can
 cease to represent that COT: losing provenance, dropping steps from the root
-dependency closure, replacing claims by vacuous propositions, hard-coding an
-answer in a definition, or changing an accepted iter-0 statement during
-refinement.
+dependency closure, replacing claims by vacuous propositions, using explicit
+ex-falso premises, or changing an accepted iter-0 statement during refinement.
 """
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, TYPE_CHECKING
@@ -394,6 +392,24 @@ def _is_reflexive(text: str) -> bool:
     return bool(left) and _normalize_expr(left) == _normalize_expr(right)
 
 
+def _has_false_premise(node: BlueprintNode, conclusion: str) -> bool:
+    """Detect explicit ex-falso premises without rejecting proof by contradiction.
+
+    The check is deliberately narrow: an input binder whose type is literally
+    ``False``, or a top-level implication whose antecedent is literally
+    ``False``.  A conclusion such as ``P → False`` is not flagged.
+    """
+    signature = _strip_lean_comments(node.signature())
+    if re.search(r"\([^():]+:\s*False\s*\)", signature):
+        return True
+    value = _strip_outer_parens(_let_terminal(conclusion))
+    positions = _scan_top_level(value, "→")
+    if not positions:
+        return False
+    antecedent = _strip_outer_parens(value[:positions[0]])
+    return _normalize_expr(antecedent) == "False"
+
+
 def _leading_let_parts(text: str) -> tuple[list[tuple[str, str]], str]:
     rest = text.strip()
     bindings: list[tuple[str, str]] = []
@@ -701,7 +717,6 @@ def validate_blueprint_fidelity(
     *,
     claimed_answer: str = "",
     require_step_bindings: bool = False,
-    allow_pending_claims: bool = False,
 ) -> list[SemanticIssue]:
     """Return deterministic provenance and high-confidence degeneration issues."""
     contract = parse_cot_manifest(manifest)
@@ -812,36 +827,16 @@ def validate_blueprint_fidelity(
             conclusion = _node_conclusion(node)
             normalized_conclusion = _normalize_expr(conclusion)
             zeta_conclusion = _zeta_simple_literal_lets(conclusion)
-            pending_match = re.fullmatch(
-                r'PendingBlueprintClaim"((?:\\.|[^"\\])*)"',
-                normalized_conclusion,
-            )
-            if "PendingBlueprintClaim" in normalized_conclusion:
-                pending_name = ""
-                if pending_match:
-                    try:
-                        pending_name = str(json.loads(f'"{pending_match.group(1)}"'))
-                    except json.JSONDecodeError:
-                        pending_name = ""
-                if (
-                    pending_match is None
-                    or pending_name != node.name
-                ):
-                    issues.append(_issue(
-                        "malformedPendingClaim",
-                        "PendingBlueprintClaim must be the complete conclusion of a proof "
-                        "node and its string must equal that declaration's name.",
-                        node=node,
-                        contract=contract,
-                    ))
-                elif not allow_pending_claims:
-                    issues.append(_issue(
-                        "unresolvedPendingClaim",
-                        "The Phase-1A placeholder has not been replaced by a concrete proposition.",
-                        node=node,
-                        contract=contract,
-                    ))
-            elif normalized_conclusion == "True":
+            if _has_false_premise(node, conclusion):
+                issues.append(_issue(
+                    "falsePremiseRoot"
+                    if node.name == blueprint.target_theorem
+                    else "falsePremiseStep",
+                    "The proposition is made trivially provable from an explicit False premise.",
+                    node=node,
+                    contract=contract,
+                ))
+            if normalized_conclusion == "True":
                 issues.append(_issue(
                     "vacuousTrueRoot" if node.name == blueprint.target_theorem else "vacuousTrueStep",
                     "A source assertion was replaced by the proposition True.",
@@ -891,14 +886,7 @@ def validate_blueprint_fidelity(
         else:
             prefix, body = _definition_parts(node)
             normalized_body = _normalize_expr(body)
-            if "PendingBlueprintClaim" in node.lean_declaration:
-                issues.append(_issue(
-                    "malformedPendingClaim",
-                    "Definitions may not use the Phase-1A pending-claim placeholder.",
-                    node=node,
-                    contract=contract,
-                ))
-            elif re.search(r":\s*Prop\s*$", prefix) and normalized_body == "True":
+            if re.search(r":\s*Prop\s*$", prefix) and normalized_body == "True":
                 issues.append(_issue(
                     "vacuousPropDefinition",
                     "A Prop definition is hard-coded to True.",
@@ -950,7 +938,6 @@ def validate_blueprint_fidelity(
         ))
     if (
         claimed_answer
-        and "PendingBlueprintClaim" not in root_conclusion
         and not _contains_answer(root_conclusion, claimed_answer)
     ):
         issues.append(_issue(

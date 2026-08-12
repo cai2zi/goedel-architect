@@ -9,7 +9,6 @@ sys.path[:0] = [str(ROOT / "experiments"), str(ROOT / "src")]
 
 from blueprint import (  # noqa: E402
     _parse_blueprint,
-    _phase1a_blocking_semantic_issues,
     _render_step_grounded_proof,
 )
 from cot_blueprint_refine.formal_steps import (  # noqa: E402
@@ -85,7 +84,7 @@ theorem root : (1 + 0:Nat) = 1 := by sorry_using [support]
         self.assertIn("stepNotRootReachable", codes)
         self.assertTrue(all(issue.severity == "warning" for issue in issues))
 
-    def test_missing_step_is_deferred_in_phase1a_but_remains_an_error(self) -> None:
+    def test_missing_step_is_a_hard_error(self) -> None:
         code = '''import Mathlib
 import Architect
 @[blueprint (title := "COT_STEP:S002") (statement := /-- result -/)]
@@ -97,7 +96,6 @@ theorem root : (1 : Nat) = 1 := by sorry_using []
         )
         missing = next(issue for issue in issues if issue.code == "stepMappingAbsent")
         self.assertEqual(missing.severity, "error")
-        self.assertNotIn(missing, _phase1a_blocking_semantic_issues(issues))
 
     def test_prop_true_is_rejected(self) -> None:
         code = '''import Mathlib
@@ -119,50 +117,22 @@ theorem root : (1:Nat) = 1 := by sorry_using [fake]
         self.assertEqual((issue.source_start, issue.source_end), (0, 14))
         self.assertEqual(issue.category, "semanticDegeneration")
 
-    def test_phase1a_pending_claim_is_allowed_but_phase1b_rejects_it(self) -> None:
+    def test_false_premise_is_rejected_but_negation_is_not(self) -> None:
         code = '''import Mathlib
 import Architect
-def PendingBlueprintClaim (_nodeId : String) : Prop := True
-@[blueprint (title := "COT_STEP:S001") (statement := /-- pending -/)]
-lemma setup : PendingBlueprintClaim "setup" := by sorry_using []
-@[blueprint (title := "COT_STEP:S002") (statement := /-- result -/)]
-theorem root : (1:Nat) = 1 := by sorry_using [setup]
-'''
-        blueprint = _parse_blueprint(code, "root")
-        phase1a_codes = {issue.code for issue in validate_blueprint_fidelity(
-            blueprint, manifest(), claimed_answer="1", require_step_bindings=True,
-            allow_pending_claims=True,
-        )}
-        phase1b_issues = validate_blueprint_fidelity(
-            blueprint, manifest(), claimed_answer="1", require_step_bindings=True,
-            allow_pending_claims=False,
-        )
-        self.assertNotIn("unresolvedPendingClaim", phase1a_codes)
-        pending = next(issue for issue in phase1b_issues if issue.code == "unresolvedPendingClaim")
-        self.assertEqual((pending.step_id, pending.node_name), ("S001", "setup"))
-
-    def test_pending_claim_must_match_node_while_root_pending_is_allowed(self) -> None:
-        code = '''import Mathlib
-import Architect
-def PendingBlueprintClaim (_nodeId : String) : Prop := True
-@[blueprint (title := "COT_STEP:S001") (statement := /-- wrong id -/)]
-lemma setup : PendingBlueprintClaim "other" := by sorry_using []
-@[blueprint (title := "COT_STEP:S002") (statement := /-- pending root -/)]
-theorem root : PendingBlueprintClaim "root" := by sorry_using [setup]
+@[blueprint (title := "COT_STEP:S001") (statement := /-- ex falso -/)]
+lemma bad (h : False) : (1 : Nat) = 1 := by sorry_using []
+@[blueprint (title := "COT_STEP:S002") (statement := /-- valid negation shape -/)]
+theorem root : (0 : Nat) = 1 → False := by sorry_using [bad]
 '''
         issues = validate_blueprint_fidelity(
             _parse_blueprint(code, "root"), manifest(), claimed_answer="1",
-            require_step_bindings=True, allow_pending_claims=True,
+            require_step_bindings=True,
         )
-        malformed = [issue for issue in issues if issue.code == "malformedPendingClaim"]
-        self.assertEqual({issue.node_name for issue in malformed}, {"setup"})
-        self.assertNotIn("unresolvedPendingClaim", {issue.code for issue in issues})
-        phase1b = validate_blueprint_fidelity(
-            _parse_blueprint(code, "root"), manifest(), claimed_answer="1",
-            require_step_bindings=True, allow_pending_claims=False,
-        )
-        unresolved = [issue for issue in phase1b if issue.code == "unresolvedPendingClaim"]
-        self.assertEqual({issue.node_name for issue in unresolved}, {"root"})
+        false_premises = [issue for issue in issues if issue.code.startswith("falsePremise")]
+        self.assertEqual([(issue.code, issue.node_name) for issue in false_premises], [
+            ("falsePremiseStep", "bad"),
+        ])
 
     def test_duplicate_root_conclusion_is_allowed(self) -> None:
         code = '''import Mathlib

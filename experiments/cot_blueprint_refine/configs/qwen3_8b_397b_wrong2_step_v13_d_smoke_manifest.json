@@ -1,8 +1,0 @@
-{
-  "schema_version": 1,
-  "selection": "one simple control and one prior Phase 1A Lean/structural failure",
-  "include_ids": [
-    "MATH-500/test/counting_and_probability/765.json",
-    "cmimc_2025/15"
-  ]
-}

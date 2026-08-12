@@ -15,16 +15,15 @@ from llm_client import make_client
 
 from blueprint import (
     Blueprint,
-    _call_blueprint_model,
+    _call_refinement_model,
     _emit_lean_check_result,
     _emit_semantic_check,
     _enabled_semantic_issues,
     _extract_lean_code,
-    _max_tokens as _blueprint_max_tokens,
     _parse_blueprint,
     _reasoning_kwargs,
     _render_step_grounded_proof,
-    _set_latest_blueprint_retry,
+    _set_latest_refinement_retry,
     format_phase2_contract_errors,
     phase2_contract_errors,
     phase2_standalone_contract_errors,
@@ -104,7 +103,7 @@ def _phase3_message_token_count(messages: list[dict[str, str]], tokenizer: Any) 
 def phase3_request_max_tokens(messages: list[dict[str, str]]) -> int:
     """Fit each refinement response into the actual remaining context window."""
     configured_cap = int(
-        os.environ.get("GOEDEL_PHASE3_MAX_OUTPUT_CAP", str(_blueprint_max_tokens()))
+        os.environ.get("GOEDEL_PHASE3_MAX_OUTPUT_CAP", "262144")
     )
     context = int(os.environ.get("GOEDEL_PHASE3_MODEL_MAX_CONTEXT", "0"))
     tokenizer_path = os.environ.get("GOEDEL_TOKENIZER_PATH", "").strip()
@@ -241,7 +240,7 @@ def refine_blueprint(
     last_error_feedback = ""
     for attempt in range(max_retries):
         request_max_tokens = phase3_request_max_tokens(messages)
-        response = _call_blueprint_model(
+        response = _call_refinement_model(
             client,
             model,
             messages,
@@ -296,7 +295,7 @@ def refine_blueprint(
                         "Only repair the Lean encoding, dependency edges, or proof sketches; "
                         "keep false/unsupported COT Step assertions as explicit gaps."
                     )
-                    _set_latest_blueprint_retry(
+                    _set_latest_refinement_retry(
                         messages,
                         base_messages,
                         lean_code,
@@ -356,7 +355,7 @@ def refine_blueprint(
                         "parameters explicit and emit helper definitions as "
                         "`@[blueprint]` definition nodes."
                     )
-                    _set_latest_blueprint_retry(
+                    _set_latest_refinement_retry(
                         messages,
                         base_messages,
                         lean_code,
@@ -374,7 +373,7 @@ def refine_blueprint(
                 f"declarations (attempt {attempt + 1}/{max_retries}). Re-emit the "
                 "blueprint with proper annotations."
             )
-            _set_latest_blueprint_retry(
+            _set_latest_refinement_retry(
                 messages,
                 base_messages,
                 lean_code,
@@ -393,7 +392,7 @@ def refine_blueprint(
             f"{error_feedback}\n\n"
             "Fix the issues and call lean_compile again."
         )
-        _set_latest_blueprint_retry(
+        _set_latest_refinement_retry(
             messages,
             base_messages,
             lean_code,

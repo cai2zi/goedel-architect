@@ -36,21 +36,10 @@ _FORMAT_ONLY_RE = re.compile(
 
 
 class FormalStepSplitError(ValueError):
-    def __init__(
-        self,
-        reason: str,
-        raw_content: str = "",
-        *,
-        forbidden_boundaries: Mapping[str, Sequence[str]] | None = None,
-    ) -> None:
+    def __init__(self, reason: str, raw_content: str = "") -> None:
         super().__init__(reason)
         self.reason = reason
         self.raw_content = raw_content
-        self.forbidden_boundaries = {
-            str(kind): [str(boundary) for boundary in boundaries]
-            for kind, boundaries in (forbidden_boundaries or {}).items()
-            if boundaries
-        }
 
 
 @dataclass(frozen=True)
@@ -320,30 +309,21 @@ def parse_split_response(
         raise FormalStepSplitError("boundaries must be unique and strictly increasing", raw)
     if values[-1] != ids[-1]:
         raise FormalStepSplitError(f"final boundary must be {ids[-1]}", raw)
-    forbidden_boundaries: dict[str, list[str]] = {
-        "headingOnly": [],
-        "colonLeadIn": [],
-    }
-    for value in values[:-1]:
-        anchor = anchors[positions[value]]
-        if str(anchor.get("kind")) == "heading":
-            forbidden_boundaries["headingOnly"].append(value)
-        if str(anchor.get("source_text") or "").rstrip().endswith(":"):
-            forbidden_boundaries["colonLeadIn"].append(value)
-    forbidden_boundaries = {
-        kind: boundaries for kind, boundaries in forbidden_boundaries.items() if boundaries
-    }
-    if forbidden_boundaries:
-        details = "; ".join(
-            f"{kind}=[{', '.join(boundaries)}]"
-            for kind, boundaries in forbidden_boundaries.items()
+    # A heading or colon-ended lead-in cannot semantically finish a Step: it
+    # introduces the material in the following anchor.  Removing such a
+    # boundary is deterministic and lossless, whereas asking the model to emit
+    # the same list again can repeat the formatting mistake indefinitely.
+    # The final boundary is never removed, so the normalized list remains a
+    # complete, ordered partition of the original COT.
+    return [
+        value
+        for value in values
+        if value == values[-1]
+        or not (
+            str(anchors[positions[value]].get("kind")) == "heading"
+            or str(anchors[positions[value]].get("source_text") or "").rstrip().endswith(":")
         )
-        raise FormalStepSplitError(
-            f"forbidden Step boundaries: {details}",
-            raw,
-            forbidden_boundaries=forbidden_boundaries,
-        )
-    return values
+    ]
 
 
 def parse_boundaries(content: str, anchors: Sequence[Mapping[str, Any]]) -> list[str]:
@@ -506,25 +486,12 @@ async def _split_one(
         except FormalStepSplitError as exc:
             final_error, final_type = exc.reason, type(exc).__name__
             if attempt < config.max_attempts:
-                correction = f"Rejected: {exc.reason}."
-                colon_boundaries = exc.forbidden_boundaries.get("colonLeadIn", [])
-                heading_boundaries = exc.forbidden_boundaries.get("headingOnly", [])
-                if colon_boundaries:
-                    correction += (
-                        f" Remove every colon-ended lead-in boundary listed above "
-                        f"({', '.join(colon_boundaries)}); each introduces the material "
-                        "immediately after it. Place those Step boundaries only after the "
-                        "attached formula and its immediate interpretation."
-                    )
-                if heading_boundaries:
-                    correction += (
-                        f" Remove every heading-only boundary listed above "
-                        f"({', '.join(heading_boundaries)}); merge each heading with the "
-                        "reasoning below it."
-                    )
                 messages = [*base_messages, {"role": "assistant", "content": exc.raw_content}, {
                     "role": "user",
-                    "content": f"{correction} Return only one corrected {_OPEN} ... {_CLOSE} block.",
+                    "content": (
+                        f"Rejected: {exc.reason}. Return only one corrected "
+                        f"{_OPEN} ... {_CLOSE} block."
+                    ),
                 }]
         except Exception as exc:  # API errors are retained as explicit failures.
             final_error, final_type = str(exc), type(exc).__name__

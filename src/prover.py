@@ -41,6 +41,18 @@ def _length_retry_max_tokens() -> int:
     return int(os.environ.get("GOEDEL_PROVER_LENGTH_RETRY_MAX_TOKENS", str(_max_tokens())))
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean, got {value!r}")
+
+
 def _tool_feedback_max_chars() -> int:
     return max(
         512,
@@ -313,6 +325,17 @@ class GoedelProver:
             self._completion_max_tokens,
             _length_retry_max_tokens(),
         )
+        self._enable_thinking = _env_bool("GOEDEL_PROVER_ENABLE_THINKING", True)
+        self._temperature = float(os.environ.get("GOEDEL_PROVER_TEMPERATURE", "0.6"))
+        self._top_p = float(os.environ.get("GOEDEL_PROVER_TOP_P", "0.95"))
+        self._top_k = int(os.environ.get("GOEDEL_PROVER_TOP_K", "20"))
+        self._min_p = float(os.environ.get("GOEDEL_PROVER_MIN_P", "0.0"))
+        self._presence_penalty = float(
+            os.environ.get("GOEDEL_PROVER_PRESENCE_PENALTY", "0.0")
+        )
+        self._repetition_penalty = float(
+            os.environ.get("GOEDEL_PROVER_REPETITION_PENALTY", "1.0")
+        )
 
     def prove_node(
         self,
@@ -439,13 +462,31 @@ class GoedelProver:
                     "turn": turn,
                     "adaptive_length_retry": adaptive_retry,
                     "max_completion_tokens": max_tokens,
+                    "enable_thinking": self._enable_thinking,
+                    "temperature": self._temperature,
+                    "top_p": self._top_p,
+                    "top_k": self._top_k,
+                    "min_p": self._min_p,
+                    "presence_penalty": self._presence_penalty,
+                    "repetition_penalty": self._repetition_penalty,
                 },
                 model=self.model_id,
                 messages=messages,
                 tools=tools,
+                temperature=self._temperature,
+                top_p=self._top_p,
+                presence_penalty=self._presence_penalty,
                 max_completion_tokens=max_tokens,
                 parallel_tool_calls=len(tools) > 1,
                 tool_choice="required",
+                extra_body={
+                    "top_k": self._top_k,
+                    "min_p": self._min_p,
+                    "repetition_penalty": self._repetition_penalty,
+                    "chat_template_kwargs": {
+                        "enable_thinking": self._enable_thinking,
+                    },
+                },
             )
 
         requested_tokens = self._completion_max_tokens

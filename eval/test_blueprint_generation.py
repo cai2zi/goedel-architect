@@ -12,13 +12,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "experiments"), str(ROOT / "src")]
 
 from blueprint import _parse_blueprint  # noqa: E402
-from phase1d import (  # noqa: E402
-    Phase1DRound,
+from blueprint_generation import (  # noqa: E402
+    GenerationRound,
     _accepted_validation_details,
-    _d_contract_errors,
+    _contract_errors,
     _submitted_code,
-    phase1d_request_budget,
-    phase1d_round_classification,
+    generation_request_budget,
+    generation_round_classification,
 )
 
 
@@ -28,10 +28,10 @@ class _Tokenizer:
         return {"input_ids": list(range(123)), "attention_mask": [1] * 123}
 
 
-class Phase1DFullRegenerationTest(unittest.TestCase):
+class BlueprintGenerationTest(unittest.TestCase):
     def test_accepted_terminal_details_are_json_serializable(self) -> None:
         details = {"semanticAudit": {"strictComparator": {"passed": True}}}
-        current_round = Phase1DRound(
+        current_round = GenerationRound(
             1, "candidate", 100, 200, (), (), (), details,
         )
         terminal = _accepted_validation_details(
@@ -44,13 +44,13 @@ class Phase1DFullRegenerationTest(unittest.TestCase):
         )
 
         json.dumps(terminal)
-        self.assertNotIn("phase1DRounds", details)
+        self.assertNotIn("generationRounds", details)
         self.assertEqual(terminal["classification"], "strictAccepted")
 
     def test_budget_counts_serialized_messages_and_tool_schema(self) -> None:
         tokenizer = _Tokenizer()
-        with patch("phase1d._load_phase1_tokenizer", return_value=tokenizer):
-            input_tokens, output_tokens = phase1d_request_budget(
+        with patch("blueprint_generation._load_phase1_tokenizer", return_value=tokenizer):
+            input_tokens, output_tokens = generation_request_budget(
                 [{"role": "user", "content": "x"}],
                 tokenizer_path="unused", model_max_context=40960,
                 safety_margin=512, tools=[{"type": "function"}],
@@ -68,7 +68,7 @@ def PendingBlueprintClaim (_nodeId : String) : Prop := True
 theorem root : PendingBlueprintClaim "root" := by sorry_using []
 '''
         blueprint = _parse_blueprint(code, "root")
-        codes = {item["code"] for item in _d_contract_errors(blueprint, "root")}
+        codes = {item["code"] for item in _contract_errors(blueprint, "root")}
         self.assertIn("forbiddenPendingClaim", codes)
 
     def test_submission_requires_one_full_lean_compile_call(self) -> None:
@@ -83,25 +83,25 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
         self.assertTrue(code.endswith("\n"))
 
     def test_warning_only_waits_until_last_round(self) -> None:
-        self.assertIsNone(phase1d_round_classification(
+        self.assertIsNone(generation_round_classification(
             round_index=7, max_turns=8, deterministic_error_count=0,
             semantic_error_count=0, warning_count=1,
         ))
-        self.assertEqual(phase1d_round_classification(
+        self.assertEqual(generation_round_classification(
             round_index=8, max_turns=8, deterministic_error_count=0,
             semantic_error_count=0, warning_count=1,
         ), "acceptedWithWarnings")
 
     def test_error_precedence_and_strict_early_exit(self) -> None:
-        self.assertEqual(phase1d_round_classification(
+        self.assertEqual(generation_round_classification(
             round_index=1, max_turns=8, deterministic_error_count=0,
             semantic_error_count=0, warning_count=0,
         ), "strictAccepted")
-        self.assertEqual(phase1d_round_classification(
+        self.assertEqual(generation_round_classification(
             round_index=8, max_turns=8, deterministic_error_count=1,
             semantic_error_count=2, warning_count=0,
         ), "structuralRejected")
-        self.assertEqual(phase1d_round_classification(
+        self.assertEqual(generation_round_classification(
             round_index=8, max_turns=8, deterministic_error_count=0,
             semantic_error_count=2, warning_count=0,
         ), "semanticRejected")

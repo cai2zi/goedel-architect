@@ -1,4 +1,8 @@
-"""Phase 1D: full-file Blueprint regeneration with complete diagnostics."""
+"""The single COT-to-Blueprint generation pipeline.
+
+Each round emits a complete Blueprint.  Deterministic Lean checks and the
+strict semantic audit are fed back into the next full-file regeneration.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -15,35 +19,46 @@ from blueprint import (
     Phase2StandaloneReport,
     ROBUSTPA_BLUEPRINT_SYSTEM_PROMPT,
     ROBUSTPA_BLUEPRINT_USER_TEMPLATE,
-    _PHASE1_LEAN_COMPILE_TOOL,
+    LEAN_COMPILE_TOOL,
     _emit_llm_response,
     _emit_usage,
     _extract_target_name,
     _load_phase1_tokenizer,
     _parse_blueprint,
-    _render_edited_blueprint,
+    canonicalize_blueprint,
     _render_step_grounded_proof,
     _unannotated_local_declaration_errors,
     phase2_contract_errors,
     phase2_standalone_contract_report,
 )
 from goedel_prompts import render
-from kimina_lean_compiler import KiminaInfrastructureError, KiminaLeanCompiler
-from llm_client import chat_completion_with_retry, make_client
-from phase1b import (
-    Phase1BValidation,
-    semantic_audit_eligible,
-    validation_details,
-    with_semantic_audit,
+from kimina_lean_compiler import (
+    CompilerResult,
+    KiminaInfrastructureError,
+    KiminaLeanCompiler,
 )
-from semantic_audit import comparator_defects
-from semantic_fidelity import parse_cot_manifest, validate_blueprint_fidelity
+from llm_client import chat_completion_with_retry, make_client
+from semantic_audit import (
+    FormalDecompilerResult,
+    StrictComparatorResult,
+    build_formal_view,
+    comparator_defects,
+    run_formal_decompiler,
+    run_strict_comparator,
+    semantic_audit_cache_key,
+    strict_comparator_messages,
+)
+from semantic_fidelity import (
+    SemanticIssue,
+    parse_cot_manifest,
+    validate_blueprint_fidelity,
+)
 from tracer import TraceEvent
 
 
-PHASE1D_SYSTEM_SUFFIX = r"""
+GENERATION_SYSTEM_SUFFIX = r"""
 
-## Phase 1D full-regeneration contract
+## Complete Blueprint generation contract
 
 Return a complete replacement Blueprint on every round.  Do not emit or refer
 to `PendingBlueprintClaim`: every definition body and every lemma/theorem
@@ -69,7 +84,7 @@ return prose or a partial declaration.
 
 
 @dataclass(frozen=True)
-class Phase1DRound:
+class GenerationRound:
     round_index: int
     candidate_hash: str
     input_tokens: int
@@ -92,9 +107,149 @@ class Phase1DRound:
         }
 
 
+@dataclass
+class BlueprintValidation:
+    lean_result: CompilerResult
+    semantic_issues: list[SemanticIssue]
+    structural_errors: list[str]
+    standalone_report: Phase2StandaloneReport
+    formal_decompiler_result: FormalDecompilerResult | None = None
+    strict_comparator_result: StrictComparatorResult | None = None
+
+    @property
+    def passed(self) -> bool:
+        return (
+            self.lean_result.success
+            and not any(issue.severity == "error" for issue in self.semantic_issues)
+            and not self.structural_errors
+            and not self.standalone_report.issues
+            and self.strict_comparator_result is not None
+            and self.strict_comparator_result.passed
+        )
+
+
+def validation_details(validation: BlueprintValidation) -> dict[str, Any]:
+    standalone = validation.standalone_report
+    audit = None
+    if validation.formal_decompiler_result and validation.strict_comparator_result:
+        audit = {
+            "formalDecompiler": validation.formal_decompiler_result.to_dict(),
+            "strictComparator": validation.strict_comparator_result.to_dict(),
+            "classification": "strictAccepted" if validation.passed else "semanticRejected",
+        }
+    return {
+        "passed": validation.passed,
+        "wholeFileLeanSuccess": validation.lean_result.success,
+        "leanErrors": list(validation.lean_result.diagnostics),
+        "semanticErrors": [
+            issue.to_dict() for issue in validation.semantic_issues
+            if issue.severity == "error"
+        ],
+        "semanticWarnings": [
+            issue.to_dict() for issue in validation.semantic_issues
+            if issue.severity == "warning"
+        ],
+        "phase2StructuralErrors": list(validation.structural_errors),
+        "phase2StandaloneErrors": [
+            issue.to_dict() for issue in standalone.issues
+        ],
+        "phase2StandaloneSummary": {
+            "checkedNodeCount": standalone.checked_node_count,
+            "cachedNodeCount": standalone.cached_node_count,
+            "failedNodeCount": len(standalone.issues),
+            "notRunReason": standalone.not_run_reason,
+            "durationMs": standalone.duration_ms,
+        },
+        "semanticAudit": audit,
+    }
+
+
+def _semantic_audit_eligible(validation: BlueprintValidation) -> bool:
+    blocking_codes = {
+        "emptyCotManifest", "missingRoot", "missingStepMapping",
+        "multipleStepMappings", "malformedStepMapping", "unknownStepMapping",
+        "rootNotFinalStep", "stepMappingAbsent",
+    }
+    return (
+        not any(
+            issue.severity == "error" and issue.code in blocking_codes
+            for issue in validation.semantic_issues
+        )
+    )
+
+
+def _with_semantic_audit(
+    validation: BlueprintValidation,
+    blueprint: Blueprint,
+    *,
+    client: Any,
+    model: str,
+    informal_statement: str,
+    claimed_answer: str,
+    semantic_manifest: Any,
+    formal_decompiler_max_tokens: int,
+    strict_comparator_max_tokens: int,
+    format_max_attempts: int,
+    decompiler_cache: dict[str, FormalDecompilerResult],
+    comparator_cache: dict[str, StrictComparatorResult],
+    tracer: Any,
+    thm_name: str,
+    round_index: int,
+) -> BlueprintValidation:
+    view = build_formal_view(blueprint)
+    decompiler = decompiler_cache.get(view.sha256)
+    if decompiler is None:
+        decompiler = run_formal_decompiler(
+            client,
+            model,
+            view=view,
+            max_tokens=formal_decompiler_max_tokens,
+            max_attempts=format_max_attempts,
+            tracer=tracer,
+            thm_name=thm_name,
+            round_index=round_index,
+        )
+        decompiler_cache[view.sha256] = decompiler
+    messages = strict_comparator_messages(
+        informal_statement,
+        claimed_answer,
+        semantic_manifest,
+        view,
+        decompiler,
+        (),
+    )
+    cache_key = semantic_audit_cache_key(model, messages)
+    comparator = comparator_cache.get(cache_key)
+    if comparator is None:
+        comparator = run_strict_comparator(
+            client,
+            model,
+            informal_statement=informal_statement,
+            claimed_answer=claimed_answer,
+            manifest=semantic_manifest,
+            view=view,
+            decompiler=decompiler,
+            open_obligations=(),
+            max_tokens=strict_comparator_max_tokens,
+            max_attempts=format_max_attempts,
+            tracer=tracer,
+            thm_name=thm_name,
+            round_index=round_index,
+        )
+        comparator_cache[cache_key] = comparator
+    return BlueprintValidation(
+        lean_result=validation.lean_result,
+        semantic_issues=validation.semantic_issues,
+        structural_errors=validation.structural_errors,
+        standalone_report=validation.standalone_report,
+        formal_decompiler_result=decompiler,
+        strict_comparator_result=comparator,
+    )
+
+
 def _accepted_validation_details(
     details: dict[str, Any],
-    rounds: Sequence[Phase1DRound],
+    rounds: Sequence[GenerationRound],
     *,
     classification: str,
     deterministic_errors: Sequence[dict[str, Any]],
@@ -108,7 +263,7 @@ def _accepted_validation_details(
     final_details["semanticAudit"] = audit
     final_details.update({
         "classification": classification,
-        "phase1DRounds": [item.to_dict() for item in rounds],
+        "generationRounds": [item.to_dict() for item in rounds],
         "finalDeterministicErrors": list(deterministic_errors),
         "finalSemanticErrors": list(semantic_errors),
         "finalWarnings": list(warnings),
@@ -117,7 +272,7 @@ def _accepted_validation_details(
     return final_details
 
 
-def phase1d_round_classification(
+def generation_round_classification(
     *,
     round_index: int,
     max_turns: int,
@@ -125,7 +280,7 @@ def phase1d_round_classification(
     semantic_error_count: int,
     warning_count: int,
 ) -> str | None:
-    """Return a terminal D classification, or None when another round is due."""
+    """Return a terminal generation classification, or None when another round is due."""
     if deterministic_error_count:
         return "structuralRejected" if round_index >= max_turns else None
     if semantic_error_count:
@@ -172,7 +327,7 @@ def _deduplicate(items: Sequence[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
     return tuple(result)
 
 
-def phase1d_request_budget(
+def generation_request_budget(
     messages: list[dict[str, Any]],
     *,
     tokenizer_path: str,
@@ -260,7 +415,7 @@ def _messages(
             + previous_feedback
         )
     return [
-        {"role": "system", "content": ROBUSTPA_BLUEPRINT_SYSTEM_PROMPT + PHASE1D_SYSTEM_SUFFIX},
+        {"role": "system", "content": ROBUSTPA_BLUEPRINT_SYSTEM_PROMPT + GENERATION_SYSTEM_SUFFIX},
         {"role": "user", "content": user},
     ]
 
@@ -271,29 +426,29 @@ def _submitted_code(response: Any) -> tuple[str, list[dict[str, Any]]]:
     problems: list[dict[str, Any]] = []
     if len(calls) != 1:
         problems.append(_issue(
-            "phase1DToolCallCount",
+            "phase1ToolCallCount",
             f"expected exactly one lean_compile call, received {len(calls)}",
         ))
         return "", problems
     call = calls[0]
     if str(call.function.name) != "lean_compile":
         problems.append(_issue(
-            "phase1DWrongTool", f"expected lean_compile, received {call.function.name}",
+            "phase1WrongTool", f"expected lean_compile, received {call.function.name}",
         ))
         return "", problems
     try:
         arguments = json.loads(call.function.arguments or "{}")
     except json.JSONDecodeError as exc:
-        problems.append(_issue("phase1DToolArguments", str(exc)))
+        problems.append(_issue("phase1ToolArguments", str(exc)))
         return "", problems
     code = arguments.get("lean_code") if isinstance(arguments, dict) else None
     if not isinstance(code, str) or not code.strip():
-        problems.append(_issue("phase1DToolArguments", "lean_code must be a non-empty string"))
+        problems.append(_issue("phase1ToolArguments", "lean_code must be a non-empty string"))
         return "", problems
     return code.strip() + "\n", problems
 
 
-def _d_contract_errors(blueprint: Blueprint, target_name: str) -> list[dict[str, Any]]:
+def _contract_errors(blueprint: Blueprint, target_name: str) -> list[dict[str, Any]]:
     errors: list[dict[str, Any]] = []
     if not blueprint.nodes:
         errors.append(_issue("noBlueprintNodes", "no annotated declarations were parsed"))
@@ -302,7 +457,7 @@ def _d_contract_errors(blueprint: Blueprint, target_name: str) -> list[dict[str,
         errors.append(_issue("missingOrWrongRoot", f"root theorem must be named {target_name}"))
     if "PendingBlueprintClaim" in blueprint.lean_file:
         errors.append(_issue(
-            "forbiddenPendingClaim", "Phase 1D forbids PendingBlueprintClaim everywhere",
+            "forbiddenPendingClaim", "Phase 1 forbids PendingBlueprintClaim everywhere",
         ))
     for raw in _unannotated_local_declaration_errors(blueprint):
         errors.append(_issue(raw.split(":", 1)[0], raw))
@@ -340,8 +495,6 @@ def _validate_round(
     semantic_manifest,
     informal_statement: str,
     claimed_answer: str,
-    semantic_require_step_ids: bool,
-    semantic_static_gate: bool,
     standalone_concurrency: int,
     client: Any,
     model: str,
@@ -354,9 +507,9 @@ def _validate_round(
     standalone_cache: dict[str, Any],
     decompiler_cache: dict[str, Any],
     comparator_cache: dict[str, Any],
-) -> tuple[Blueprint, Phase1BValidation, tuple[dict[str, Any], ...], tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
+) -> tuple[Blueprint, BlueprintValidation, tuple[dict[str, Any], ...], tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
     candidate = _parse_blueprint(code, target_name)
-    deterministic: list[dict[str, Any]] = _d_contract_errors(candidate, target_name)
+    deterministic: list[dict[str, Any]] = _contract_errors(candidate, target_name)
     lean_result = compiler.check_blueprint(code, target_name)
     if lean_result.failure_kind == "infra":
         raise KiminaInfrastructureError(
@@ -369,14 +522,13 @@ def _validate_round(
         candidate,
         semantic_manifest,
         claimed_answer=claimed_answer,
-        require_step_bindings=semantic_require_step_ids,
-        allow_pending_claims=False,
+        require_step_bindings=True,
     ) if candidate.nodes else []
     for issue in semantic_issues:
         row = _issue(
             issue.code, issue.message, node_name=issue.node_name, step_id=issue.step_id,
         )
-        if issue.severity == "error" and semantic_static_gate:
+        if issue.severity == "error":
             deterministic.append(row)
         elif issue.severity == "warning":
             warnings.append(row)
@@ -385,7 +537,7 @@ def _validate_round(
     canonical_result = None
     if candidate.nodes:
         try:
-            formal_blueprint = _render_edited_blueprint(candidate, list(candidate.nodes))
+            formal_blueprint = canonicalize_blueprint(candidate, list(candidate.nodes))
         except ValueError as exc:
             deterministic.append(_issue("canonicalRebuild", str(exc)))
         else:
@@ -406,14 +558,13 @@ def _validate_round(
             formal_blueprint,
             compiler,
             concurrency=standalone_concurrency,
-            skip_pending=False,
             cache=standalone_cache,
             tracer=tracer,
             thm_name=thm_name,
             round_index=round_index,
         )
     else:
-        standalone = Phase2StandaloneReport((), 0, 0, 0, 0.0, "deterministicErrors")
+        standalone = Phase2StandaloneReport((), 0, 0, 0.0, "deterministicErrors")
     for raw in structural:
         deterministic.append(_issue("phase2Structural", raw))
     for item in standalone.issues:
@@ -424,21 +575,15 @@ def _validate_round(
             step_id=getattr(item, "step_id", ""),
         ))
 
-    validation = Phase1BValidation(
+    validation = BlueprintValidation(
         lean_result=lean_result,
         semantic_issues=semantic_issues,
-        source_contexts=[],
         structural_errors=structural,
         standalone_report=standalone,
-        pending_node_names=tuple(
-            node.name for node in formal_blueprint.nodes
-            if "PendingBlueprintClaim" in node.lean_declaration
-        ),
-        semantic_audit_required=True,
     )
     semantic: list[dict[str, Any]] = []
-    if formal_blueprint.nodes and semantic_audit_eligible(validation):
-        validation = with_semantic_audit(
+    if formal_blueprint.nodes and _semantic_audit_eligible(validation):
+        validation = _with_semantic_audit(
             validation,
             formal_blueprint,
             client=client,
@@ -451,7 +596,6 @@ def _validate_round(
             format_max_attempts=semantic_format_attempts,
             decompiler_cache=decompiler_cache,
             comparator_cache=comparator_cache,
-            obligation_ledger={},
             tracer=tracer,
             thm_name=thm_name,
             round_index=round_index,
@@ -493,7 +637,7 @@ def _validate_round(
     )
 
 
-def run_phase1d_full_regeneration(
+def generate_blueprint(
     *,
     informal_statement: str,
     informal_proof: str,
@@ -516,14 +660,12 @@ def run_phase1d_full_regeneration(
     presence_penalty: float,
     repetition_penalty: float,
     standalone_concurrency: int,
-    semantic_require_step_ids: bool,
-    semantic_static_gate: bool,
     decompiler_max_tokens: int,
     comparator_max_tokens: int,
     semantic_format_attempts: int,
 ) -> Blueprint:
     if max_turns <= 0:
-        raise ValueError("phase1d max_turns must be positive")
+        raise ValueError("generation max_turns must be positive")
     semantic_manifest = parse_cot_manifest(cot_manifest_json)
     step_grounded_proof = _render_step_grounded_proof(
         cot_manifest_json, include_ir=False,
@@ -533,12 +675,12 @@ def run_phase1d_full_regeneration(
     previous_feedback = ""
     candidates: list[str] = []
     labels: list[str] = []
-    rounds: list[Phase1DRound] = []
+    rounds: list[GenerationRound] = []
     standalone_cache: dict[str, Any] = {}
     decompiler_cache: dict[str, Any] = {}
     comparator_cache: dict[str, Any] = {}
     latest_blueprint: Blueprint | None = None
-    latest_validation: Phase1BValidation | None = None
+    latest_validation: BlueprintValidation | None = None
     latest_deterministic: tuple[dict[str, Any], ...] = ()
     latest_semantic: tuple[dict[str, Any], ...] = ()
     latest_warnings: tuple[dict[str, Any], ...] = ()
@@ -552,32 +694,32 @@ def run_phase1d_full_regeneration(
             previous_blueprint=previous_code,
             previous_feedback=previous_feedback,
         )
-        input_tokens, completion_budget = phase1d_request_budget(
+        input_tokens, completion_budget = generation_request_budget(
             messages,
             tokenizer_path=tokenizer_path,
             model_max_context=model_max_context,
             safety_margin=context_safety_margin,
-            tools=[_PHASE1_LEAN_COMPILE_TOOL],
+            tools=[LEAN_COMPILE_TOOL],
         )
         if completion_budget <= 0:
             raise BlueprintGenerationError(
-                "Phase 1D input exhausts the model context window.",
+                "Phase 1 input exhausts the model context window.",
                 last_candidate=previous_code,
                 diagnostics=[
                     f"inputTokens={input_tokens} modelContext={model_max_context} "
                     f"safetyMargin={context_safety_margin}"
                 ],
                 attempt=round_index,
-                failure_stage="phase1DContextBudgetExceeded",
+                failure_stage="phase1ContextBudgetExceeded",
                 candidate_history=candidates,
                 candidate_labels=labels,
-                validation_details={"phase1DRounds": [item.to_dict() for item in rounds]},
+                validation_details={"generationRounds": [item.to_dict() for item in rounds]},
             )
         span_id = uuid.uuid4().hex
         started_ns = time.monotonic_ns()
         if tracer:
             tracer.emit(TraceEvent(
-                kind="phase1DFullGenerationStart",
+                kind="phase1GenerationStart",
                 thm_name=thm_name,
                 turn=round_index,
                 span_id=span_id,
@@ -595,19 +737,19 @@ def run_phase1d_full_regeneration(
                 },
             ))
         seed = int.from_bytes(hashlib.sha256(
-            f"phase1D|{thm_name}|{round_index}".encode()
+            f"blueprint-generation|{thm_name}|{round_index}".encode()
         ).digest()[:4], "big")
         response = chat_completion_with_retry(
             client,
             tracer=tracer,
             thm_name=thm_name,
-            phase="phase1D",
+            phase="phase1",
             model_id=model,
-            operation="phase1d_full_regeneration",
+            operation="blueprint_generation",
             trace_args={"round": round_index, "max_completion_tokens": completion_budget},
             model=model,
             messages=messages,
-            tools=[_PHASE1_LEAN_COMPILE_TOOL],
+            tools=[LEAN_COMPILE_TOOL],
             tool_choice="required",
             parallel_tool_calls=False,
             temperature=temperature,
@@ -622,11 +764,11 @@ def run_phase1d_full_regeneration(
                 "chat_template_kwargs": {"enable_thinking": enable_thinking},
             },
         )
-        _emit_usage(tracer, thm_name, "phase1D", model, response)
+        _emit_usage(tracer, thm_name, "phase1", model, response)
         _emit_llm_response(
             tracer,
             thm_name=thm_name,
-            phase="phase1D",
+            phase="phase1",
             model=model,
             response=response,
             attempt=1,
@@ -645,7 +787,7 @@ def run_phase1d_full_regeneration(
         else:
             previous_code = code
             candidates.append(code)
-            labels.append(f"phase1d_round_{round_index}")
+            labels.append(f"generation_round_{round_index}")
             (
                 latest_blueprint,
                 latest_validation,
@@ -659,8 +801,6 @@ def run_phase1d_full_regeneration(
                 semantic_manifest=semantic_manifest,
                 informal_statement=informal_statement,
                 claimed_answer=claimed_answer,
-                semantic_require_step_ids=semantic_require_step_ids,
-                semantic_static_gate=semantic_static_gate,
                 standalone_concurrency=standalone_concurrency,
                 client=client,
                 model=model,
@@ -680,7 +820,7 @@ def run_phase1d_full_regeneration(
             candidate_hash = hashlib.sha256(code.encode()).hexdigest()
             details = validation_details(latest_validation)
 
-        round_row = Phase1DRound(
+        round_row = GenerationRound(
             round_index,
             candidate_hash,
             input_tokens,
@@ -692,9 +832,9 @@ def run_phase1d_full_regeneration(
         )
         rounds.append(round_row)
         for kind, inventory, ok in (
-            ("phase1DDeterministicValidation", latest_deterministic, not latest_deterministic),
-            ("phase1DSemanticAudit", latest_semantic, not latest_semantic),
-            ("phase1DWarningInventory", latest_warnings, not latest_warnings),
+            ("phase1DeterministicValidation", latest_deterministic, not latest_deterministic),
+            ("phase1SemanticAudit", latest_semantic, not latest_semantic),
+            ("phase1WarningInventory", latest_warnings, not latest_warnings),
         ):
             if tracer:
                 tracer.emit(TraceEvent(
@@ -706,7 +846,7 @@ def run_phase1d_full_regeneration(
                 ))
         if tracer:
             tracer.emit(TraceEvent(
-                kind="phase1DRoundAssessment",
+                kind="phase1RoundAssessment",
                 thm_name=thm_name,
                 turn=round_index,
                 args={
@@ -718,7 +858,7 @@ def run_phase1d_full_regeneration(
                 ok=not latest_deterministic and not latest_semantic and not latest_warnings,
             ))
             tracer.emit(TraceEvent(
-                kind="phase1DFullGenerationEnd",
+                kind="phase1GenerationEnd",
                 thm_name=thm_name,
                 turn=round_index,
                 span_id=span_id,
@@ -727,7 +867,7 @@ def run_phase1d_full_regeneration(
                 duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
             ))
 
-        classification = phase1d_round_classification(
+        classification = generation_round_classification(
             round_index=round_index,
             max_turns=max_turns,
             deterministic_error_count=len(latest_deterministic),
@@ -737,7 +877,7 @@ def run_phase1d_full_regeneration(
         if latest_blueprint is not None and classification in {
             "strictAccepted", "acceptedWithWarnings",
         }:
-            # ``details`` is also retained by the current Phase1DRound.  Do not
+            # ``details`` is also retained by the current GenerationRound.  Do not
             # add the round history back to that same object: the current
             # round's ``validation`` would then point at a dictionary which
             # contains the current round again, making the terminal result
@@ -750,12 +890,12 @@ def run_phase1d_full_regeneration(
                 semantic_errors=latest_semantic,
                 warnings=latest_warnings,
             )
-            latest_blueprint.phase1b_validation = final_details
-            latest_blueprint.phase1b_edit_history = [item.to_dict() for item in rounds]
+            latest_blueprint.generation_validation = final_details
+            latest_blueprint.generation_history = [item.to_dict() for item in rounds]
             latest_blueprint.candidate_history = list(candidates)
             latest_blueprint.candidate_labels = list(labels)
             latest_blueprint.semantic_gate_results.append({
-                "stage": "phase1D",
+                "stage": "generation",
                 "passed": True,
                 "classification": classification,
                 "issues": [
@@ -764,7 +904,7 @@ def run_phase1d_full_regeneration(
             })
             if tracer:
                 tracer.emit(TraceEvent(
-                    kind="phase1DFinalClassification",
+                    kind="phase1FinalClassification",
                     thm_name=thm_name,
                     turn=round_index,
                     args={"classification": classification, "warningCount": len(latest_warnings)},
@@ -775,11 +915,11 @@ def run_phase1d_full_regeneration(
     deterministic_failed = bool(latest_deterministic)
     semantic_failed = bool(latest_semantic)
     failure_stage = (
-        "phase1DDeterministicAndSemantic"
+        "phase1DeterministicAndSemantic"
         if deterministic_failed and semantic_failed else
-        "phase1DDeterministic"
+        "phase1Deterministic"
         if deterministic_failed else
-        "phase1DSemantic"
+        "phase1Semantic"
     )
     final_details = validation_details(latest_validation) if latest_validation else {}
     final_details.update({
@@ -789,14 +929,14 @@ def run_phase1d_full_regeneration(
                 ("deterministic", deterministic_failed), ("semantic", semantic_failed),
             ) if present
         ],
-        "phase1DRounds": [item.to_dict() for item in rounds],
+        "generationRounds": [item.to_dict() for item in rounds],
         "finalDeterministicErrors": list(latest_deterministic),
         "finalSemanticErrors": list(latest_semantic),
         "finalWarnings": list(latest_warnings),
     })
     if tracer:
         tracer.emit(TraceEvent(
-            kind="phase1DFinalClassification",
+            kind="phase1FinalClassification",
             thm_name=thm_name,
             turn=max_turns,
             args={
@@ -807,7 +947,7 @@ def run_phase1d_full_regeneration(
             ok=False,
         ))
     raise BlueprintGenerationError(
-        "Phase 1D exhausted its full-regeneration turns.",
+        "Phase 1 exhausted its full-regeneration turns.",
         last_candidate=previous_code,
         diagnostics=[previous_feedback],
         attempt=max_turns,
@@ -815,12 +955,12 @@ def run_phase1d_full_regeneration(
         candidate_history=candidates,
         candidate_labels=labels,
         validation_details=final_details,
-        node_edit_rounds=[item.to_dict() for item in rounds],
+        generation_history=[item.to_dict() for item in rounds],
     )
 
 
 __all__ = [
-    "phase1d_request_budget",
-    "phase1d_round_classification",
-    "run_phase1d_full_regeneration",
+    "generation_request_budget",
+    "generation_round_classification",
+    "generate_blueprint",
 ]

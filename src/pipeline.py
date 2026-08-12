@@ -1,9 +1,7 @@
 """Kimina-only Blueprint -> Proving -> Refinement pipeline."""
 from __future__ import annotations
-
 import asyncio
 from concurrent.futures import Executor
-from dataclasses import dataclass, field
 from pathlib import Path
 
 from blueprint import (
@@ -11,7 +9,6 @@ from blueprint import (
     _emit_semantic_check,
     _enabled_semantic_issues,
     format_phase2_contract_errors,
-    generate_blueprint,
     phase2_contract_errors,
     render_solved_declaration,
 )
@@ -37,18 +34,6 @@ from tracer import NullTracer, TraceEvent
 
 
 MAX_REFINEMENT_ITERATIONS = 8
-
-
-@dataclass
-class ProofResult:
-    success: bool
-    theorem_name: str
-    proof_body: str = ""
-    final_lean_file: str = ""
-    final_lean_errors: list[str] = field(default_factory=list)
-    iterations: int = 0
-    proved_nodes: list[str] = field(default_factory=list)
-    failed_nodes: list[str] = field(default_factory=list)
 
 
 def _invalidate_stale_proofs(
@@ -121,36 +106,6 @@ def _assemble_partial_file(
             parts.append(node.full_declaration().strip())
     return "\n\n".join(part for part in parts if part) + "\n"
 
-
-def run_phase1(
-    theorem_stmt: str,
-    *,
-    compiler: KiminaLeanCompiler,
-    nl_proof: str | None = None,
-    model: str = "labs-leanstral-1-5",
-    checkpoint_path: Path | None = None,
-    tracer=None,
-    thm_name: str = "",
-    phase2_contract_check_concurrency: int = 1,
-) -> Blueprint:
-    blueprint = generate_blueprint(
-        theorem_stmt=theorem_stmt,
-        nl_proof=nl_proof,
-        model=model,
-        compiler=compiler,
-        tracer=tracer,
-        thm_name=thm_name,
-        phase2_contract_check_concurrency=phase2_contract_check_concurrency,
-    )
-    if checkpoint_path is not None:
-        state = CheckpointState(
-            informal_statement=theorem_stmt,
-            informal_proof=nl_proof or "",
-            model=model,
-        )
-        state.set_blueprint(blueprint)
-        state.save(checkpoint_path)
-    return blueprint
 
 
 async def run_phase2_async(
@@ -438,92 +393,3 @@ def _orch_result_from_checkpoint(
         active_nodes=active_node_names(blueprint),
         root_name=blueprint.target_theorem,
     )
-
-
-def _proof_result_from_checkpoint(state: CheckpointState) -> ProofResult:
-    blueprint = state.get_blueprint()
-    if blueprint is None:
-        raise RuntimeError("Checkpoint has no blueprint")
-    orch_result = _orch_result_from_checkpoint(state, blueprint)
-    return ProofResult(
-        success=state.root_proved,
-        theorem_name=blueprint.target_theorem,
-        proof_body=state.proved_cache.get(blueprint.target_theorem, ""),
-        final_lean_file=state.final_lean_file or _assemble_partial_file(
-            blueprint, orch_result, state.proved_cache,
-        ),
-        final_lean_errors=list(state.final_lean_errors),
-        iterations=state.iteration + 1,
-        proved_nodes=sorted(orch_result.proved),
-        failed_nodes=sorted(orch_result.failed),
-    )
-
-
-def prove_theorem(
-    theorem_stmt: str,
-    *,
-    compiler: KiminaLeanCompiler,
-    nl_proof: str | None = None,
-    model: str = "labs-leanstral-1-5",
-    retrieval: MathlibRetrieval | None = None,
-    max_iterations: int = MAX_REFINEMENT_ITERATIONS,
-    tracer=None,
-    checkpoint_path: Path,
-    thm_name: str = "",
-    node_timeout_s: float | None = 300.0,
-    llm_api_timeout_s: float | None = 120.0,
-    node_max_prove_turns: int | None = None,
-    node_max_negation_probe_turns: int = 1,
-    max_tool_calls_per_turn: int = 3,
-    proof_policy: str = "full",
-    critical_negation_max_turns: int = 0,
-) -> ProofResult:
-    tracer = tracer or NullTracer()
-    state = CheckpointState.load_or_none(checkpoint_path)
-    if state is not None and nl_proof and not state.informal_proof:
-        # Backfill checkpoints written before `informal_proof` was persisted.
-        state.informal_proof = nl_proof
-        state.save(checkpoint_path)
-    if state is None:
-        run_phase1(
-            theorem_stmt,
-            compiler=compiler,
-            nl_proof=nl_proof,
-            model=model,
-            checkpoint_path=checkpoint_path,
-            tracer=tracer,
-            thm_name=thm_name,
-        )
-    while True:
-        state = CheckpointState.load(checkpoint_path)
-        if state.status in {RunStatus.SOLVED, RunStatus.ERROR, RunStatus.EXHAUSTED}:
-            return _proof_result_from_checkpoint(state)
-        run_phase2(
-            checkpoint_path=checkpoint_path,
-            compiler=compiler,
-            retrieval=retrieval,
-            tracer=tracer,
-            node_timeout_s=node_timeout_s,
-            llm_api_timeout_s=llm_api_timeout_s,
-            model=model,
-            node_max_prove_turns=node_max_prove_turns,
-            node_max_negation_probe_turns=node_max_negation_probe_turns,
-            max_tool_calls_per_turn=max_tool_calls_per_turn,
-            proof_policy=proof_policy,
-            critical_negation_max_turns=critical_negation_max_turns,
-        )
-        state = CheckpointState.load(checkpoint_path)
-        if state.status != RunStatus.RUNNING:
-            return _proof_result_from_checkpoint(state)
-        if state.iteration >= max_iterations:
-            state.status = RunStatus.EXHAUSTED
-            state.save(checkpoint_path)
-            return _proof_result_from_checkpoint(state)
-        run_phase3(
-            checkpoint_path=checkpoint_path,
-            compiler=compiler,
-            model=model,
-            max_iterations=max_iterations,
-            tracer=tracer,
-            thm_name=thm_name,
-        )

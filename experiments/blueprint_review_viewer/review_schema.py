@@ -1,9 +1,4 @@
-"""Versioned, read-only review artifact generation.
-
-The viewer only consumes these artifacts.  The schema intentionally keeps
-candidate snapshots and edit events generic so a later Repair Bundle/Subgraph
-pipeline can add operation types without a front-end redesign.
-"""
+"""Versioned, read-only review artifacts for full Blueprint generations."""
 from __future__ import annotations
 
 import hashlib
@@ -18,7 +13,7 @@ from . import REVIEW_SCHEMA_VERSION
 
 
 _CANDIDATE_RE = re.compile(
-    r"^(?P<kind>phase1a_attempt|phase1_iter|phase1b_round|phase1b_seed|phase1b_final|phase1_failed_last)(?:_(?P<round>\d+))?\.lean$"
+    r"^(?P<kind>generation_round|phase1_failed_last)(?:_(?P<round>\d+))?\.lean$"
 )
 
 
@@ -122,8 +117,7 @@ def _candidate_files(blueprint_dir: Path) -> list[Path]:
     if not blueprint_dir.is_dir():
         return []
     files = [path for path in blueprint_dir.glob("*.lean") if _CANDIDATE_RE.match(path.name)]
-    rank = {"phase1b_seed": 0, "phase1a_attempt": 1, "phase1_iter": 2,
-            "phase1b_round": 3, "phase1b_final": 4, "phase1_failed_last": 5}
+    rank = {"generation_round": 0, "phase1_failed_last": 1}
     def sort_key(path: Path) -> tuple[int, int, str]:
         match = _CANDIDATE_RE.match(path.name)
         assert match is not None
@@ -151,51 +145,8 @@ def _trace_events(row: dict[str, Any]) -> list[dict[str, Any]]:
     return events
 
 
-def _edits(row: dict[str, Any], events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Merge compact result history with full trace tool calls where present."""
-    result: list[dict[str, Any]] = []
-    calls: list[dict[str, Any]] = []
-    for event in events:
-        if event.get("kind") == "tool_call" and event.get("tool_name") == "editBlueprintNode":
-            calls.append(event)
-    for index, event in enumerate(calls, start=1):
-        args = event.get("args") if isinstance(event.get("args"), dict) else {}
-        result.append({
-            "operationId": f"trace-edit-{index}",
-            "operationType": "nodeEdit",
-            "scope": "node",
-            "round": event.get("round") or event.get("iteration"),
-            "nodeName": args.get("node_name") or args.get("nodeName"),
-            "action": args.get("action"),
-            "reason": args.get("reason", ""),
-            "expectedNodeHash": args.get("expected_node_hash", ""),
-            "replacement": args.get("replacement", ""),
-            "lifecycle": [{"stage": "proposed", "at": event.get("ts") or event.get("wall_time_ns")}],
-            "raw": {"toolCall": event},
-        })
-    for history in row.get("phase1b_edit_history") or []:
-        if not isinstance(history, dict):
-            continue
-        round_number = history.get("round")
-        for bucket, stage in (("accepted", "atomicallyApplied"), ("rejected", "rejected"), ("identical", "identical")):
-            for item in history.get(bucket) or []:
-                if not isinstance(item, dict):
-                    continue
-                name = item.get("nodeName") or item.get("node_name")
-                matching = next((edit for edit in result if edit.get("round") == round_number and edit.get("nodeName") == name), None)
-                lifecycle = {"stage": stage, "details": item}
-                if matching:
-                    matching["lifecycle"].append(lifecycle)
-                else:
-                    result.append({"operationId": f"history-{round_number}-{bucket}-{len(result)}",
-                                   "operationType": "nodeEdit", "scope": "node", "round": round_number,
-                                   "nodeName": name, "action": item.get("action"), "reason": "",
-                                   "lifecycle": [lifecycle], "raw": {"history": item}})
-    return result
-
-
 def _validation(row: dict[str, Any]) -> dict[str, Any]:
-    validation = row.get("phase1b_validation")
+    validation = row.get("generation_validation")
     if isinstance(validation, dict):
         return validation
     return {}
@@ -225,11 +176,10 @@ def build_review_artifact(experiment_root: Path, row: dict[str, Any]) -> dict[st
         "result": {key: row.get(key, "") for key in ("status", "phase", "success", "root_proved", "error", "semantic_status")},
         "cotSteps": cot_steps,
         "candidates": candidates,
-        "edits": _edits(row, events),
         "validation": validation,
         "semanticAudit": audit if isinstance(audit, dict) else {},
         "traceSummary": {"eventCount": len(events), "tracePath": _safe_relative(Path(str(row.get("trace_path") or "")), experiment_root)},
-        "futureCompatibility": {"operationTypes": ["nodeEdit", "dependencyEdit", "repairBundle", "subgraphEdit"], "readOnly": True},
+        "readOnly": True,
     }
 
 

@@ -11,11 +11,8 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from blueprint import (  # noqa: E402
     BlueprintNode,
-    _apply_node_edits,
     _extract_lean_code,
-    _node_hash,
     _parse_blueprint,
-    _validate_node_edit,
     extract_blueprint_signature,
     format_phase2_standalone_issues,
     phase2_contract_error_counts,
@@ -166,17 +163,11 @@ theorem root : (1 : Nat) = 1 := by sorry_using []
         self.assertEqual((first.cached_node_count, second.cached_node_count), (0, 1))
         self.assertEqual(compiler.request_count, 1)
 
-        root = blueprint.node_by_name("root")
         replacement = '''@[blueprint (title := "COT_STEP:S001")
   (statement := /-- Two minus one equals one. -/)
   (proof := /-- Deferred. -/)]
 theorem root : (2 : Nat) - 1 = 1 := by sorry_using []'''
-        edit, reason = _validate_node_edit(
-            blueprint, action="replace", node_name="root",
-            expected_hash=_node_hash(root), replacement=replacement,
-        )
-        self.assertEqual(reason, "")
-        revised = _apply_node_edits(blueprint, [edit])
+        revised = _parse_blueprint("import Mathlib\n" + replacement, "root")
         third = phase2_standalone_contract_report(revised, compiler, cache=cache)
         self.assertEqual(third.cached_node_count, 0)
         self.assertEqual(compiler.request_count, 2)

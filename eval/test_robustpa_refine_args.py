@@ -55,25 +55,19 @@ class RobustPAConfigTest(unittest.TestCase):
         )
         config.execution_mode = "phase1_only"
         _validate_args(SimpleNamespace(**OmegaConf.to_container(config, resolve=False)))
+        config.execution_mode = "phase2_only"
+        config.resume = True
+        config.max_refinement_iterations = 0
+        _validate_args(SimpleNamespace(**OmegaConf.to_container(config, resolve=False)))
         config.execution_mode = "unknown"
         with self.assertRaisesRegex(ValueError, "execution_mode"):
             _validate_args(SimpleNamespace(**OmegaConf.to_container(config, resolve=False)))
 
-    def test_whole_cot_semantic_source_mode_has_consistent_flags(self) -> None:
-        config = OmegaConf.load(
-            REPO_ROOT / "experiments/robustpa_refine/configs/base.yaml"
-        )
-        config.semantic_fidelity_enabled = True
-        config.semantic_source_mode = "whole_cot"
-        config.semantic_require_step_ids = False
-        _validate_args(SimpleNamespace(**OmegaConf.to_container(config, resolve=False)))
-        config.semantic_require_step_ids = True
-        with self.assertRaisesRegex(ValueError, "cannot require Step IDs"):
-            _validate_args(SimpleNamespace(**OmegaConf.to_container(config, resolve=False)))
-
     def test_resume_treats_terminal_phase1_results_and_errors_as_complete(self) -> None:
-        args = SimpleNamespace(resume=True, retry_error_results=False)
-        self.assertTrue(_should_skip_existing({"status": "phase1_accepted"}, args))
+        args = SimpleNamespace(
+            resume=True, retry_error_results=False, execution_mode="full",
+        )
+        self.assertTrue(_should_skip_existing({"status": "strictAccepted"}, args))
         self.assertTrue(_should_skip_existing({"status": "exhausted"}, args))
         self.assertTrue(_should_skip_existing({"status": "error"}, args))
         self.assertTrue(_should_skip_existing({"root_proved": True}, args))
@@ -82,17 +76,27 @@ class RobustPAConfigTest(unittest.TestCase):
         args.retry_error_results = True
         self.assertFalse(_should_skip_existing({"status": "error"}, args))
 
+    def test_phase2_only_selects_only_accepted_phase1_seeds(self) -> None:
+        args = SimpleNamespace(
+            resume=True, retry_error_results=False, execution_mode="phase2_only",
+        )
+        self.assertFalse(_should_skip_existing({"status": "strictAccepted"}, args))
+        self.assertFalse(_should_skip_existing({"status": "acceptedWithWarnings"}, args))
+        self.assertTrue(_should_skip_existing({"status": "semanticRejected"}, args))
+        self.assertTrue(_should_skip_existing({"status": "structuralRejected"}, args))
+        self.assertTrue(_should_skip_existing({"status": "solved"}, args))
+
     def test_phase1_acceptance_reports_warning_partition(self) -> None:
         metrics = _metric_row("global", [
-            {"status": "phase1_accepted", "semantic_warning_codes": []},
-            {"status": "phase1_accepted",
+            {"status": "strictAccepted", "semantic_warning_codes": []},
+            {"status": "acceptedWithWarnings",
              "semantic_warning_codes": ["nodeNotRootReachable"]},
             {"status": "error", "phase": "phase1",
              "semantic_warning_codes": ["stepNotRootReachable"]},
         ])
-        self.assertEqual(metrics["phase1_accepted"], 2)
-        self.assertEqual(metrics["phase1_accepted_with_warnings"], 1)
-        self.assertEqual(metrics["phase1_accepted_without_warnings"], 1)
+        self.assertEqual(metrics["blueprint_accepted"], 2)
+        self.assertEqual(metrics["blueprint_accepted_with_warnings"], 1)
+        self.assertEqual(metrics["blueprint_accepted_without_warnings"], 1)
 
     def test_new_successes_are_bucketed_by_refinement_count(self) -> None:
         rows = [

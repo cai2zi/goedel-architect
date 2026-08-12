@@ -1,8 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-cd /ssd/czx/goedel-architect
-exec /ssd/miniconda3/envs/lean4-czx/bin/python \
-  experiments/cot_blueprint_refine/run_experiment.py \
-  --profile qwen3_8b_397b_wrong46_step_v2_phase1_tools \
-  --stage phase1-only "$@"

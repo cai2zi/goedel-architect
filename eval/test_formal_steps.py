@@ -76,7 +76,7 @@ class FormalStepsTest(unittest.TestCase):
             [final],
         )
 
-    def test_heading_and_colon_cannot_end_a_step(self) -> None:
+    def test_heading_and_colon_boundaries_are_removed_losslessly(self) -> None:
         source = "### Compute\nNow calculate:\n$x=1$.\n"
         anchors = make_boundary_anchors(source)
         for forbidden in anchors[:-1]:
@@ -85,10 +85,12 @@ class FormalStepsTest(unittest.TestCase):
                     "[[FORMAL_STEPS_V4]]\n" + forbidden["anchor_id"] + "\n"
                     + anchors[-1]["anchor_id"] + "\n[[/FORMAL_STEPS_V4]]"
                 )
-                with self.assertRaises(FormalStepSplitError):
-                    parse_boundaries(content, anchors)
+                boundaries = parse_boundaries(content, anchors)
+                self.assertEqual(boundaries, [anchors[-1]["anchor_id"]])
+                spans = spans_from_boundaries(source, anchors, boundaries)
+                self.assertEqual("".join(source[a:b] for a, b in spans), source)
 
-    def test_parser_reports_all_forbidden_boundaries_in_one_attempt(self) -> None:
+    def test_parser_removes_all_nonsemantic_boundaries_in_one_pass(self) -> None:
         source = (
             "First calculation:\n"
             "$x=1$.\n"
@@ -108,16 +110,10 @@ class FormalStepsTest(unittest.TestCase):
             + "\n".join([*forbidden, anchors[-1]["anchor_id"]])
             + "\n[[/FORMAL_STEPS_V4]]"
         )
-        with self.assertRaises(FormalStepSplitError) as caught:
-            parse_split_response(content, anchors)
-        reported = {
-            boundary
-            for boundaries in caught.exception.forbidden_boundaries.values()
-            for boundary in boundaries
-        }
-        self.assertEqual(reported, set(forbidden))
-        for boundary in forbidden:
-            self.assertIn(boundary, caught.exception.reason)
+        boundaries = parse_split_response(content, anchors)
+        self.assertEqual(boundaries, [anchors[-1]["anchor_id"]])
+        spans = spans_from_boundaries(source, anchors, boundaries)
+        self.assertEqual("".join(source[a:b] for a, b in spans), source)
 
     def test_prompt_has_soft_step_prior(self) -> None:
         source = "We compute x. Therefore x=1. " * 30

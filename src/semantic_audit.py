@@ -1,4 +1,4 @@
-"""Strict two-stage Phase-1B semantic audit.
+"""Strict two-stage semantic audit for complete Blueprint generation.
 
 The formal decompiler never sees the problem or COT.  The strict comparator
 receives its frozen literal translation and reports concrete omissions or
@@ -16,7 +16,7 @@ from llm_client import chat_completion_with_retry
 from tracer import TraceEvent
 
 
-PROMPT_VERSION = "phase1b-semantic-audit-v7"
+PROMPT_VERSION = "blueprint-semantic-audit-v1"
 SEMANTIC_EFFECTS = {"objectDefinition", "proposition", "vacuous"}
 
 
@@ -95,6 +95,18 @@ Perform a mechanical clause audit before writing JSON:
 6. Compare every conjunct and inequality. Boundary-only, one-sided, or
    restricted-family claims are weakened when the source includes an interior,
    converse, total-count bridge, or additional condition.
+7. Give no credit to ex-falso encodings. A node with a literal `False`
+   premise does not formalize the source clause merely because it can conclude
+   any proposition.
+8. A numeric value introduced by a definition is not a derived result unless
+   its formal body is connected to the source objects and relations. Merely
+   assigning the COT answer to a fresh constant is answer hard-coding.
+9. Track object identity across Steps. Independent existential variables or
+   freshly rebound coordinates do not represent the same source object just
+   because their names or values resemble it.
+10. The root must mention the shared target object and its relevant relation
+    in its formal type. A dependency edge alone does not repair an unrelated
+    root conclusion.
 
 Never repair, reinterpret, or charitably complete the formalization. When in
 doubt, describe the literal formal conclusion first and record the absent
@@ -711,7 +723,7 @@ def _run_stage(
                 raise SemanticAuditFormatError(
                     exc.reason, raw_content=content, attempts=attempts,
                 ) from exc
-            if operation == "phase1b_formal_decompiler":
+            if operation == "formal_decompiler":
                 schema_guidance = (
                     "Every nodes item must have exactly node_name, kind, translation, "
                     "semantic_effect, introduced_objects, and referenced_objects. "
@@ -758,7 +770,7 @@ def run_formal_decompiler(
 ) -> FormalDecompilerResult:
     if tracer is not None:
         tracer.emit(TraceEvent(
-            kind="phase1BFormalDecompileStart", thm_name=thm_name, turn=round_index,
+            kind="formalDecompileStart", thm_name=thm_name, turn=round_index,
             args={"round": round_index, "formalViewHash": view.sha256, "nodeCount": len(view.nodes)},
         ))
     parsed, content, reasoning, finish, request_id, attempts, usage = _run_stage(
@@ -766,7 +778,7 @@ def run_formal_decompiler(
         parser=parse_formal_decompiler, parser_kwargs={"view": view},
         max_tokens=max_tokens, max_attempts=max_attempts, tracer=tracer,
         thm_name=thm_name, round_index=round_index,
-        phase="phase1BFormalDecompiler", operation="phase1b_formal_decompiler",
+        phase="formalDecompiler", operation="formal_decompiler",
     )
     result = FormalDecompilerResult(
         parsed, content, reasoning, finish, request_id,
@@ -774,13 +786,13 @@ def run_formal_decompiler(
     )
     if tracer is not None:
         tracer.emit(TraceEvent(
-            kind="phase1BFormalDecompileResult", thm_name=thm_name, turn=round_index,
+            kind="formalDecompileResult", thm_name=thm_name, turn=round_index,
             args={"round": round_index, "formalViewHash": view.sha256,
                   "vacuousNodes": list(result.vacuous_nodes), "result": result.to_dict()},
             ok=not bool(result.vacuous_nodes),
         ))
         tracer.emit(TraceEvent(
-            kind="phase1BFormalDecompileEnd", thm_name=thm_name, turn=round_index,
+            kind="formalDecompileEnd", thm_name=thm_name, turn=round_index,
             args={"round": round_index, "attemptCount": len(attempts),
                   "promptTokens": usage[0], "completionTokens": usage[1],
                   "totalTokens": usage[2], "requestId": request_id},
@@ -811,7 +823,7 @@ def run_strict_comparator(
     cache_key = semantic_audit_cache_key(model, messages)
     if tracer is not None:
         tracer.emit(TraceEvent(
-            kind="phase1BStrictCompareStart", thm_name=thm_name, turn=round_index,
+            kind="strictCompareStart", thm_name=thm_name, turn=round_index,
             args={"round": round_index, "formalViewHash": view.sha256,
                   "cacheKey": cache_key, "stepCount": len(_manifest_steps(manifest)),
                   "openObligationCount": len(open_obligations)},
@@ -824,7 +836,7 @@ def run_strict_comparator(
         },
         max_tokens=max_tokens, max_attempts=max_attempts, tracer=tracer,
         thm_name=thm_name, round_index=round_index,
-        phase="phase1BStrictComparator", operation="phase1b_strict_comparator",
+        phase="strictComparator", operation="strict_comparator",
     )
     steps, root, unreachable, dependencies, obligation_results, passed = parsed
     result = StrictComparatorResult(
@@ -833,13 +845,13 @@ def run_strict_comparator(
     )
     if tracer is not None:
         tracer.emit(TraceEvent(
-            kind="phase1BStrictCompareResult", thm_name=thm_name, turn=round_index,
+            kind="strictCompareResult", thm_name=thm_name, turn=round_index,
             args={"round": round_index, "formalViewHash": view.sha256,
                   "cacheKey": cache_key, "passed": passed, "result": result.to_dict()},
             ok=passed,
         ))
         tracer.emit(TraceEvent(
-            kind="phase1BStrictCompareEnd", thm_name=thm_name, turn=round_index,
+            kind="strictCompareEnd", thm_name=thm_name, turn=round_index,
             args={"round": round_index, "passed": passed, "attemptCount": len(attempts),
                   "promptTokens": usage[0], "completionTokens": usage[1],
                   "totalTokens": usage[2], "requestId": request_id},

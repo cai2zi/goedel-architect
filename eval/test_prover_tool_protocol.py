@@ -166,6 +166,41 @@ class ProverToolProtocolTest(unittest.TestCase):
             1,
         )
 
+    def test_phase2_uses_explicit_qwen_thinking_sampling(self) -> None:
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "GOEDEL_PROVER_ENABLE_THINKING": "true",
+                    "GOEDEL_PROVER_TEMPERATURE": "0.6",
+                    "GOEDEL_PROVER_TOP_P": "0.95",
+                    "GOEDEL_PROVER_TOP_K": "20",
+                    "GOEDEL_PROVER_MIN_P": "0.0",
+                    "GOEDEL_PROVER_PRESENCE_PENALTY": "0.0",
+                    "GOEDEL_PROVER_REPETITION_PENALTY": "1.0",
+                },
+            ),
+            patch("prover.make_client", return_value=object()),
+        ):
+            prover = GoedelProver("model", Retrieval())
+        completed = response(
+            [ToolCall("proof", "lean_compile", {"proof_body": "by trivial"})],
+            finish_reason="tool_calls",
+        )
+        with patch("prover.chat_completion_with_retry", return_value=completed) as chat:
+            prover._chat([], "root", 1, "prove", [LEAN_COMPILE_TOOL], "prove_node")
+        kwargs = chat.call_args.kwargs
+        self.assertEqual(kwargs["temperature"], 0.6)
+        self.assertEqual(kwargs["top_p"], 0.95)
+        self.assertEqual(kwargs["presence_penalty"], 0.0)
+        self.assertEqual(kwargs["extra_body"], {
+            "top_k": 20,
+            "min_p": 0.0,
+            "repetition_penalty": 1.0,
+            "chat_template_kwargs": {"enable_thinking": True},
+        })
+        self.assertTrue(kwargs["trace_args"]["enable_thinking"])
+
     def test_same_turn_duplicates_are_removed(self) -> None:
         prover = self.make_prover()
         calls = [

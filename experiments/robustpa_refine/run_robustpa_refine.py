@@ -15,7 +15,7 @@ import traceback
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
-from functools import lru_cache, partial
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -31,9 +31,8 @@ sys.path.insert(0, str(REPO_ROOT / "experiments"))
 from blueprint import (  # noqa: E402
     Blueprint,
     BlueprintGenerationError,
-    generate_blueprint_from_informal,
 )
-from phase1d import run_phase1d_full_regeneration  # noqa: E402
+from blueprint_generation import generate_blueprint  # noqa: E402
 from blueprint_review_viewer.review_schema import index_entry, write_review_artifact  # noqa: E402
 from checkpoint import CheckpointState, RunStatus  # noqa: E402
 from robustpa_refine.io_utils import append_jsonl, safe_stem, unlink_if_exists, write_json  # noqa: E402
@@ -181,81 +180,37 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
     args.node_max_negation_probe_turns = int(args.node_max_negation_probe_turns)
     args.critical_negation_max_turns = int(args.critical_negation_max_turns)
     args.max_tool_calls_per_turn = int(args.max_tool_calls_per_turn)
-    args.phase1_max_tool_turns = int(args.phase1_max_tool_turns)
-    args.phase1a_max_tool_turns = int(getattr(args, "phase1a_max_tool_turns", args.phase1_max_tool_turns))
-    args.phase1a_enable_thinking = bool(getattr(args, "phase1a_enable_thinking", False))
-    for name in ("phase1a_temperature", "phase1a_top_p", "phase1a_min_p", "phase1a_presence_penalty", "phase1a_repetition_penalty"):
-        setattr(args, name, float(getattr(args, name)))
-    args.phase1a_top_k = int(args.phase1a_top_k)
-    args.phase1a_max_tokens = int(args.phase1a_max_tokens)
-    args.phase1d_max_turns = int(args.phase1d_max_turns)
-    args.phase1d_enable_thinking = bool(args.phase1d_enable_thinking)
+    args.generation_max_turns = int(args.generation_max_turns)
+    args.generation_enable_thinking = bool(args.generation_enable_thinking)
     for name in (
-        "phase1d_temperature", "phase1d_top_p", "phase1d_min_p",
-        "phase1d_presence_penalty", "phase1d_repetition_penalty",
+        "generation_temperature", "generation_top_p", "generation_min_p",
+        "generation_presence_penalty", "generation_repetition_penalty",
     ):
         setattr(args, name, float(getattr(args, name)))
-    args.phase1d_top_k = int(args.phase1d_top_k)
-    args.phase1d_model_max_context = int(args.phase1d_model_max_context)
-    args.phase1d_context_safety_margin = int(args.phase1d_context_safety_margin)
-    args.tokenizer_path = os.environ.get("GOEDEL_TOKENIZER_PATH", "").strip()
-    args.phase1b_max_turns = int(getattr(args, "phase1b_max_turns", args.phase1_max_tool_turns))
-    args.phase1_max_tool_calls_per_turn = int(args.phase1_max_tool_calls_per_turn)
-    args.phase1_mathlib_search_max_calls = int(args.phase1_mathlib_search_max_calls)
-    args.phase1b_formal_decompiler_max_tokens = int(
-        args.phase1b_formal_decompiler_max_tokens
+    args.generation_top_k = int(args.generation_top_k)
+    args.generation_model_max_context = int(args.generation_model_max_context)
+    args.generation_context_safety_margin = int(args.generation_context_safety_margin)
+    args.tokenizer_path = os.environ.get(
+        "GOEDEL_TOKENIZER_PATH", str(getattr(args, "tokenizer_path", ""))
+    ).strip()
+    args.formal_decompiler_max_tokens = int(
+        args.formal_decompiler_max_tokens
     )
-    args.phase1b_strict_comparator_max_tokens = int(
-        args.phase1b_strict_comparator_max_tokens
+    args.strict_comparator_max_tokens = int(
+        args.strict_comparator_max_tokens
     )
-    args.phase1b_semantic_format_max_attempts = int(
-        args.phase1b_semantic_format_max_attempts
+    args.semantic_format_max_attempts = int(
+        args.semantic_format_max_attempts
     )
-    args.phase1b_repair_strategy = str(args.phase1b_repair_strategy)
-    args.phase1b_editor_attempts_per_turn = int(
-        args.phase1b_editor_attempts_per_turn
-    )
-    args.phase1b_flow = str(getattr(args, "phase1b_flow", "mixed"))
-    args.phase1b_deterministic_max_turns = int(getattr(args, "phase1b_deterministic_max_turns", 4))
-    args.phase1b_semantic_max_turns = int(getattr(args, "phase1b_semantic_max_turns", 8))
-    args.phase1b_editor_enable_thinking = bool(getattr(args, "phase1b_editor_enable_thinking", False))
-    for name in ("phase1b_editor_temperature", "phase1b_editor_top_p", "phase1b_editor_min_p", "phase1b_editor_presence_penalty", "phase1b_editor_repetition_penalty"):
-        setattr(args, name, float(getattr(args, name)))
-    args.phase1b_editor_top_k = int(args.phase1b_editor_top_k)
-    args.phase1b_editor_max_tokens = int(args.phase1b_editor_max_tokens)
-    args.phase1b_plan_max_tokens = int(args.phase1b_plan_max_tokens)
-    args.phase1b_plan_format_attempts = int(args.phase1b_plan_format_attempts)
-    args.phase1b_plan_max_chars = int(args.phase1b_plan_max_chars)
-    args.phase1b_subgraph_max_edits = int(args.phase1b_subgraph_max_edits)
-    args.phase1b_closure_rounds = int(args.phase1b_closure_rounds)
-    args.phase1b_mathlib_search_policy = str(
-        args.phase1b_mathlib_search_policy
-    )
-    args.phase1b_mathlib_search_max_queries_per_turn = int(
-        args.phase1b_mathlib_search_max_queries_per_turn
-    )
-    args.phase1b_mathlib_search_max_results_per_query = int(
-        args.phase1b_mathlib_search_max_results_per_query
-    )
-    seed_root = getattr(args, "phase1b_seed_blueprint_root", None)
-    args.phase1b_seed_blueprint_root = (
-        _resolve_path(seed_root, original_cwd) if seed_root else None
-    )
-    args.phase1b_seed_required = bool(getattr(args, "phase1b_seed_required", False))
-    args.phase1b_seed_filename = str(
-        getattr(args, "phase1b_seed_filename", "phase1b_final.lean")
-    )
+    args.refinement_max_retries = int(args.refinement_max_retries)
     _validate_args(args)
     return args
 
 
 def _validate_args(args: argparse.Namespace) -> None:
-    if args.execution_mode not in {
-        "full", "phase1_only", "phase1a_only", "phase1d_full_regeneration",
-    }:
+    if args.execution_mode not in {"full", "phase1_only", "phase2_only"}:
         raise ValueError(
-            "execution_mode must be one of: full, phase1_only, phase1a_only, "
-            "phase1d_full_regeneration"
+            "execution_mode must be one of: full, phase1_only, phase2_only"
         )
     for name in (
         "phase1_concurrency",
@@ -266,91 +221,36 @@ def _validate_args(args: argparse.Namespace) -> None:
         "lean_max_inflight_snippets",
         "lean_batch_size",
         "lean_parallel_batches",
-        "blueprint_max_retries",
+        "refinement_max_retries",
         "node_max_prove_turns",
-        "phase1_max_tool_turns",
-        "phase1a_max_tool_turns",
-        "phase1b_max_turns",
-        "phase1_max_tool_calls_per_turn",
+        "generation_max_turns",
+        "formal_decompiler_max_tokens",
+        "strict_comparator_max_tokens",
+        "semantic_format_max_attempts",
     ):
         if getattr(args, name) <= 0:
             raise ValueError(f"{name} must be positive")
     if args.max_refinement_iterations < 0:
         raise ValueError("max_refinement_iterations must be non-negative")
-    if args.phase1_mathlib_search_max_calls < 0:
-        raise ValueError("Phase-1 search limit must be non-negative")
+    if args.execution_mode == "phase2_only":
+        if not args.resume:
+            raise ValueError("phase2_only requires resume=true")
+        if args.max_refinement_iterations != 0:
+            raise ValueError(
+                "phase2_only requires max_refinement_iterations=0"
+            )
     if args.node_max_negation_probe_turns < 0:
         raise ValueError("node_max_negation_probe_turns must be non-negative")
     if args.critical_negation_max_turns < 0:
         raise ValueError("critical_negation_max_turns must be non-negative")
-    if args.phase1b_formal_decompiler_max_tokens <= 0:
-        raise ValueError("phase1b_formal_decompiler_max_tokens must be positive")
-    if args.phase1b_strict_comparator_max_tokens <= 0:
-        raise ValueError("phase1b_strict_comparator_max_tokens must be positive")
-    if args.phase1b_semantic_format_max_attempts <= 0:
-        raise ValueError("phase1b_semantic_format_max_attempts must be positive")
-    if args.phase1b_plan_max_tokens <= 0:
-        raise ValueError("phase1b_plan_max_tokens must be positive")
-    if args.phase1b_repair_strategy not in {"planDirect", "directEdit"}:
+    if args.generation_model_max_context <= 0:
+        raise ValueError("generation_model_max_context must be positive")
+    if args.generation_context_safety_margin < 0:
+        raise ValueError("generation_context_safety_margin must be non-negative")
+    if not args.tokenizer_path:
         raise ValueError(
-            "phase1b_repair_strategy must be planDirect or directEdit"
+            "tokenizer_path is required for dynamic generation budgeting"
         )
-    if args.phase1b_editor_attempts_per_turn <= 0:
-        raise ValueError("phase1b_editor_attempts_per_turn must be positive")
-    if args.phase1b_flow not in {"mixed", "twoStage"}:
-        raise ValueError("phase1b_flow must be mixed or twoStage")
-    if args.phase1b_deterministic_max_turns < 0 or args.phase1b_semantic_max_turns < 0:
-        raise ValueError("two-stage Phase-1B turn limits must be non-negative")
-    if args.phase1b_editor_max_tokens <= 0:
-        raise ValueError("phase1b_editor_max_tokens must be positive")
-    if args.phase1a_max_tokens <= 0:
-        raise ValueError("phase1a_max_tokens must be positive")
-    if args.phase1d_max_turns <= 0:
-        raise ValueError("phase1d_max_turns must be positive")
-    if args.phase1d_model_max_context <= 0:
-        raise ValueError("phase1d_model_max_context must be positive")
-    if args.phase1d_context_safety_margin < 0:
-        raise ValueError("phase1d_context_safety_margin must be non-negative")
-    if args.execution_mode == "phase1d_full_regeneration" and not args.tokenizer_path:
-        raise ValueError(
-            "GOEDEL_TOKENIZER_PATH is required for Phase 1D dynamic token budgeting"
-        )
-    if args.phase1b_plan_format_attempts <= 0:
-        raise ValueError("phase1b_plan_format_attempts must be positive")
-    if args.phase1b_plan_max_chars <= 0:
-        raise ValueError("phase1b_plan_max_chars must be positive")
-    if args.phase1b_subgraph_max_edits <= 0:
-        raise ValueError("phase1b_subgraph_max_edits must be positive")
-    if args.phase1b_closure_rounds < 0:
-        raise ValueError("phase1b_closure_rounds must be non-negative")
-    if args.phase1b_closure_rounds > args.phase1b_max_turns:
-        raise ValueError(
-            "phase1b_closure_rounds cannot exceed phase1b_max_turns"
-        )
-    if args.phase1b_mathlib_search_max_queries_per_turn < 0:
-        raise ValueError(
-            "phase1b_mathlib_search_max_queries_per_turn must be non-negative"
-        )
-    if args.phase1b_mathlib_search_policy != "leanErrorsOnly":
-        raise ValueError(
-            "phase1b_mathlib_search_policy must be leanErrorsOnly"
-        )
-    if args.phase1b_mathlib_search_max_results_per_query <= 0:
-        raise ValueError(
-            "phase1b_mathlib_search_max_results_per_query must be positive"
-        )
-    if args.phase1b_seed_required and args.phase1b_seed_blueprint_root is None:
-        raise ValueError(
-            "phase1b_seed_required=true requires phase1b_seed_blueprint_root"
-        )
-    if Path(args.phase1b_seed_filename).name != args.phase1b_seed_filename:
-        raise ValueError("phase1b_seed_filename must be a basename")
-    if args.semantic_source_mode not in {"step_grounded", "whole_cot"}:
-        raise ValueError("semantic_source_mode must be one of: step_grounded, whole_cot")
-    if args.semantic_source_mode == "whole_cot" and not args.semantic_fidelity_enabled:
-        raise ValueError("whole_cot semantic source mode requires semantic fidelity")
-    if args.semantic_source_mode == "whole_cot" and args.semantic_require_step_ids:
-        raise ValueError("whole_cot semantic source mode cannot require Step IDs")
     if args.proof_policy not in {"full", "first_failed_wave", "critical_path"}:
         raise ValueError("proof_policy must be one of: full, first_failed_wave, critical_path")
     if args.node_timeout_s is not None and args.node_timeout_s <= 0:
@@ -457,76 +357,6 @@ def _record_paths(output_root: Path, record: Record) -> tuple[Path, Path, Path]:
     return checkpoint_path, trace_path, blueprint_dir
 
 
-@lru_cache(maxsize=8)
-def _seed_result_rows(results_path: str) -> dict[str, dict[str, Any]]:
-    path = Path(results_path)
-    rows: dict[str, dict[str, Any]] = {}
-    if not path.exists():
-        return rows
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            source_id = str(row.get("source_id") or "")
-            if source_id:
-                rows[source_id] = row
-    return rows
-
-
-def _load_phase1b_seed_blueprint(
-    args: argparse.Namespace,
-    record: Record,
-) -> str:
-    root = args.phase1b_seed_blueprint_root
-    if root is None:
-        return ""
-    seed_path = root / record.subset / record.split / record.record_id / args.phase1b_seed_filename
-    metadata_path = root.parent / "results.jsonl"
-    metadata = _seed_result_rows(str(metadata_path)).get(record.source_id)
-    problems: list[str] = []
-    ready_path = root.parent / "PHASE1A_READY.json"
-    ready_record = None
-    if args.phase1b_seed_required:
-        if not ready_path.is_file():
-            problems.append(f"missing shared Phase 1A READY manifest: {ready_path}")
-        else:
-            ready_payload = json.loads(ready_path.read_text(encoding="utf-8"))
-            ready_record = next((item for item in ready_payload.get("records", [])
-                                 if item.get("source_id") == record.source_id), None)
-            if ready_record is None:
-                problems.append("source_id missing from shared Phase 1A READY manifest")
-    if not seed_path.is_file():
-        problems.append(f"missing seed file: {seed_path}")
-    if metadata is None:
-        problems.append(f"missing seed metadata for source_id={record.source_id}")
-    else:
-        if str(metadata.get("theorem_name") or "") != record.theorem_name:
-            problems.append("theorem name mismatch")
-        if str(metadata.get("claimed_answer") or "") != record.claimed_answer:
-            problems.append("claimed answer mismatch")
-        old_manifest = str(metadata.get("cot_manifest_json") or "")
-        old_hash = hashlib.sha256(old_manifest.encode()).hexdigest()
-        new_hash = hashlib.sha256(record.cot_manifest_json.encode()).hexdigest()
-        if old_hash != new_hash:
-            problems.append(
-                f"COT manifest hash mismatch: seed={old_hash} current={new_hash}"
-            )
-    if seed_path.is_file() and ready_record is not None:
-        actual_lean_hash = hashlib.sha256(seed_path.read_bytes()).hexdigest()
-        if actual_lean_hash != str(ready_record.get("lean_hash") or ""):
-            problems.append("Lean hash mismatch against shared Phase 1A READY manifest")
-    if problems:
-        if args.phase1b_seed_required:
-            raise BlueprintGenerationError(
-                "Seed Blueprint validation failed: " + "; ".join(problems),
-                diagnostics=problems,
-                failure_stage="seedBlueprintInvalid",
-            )
-        return ""
-    return seed_path.read_text(encoding="utf-8")
-
-
 def _write_blueprint_snapshot(
     output_root: Path,
     record: Record,
@@ -547,7 +377,7 @@ def _write_phase1_candidates(
     candidates: list[str],
     labels: list[str] | None = None,
 ) -> list[str]:
-    """Persist labeled Phase-1A attempts and Phase-1B patch-round snapshots."""
+    """Persist complete Blueprint candidates from each generation round."""
     blueprint_dir.mkdir(parents=True, exist_ok=True)
     paths: list[str] = []
     for index, candidate in enumerate(candidates):
@@ -703,72 +533,28 @@ def _result_row(
         "max_tool_calls_per_turn": args.max_tool_calls_per_turn,
         "proof_policy": args.proof_policy,
         "critical_negation_max_turns": args.critical_negation_max_turns,
-        "semantic_fidelity_enabled": bool(args.semantic_fidelity_enabled),
-        "semantic_require_step_ids": bool(args.semantic_require_step_ids),
-        "semantic_static_gate": bool(args.semantic_static_gate),
-        "semantic_minimal_ir": bool(args.semantic_minimal_ir),
-        "semantic_freeze_refinement": bool(args.semantic_freeze_refinement),
-        "phase1b_semantic_audit_enabled": bool(args.phase1b_semantic_audit_enabled),
-        "phase1b_formal_decompiler_max_tokens": (
-            args.phase1b_formal_decompiler_max_tokens
-        ),
-        "phase1b_strict_comparator_max_tokens": (
-            args.phase1b_strict_comparator_max_tokens
-        ),
-        "phase1b_semantic_format_max_attempts": (
-            args.phase1b_semantic_format_max_attempts
-        ),
-        "phase1b_repair_strategy": args.phase1b_repair_strategy,
-        "phase1b_editor_attempts_per_turn": args.phase1b_editor_attempts_per_turn,
-        "phase1a_max_tool_turns": args.phase1a_max_tool_turns,
-        "phase1a_sampling": {
-            "enable_thinking": args.phase1a_enable_thinking,
-            "temperature": args.phase1a_temperature,
-            "top_p": args.phase1a_top_p,
-            "top_k": args.phase1a_top_k,
-            "min_p": args.phase1a_min_p,
-            "presence_penalty": args.phase1a_presence_penalty,
-            "repetition_penalty": args.phase1a_repetition_penalty,
-            "max_tokens": args.phase1a_max_tokens,
+        "generation_max_turns": args.generation_max_turns,
+        "generation_sampling": {
+            "enable_thinking": args.generation_enable_thinking,
+            "temperature": args.generation_temperature,
+            "top_p": args.generation_top_p,
+            "top_k": args.generation_top_k,
+            "min_p": args.generation_min_p,
+            "presence_penalty": args.generation_presence_penalty,
+            "repetition_penalty": args.generation_repetition_penalty,
         },
-        "phase1b_max_turns": args.phase1b_max_turns,
-        "phase1b_flow": args.phase1b_flow,
-        "phase1b_deterministic_max_turns": args.phase1b_deterministic_max_turns,
-        "phase1b_semantic_max_turns": args.phase1b_semantic_max_turns,
-        "phase1b_editor_sampling": {
-            "enable_thinking": args.phase1b_editor_enable_thinking,
-            "temperature": args.phase1b_editor_temperature,
-            "top_p": args.phase1b_editor_top_p,
-            "top_k": args.phase1b_editor_top_k,
-            "min_p": args.phase1b_editor_min_p,
-            "presence_penalty": args.phase1b_editor_presence_penalty,
-            "repetition_penalty": args.phase1b_editor_repetition_penalty,
-            "max_tokens": args.phase1b_editor_max_tokens,
-        },
-        "phase1b_plan_max_tokens": args.phase1b_plan_max_tokens,
-        "phase1b_plan_format_attempts": args.phase1b_plan_format_attempts,
-        "phase1b_plan_max_chars": args.phase1b_plan_max_chars,
-        "phase1b_subgraph_max_edits": args.phase1b_subgraph_max_edits,
-        "phase1b_closure_rounds": args.phase1b_closure_rounds,
-        "phase1b_mathlib_search_max_queries_per_turn": (
-            args.phase1b_mathlib_search_max_queries_per_turn
-        ),
-        "phase1b_mathlib_search_policy": args.phase1b_mathlib_search_policy,
-        "phase1b_mathlib_search_max_results_per_query": (
-            args.phase1b_mathlib_search_max_results_per_query
-        ),
-        "phase1b_seed_blueprint_root": str(args.phase1b_seed_blueprint_root or ""),
-        "phase1b_seed_required": bool(args.phase1b_seed_required),
-        "semantic_source_mode": str(args.semantic_source_mode),
+        "formal_decompiler_max_tokens": args.formal_decompiler_max_tokens,
+        "strict_comparator_max_tokens": args.strict_comparator_max_tokens,
+        "semantic_format_max_attempts": args.semantic_format_max_attempts,
         "semantic_status": state.semantic_status if state else "",
         "semantic_gate_results": semantic_gate_results,
         "semantic_warning_codes": semantic_warning_codes,
         "semantic_warning_count": len(semantic_warnings),
-        "phase1b_validation": dict(
-            blueprint.phase1b_validation if blueprint is not None else {}
+        "generation_validation": dict(
+            blueprint.generation_validation if blueprint is not None else {}
         ),
-        "phase1b_edit_history": list(
-            blueprint.phase1b_edit_history if blueprint is not None else []
+        "generation_history": list(
+            blueprint.generation_history if blueprint is not None else []
         ),
         **score,
     }
@@ -778,28 +564,24 @@ def _result_row(
 
 
 def _accepted_phase1_status(blueprint: Blueprint) -> str:
-    audit = blueprint.phase1b_validation.get("semanticAudit")
+    audit = blueprint.generation_validation.get("semanticAudit")
     if isinstance(audit, dict):
         classification = str(audit.get("classification") or "")
         if classification in {
-            "strictAccepted", "acceptedWithJustifiedSideBranches", "acceptedWithWarnings",
+            "strictAccepted", "acceptedWithWarnings",
         }:
             return classification
-    return "phase1_accepted"
+    raise RuntimeError("validated Blueprint is missing a terminal generation classification")
 
 
 def _failed_phase1_status(exc: Exception) -> str:
     if not isinstance(exc, BlueprintGenerationError):
         return "infraError"
-    if exc.failure_stage in {
-        "phase1BSemanticAuditFormat",
-    }:
-        return "infraError"
-    if exc.failure_stage == "phase1DSemantic":
+    if exc.failure_stage == "phase1Semantic":
         return "semanticRejected"
     if exc.failure_stage in {
-        "phase1DDeterministic", "phase1DDeterministicAndSemantic",
-        "phase1DContextBudgetExceeded",
+        "phase1Deterministic", "phase1DeterministicAndSemantic",
+        "phase1ContextBudgetExceeded",
     }:
         return "structuralRejected"
     audit = exc.validation_details.get("semanticAudit")
@@ -807,7 +589,6 @@ def _failed_phase1_status(exc: Exception) -> str:
         comparator = audit.get("strictComparator") or {}
         if (
             comparator.get("passed") is False
-            or audit.get("openObligations")
         ):
             return "semanticRejected"
     return "structuralRejected"
@@ -878,16 +659,40 @@ async def _run_record(
     state: CheckpointState | None = None
     phase = "phase1"
     try:
-        phase1b_seed_lean_code = _load_phase1b_seed_blueprint(args, record)
-        phase1_tracer = tracer.with_context(phase="phase1", iteration=0)
-        async with phase1_sem:
-            tqdm.write(f"[phase1-start] {record.unique_id}")
-            if args.execution_mode == "phase1d_full_regeneration":
-                phase = "phase1d"
+        if args.execution_mode == "phase2_only":
+            phase = "phase2"
+            state = CheckpointState.load(checkpoint_path)
+            blueprint = state.get_blueprint()
+            if blueprint is None:
+                raise RuntimeError(f"No Phase 1 Blueprint in checkpoint {checkpoint_path}")
+            mismatches = []
+            if state.informal_statement != record.informal_statement:
+                mismatches.append("informal_statement")
+            if state.informal_proof != record.informal_proof:
+                mismatches.append("informal_proof")
+            if state.cot_manifest_json != record.cot_manifest_json:
+                mismatches.append("cot_manifest_json")
+            if state.claimed_answer != record.claimed_answer:
+                mismatches.append("claimed_answer")
+            if blueprint.target_theorem != record.theorem_name:
+                mismatches.append("target_theorem")
+            if mismatches:
+                raise RuntimeError(
+                    "Phase 2 checkpoint does not match the prepared record: "
+                    + ", ".join(mismatches)
+                )
+            tqdm.write(
+                f"[phase2-resume] {record.unique_id} nodes={len(blueprint.nodes)} "
+                f"iteration={state.iteration}"
+            )
+        else:
+            phase1_tracer = tracer.with_context(phase="phase1", iteration=0)
+            async with phase1_sem:
+                tqdm.write(f"[phase1-start] {record.unique_id}")
                 blueprint = await loop.run_in_executor(
                     phase_executor,
                     partial(
-                        run_phase1d_full_regeneration,
+                        generate_blueprint,
                         informal_statement=record.informal_statement,
                         informal_proof=record.informal_proof,
                         cot_manifest_json=record.cot_manifest_json,
@@ -897,167 +702,70 @@ async def _run_record(
                         compiler=runtime.compiler,
                         tracer=phase1_tracer,
                         thm_name=record.unique_id,
-                        max_turns=args.phase1d_max_turns,
+                        max_turns=args.generation_max_turns,
                         tokenizer_path=args.tokenizer_path,
-                        model_max_context=args.phase1d_model_max_context,
-                        context_safety_margin=args.phase1d_context_safety_margin,
-                        enable_thinking=args.phase1d_enable_thinking,
-                        temperature=args.phase1d_temperature,
-                        top_p=args.phase1d_top_p,
-                        top_k=args.phase1d_top_k,
-                        min_p=args.phase1d_min_p,
-                        presence_penalty=args.phase1d_presence_penalty,
-                        repetition_penalty=args.phase1d_repetition_penalty,
+                        model_max_context=args.generation_model_max_context,
+                        context_safety_margin=args.generation_context_safety_margin,
+                        enable_thinking=args.generation_enable_thinking,
+                        temperature=args.generation_temperature,
+                        top_p=args.generation_top_p,
+                        top_k=args.generation_top_k,
+                        min_p=args.generation_min_p,
+                        presence_penalty=args.generation_presence_penalty,
+                        repetition_penalty=args.generation_repetition_penalty,
                         standalone_concurrency=args.phase2_contract_check_concurrency,
-                        semantic_require_step_ids=args.semantic_require_step_ids,
-                        semantic_static_gate=args.semantic_static_gate,
-                        decompiler_max_tokens=args.phase1b_formal_decompiler_max_tokens,
-                        comparator_max_tokens=args.phase1b_strict_comparator_max_tokens,
-                        semantic_format_attempts=args.phase1b_semantic_format_max_attempts,
+                        decompiler_max_tokens=args.formal_decompiler_max_tokens,
+                        comparator_max_tokens=args.strict_comparator_max_tokens,
+                        semantic_format_attempts=args.semantic_format_max_attempts,
                     ),
                 )
-            else:
-                blueprint = await loop.run_in_executor(
-                    phase_executor,
-                    partial(
-                    generate_blueprint_from_informal,
+                _write_phase1_candidates(
+                    blueprint_dir, blueprint.candidate_history, blueprint.candidate_labels,
+                )
+                state = CheckpointState(
                     informal_statement=record.informal_statement,
                     informal_proof=record.informal_proof,
                     cot_manifest_json=record.cot_manifest_json,
                     claimed_answer=record.claimed_answer,
-                    target_name=record.theorem_name,
                     model=args.model,
-                    compiler=runtime.compiler,
-                    tracer=phase1_tracer,
-                    thm_name=record.unique_id,
-                    max_retries=args.blueprint_max_retries,
-                    phase2_contract_check_concurrency=args.phase2_contract_check_concurrency,
-                    semantic_fidelity_enabled=args.semantic_fidelity_enabled,
-                    semantic_require_step_ids=args.semantic_require_step_ids,
-                    semantic_static_gate=args.semantic_static_gate,
-                    semantic_minimal_ir=args.semantic_minimal_ir,
-                    semantic_source_mode=args.semantic_source_mode,
-                    phase1_max_tool_turns=args.phase1a_max_tool_turns,
-                    phase1a_enable_thinking=args.phase1a_enable_thinking,
-                    phase1a_temperature=args.phase1a_temperature,
-                    phase1a_top_p=args.phase1a_top_p,
-                    phase1a_top_k=args.phase1a_top_k,
-                    phase1a_min_p=args.phase1a_min_p,
-                    phase1a_presence_penalty=args.phase1a_presence_penalty,
-                    phase1a_repetition_penalty=args.phase1a_repetition_penalty,
-                    phase1a_max_tokens=args.phase1a_max_tokens,
-                    phase1b_max_turns=args.phase1b_max_turns,
-                    phase1a_only=(args.execution_mode == "phase1a_only"),
-                    phase1_max_tool_calls_per_turn=args.phase1_max_tool_calls_per_turn,
-                    phase1_mathlib_search_max_calls=args.phase1_mathlib_search_max_calls,
-                    phase1b_semantic_audit_enabled=(
-                        args.phase1b_semantic_audit_enabled
-                    ),
-                    phase1b_formal_decompiler_max_tokens=(
-                        args.phase1b_formal_decompiler_max_tokens
-                    ),
-                    phase1b_strict_comparator_max_tokens=(
-                        args.phase1b_strict_comparator_max_tokens
-                    ),
-                    phase1b_semantic_format_max_attempts=(
-                        args.phase1b_semantic_format_max_attempts
-                    ),
-                    phase1b_repair_strategy=args.phase1b_repair_strategy,
-                    phase1b_editor_attempts_per_turn=(
-                        args.phase1b_editor_attempts_per_turn
-                    ),
-                    phase1b_flow=args.phase1b_flow,
-                    phase1b_deterministic_max_turns=args.phase1b_deterministic_max_turns,
-                    phase1b_semantic_max_turns=args.phase1b_semantic_max_turns,
-                    phase1b_editor_enable_thinking=args.phase1b_editor_enable_thinking,
-                    phase1b_editor_temperature=args.phase1b_editor_temperature,
-                    phase1b_editor_top_p=args.phase1b_editor_top_p,
-                    phase1b_editor_top_k=args.phase1b_editor_top_k,
-                    phase1b_editor_min_p=args.phase1b_editor_min_p,
-                    phase1b_editor_presence_penalty=args.phase1b_editor_presence_penalty,
-                    phase1b_editor_repetition_penalty=args.phase1b_editor_repetition_penalty,
-                    phase1b_editor_max_tokens=args.phase1b_editor_max_tokens,
-                    phase1b_plan_max_tokens=args.phase1b_plan_max_tokens,
-                    phase1b_plan_format_attempts=(
-                        args.phase1b_plan_format_attempts
-                    ),
-                    phase1b_plan_max_chars=args.phase1b_plan_max_chars,
-                    phase1b_subgraph_max_edits=args.phase1b_subgraph_max_edits,
-                    phase1b_closure_rounds=args.phase1b_closure_rounds,
-                    phase1b_mathlib_search_max_queries_per_turn=(
-                        args.phase1b_mathlib_search_max_queries_per_turn
-                    ),
-                    phase1b_mathlib_search_policy=(
-                        args.phase1b_mathlib_search_policy
-                    ),
-                    phase1b_mathlib_search_max_results_per_query=(
-                        args.phase1b_mathlib_search_max_results_per_query
-                    ),
-                    phase1b_seed_lean_code=phase1b_seed_lean_code,
-                ),
+                    semantic_fidelity_enabled=True,
+                    semantic_require_step_ids=True,
+                    semantic_static_gate=True,
+                    semantic_minimal_ir=False,
+                    semantic_freeze_refinement=False,
+                    semantic_source_mode="step_grounded",
                 )
-            _write_phase1_candidates(
-                blueprint_dir, blueprint.candidate_history, blueprint.candidate_labels,
-            )
-            state = CheckpointState(
-                informal_statement=record.informal_statement,
-                informal_proof=record.informal_proof,
-                cot_manifest_json=record.cot_manifest_json,
-                claimed_answer=record.claimed_answer,
-                model=args.model,
-                semantic_fidelity_enabled=bool(args.semantic_fidelity_enabled),
-                semantic_require_step_ids=bool(args.semantic_require_step_ids),
-                semantic_static_gate=bool(args.semantic_static_gate),
-                semantic_minimal_ir=bool(args.semantic_minimal_ir),
-                semantic_freeze_refinement=bool(args.semantic_freeze_refinement),
-                semantic_source_mode=str(args.semantic_source_mode),
-            )
-            state.semantic_gate_results = list(blueprint.semantic_gate_results)
-            state.semantic_status = (
-                _accepted_phase1_status(blueprint)
-                if args.semantic_fidelity_enabled else "disabled"
-            )
-            if args.semantic_fidelity_enabled:
+                state.semantic_gate_results = list(blueprint.semantic_gate_results)
+                state.semantic_status = _accepted_phase1_status(blueprint)
                 state.semantic_contract_snapshot = asdict(
                     snapshot_blueprint_semantics(
                         blueprint,
                         parse_cot_manifest(record.cot_manifest_json),
                     ),
                 )
-            state.set_blueprint(blueprint)
-            state.save(checkpoint_path)
-            path = _write_blueprint_snapshot(
-                output_root, record, iteration=0, label="phase1", blueprint=blueprint
-            )
-            await _append_round(
-                rounds_path,
-                rounds_lock,
-                record,
-                phase="after_phase1",
-                iteration=0,
-                blueprint_path=path,
-                blueprint=blueprint,
-                state=state,
-            )
-            tqdm.write(f"[phase1-done] {record.unique_id} nodes={len(blueprint.nodes)}")
+                state.set_blueprint(blueprint)
+                state.save(checkpoint_path)
+                path = _write_blueprint_snapshot(
+                    output_root, record, iteration=0, label="phase1", blueprint=blueprint
+                )
+                await _append_round(
+                    rounds_path,
+                    rounds_lock,
+                    record,
+                    phase="after_phase1",
+                    iteration=0,
+                    blueprint_path=path,
+                    blueprint=blueprint,
+                    state=state,
+                )
+                tqdm.write(f"[phase1-done] {record.unique_id} nodes={len(blueprint.nodes)}")
 
-        if args.execution_mode in {
-            "phase1_only", "phase1a_only", "phase1d_full_regeneration",
-        }:
-            if args.execution_mode == "phase1a_only":
-                terminal_status = "phase1aReady"
-                terminal_phase = "phase1a"
-            elif args.execution_mode == "phase1d_full_regeneration":
-                terminal_status = _accepted_phase1_status(blueprint)
-                terminal_phase = "phase1d"
-            else:
-                terminal_status = _accepted_phase1_status(blueprint)
-                terminal_phase = "phase1"
+        if args.execution_mode == "phase1_only":
             return _result_row(
                 record,
                 output_root,
-                status=terminal_status,
-                phase=terminal_phase,
+                status=_accepted_phase1_status(blueprint),
+                phase="phase1",
                 blueprint=blueprint,
                 state=state,
                 runtime=runtime,
@@ -1163,12 +871,12 @@ async def _run_record(
                         max_iterations=args.max_refinement_iterations,
                         tracer=phase3_tracer,
                         thm_name=record.unique_id,
-                        blueprint_max_retries=args.blueprint_max_retries,
+                        blueprint_max_retries=args.refinement_max_retries,
                         phase2_contract_check_concurrency=args.phase2_contract_check_concurrency,
-                        semantic_fidelity_enabled=args.semantic_fidelity_enabled,
-                        semantic_require_step_ids=args.semantic_require_step_ids,
-                        semantic_static_gate=args.semantic_static_gate,
-                        semantic_freeze_refinement=args.semantic_freeze_refinement,
+                        semantic_fidelity_enabled=True,
+                        semantic_require_step_ids=True,
+                        semantic_static_gate=True,
+                        semantic_freeze_refinement=False,
                     ),
                 )
                 state = CheckpointState.load(checkpoint_path)
@@ -1198,7 +906,7 @@ async def _run_record(
             output_root,
             status=(
                 _failed_phase1_status(exc)
-                if phase in {"phase1", "phase1d"}
+                if phase == "phase1"
                 else "infraError"
             ),
             phase=phase,
@@ -1225,15 +933,15 @@ async def _run_record(
                 "finish_reason": exc.finish_reason,
                 "diagnostics": exc.diagnostics,
                 "validation": exc.validation_details,
-                "node_edit_rounds": exc.node_edit_rounds,
+                "generation_history": exc.generation_history,
             })
             row.update({
                 "failed_blueprint_candidate_path": str(candidate_path),
                 "failed_blueprint_diagnostics_path": str(diagnostics_path),
                 "failed_blueprint_failure_stage": exc.failure_stage,
                 "phase1_candidate_paths": candidate_paths,
-                "phase1b_validation": exc.validation_details,
-                "phase1b_edit_history": exc.node_edit_rounds,
+                "generation_validation": exc.validation_details,
+                "generation_history": exc.generation_history,
             })
         return row
     finally:
@@ -1244,10 +952,9 @@ def _metric_row(scope: str, rows: list[dict[str, Any]], subset: str = "", split:
     total = len(rows)
     root = sum(1 for row in rows if row.get("root_proved"))
     accepted_statuses = {
-        "phase1_accepted", "strictAccepted", "acceptedWithJustifiedSideBranches",
-        "acceptedWithWarnings",
+        "strictAccepted", "acceptedWithWarnings",
     }
-    phase1_accepted_rows = [row for row in rows if row.get("status") in accepted_statuses]
+    accepted_rows = [row for row in rows if row.get("status") in accepted_statuses]
     return {
         "scope": scope,
         "subset": subset,
@@ -1263,21 +970,18 @@ def _metric_row(scope: str, rows: list[dict[str, Any]], subset: str = "", split:
             if row.get("status") in {"error", "semanticRejected", "structuralRejected", "infraError"}
             and row.get("phase") == "phase1"
         ),
-        "phase1_accepted": len(phase1_accepted_rows),
+        "blueprint_accepted": len(accepted_rows),
         "strict_accepted": sum(1 for row in rows if row.get("status") == "strictAccepted"),
-        "accepted_with_justified_side_branches": sum(
-            1 for row in rows if row.get("status") == "acceptedWithJustifiedSideBranches"
-        ),
         "accepted_with_warnings": sum(
             1 for row in rows if row.get("status") == "acceptedWithWarnings"
         ),
         "semantic_rejected": sum(1 for row in rows if row.get("status") == "semanticRejected"),
         "structural_rejected": sum(1 for row in rows if row.get("status") == "structuralRejected"),
-        "phase1_accepted_with_warnings": sum(
-            1 for row in phase1_accepted_rows if row.get("semantic_warning_codes")
+        "blueprint_accepted_with_warnings": sum(
+            1 for row in accepted_rows if row.get("semantic_warning_codes")
         ),
-        "phase1_accepted_without_warnings": sum(
-            1 for row in phase1_accepted_rows if not row.get("semantic_warning_codes")
+        "blueprint_accepted_without_warnings": sum(
+            1 for row in accepted_rows if not row.get("semantic_warning_codes")
         ),
         "refine_failed": sum(1 for row in rows if row.get("status") == "error" and row.get("phase") == "phase3"),
         "exhausted": sum(1 for row in rows if row.get("status") == "exhausted"),
@@ -1440,17 +1144,17 @@ def _format_new_success_by_refinement_iteration(rows: list[dict[str, Any]]) -> s
     )
 
 
-def _phase1d_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    phase1d_rows = [row for row in rows if row.get("phase") == "phase1d"]
-    if not phase1d_rows:
+def _generation_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    generation_rows = [row for row in rows if row.get("generation_validation")]
+    if not generation_rows:
         return {}
     warning_codes: dict[str, int] = defaultdict(int)
     deterministic_codes: dict[str, int] = defaultdict(int)
     semantic_codes: dict[str, int] = defaultdict(int)
     success_by_round: dict[str, int] = defaultdict(int)
     warning_ids: list[str] = []
-    for row in phase1d_rows:
-        details = row.get("phase1b_validation") or {}
+    for row in generation_rows:
+        details = row.get("generation_validation") or {}
         warnings = details.get("finalWarnings") or []
         deterministic = details.get("finalDeterministicErrors") or []
         semantic = details.get("finalSemanticErrors") or []
@@ -1461,19 +1165,19 @@ def _phase1d_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         for item in semantic:
             semantic_codes[str(item.get("code") or "unknown")] += 1
         if row.get("status") in {"strictAccepted", "acceptedWithWarnings"}:
-            rounds = details.get("phase1DRounds") or []
+            rounds = details.get("generationRounds") or []
             success_by_round[str(len(rounds))] += 1
         if row.get("status") == "acceptedWithWarnings":
             warning_ids.append(str(row.get("source_id") or row.get("id") or ""))
-    strict = sum(row.get("status") == "strictAccepted" for row in phase1d_rows)
-    with_warnings = sum(row.get("status") == "acceptedWithWarnings" for row in phase1d_rows)
+    strict = sum(row.get("status") == "strictAccepted" for row in generation_rows)
+    with_warnings = sum(row.get("status") == "acceptedWithWarnings" for row in generation_rows)
     accepted = strict + with_warnings
     return {
-        "total": len(phase1d_rows),
+        "total": len(generation_rows),
         "strictAccepted": strict,
         "acceptedWithWarnings": with_warnings,
         "acceptedTotal": accepted,
-        "warningAcceptedRate": with_warnings / len(phase1d_rows) if phase1d_rows else 0.0,
+        "warningAcceptedRate": with_warnings / len(generation_rows) if generation_rows else 0.0,
         "warningCodeDistribution": dict(sorted(warning_codes.items())),
         "warningAcceptedSourceIds": sorted(warning_ids),
         "successByRound": dict(sorted(success_by_round.items(), key=lambda item: int(item[0]))),
@@ -1515,9 +1219,9 @@ def _write_metrics(
         "groups": metric_rows,
         "new_success_by_refinement_iteration": _new_success_by_refinement_iteration(rows),
     }
-    phase1d = _phase1d_summary(rows)
-    if phase1d:
-        metrics["phase1d"] = phase1d
+    generation = _generation_summary(rows)
+    if generation:
+        metrics["blueprint_generation"] = generation
     if elapsed_s is not None:
         metrics["elapsed_time"] = _format_elapsed_time(elapsed_s)
         metrics["elapsed_time_s"] = round(elapsed_s, 3)
@@ -1535,9 +1239,13 @@ def _write_metrics(
 def _should_skip_existing(row: dict[str, Any] | None, args: argparse.Namespace) -> bool:
     if not args.resume or row is None:
         return False
+    if getattr(args, "execution_mode", "full") == "phase2_only":
+        # Only accepted Phase 1 rows are eligible seeds. Phase 1 rejects and
+        # already-terminal Phase 2 rows remain untouched in results.jsonl.
+        return row.get("status") not in {"strictAccepted", "acceptedWithWarnings"}
     if row.get("root_proved") is True or row.get("status") in {
-        "exhausted", "phase1_accepted", "phase1aReady", "strictAccepted",
-        "acceptedWithJustifiedSideBranches", "acceptedWithWarnings",
+        "exhausted", "strictAccepted",
+        "acceptedWithWarnings",
     }:
         return True
     return row.get("status") in {
@@ -1572,12 +1280,14 @@ async def _run_experiment(
 
     pending_ids = {record.unique_id for record in pending}
     if args.resume:
-        _remove_jsonl_rows(results_path, pending_ids)
-        _remove_jsonl_rows(rounds_path, pending_ids)
+        if args.execution_mode != "phase2_only":
+            _remove_jsonl_rows(results_path, pending_ids)
+            _remove_jsonl_rows(rounds_path, pending_ids)
         for record_id in pending_ids:
             existing.pop(record_id, None)
-    for record in pending:
-        _clear_record_outputs(output_root, record)
+    if args.execution_mode != "phase2_only":
+        for record in pending:
+            _clear_record_outputs(output_root, record)
 
     print(f"[select] records={len(records)} pending={len(pending)} skipped={skipped} output={output_root}", flush=True)
     print(
@@ -1598,10 +1308,8 @@ async def _run_experiment(
         f"negation_probe_turns={args.node_max_negation_probe_turns} "
         f"max_tool_calls_per_turn={args.max_tool_calls_per_turn} "
         f"proof_policy={args.proof_policy} "
-        f"semantic_fidelity={args.semantic_fidelity_enabled} "
-        f"semantic_source_mode={args.semantic_source_mode} "
-        f"semantic_static_gate={args.semantic_static_gate} "
-        f"semantic_freeze={args.semantic_freeze_refinement}",
+        "blueprint_generation=full_regeneration "
+        "semantic_static_gate=true semantic_strict_comparator=true",
         flush=True,
     )
 
@@ -1714,8 +1422,10 @@ async def _run_experiment(
     print(f"[done] results={results_path}", flush=True)
     print(f"[rounds] {rounds_path}", flush=True)
     print(f"[metrics] primary root_proved_acc={metrics['groups'][0]['root_proved_acc']}", flush=True)
-    if metrics.get("phase1d"):
-        print("[phase1d-summary] " + json.dumps(metrics["phase1d"], ensure_ascii=False), flush=True)
+    if metrics.get("blueprint_generation"):
+        print("[blueprint-generation-summary] " + json.dumps(
+            metrics["blueprint_generation"], ensure_ascii=False
+        ), flush=True)
     print("[new-success-by-refinement-iteration]", flush=True)
     print(_format_new_success_by_refinement_iteration(final_rows), flush=True)
 
