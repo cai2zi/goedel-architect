@@ -26,6 +26,9 @@ from mathlib_retrieval import MathlibRetrieval
 from tracer import NullTracer, TraceEvent
 
 
+NEGATION_SEMANTICS = "closed_theorem_exact_v1"
+
+
 PROVER_SYSTEM_PROMPT = load("prover_system")
 PROVER_USER_TEMPLATE = load("prover_user")
 DEFAULT_NODE_MAX_PROVE_TURNS = 8

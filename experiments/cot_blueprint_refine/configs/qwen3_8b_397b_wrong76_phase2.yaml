@@ -1,7 +1,7 @@
 # Qwen 397B Phase 2 on the exact Whole-COT Blueprint source used by StepFun.
 input_predictions: /ssd/czx/czx_work/cot_blueprint_refine/subsets/qwen3_8b_original_answer_incorrect/predictions.jsonl
 output_base: /ssd/czx/czx_work/cot_blueprint_refine
-exp_name: qwen3_8b_397b_wrong76_whole_cot_phase2_stepfun_inputs
+exp_name: qwen3_8b_397b_wrong76_whole_cot_phase2_closed_negation
 # false: discard this Phase 2 output and restart from the immutable Phase 1 seed.
 # true: resume/skip results only under this Phase 2 exp_name.
 resume: true

@@ -66,8 +66,9 @@ def extract_proof_body(text: str) -> str | None:
     block = _last_fenced_block(candidate)
     if block is not None:
         candidate = block
-    match = re.search(r":=\s*by\b", candidate)
-    if match:
+    matches = list(re.finditer(r":=\s*by\b", candidate))
+    if matches:
+        match = matches[-1]
         body = "by" + candidate[match.end():]
         return body.strip()
     match = re.search(r"(?m)^\s*by\b", candidate)

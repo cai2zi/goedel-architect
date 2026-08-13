@@ -25,6 +25,7 @@ from stepfun_repl_prover import (
     extract_proof_body,
     extract_sketch,
 )
+from goedel_self_correct_prover import GoedelSelfCorrectProver, GOEDEL_USER_PROMPT
 from kimina_lean_compiler import CompilerResult
 
 
@@ -70,6 +71,13 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(extract_proof_body(extract_sketch(text) or ""), "by simp")
         final = "</think>\n```lean\ntheorem x : True := by trivial\n```<｜end▁of▁sentence｜>"
         self.assertEqual(extract_proof_body(final), "by trivial")
+
+    def test_complete_file_uses_last_declaration_proof(self) -> None:
+        text = """```lean4
+lemma parent : True := by trivial
+theorem root : True := by exact True.intro
+```"""
+        self.assertEqual(extract_proof_body(text), "by exact True.intro")
 
 
 class InputTests(unittest.TestCase):
@@ -170,6 +178,11 @@ class FakeTokenizer:
         return list(range(len(prompt)))
 
 
+class FakeGoedelTokenizer:
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True):
+        return list(range(sum(len(message["content"]) for message in messages)))
+
+
 class FakeCompletions:
     def __init__(self):
         self.calls = 0
@@ -195,6 +208,36 @@ class FakeCompletions:
 class FakeCompiler:
     def check(self, lean_code, allow_sorry=False):
         self.last_code = lean_code
+        return CompilerResult(True, raw_output="{}")
+
+
+class FakeGoedelCompletions:
+    def __init__(self):
+        self.calls = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        number = len(self.calls)
+        text = (
+            "Proof plan: try the wrong tactic.\n```lean4\ntheorem root : True := by omega\n```"
+            if number == 1 else
+            "Updated plan: use the constructor.\n```lean4\ntheorem root : True := by trivial\n```"
+        )
+        message = SimpleNamespace(content=text, reasoning_content=None, model_extra={})
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=message, finish_reason="stop")],
+            usage=SimpleNamespace(prompt_tokens=20, completion_tokens=10),
+        )
+
+
+class CorrectingCompiler:
+    def __init__(self):
+        self.calls = 0
+
+    def check(self, lean_code, allow_sorry=False):
+        self.calls += 1
+        if self.calls == 1:
+            return CompilerResult(False, errors=["unknown tactic"], failure_kind="lean")
         return CompilerResult(True, raw_output="{}")
 
     def check_node(self, proof_body, **kwargs):
@@ -235,6 +278,38 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.status, "solved")
         self.assertEqual(outcome.turns, 2)
         self.assertEqual(client.completions.calls, 2)
+
+    async def test_goedel_native_prompt_and_two_round_self_correction(self) -> None:
+        completions = FakeGoedelCompletions()
+        client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        compiler = CorrectingCompiler()
+        prover = GoedelSelfCorrectProver(
+            client=client,
+            tokenizer=FakeGoedelTokenizer(),
+            compiler=compiler,
+            config={
+                "name": "Goedel-Prover-V2-8B", "max_context_tokens": 40960,
+                "initial_max_tokens": 32768, "correction_max_tokens": 8192,
+                "self_correction_rounds": 2, "temperature": 0.6,
+                "top_p": 0.95, "top_k": 20, "seed": 30,
+                "api_concurrency": 8,
+            },
+        )
+        problem = build_node_problem(
+            synthetic_blueprint(), "root", {"l1": "by trivial"}, stage="positive",
+        )
+        outcome = await prover.prove(problem)
+        self.assertEqual(outcome.status, "solved")
+        self.assertEqual(outcome.proof_body, "by trivial")
+        self.assertEqual(outcome.turns, 2)
+        self.assertIn("Complete the following Lean 4 code", completions.calls[0]["messages"][0]["content"])
+        self.assertIn("unknown tactic", completions.calls[1]["messages"][-1]["content"])
+        self.assertEqual(completions.calls[0]["max_tokens"], 32768)
+        self.assertLessEqual(completions.calls[1]["max_tokens"], 8192)
+
+    def test_goedel_prompt_matches_model_card_protocol(self) -> None:
+        self.assertIn("Complete the following Lean 4 code", GOEDEL_USER_PROMPT)
+        self.assertIn("detailed proof plan", GOEDEL_USER_PROMPT)
 
 
 if __name__ == "__main__":

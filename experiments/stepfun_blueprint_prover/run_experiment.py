@@ -16,6 +16,7 @@ from typing import Any
 
 import httpx
 import yaml
+from tqdm.auto import tqdm
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[1]
@@ -28,9 +29,11 @@ from blueprint import Blueprint  # noqa: E402
 from kimina_lean_compiler import KiminaLeanCompiler  # noqa: E402
 from orchestrator import active_node_names  # noqa: E402
 from pipeline import _assemble_final_file  # noqa: E402
+from prover import NEGATION_SEMANTICS  # noqa: E402
 from input_loader import AcceptedBlueprint, load_accepted_blueprints  # noqa: E402
 from node_context import build_node_problem  # noqa: E402
 from stepfun_repl_prover import ProverOutcome, StepFunReplProver  # noqa: E402
+from goedel_self_correct_prover import GoedelSelfCorrectProver  # noqa: E402
 
 
 @dataclass
@@ -92,7 +95,8 @@ def load_config(path: Path) -> dict[str, Any]:
 def new_checkpoint(source: AcceptedBlueprint) -> dict[str, Any]:
     active = active_node_names(source.blueprint)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "negation_semantics": NEGATION_SEMANTICS,
         "record_id": source.record_id,
         "source_id": source.source_id,
         "subset": source.subset,
@@ -114,6 +118,11 @@ def load_runtime(source: AcceptedBlueprint, output_root: Path, resume: bool) -> 
         data = json.loads(checkpoint.read_text(encoding="utf-8"))
         if data.get("source_checkpoint_sha256") != source.checkpoint_sha256:
             raise ValueError(f"source checkpoint drift for {source.key}")
+        if data.get("negation_semantics") != NEGATION_SEMANTICS:
+            raise ValueError(
+                f"checkpoint uses legacy negation semantics for {source.key}; "
+                "use a fresh output_root or --no-resume"
+            )
     else:
         data = new_checkpoint(source)
         atomic_json(checkpoint, data)
@@ -162,6 +171,7 @@ def persist_outcome(
         "record_id": runtime.source.record_id,
         "node_name": node_name,
         "stage": stage,
+        "negation_semantics": NEGATION_SEMANTICS if stage == "negative" else None,
         "outcome": full,
         "trajectory": trajectory,
     })
@@ -181,11 +191,25 @@ def persist_outcome(
 
 async def run_positive(
     runtimes: list[RecordRuntime],
-    prover: StepFunReplProver,
+    prover: Any,
     output_root: Path,
 ) -> None:
     inflight: dict[asyncio.Task[ProverOutcome], tuple[RecordRuntime, str]] = {}
     scheduled: set[tuple[str, str]] = set()
+    total_nodes = sum(len(proof_nodes(runtime)) for runtime in runtimes)
+    completed_nodes = sum(len(runtime.positive) for runtime in runtimes)
+    statuses = Counter(
+        result.get("status", "unknown")
+        for runtime in runtimes for result in runtime.positive.values()
+    )
+    progress = tqdm(
+        total=total_nodes,
+        initial=completed_nodes,
+        desc="positive nodes",
+        unit="node",
+        dynamic_ncols=True,
+    )
+    progress.set_postfix(dict(statuses), refresh=False)
 
     def enqueue_ready() -> int:
         added = 0
@@ -205,44 +229,74 @@ async def run_positive(
                 added += 1
         return added
 
-    enqueue_ready()
-    while inflight:
-        done, _ = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            runtime, name = inflight.pop(task)
-            outcome = task.result()
-            persist_outcome(output_root, runtime, name, "positive", outcome)
-            print(
-                f"[positive] {runtime.source.record_id} node={name} "
-                f"status={outcome.status} turns={outcome.turns}",
-                flush=True,
-            )
+    try:
         enqueue_ready()
+        while inflight:
+            done, _ = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                runtime, name = inflight.pop(task)
+                outcome = task.result()
+                persist_outcome(output_root, runtime, name, "positive", outcome)
+                statuses[outcome.status] += 1
+                progress.update(1)
+                progress.set_postfix(dict(statuses), refresh=False)
+                tqdm.write(
+                    f"[positive] {runtime.source.record_id} node={name} "
+                    f"status={outcome.status} turns={outcome.turns}"
+                )
+            enqueue_ready()
 
-    for runtime in runtimes:
-        for name in proof_nodes(runtime):
-            if name in runtime.positive:
-                continue
-            unresolved = unresolved_direct_dependencies(runtime, name)
-            runtime.positive[name] = {
-                "status": "blocked_by_dependency",
-                "proof_body": "",
-                "lean_errors": [f"Unresolved dependencies: {', '.join(unresolved)}"],
-                "turns": 0,
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "elapsed_seconds": 0.0,
-            }
-        atomic_json(runtime.checkpoint_path, runtime.data)
+        for runtime in runtimes:
+            blocked = 0
+            for name in proof_nodes(runtime):
+                if name in runtime.positive:
+                    continue
+                unresolved = unresolved_direct_dependencies(runtime, name)
+                runtime.positive[name] = {
+                    "status": "blocked_by_dependency",
+                    "proof_body": "",
+                    "lean_errors": [f"Unresolved dependencies: {', '.join(unresolved)}"],
+                    "turns": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "elapsed_seconds": 0.0,
+                }
+                blocked += 1
+            if blocked:
+                statuses["blocked_by_dependency"] += blocked
+                progress.update(blocked)
+                progress.set_postfix(dict(statuses), refresh=False)
+            atomic_json(runtime.checkpoint_path, runtime.data)
+    finally:
+        progress.close()
 
 
 async def run_negative(
     runtimes: list[RecordRuntime],
-    prover: StepFunReplProver,
+    prover: Any,
     output_root: Path,
 ) -> None:
     tasks: dict[asyncio.Task[ProverOutcome], tuple[RecordRuntime, str]] = {}
     excluded = {"solved", "blocked_by_dependency", "infra_error"}
+    eligible = [
+        (runtime, name)
+        for runtime in runtimes
+        for name, positive in runtime.positive.items()
+        if positive.get("status") not in excluded
+    ]
+    completed = sum(name in runtime.negative for runtime, name in eligible)
+    statuses = Counter(
+        runtime.negative[name].get("status", "unknown")
+        for runtime, name in eligible if name in runtime.negative
+    )
+    progress = tqdm(
+        total=len(eligible),
+        initial=completed,
+        desc="negative nodes",
+        unit="node",
+        dynamic_ncols=True,
+    )
+    progress.set_postfix(dict(statuses), refresh=False)
     for runtime in runtimes:
         for name, positive in runtime.positive.items():
             if positive.get("status") in excluded or name in runtime.negative:
@@ -251,17 +305,22 @@ async def run_negative(
                 runtime.blueprint, name, runtime.proved_cache, stage="negative",
             )
             tasks[asyncio.create_task(prover.prove(problem))] = (runtime, name)
-    while tasks:
-        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            runtime, name = tasks.pop(task)
-            outcome = task.result()
-            persist_outcome(output_root, runtime, name, "negative", outcome)
-            print(
-                f"[negative] {runtime.source.record_id} node={name} "
-                f"status={runtime.negative[name]['status']} prover={outcome.status}",
-                flush=True,
-            )
+    try:
+        while tasks:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                runtime, name = tasks.pop(task)
+                outcome = task.result()
+                persist_outcome(output_root, runtime, name, "negative", outcome)
+                statuses[runtime.negative[name]["status"]] += 1
+                progress.update(1)
+                progress.set_postfix(dict(statuses), refresh=False)
+                tqdm.write(
+                    f"[negative] {runtime.source.record_id} node={name} "
+                    f"status={runtime.negative[name]['status']} prover={outcome.status}"
+                )
+    finally:
+        progress.close()
 
 
 async def verify_finals(
@@ -269,42 +328,58 @@ async def verify_finals(
     compiler: KiminaLeanCompiler,
     output_root: Path,
 ) -> None:
-    async def verify(runtime: RecordRuntime) -> None:
-        root = runtime.blueprint.target_theorem
-        if runtime.positive.get(root, {}).get("status") != "solved":
-            runtime.data["final"] = {
-                "status": "root_not_solved",
-                "root_status": runtime.positive.get(root, {}).get("status", "missing"),
-            }
-            atomic_json(runtime.checkpoint_path, runtime.data)
-            return
-        try:
-            lean = _assemble_final_file(runtime.blueprint, None, runtime.proved_cache)
-        except Exception as exc:  # noqa: BLE001
-            runtime.data["final"] = {
-                "status": "assembly_error", "errors": [f"{type(exc).__name__}: {exc}"],
-            }
-            atomic_json(runtime.checkpoint_path, runtime.data)
-            return
-        result = await asyncio.to_thread(compiler.check, lean, False)
-        lean_path = (
-            output_root / "final_lean" / runtime.source.subset / runtime.source.split
-            / f"{safe_name(runtime.source.record_id)}.lean"
-        )
-        lean_path.parent.mkdir(parents=True, exist_ok=True)
-        lean_path.write_text(lean, encoding="utf-8")
-        runtime.data["final"] = {
-            "status": "solved" if result.success and not result.has_sorry else (
-                "infra_error" if result.failure_kind == "infra" else "final_assembly_failed"
-            ),
-            "lean_path": str(lean_path),
-            "errors": result.diagnostics,
-            "warnings": result.warnings,
-            "timings": result.timings,
-        }
-        atomic_json(runtime.checkpoint_path, runtime.data)
+    progress = tqdm(
+        total=len(runtimes),
+        desc="final blueprints",
+        unit="blueprint",
+        dynamic_ncols=True,
+    )
+    statuses: Counter[str] = Counter()
 
-    await asyncio.gather(*(verify(runtime) for runtime in runtimes))
+    async def verify(runtime: RecordRuntime) -> None:
+        try:
+            root = runtime.blueprint.target_theorem
+            if runtime.positive.get(root, {}).get("status") != "solved":
+                runtime.data["final"] = {
+                    "status": "root_not_solved",
+                    "root_status": runtime.positive.get(root, {}).get("status", "missing"),
+                }
+                atomic_json(runtime.checkpoint_path, runtime.data)
+                return
+            try:
+                lean = _assemble_final_file(runtime.blueprint, None, runtime.proved_cache)
+            except Exception as exc:  # noqa: BLE001
+                runtime.data["final"] = {
+                    "status": "assembly_error", "errors": [f"{type(exc).__name__}: {exc}"],
+                }
+                atomic_json(runtime.checkpoint_path, runtime.data)
+                return
+            result = await asyncio.to_thread(compiler.check, lean, False)
+            lean_path = (
+                output_root / "final_lean" / runtime.source.subset / runtime.source.split
+                / f"{safe_name(runtime.source.record_id)}.lean"
+            )
+            lean_path.parent.mkdir(parents=True, exist_ok=True)
+            lean_path.write_text(lean, encoding="utf-8")
+            runtime.data["final"] = {
+                "status": "solved" if result.success and not result.has_sorry else (
+                    "infra_error" if result.failure_kind == "infra" else "final_assembly_failed"
+                ),
+                "lean_path": str(lean_path),
+                "errors": result.diagnostics,
+                "warnings": result.warnings,
+                "timings": result.timings,
+            }
+            atomic_json(runtime.checkpoint_path, runtime.data)
+        finally:
+            statuses[runtime.data.get("final", {}).get("status", "unknown")] += 1
+            progress.update(1)
+            progress.set_postfix(dict(statuses), refresh=False)
+
+    try:
+        await asyncio.gather(*(verify(runtime) for runtime in runtimes))
+    finally:
+        progress.close()
 
 
 def result_row(runtime: RecordRuntime) -> dict[str, Any]:
@@ -317,6 +392,7 @@ def result_row(runtime: RecordRuntime) -> dict[str, Any]:
         "split": runtime.source.split,
         "source_checkpoint": str(runtime.source.checkpoint_path),
         "source_checkpoint_sha256": runtime.source.checkpoint_sha256,
+        "negation_semantics": NEGATION_SEMANTICS,
         "checkpoint_path": str(runtime.checkpoint_path),
         "target_theorem": runtime.blueprint.target_theorem,
         "active_node_count": len(runtime.data["active_nodes"]),
@@ -348,6 +424,7 @@ def summarize(rows: list[dict[str, Any]], runtimes: list[RecordRuntime]) -> dict
     final_counts = Counter(row["final_status"] for row in rows)
     total = len(rows)
     return {
+        "negation_semantics": NEGATION_SEMANTICS,
         "blueprints": total,
         "blueprint_solved": final_counts["solved"],
         "blueprint_pass_rate": final_counts["solved"] / total if total else 0.0,
@@ -368,6 +445,15 @@ async def preflight(config: dict[str, Any]) -> None:
     async with httpx.AsyncClient(timeout=10) as client:
         response = await client.get(model_url)
         response.raise_for_status()
+        served = {
+            str(item.get("id")) for item in (response.json().get("data") or [])
+            if isinstance(item, dict)
+        }
+        expected = str(config["model"]["name"])
+        if expected not in served:
+            raise RuntimeError(
+                f"vLLM serves {sorted(served)}, but config requires {expected}"
+            )
         health = await client.get(str(config["lean"]["api_url"]).rstrip("/") + "/health")
         health.raise_for_status()
 
@@ -413,13 +499,21 @@ async def run(args: argparse.Namespace) -> None:
         parallel_batches=int(lean_config["parallel_batches"]),
         batch_wait_ms=float(lean_config["batch_wait_ms"]),
     )
-    prover = StepFunReplProver(client=client, tokenizer=tokenizer, compiler=compiler, config=model_config)
+    protocol = str(model_config.get("protocol") or "stepfun_repl")
+    prover_cls = {
+        "stepfun_repl": StepFunReplProver,
+        "goedel_self_correct": GoedelSelfCorrectProver,
+    }.get(protocol)
+    if prover_cls is None:
+        raise ValueError(f"unsupported model protocol: {protocol}")
+    prover = prover_cls(client=client, tokenizer=tokenizer, compiler=compiler, config=model_config)
     started = time.time()
     atomic_json(output_root / "manifest.json", {
         "started_at": started,
         "source_root": str(source_root),
         "selected_records": len(accepted),
         "selected_ids": [item.record_id for item in accepted],
+        "negation_semantics": NEGATION_SEMANTICS,
         "config": config,
     })
     try:

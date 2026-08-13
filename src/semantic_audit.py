@@ -739,8 +739,16 @@ def _response_parts(response: Any) -> tuple[str, str, str | None, str, tuple[int
     message = choice.message
     content = str(getattr(message, "content", None) or "")
     reasoning = getattr(message, "reasoning_content", None)
+    if reasoning is None:
+        # vLLM's current OpenAI-compatible response model exposes Qwen
+        # thinking output as ``message.reasoning`` rather than
+        # ``message.reasoning_content``.
+        reasoning = getattr(message, "reasoning", None)
     if reasoning is None and getattr(message, "model_extra", None):
-        reasoning = message.model_extra.get("reasoning_content")
+        reasoning = (
+            message.model_extra.get("reasoning_content")
+            or message.model_extra.get("reasoning")
+        )
     usage = getattr(response, "usage", None)
     prompt = int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0
     completion = int(getattr(usage, "completion_tokens", 0) or 0) if usage else 0

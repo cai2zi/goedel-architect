@@ -36,21 +36,21 @@ FINAL_LABELS = {"definition_valid", "proved", "disproved", "blocked_by_dependenc
 POSITIVE_CANDIDATES = [
     ("rfl", "by\n  rfl"),
     ("norm_num", "by\n  norm_num"),
-    ("decide", "by\n  decide"),
     ("simp", "by\n  simp"),
     ("omega", "by\n  omega"),
     ("ring", "by\n  ring"),
     ("linarith", "by\n  linarith"),
     ("nlinarith", "by\n  nlinarith"),
-    ("aesop", "by\n  aesop"),
+    ("high_decide", "by\n  set_option maxRecDepth 100000 in\n    decide"),
+    ("high_norm_num", "by\n  set_option maxRecDepth 100000 in\n    norm_num"),
 ]
 
 NEGATIVE_CANDIDATES = [
     ("norm_num", "by\n  norm_num"),
-    ("decide", "by\n  decide"),
     ("simp", "by\n  simp"),
     ("omega", "by\n  omega"),
-    ("aesop", "by\n  aesop"),
+    ("high_decide", "by\n  set_option maxRecDepth 100000 in\n    decide"),
+    ("high_norm_num", "by\n  set_option maxRecDepth 100000 in\n    norm_num"),
 ]
 
 
@@ -115,14 +115,15 @@ def proof_nodes(source) -> list:
     return [n for n in source.blueprint.dependency_order() if n.name in active and n.kind in {"lemma", "theorem"}]
 
 
-def assemble_attempt(problem, proof_body: str) -> str:
+def assemble_attempt(problem, proof_body: str, prefix_code: str = "") -> str:
     decl = extract_current_node_decl(problem.node_decl)
     decl, count = BLUEPRINT_PROOF_RE.subn(lambda _: f":= {proof_body}", decl, count=1)
     if count != 1:
         raise ValueError(f"missing proof placeholder: {problem.node_name}")
     return "\n\n".join(
         value for value in (
-            problem.header.rstrip(), problem.parent_lemma_decls.strip(), decl.strip(),
+            problem.header.rstrip(), problem.parent_lemma_decls.strip(),
+            prefix_code.strip(), decl.strip(),
         ) if value
     ) + "\n"
 
@@ -261,6 +262,53 @@ def attempt_candidates(compiler, records, stage: str) -> int:
     return solved
 
 
+def apply_manual_proofs(
+    compiler, records, record_id: str | None = None, node_name: str | None = None,
+    reasoning: str | None = None,
+) -> tuple[int, list[dict[str, Any]]]:
+    from manual_proofs import MANUAL_PROOFS
+
+    by_id = {source.record_id: (source, path, data) for source, path, data in records}
+    accepted = 0
+    failures = []
+    for entry in MANUAL_PROOFS:
+        if record_id is not None and entry["record_id"] != record_id:
+            continue
+        if node_name is not None and entry["node_name"] != node_name:
+            continue
+        if reasoning is not None and entry["reasoning"] != reasoning:
+            continue
+        source, path, data = by_id[entry["record_id"]]
+        node = source.blueprint.node_by_name(entry["node_name"])
+        if node is None:
+            raise KeyError(f"missing node: {entry}")
+        existing = data["labels"].get(node.name)
+        if existing:
+            continue
+        if not ready(source, data, node):
+            failures.append({**entry, "error": "not_ready"})
+            continue
+        problem = build_node_problem(
+            source.blueprint, node.name, verified_proofs(data), stage=entry["stage"],
+        )
+        code = assemble_attempt(problem, entry["proof_body"], entry.get("prefix_code", ""))
+        result = compiler.check(code)
+        if result.success and not result.has_sorry:
+            save_verified(
+                source, path, data, node,
+                "proved" if entry["stage"] == "positive" else "disproved",
+                entry["proof_body"], code, entry["reasoning"], result,
+            )
+            accepted += 1
+        else:
+            failures.append({
+                **entry, "error": "lean_rejected", "diagnostics": result.diagnostics,
+                "failure_kind": result.failure_kind,
+            })
+    atomic_json(OUTPUT_ROOT / "manual_failures.json", failures)
+    return accepted, failures
+
+
 def summary(records) -> dict[str, Any]:
     counts = Counter()
     missing = []
@@ -280,6 +328,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--initialize", action="store_true")
     parser.add_argument("--sweep", action="store_true")
+    parser.add_argument("--propagate", action="store_true")
+    parser.add_argument("--manual", action="store_true")
+    parser.add_argument("--record-id")
+    parser.add_argument("--node-name")
+    parser.add_argument("--reasoning")
     args = parser.parse_args()
     records = load_records()
     compiler = KiminaLeanCompiler(
@@ -290,6 +343,15 @@ def main() -> None:
     try:
         if args.initialize:
             initialize_definitions(compiler, records)
+        if args.propagate:
+            print({"blocked": propagate_blocks(records)}, flush=True)
+        if args.manual:
+            accepted, failures = apply_manual_proofs(
+                compiler, records, args.record_id, args.node_name,
+                args.reasoning,
+            )
+            print({"manual_accepted": accepted, "manual_failures": len(failures)}, flush=True)
+            print({"blocked": propagate_blocks(records)}, flush=True)
         if args.sweep:
             while True:
                 changed = propagate_blocks(records)

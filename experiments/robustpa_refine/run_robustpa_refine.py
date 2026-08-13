@@ -45,6 +45,7 @@ from robustpa_refine.runtime import (  # noqa: E402
 from mathlib_retrieval import MathlibRetrieval  # noqa: E402
 from orchestrator import active_node_names  # noqa: E402
 from pipeline import run_phase2_async, run_phase3  # noqa: E402
+from prover import NEGATION_SEMANTICS  # noqa: E402
 from semantic_fidelity import snapshot_blueprint_semantics  # noqa: E402
 from tracer import JsonlTracer, TraceEvent  # noqa: E402
 
@@ -558,6 +559,7 @@ def _result_row(
         "lean_runtime": runtime.metadata,
         "node_max_prove_turns": args.node_max_prove_turns,
         "negation_probe_turns": args.node_max_negation_probe_turns,
+        "negation_semantics": NEGATION_SEMANTICS,
         "max_tool_calls_per_turn": args.max_tool_calls_per_turn,
         "proof_policy": args.proof_policy,
         "critical_negation_max_turns": args.critical_negation_max_turns,

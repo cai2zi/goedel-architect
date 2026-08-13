@@ -24,6 +24,7 @@ from semantic_audit import (  # noqa: E402
     parse_formal_decompiler,
     parse_joint_whole_cot_audit,
     parse_whole_cot_comparator,
+    _response_parts,
     run_formal_decompiler,
     run_joint_whole_cot_audit,
     semantic_audit_cache_key,
@@ -207,6 +208,22 @@ class SemanticAuditTest(unittest.TestCase):
             "repetition_penalty": 1.0,
             "chat_template_kwargs": {"enable_thinking": True},
         })
+
+    def test_response_parts_accepts_vllm_reasoning_field(self) -> None:
+        response = SimpleNamespace(
+            id="request",
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="{}", reasoning="visible thinking"),
+                finish_reason="stop",
+            )],
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=20, total_tokens=30),
+        )
+        content, reasoning, finish, request_id, usage = _response_parts(response)
+        self.assertEqual(content, "{}")
+        self.assertEqual(reasoning, "visible thinking")
+        self.assertEqual(finish, "stop")
+        self.assertEqual(request_id, "request")
+        self.assertEqual(usage, (10, 20, 30))
 
     def test_joint_schema_requires_order_and_known_nodes(self) -> None:
         view = build_formal_view(_parse_blueprint(LEAN, "root"))
