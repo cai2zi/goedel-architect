@@ -40,10 +40,14 @@ from kimina_lean_compiler import (
 from llm_client import chat_completion_with_retry, make_client
 from semantic_audit import (
     FormalDecompilerResult,
+    JointWholeCotAuditResult,
     WholeCotComparatorResult,
+    JOINT_WHOLE_COT_PROMPT_VERSION,
     WHOLE_COT_PROMPT_VERSION,
     build_formal_view,
+    joint_whole_cot_audit_messages,
     run_formal_decompiler,
+    run_joint_whole_cot_audit,
     run_whole_cot_comparator,
     semantic_audit_cache_key,
     whole_cot_comparator_defects,
@@ -105,8 +109,13 @@ class BlueprintValidation:
     mechanical_stage_reached: str = "parse_basic"
     mechanical_failure_stage: str | None = None
     semantic_audit_invoked: bool = False
+    semantic_audit_mode: str = "separate"
+    semantic_request_count: int = 0
+    semantic_cache_hits: dict[str, bool] | None = None
+    semantic_output_budget: int | None = None
     formal_decompiler_result: FormalDecompilerResult | None = None
     strict_comparator_result: WholeCotComparatorResult | None = None
+    joint_audit_result: JointWholeCotAuditResult | None = None
     semantic_audit_protocol: str = WHOLE_COT_PROMPT_VERSION
 
     @property
@@ -137,9 +146,15 @@ def validation_details(validation: BlueprintValidation) -> dict[str, Any]:
         audit = {
             "formalDecompiler": validation.formal_decompiler_result.to_dict(),
             "protocol": validation.semantic_audit_protocol,
+            "mode": validation.semantic_audit_mode,
+            "actualRequestCount": validation.semantic_request_count,
+            "cacheHits": dict(validation.semantic_cache_hits or {}),
+            "outputBudget": validation.semantic_output_budget,
             "classification": "strictAccepted" if validation.passed else "semanticRejected",
         }
         audit["wholeCotComparator"] = validation.strict_comparator_result.to_dict()
+        if validation.joint_audit_result is not None:
+            audit["jointRequest"] = validation.joint_audit_result.to_dict()
     static_errors = [
         issue.to_dict() for issue in validation.semantic_issues
         if issue.severity == "error"
@@ -178,6 +193,10 @@ def validation_details(validation: BlueprintValidation) -> dict[str, Any]:
             "durationMs": standalone.duration_ms,
         },
         "semanticAuditInvoked": validation.semantic_audit_invoked,
+        "semanticAuditMode": validation.semantic_audit_mode,
+        "semanticActualRequestCount": validation.semantic_request_count,
+        "semanticCacheHits": dict(validation.semantic_cache_hits or {}),
+        "semanticOutputBudget": validation.semantic_output_budget,
         "semanticAudit": audit,
     }
 
@@ -201,33 +220,139 @@ def _with_semantic_audit(
     semantic_audit_min_p: float,
     semantic_audit_presence_penalty: float,
     semantic_audit_repetition_penalty: float,
+    semantic_audit_mode: str,
+    joint_semantic_audit_max_tokens: int,
+    tokenizer_path: str,
+    model_max_context: int,
+    context_safety_margin: int,
     decompiler_cache: dict[str, FormalDecompilerResult],
     comparator_cache: dict[str, Any],
+    joint_cache: dict[str, JointWholeCotAuditResult],
     tracer: Any,
     thm_name: str,
     round_index: int,
 ) -> BlueprintValidation:
-    view = build_formal_view(blueprint, include_step_ids=False)
-    decompiler = decompiler_cache.get(view.sha256)
-    if decompiler is None:
-        decompiler = run_formal_decompiler(
-            client,
-            model,
-            view=view,
-            max_tokens=formal_decompiler_max_tokens,
-            max_attempts=format_max_attempts,
-            enable_thinking=semantic_audit_enable_thinking,
-            temperature=semantic_audit_temperature,
-            top_p=semantic_audit_top_p,
-            top_k=semantic_audit_top_k,
-            min_p=semantic_audit_min_p,
-            presence_penalty=semantic_audit_presence_penalty,
-            repetition_penalty=semantic_audit_repetition_penalty,
-            tracer=tracer,
-            thm_name=thm_name,
-            round_index=round_index,
+    view = build_formal_view(blueprint)
+    if semantic_audit_mode == "joint":
+        messages = joint_whole_cot_audit_messages(
+            informal_statement, informal_proof, claimed_answer, view,
         )
+        joint_input_tokens, available = generation_request_budget(
+            messages, tokenizer_path=tokenizer_path,
+            model_max_context=model_max_context,
+            safety_margin=context_safety_margin,
+        )
+        output_budget = min(joint_semantic_audit_max_tokens, available)
+        if output_budget < 512:
+            raise RuntimeError(
+                "joint semantic audit has insufficient context: "
+                f"inputTokens={joint_input_tokens} availableOutputTokens={available} "
+                f"minimumOutputTokens=512 modelContext={model_max_context}"
+            )
+        request_params = {
+            "enable_thinking": semantic_audit_enable_thinking,
+            "temperature": semantic_audit_temperature,
+            "top_p": semantic_audit_top_p,
+            "top_k": semantic_audit_top_k,
+            "min_p": semantic_audit_min_p,
+            "presence_penalty": semantic_audit_presence_penalty,
+            "repetition_penalty": semantic_audit_repetition_penalty,
+            "max_tokens": output_budget,
+        }
+        cache_key = semantic_audit_cache_key(
+            model, messages, version=JOINT_WHOLE_COT_PROMPT_VERSION,
+            request_params=request_params,
+        )
+        joint = joint_cache.get(cache_key)
+        cache_hit = joint is not None
+        validation.semantic_audit_invoked = True
+        validation.semantic_audit_mode = "joint"
+        validation.semantic_cache_hits = {"joint": cache_hit}
+        validation.semantic_output_budget = output_budget
+        validation.semantic_audit_protocol = JOINT_WHOLE_COT_PROMPT_VERSION
+        if joint is None:
+            try:
+                joint = run_joint_whole_cot_audit(
+                    client, model, informal_statement=informal_statement,
+                    informal_proof=informal_proof, claimed_answer=claimed_answer,
+                    view=view, max_tokens=output_budget,
+                    max_attempts=format_max_attempts, tracer=tracer,
+                    enable_thinking=semantic_audit_enable_thinking,
+                    temperature=semantic_audit_temperature,
+                    top_p=semantic_audit_top_p, top_k=semantic_audit_top_k,
+                    min_p=semantic_audit_min_p,
+                    presence_penalty=semantic_audit_presence_penalty,
+                    repetition_penalty=semantic_audit_repetition_penalty,
+                    thm_name=thm_name, round_index=round_index,
+                )
+            except Exception as exc:
+                validation.semantic_request_count = max(
+                    1, len(getattr(exc, "attempts", ()) or ()),
+                )
+                raise
+            joint_cache[cache_key] = joint
+        elif tracer:
+            tracer.emit(TraceEvent(
+                kind="jointSemanticAuditCacheHit", thm_name=thm_name,
+                turn=round_index,
+                args={
+                    "round": round_index, "cacheKey": cache_key,
+                    "formalViewHash": view.sha256,
+                    "actualRequestCount": 0,
+                },
+                ok=True,
+            ))
+        return BlueprintValidation(
+            lean_result=validation.lean_result,
+            semantic_issues=validation.semantic_issues,
+            structural_errors=validation.structural_errors,
+            standalone_report=validation.standalone_report,
+            canonical_lean_result=validation.canonical_lean_result,
+            mechanical_stage_reached=validation.mechanical_stage_reached,
+            mechanical_failure_stage=validation.mechanical_failure_stage,
+            semantic_audit_invoked=True,
+            semantic_audit_mode="joint",
+            semantic_request_count=0 if cache_hit else len(joint.attempts),
+            semantic_cache_hits={"joint": cache_hit},
+            semantic_output_budget=output_budget,
+            formal_decompiler_result=joint.decompiler,
+            strict_comparator_result=joint.comparator,
+            joint_audit_result=joint,
+            semantic_audit_protocol=JOINT_WHOLE_COT_PROMPT_VERSION,
+        )
+
+    validation.semantic_audit_invoked = True
+    validation.semantic_audit_mode = "separate"
+    validation.semantic_audit_protocol = WHOLE_COT_PROMPT_VERSION
+    decompiler = decompiler_cache.get(view.sha256)
+    decompiler_hit = decompiler is not None
+    validation.semantic_cache_hits = {"formalDecompiler": decompiler_hit}
+    if decompiler is None:
+        try:
+            decompiler = run_formal_decompiler(
+                client,
+                model,
+                view=view,
+                max_tokens=formal_decompiler_max_tokens,
+                max_attempts=format_max_attempts,
+                enable_thinking=semantic_audit_enable_thinking,
+                temperature=semantic_audit_temperature,
+                top_p=semantic_audit_top_p,
+                top_k=semantic_audit_top_k,
+                min_p=semantic_audit_min_p,
+                presence_penalty=semantic_audit_presence_penalty,
+                repetition_penalty=semantic_audit_repetition_penalty,
+                tracer=tracer,
+                thm_name=thm_name,
+                round_index=round_index,
+            )
+        except Exception as exc:
+            validation.semantic_request_count = max(
+                1, len(getattr(exc, "attempts", ()) or ()),
+            )
+            raise
         decompiler_cache[view.sha256] = decompiler
+        validation.semantic_request_count = len(decompiler.attempts)
     messages = whole_cot_comparator_messages(
         informal_statement, informal_proof, claimed_answer, view, decompiler,
     )
@@ -235,22 +360,30 @@ def _with_semantic_audit(
         model, messages, version=WHOLE_COT_PROMPT_VERSION,
     )
     comparator = comparator_cache.get(cache_key)
+    comparator_hit = comparator is not None
+    validation.semantic_cache_hits["wholeCotComparator"] = comparator_hit
     if comparator is None:
-        comparator = run_whole_cot_comparator(
-            client, model, informal_statement=informal_statement,
-            informal_proof=informal_proof, claimed_answer=claimed_answer,
-            view=view, decompiler=decompiler,
-            max_tokens=strict_comparator_max_tokens,
-            max_attempts=format_max_attempts, tracer=tracer,
-            enable_thinking=semantic_audit_enable_thinking,
-            temperature=semantic_audit_temperature,
-            top_p=semantic_audit_top_p,
-            top_k=semantic_audit_top_k,
-            min_p=semantic_audit_min_p,
-            presence_penalty=semantic_audit_presence_penalty,
-            repetition_penalty=semantic_audit_repetition_penalty,
-            thm_name=thm_name, round_index=round_index,
-        )
+        try:
+            comparator = run_whole_cot_comparator(
+                client, model, informal_statement=informal_statement,
+                informal_proof=informal_proof, claimed_answer=claimed_answer,
+                view=view, decompiler=decompiler,
+                max_tokens=strict_comparator_max_tokens,
+                max_attempts=format_max_attempts, tracer=tracer,
+                enable_thinking=semantic_audit_enable_thinking,
+                temperature=semantic_audit_temperature,
+                top_p=semantic_audit_top_p,
+                top_k=semantic_audit_top_k,
+                min_p=semantic_audit_min_p,
+                presence_penalty=semantic_audit_presence_penalty,
+                repetition_penalty=semantic_audit_repetition_penalty,
+                thm_name=thm_name, round_index=round_index,
+            )
+        except Exception as exc:
+            validation.semantic_request_count += max(
+                1, len(getattr(exc, "attempts", ()) or ()),
+            )
+            raise
         comparator_cache[cache_key] = comparator
     return BlueprintValidation(
         lean_result=validation.lean_result,
@@ -261,6 +394,16 @@ def _with_semantic_audit(
         mechanical_stage_reached=validation.mechanical_stage_reached,
         mechanical_failure_stage=validation.mechanical_failure_stage,
         semantic_audit_invoked=True,
+        semantic_audit_mode="separate",
+        semantic_request_count=(
+            (0 if decompiler_hit else len(decompiler.attempts))
+            + (0 if comparator_hit else len(comparator.attempts))
+        ),
+        semantic_cache_hits={
+            "formalDecompiler": decompiler_hit,
+            "wholeCotComparator": comparator_hit,
+        },
+        semantic_output_budget=None,
         formal_decompiler_result=decompiler,
         strict_comparator_result=comparator,
         semantic_audit_protocol=WHOLE_COT_PROMPT_VERSION,
@@ -362,12 +505,13 @@ def generation_request_budget(
     """Return serialized input tokens and the exact remaining completion budget."""
     tokenizer = _load_phase1_tokenizer(tokenizer_path)
     try:
-        encoded = tokenizer.apply_chat_template(
-            messages,
-            tools=tools or [],
-            tokenize=True,
-            add_generation_prompt=True,
-        )
+        template_kwargs: dict[str, Any] = {
+            "tokenize": True,
+            "add_generation_prompt": True,
+        }
+        if tools is not None:
+            template_kwargs["tools"] = tools
+        encoded = tokenizer.apply_chat_template(messages, **template_kwargs)
         input_ids = encoded.get("input_ids") if hasattr(encoded, "get") else encoded
         if (
             isinstance(input_ids, Sequence)
@@ -379,7 +523,7 @@ def generation_request_budget(
         input_tokens = len(input_ids)
     except (TypeError, ValueError):
         payload = json.dumps(
-            {"messages": messages, "tools": tools or []},
+            {"messages": messages, **({"tools": tools} if tools is not None else {})},
             ensure_ascii=False,
             sort_keys=True,
         )
@@ -533,6 +677,7 @@ def _mechanical_validation(
     structural: Sequence[str] = (),
     standalone: Phase2StandaloneReport | None = None,
     static_issues: Sequence[SemanticIssue] = (),
+    semantic_audit_mode: str = "separate",
 ) -> BlueprintValidation:
     return BlueprintValidation(
         lean_result=whole_result,
@@ -542,6 +687,7 @@ def _mechanical_validation(
         canonical_lean_result=canonical_result,
         mechanical_stage_reached=stage_reached,
         mechanical_failure_stage=failure_stage,
+        semantic_audit_mode=semantic_audit_mode,
     )
 
 
@@ -566,12 +712,18 @@ def _validate_round(
     semantic_audit_min_p: float,
     semantic_audit_presence_penalty: float,
     semantic_audit_repetition_penalty: float,
+    semantic_audit_mode: str,
+    joint_semantic_audit_max_tokens: int,
+    tokenizer_path: str,
+    model_max_context: int,
+    context_safety_margin: int,
     tracer,
     thm_name: str,
     round_index: int,
     standalone_cache: dict[str, Any],
     decompiler_cache: dict[str, Any],
     comparator_cache: dict[str, Any],
+    joint_cache: dict[str, JointWholeCotAuditResult],
 ) -> tuple[Blueprint, BlueprintValidation, tuple[dict[str, Any], ...], tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
     """Validate one candidate with strict mechanical short-circuiting."""
     candidate = _parse_blueprint(code, target_name)
@@ -581,6 +733,7 @@ def _validate_round(
         validation = _mechanical_validation(
             whole_result=_failed_compile("whole_file_lean not run"),
             stage_reached="parse_basic", failure_stage="parse_basic",
+            semantic_audit_mode=semantic_audit_mode,
         )
         return candidate, validation, _deduplicate(deterministic), (), ()
 
@@ -600,6 +753,7 @@ def _validate_round(
         validation = _mechanical_validation(
             whole_result=lean_result, stage_reached="whole_file_lean",
             failure_stage="whole_file_lean",
+            semantic_audit_mode=semantic_audit_mode,
         )
         return candidate, validation, _deduplicate(deterministic), (), _deduplicate(warnings)
 
@@ -610,6 +764,7 @@ def _validate_round(
         validation = _mechanical_validation(
             whole_result=lean_result, stage_reached="canonical_rebuild",
             failure_stage="canonical_rebuild",
+            semantic_audit_mode=semantic_audit_mode,
         )
         return candidate, validation, _deduplicate(deterministic), (), _deduplicate(warnings)
 
@@ -622,6 +777,7 @@ def _validate_round(
         validation = _mechanical_validation(
             whole_result=lean_result, stage_reached="phase2_contract",
             failure_stage="phase2_contract", structural=structural,
+            semantic_audit_mode=semantic_audit_mode,
         )
         return formal_blueprint, validation, _deduplicate(deterministic), (), _deduplicate(warnings)
 
@@ -641,6 +797,7 @@ def _validate_round(
         validation = _mechanical_validation(
             whole_result=lean_result, canonical_result=canonical_result,
             stage_reached="canonical_lean", failure_stage="canonical_lean",
+            semantic_audit_mode=semantic_audit_mode,
         )
         return formal_blueprint, validation, _deduplicate(deterministic), (), _deduplicate(warnings)
 
@@ -659,6 +816,7 @@ def _validate_round(
             whole_result=lean_result, canonical_result=canonical_result,
             stage_reached="phase2_standalone", failure_stage="phase2_standalone",
             structural=structural, standalone=standalone,
+            semantic_audit_mode=semantic_audit_mode,
         )
         return formal_blueprint, validation, _deduplicate(deterministic), (), _deduplicate(warnings)
 
@@ -669,6 +827,7 @@ def _validate_round(
         whole_result=lean_result, canonical_result=canonical_result,
         stage_reached="static_shadow", failure_stage=None,
         structural=structural, standalone=standalone, static_issues=semantic_issues,
+        semantic_audit_mode=semantic_audit_mode,
     )
     semantic: list[dict[str, Any]] = []
     try:
@@ -690,15 +849,25 @@ def _validate_round(
             semantic_audit_min_p=semantic_audit_min_p,
             semantic_audit_presence_penalty=semantic_audit_presence_penalty,
             semantic_audit_repetition_penalty=semantic_audit_repetition_penalty,
+            semantic_audit_mode=semantic_audit_mode,
+            joint_semantic_audit_max_tokens=joint_semantic_audit_max_tokens,
+            tokenizer_path=tokenizer_path,
+            model_max_context=model_max_context,
+            context_safety_margin=context_safety_margin,
             decompiler_cache=decompiler_cache,
             comparator_cache=comparator_cache,
+            joint_cache=joint_cache,
             tracer=tracer,
             thm_name=thm_name,
             round_index=round_index,
         )
     except Exception as exc:
         validation.semantic_audit_invoked = True
-        validation.mechanical_stage_reached = "formal_decompiler_or_comparator"
+        validation.semantic_audit_mode = semantic_audit_mode
+        validation.mechanical_stage_reached = (
+            "joint_semantic_audit"
+            if semantic_audit_mode == "joint" else "formal_decompiler_or_comparator"
+        )
         raise SemanticAuditExecutionError(str(exc), validation) from exc
 
     decompiler = validation.formal_decompiler_result
@@ -773,12 +942,18 @@ def generate_blueprint(
     semantic_audit_min_p: float = 0.0,
     semantic_audit_presence_penalty: float = 0.0,
     semantic_audit_repetition_penalty: float = 1.0,
+    semantic_audit_mode: str = "separate",
+    joint_semantic_audit_max_tokens: int = 32768,
     prompt_profile: str = "whole_cot_minimal",
 ) -> Blueprint:
     if max_turns <= 0:
         raise ValueError("generation max_turns must be positive")
     if prompt_profile not in {"whole_cot_minimal", "standard"}:
         raise ValueError("prompt_profile must be whole_cot_minimal or standard")
+    if semantic_audit_mode not in {"separate", "joint"}:
+        raise ValueError("semantic_audit_mode must be separate or joint")
+    if joint_semantic_audit_max_tokens <= 0:
+        raise ValueError("joint_semantic_audit_max_tokens must be positive")
     client = make_client(model)
     previous_code = ""
     previous_feedback = ""
@@ -788,6 +963,7 @@ def generate_blueprint(
     standalone_cache: dict[str, Any] = {}
     decompiler_cache: dict[str, Any] = {}
     comparator_cache: dict[str, Any] = {}
+    joint_cache: dict[str, JointWholeCotAuditResult] = {}
     latest_blueprint: Blueprint | None = None
     latest_validation: BlueprintValidation | None = None
     latest_deterministic: tuple[dict[str, Any], ...] = ()
@@ -845,6 +1021,16 @@ def generate_blueprint(
                     "minP": min_p,
                     "presencePenalty": presence_penalty,
                     "repetitionPenalty": repetition_penalty,
+                    "semanticAuditMode": semantic_audit_mode,
+                    "semanticAuditSampling": {
+                        "enableThinking": semantic_audit_enable_thinking,
+                        "temperature": semantic_audit_temperature,
+                        "topP": semantic_audit_top_p,
+                        "topK": semantic_audit_top_k,
+                        "minP": semantic_audit_min_p,
+                        "presencePenalty": semantic_audit_presence_penalty,
+                        "repetitionPenalty": semantic_audit_repetition_penalty,
+                    },
                 },
             ))
         seed = int.from_bytes(hashlib.sha256(
@@ -921,10 +1107,16 @@ def generate_blueprint(
                     semantic_audit_min_p=semantic_audit_min_p,
                     semantic_audit_presence_penalty=semantic_audit_presence_penalty,
                     semantic_audit_repetition_penalty=semantic_audit_repetition_penalty,
+                    semantic_audit_mode=semantic_audit_mode,
+                    joint_semantic_audit_max_tokens=joint_semantic_audit_max_tokens,
+                    tokenizer_path=tokenizer_path,
+                    model_max_context=model_max_context,
+                    context_safety_margin=context_safety_margin,
                     tracer=tracer, thm_name=thm_name, round_index=round_index,
                     standalone_cache=standalone_cache,
                     decompiler_cache=decompiler_cache,
                     comparator_cache=comparator_cache,
+                    joint_cache=joint_cache,
                 )
             except SemanticAuditExecutionError as exc:
                 latest_blueprint = _parse_blueprint(code, target_name)
@@ -932,7 +1124,11 @@ def generate_blueprint(
                 details = validation_details(latest_validation)
                 audit_error = _issue(
                     "semanticAuditError", exc,
-                    stage="formal_decompiler_or_comparator",
+                    stage=(
+                        "joint_semantic_audit"
+                        if semantic_audit_mode == "joint"
+                        else "formal_decompiler_or_comparator"
+                    ),
                 )
                 failed_round = GenerationRound(
                     round_index=round_index,
@@ -1007,6 +1203,18 @@ def generate_blueprint(
                     args={
                         "round": round_index, "invoked": semantic_invoked,
                         "count": len(inventory), "issues": list(inventory),
+                        "semanticAuditMode": semantic_audit_mode,
+                        "actualRequestCount": (
+                            latest_validation.semantic_request_count
+                            if latest_validation else 0
+                        ),
+                        "cacheHits": dict(
+                            latest_validation.semantic_cache_hits or {}
+                        ) if latest_validation else {},
+                        "outputBudget": (
+                            latest_validation.semantic_output_budget
+                            if latest_validation else None
+                        ),
                     },
                     ok=ok,
                 ))
@@ -1020,6 +1228,24 @@ def generate_blueprint(
                     "deterministicErrorCount": len(latest_deterministic),
                     "semanticErrorCount": len(latest_semantic),
                     "warningCount": len(latest_warnings),
+                    "mechanicalStageReached": (
+                        latest_validation.mechanical_stage_reached
+                        if latest_validation else "submission"
+                    ),
+                    "mechanicalFailureStage": (
+                        latest_validation.mechanical_failure_stage
+                        if latest_validation else "submission"
+                    ),
+                    "semanticEligible": bool(
+                        latest_validation
+                        and latest_validation.mechanical_failure_stage is None
+                    ),
+                    "semanticAuditMode": semantic_audit_mode,
+                    "semanticAuditInvoked": semantic_invoked,
+                    "semanticRequestCount": (
+                        latest_validation.semantic_request_count
+                        if latest_validation else 0
+                    ),
                 },
                 ok=not latest_deterministic and not latest_semantic and not latest_warnings,
             ))
@@ -1058,6 +1284,7 @@ def generate_blueprint(
             )
             final_details["staticGateMode"] = "shadow"
             final_details["semanticStaticGate"] = False
+            final_details["semanticAuditMode"] = semantic_audit_mode
             latest_blueprint.generation_validation = final_details
             latest_blueprint.generation_history = [item.to_dict() for item in rounds]
             latest_blueprint.candidate_history = list(candidates)
@@ -1099,6 +1326,7 @@ def generate_blueprint(
         ),
         "staticGateMode": "shadow",
         "semanticStaticGate": False,
+        "semanticAuditMode": semantic_audit_mode,
         "finalErrorKinds": [
             name for name, present in (
                 ("deterministic", deterministic_failed), ("semantic", semantic_failed),

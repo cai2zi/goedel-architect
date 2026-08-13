@@ -804,7 +804,9 @@ class GoedelProver:
             {
                 "role": "user",
                 "content": (
-                    "Try to prove this formal negation. Call lean_compile with "
+                    "Try to prove this exact formal negation of the entire closed theorem. "
+                    "For a universally quantified theorem, a counterexample is sufficient. "
+                    "Call lean_compile with "
                     f"a proof body beginning with `by`.\n\n```lean\n{negation_decl}\n```"
                 ),
             },
@@ -882,6 +884,14 @@ def _compiler_outcome(result: CompilerResult, proof_body: str) -> _ToolOutcome:
 
 
 def _build_negation_node_decl(node_decl: str, node_name: str) -> str:
+    """Return the exact negation of the theorem after closing its binders.
+
+    For example, ``theorem f (x : α) (h : H x) : P x`` denotes the closed
+    proposition ``∀ (x : α) (h : H x), P x``.  Its negation must therefore be
+    ``¬ (∀ (x : α) (h : H x), P x)``.  Keeping the binders on ``neg_f`` and
+    negating only ``P x`` would instead assert the strictly stronger pointwise
+    statement ``∀ x, H x → ¬ P x`` and would miss ordinary counterexamples.
+    """
     decl = lemma_to_theorem(extract_current_node_decl(node_decl)).strip()
     proof_match = BLUEPRINT_PROOF_RE.search(decl)
     signature = decl[:proof_match.start()].strip() if proof_match else decl.split(":=", 1)[0].strip()
@@ -890,15 +900,19 @@ def _build_negation_node_decl(node_decl: str, node_name: str) -> str:
     head = re.match(r"^\s*(?:theorem|lemma)\s+\S+", signature)
     if not head:
         raise ValueError("node declaration is not a theorem/lemma")
-    signature = f"theorem {_lean_safe_negation_name(node_name)}" + signature[head.end():]
-    colon = _find_top_level_colon(signature)
+    telescope_and_conclusion = signature[head.end():]
+    colon = _find_top_level_colon(telescope_and_conclusion)
     if colon is None:
         raise ValueError("could not find theorem conclusion separator")
-    prefix = signature[:colon].rstrip()
-    conclusion = signature[colon + 1:].strip()
+    binders = telescope_and_conclusion[:colon].strip()
+    conclusion = telescope_and_conclusion[colon + 1:].strip()
     if not conclusion:
         raise ValueError("empty theorem conclusion")
-    return f"{prefix} : ¬ ({conclusion}) := by sorry_using []"
+    closed_proposition = f"∀ {binders}, {conclusion}" if binders else conclusion
+    return (
+        f"theorem {_lean_safe_negation_name(node_name)} : "
+        f"¬ ({closed_proposition}) := by sorry_using []"
+    )
 
 
 def _lean_safe_negation_name(node_name: str) -> str:

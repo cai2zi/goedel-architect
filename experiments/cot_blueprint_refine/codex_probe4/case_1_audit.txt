@@ -1,0 +1,14 @@
+You are evaluating one formalization artifact. Work only from the two files named below; do not read results.jsonl, review.json, traces, checkpoints, or neighboring experiment metadata.
+
+Case ID: aime_2025/10
+Task: semantic_audit
+
+Source problem and informal solution are the JSONL row whose `name` is `aime_2025/10` in:
+/ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong76_whole_cot_blueprint_generation/prepared/generation_inputs.jsonl
+
+Candidate Blueprint:
+/ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong76_whole_cot_blueprint_generation/robustpa/blueprint/blueprints/qwen3_8b_math_verify/aime_2025/robustpa_aime_2025_10/round_00_phase1.lean
+
+Decide whether the formal Blueprint faithfully formalizes the substantive counting claim and derivation in the original problem, rather than merely restating the claimed numerical answer or proving a weakened/vacuous surrogate. Return verdict `faithful` or `reject`. Give concrete evidence naming the missing or represented mathematical objects and relations. `proof_body` must be an empty string and `lean_verified` must be false.
+
+Return only the JSON object required by the output schema.

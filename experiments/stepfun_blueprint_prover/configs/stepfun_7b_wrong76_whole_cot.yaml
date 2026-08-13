@@ -1,0 +1,35 @@
+source_experiment_root: /ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong76_whole_cot_blueprint_generation_thinking_judge/robustpa/blueprint
+output_root: /ssd/czx/czx_work/stepfun_blueprint_prover/stepfun_7b_wrong76_whole_cot
+
+model:
+  name: StepFun-Prover-Preview-7B
+  path: /ssd/czx/models/StepFun-Prover-Preview-7B
+  api_base_url: http://127.0.0.1:8001/v1
+  api_key: EMPTY
+  max_context_tokens: 40960
+  temperature: 1.0
+  top_p: 0.999
+  top_k: -1
+  seed: 42
+  api_concurrency: 128
+  stop_token_ids: [151643, 151666]
+  include_stop_str_in_output: true
+
+lean:
+  api_url: http://127.0.0.1:8000
+  # Kimina currently requires a positive server-side timeout. One day is used
+  # as an effectively unbounded guard; the experiment has no node wall timeout.
+  server_timeout_seconds: 86400
+  reuse: true
+  debug: false
+  max_inflight_snippets: 48
+  batch_size: 8
+  global_batching: true
+  parallel_batches: 6
+  batch_wait_ms: 10
+
+run:
+  resume: true
+  positive_then_negative: true
+  negative_all_positive_failed: true
+  limit: null

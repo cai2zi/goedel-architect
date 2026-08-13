@@ -1,7 +1,7 @@
-# Independent Phase 2 output seeded read-only from the accepted Phase 1 run.
+# Qwen 397B Phase 2 on the exact Whole-COT Blueprint source used by StepFun.
 input_predictions: /ssd/czx/czx_work/cot_blueprint_refine/subsets/qwen3_8b_original_answer_incorrect/predictions.jsonl
 output_base: /ssd/czx/czx_work/cot_blueprint_refine
-exp_name: qwen3_8b_397b_wrong76_phase2
+exp_name: qwen3_8b_397b_wrong76_whole_cot_phase2_stepfun_inputs
 # false: discard this Phase 2 output and restart from the immutable Phase 1 seed.
 # true: resume/skip results only under this Phase 2 exp_name.
 resume: true
@@ -21,12 +21,14 @@ environment:
 
 blueprint:
   execution_mode: phase2_only
-  phase1_input_experiment_root: /ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong76_blueprint_generation
+  # This is the source_experiment_root used by the completed StepFun run.
+  # Its 45 strictAccepted checkpoints are treated as immutable Phase 2 seeds.
+  phase1_input_experiment_root: /ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong76_whole_cot_blueprint_generation_thinking_judge
   retry_error_results: false
   max_refinement_iterations: 0
 
   # Phase 2 prover budget.
-  node_max_prove_turns: 16
+  node_max_prove_turns: 8
   node_max_negation_probe_turns: 4
   max_tool_calls_per_turn: 4
   proof_policy: full
@@ -34,7 +36,7 @@ blueprint:
 
   # Phase 1 settings are inherited but unused in phase2_only mode.
   phase1_concurrency: 1
-  phase2_blueprint_concurrency: 76
+  phase2_blueprint_concurrency: 45
   phase2_node_concurrency: 512
   refine_concurrency: 1
   phase2_contract_check_concurrency: 32

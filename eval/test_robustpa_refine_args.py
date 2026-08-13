@@ -81,6 +81,22 @@ theorem root : (1 + 1 : Nat) = 2 := by sorry_using []
         self.assertNotIn("parallel_tool_calls", config)
         self.assertEqual(config.node_max_negation_probe_turns, 1)
         self.assertEqual(config.max_tool_calls_per_turn, 3)
+        self.assertEqual(config.semantic_audit_mode, "separate")
+        self.assertEqual(config.joint_semantic_audit_max_tokens, 32768)
+
+    def test_semantic_audit_mode_and_joint_budget_are_validated(self) -> None:
+        config = OmegaConf.load(
+            REPO_ROOT / "experiments/robustpa_refine/configs/base.yaml"
+        )
+        args = SimpleNamespace(**OmegaConf.to_container(config, resolve=False))
+        _validate_args(args)
+        args.semantic_audit_mode = "invalid"
+        with self.assertRaisesRegex(ValueError, "semantic_audit_mode"):
+            _validate_args(args)
+        args.semantic_audit_mode = "joint"
+        args.joint_semantic_audit_max_tokens = 0
+        with self.assertRaisesRegex(ValueError, "joint_semantic_audit_max_tokens"):
+            _validate_args(args)
 
     def test_tool_budget_must_be_positive(self) -> None:
         config = OmegaConf.load(

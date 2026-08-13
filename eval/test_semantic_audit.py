@@ -13,14 +13,20 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from blueprint import _parse_blueprint  # noqa: E402
 from semantic_audit import (  # noqa: E402
-    COMPARATOR_SYSTEM_PROMPT,
     FormalDecompilerResult,
+    JOINT_SEMANTIC_EFFECT_ALIASES,
+    JOINT_WHOLE_COT_SYSTEM_PROMPT,
+    JOINT_WHOLE_COT_PROMPT_VERSION,
     SemanticAuditFormatError,
+    WHOLE_COT_PROMPT_VERSION,
     build_formal_view,
+    joint_whole_cot_audit_messages,
     parse_formal_decompiler,
-    parse_strict_comparator,
+    parse_joint_whole_cot_audit,
     parse_whole_cot_comparator,
     run_formal_decompiler,
+    run_joint_whole_cot_audit,
+    semantic_audit_cache_key,
     whole_cot_comparator_messages,
 )
 
@@ -40,13 +46,6 @@ def sourceValue : Nat := 6
 theorem root : sourceValue = 6 := by
   sorry_using [sourceValue]
 '''
-
-
-def _manifest():
-    return SimpleNamespace(steps=(
-        SimpleNamespace(step_id="S001", source_text="Set the source value to 6."),
-        SimpleNamespace(step_id="S002", source_text="Therefore the answer is 6."),
-    ))
 
 
 def _decompiler(view, *, vacuous: bool = False):
@@ -76,47 +75,40 @@ def _decompiler(view, *, vacuous: bool = False):
     )
 
 
-def _comparator_payload(*, missing: bool = False, root_ok: bool = True):
+def _whole_cot_payload(*, missing: bool = False, root_ok: bool = True):
     issue = ({
-        "clause": "sourceValue must be bound to the source object",
-        "node_names": ["root"],
-        "reason": "The source object is replaced.",
+        "clause": "bind original object", "node_names": ["root"],
+        "reason": "target object replaced",
     } if missing else None)
     return {
-        "steps": [
-            {
-                "step_id": "S001",
-                "combined_formal_translation": "Defines sourceValue as six.",
-                "missing_clauses": [],
-                "weakened_clauses": [],
-                "unbound_objects": [],
-                "wrong_relations": [],
-            },
-            {
-                "step_id": "S002",
-                "combined_formal_translation": "Concludes sourceValue equals six.",
-                "missing_clauses": [issue] if issue else [],
-                "weakened_clauses": [],
-                "unbound_objects": [],
-                "wrong_relations": [],
-            },
-        ],
+        "cot": {
+            "combined_formal_translation": "Defines and uses sourceValue.",
+            "missing_clauses": [issue] if issue else [],
+            "weakened_clauses": [], "unbound_objects": [],
+            "wrong_relations": [], "added_clauses": [],
+        },
         "root": {
             "translation": "sourceValue equals six.",
             "target_object_preserved": root_ok,
             "answer_grounded": root_ok,
-            "reasons": [] if root_ok else ["The root replaces the target object."],
+            "reasons": [] if root_ok else ["target object replaced"],
         },
-        "unreachable_steps": [],
-        "dependency_issues": [],
-        "obligation_results": [],
+        "unreachable_nodes": [], "dependency_issues": [],
+    }
+
+
+def _joint_payload(view, *, missing: bool = False, root_ok: bool = True):
+    return {
+        "formal_decompiler": json.loads(_decompiler(view).raw_content),
+        "whole_cot_comparator": _whole_cot_payload(
+            missing=missing, root_ok=root_ok,
+        ),
     }
 
 
 class SemanticAuditTest(unittest.TestCase):
     def setUp(self) -> None:
         self.view = build_formal_view(_parse_blueprint(LEAN, "root"))
-        self.manifest = _manifest()
 
     def test_formal_view_strips_metadata_comments_and_proof_body(self) -> None:
         declarations = {node.node_name: node.declaration for node in self.view.nodes}
@@ -134,34 +126,16 @@ class SemanticAuditTest(unittest.TestCase):
         with self.assertRaises(SemanticAuditFormatError):
             parse_formal_decompiler(json.dumps(value), view=self.view)
 
-    def test_comparator_pass_is_computed_from_all_defects(self) -> None:
-        decompiler = _decompiler(self.view)
-        parsed = parse_strict_comparator(
-            json.dumps(_comparator_payload()), manifest=self.manifest,
-            view=self.view, decompiler=decompiler, open_obligations=(),
-        )
-        self.assertTrue(parsed[-1])
-
-        parsed = parse_strict_comparator(
-            json.dumps(_comparator_payload(missing=True)), manifest=self.manifest,
-            view=self.view, decompiler=decompiler, open_obligations=(),
-        )
-        self.assertFalse(parsed[-1])
-
-        parsed = parse_strict_comparator(
-            json.dumps(_comparator_payload()), manifest=self.manifest,
-            view=self.view, decompiler=_decompiler(self.view, vacuous=True),
-            open_obligations=(),
-        )
-        self.assertFalse(parsed[-1])
-
-    def test_comparator_prompt_demands_object_and_direction_fidelity(self) -> None:
-        self.assertIn("Give no credit to ex-falso", COMPARATOR_SYSTEM_PROMPT)
-        self.assertIn("Track object identity across Steps", COMPARATOR_SYSTEM_PROMPT)
-        self.assertIn("root must mention the shared target object", COMPARATOR_SYSTEM_PROMPT)
+    def test_separate_decompiler_keeps_strict_semantic_effect_enum(self) -> None:
+        value = json.loads(_decompiler(self.view).raw_content)
+        value["nodes"][1]["semantic_effect"] = "theoremStatement"
+        with self.assertRaisesRegex(
+            SemanticAuditFormatError, "invalid semantic_effect theoremStatement",
+        ):
+            parse_formal_decompiler(json.dumps(value), view=self.view)
 
     def test_whole_cot_formal_view_and_comparator_have_no_step_inventory(self) -> None:
-        view = build_formal_view(_parse_blueprint(LEAN, "root"), include_step_ids=False)
+        view = build_formal_view(_parse_blueprint(LEAN, "root"))
         decompiler = _decompiler(view)
         payload = {
             "cot": {
@@ -188,7 +162,7 @@ class SemanticAuditTest(unittest.TestCase):
         self.assertNotIn("COT_STEP", messages)
 
     def test_whole_cot_comparator_rejects_missing_clause(self) -> None:
-        view = build_formal_view(_parse_blueprint(LEAN, "root"), include_step_ids=False)
+        view = build_formal_view(_parse_blueprint(LEAN, "root"))
         decompiler = _decompiler(view)
         issue = {"clause": "bind original object", "node_names": ["root"], "reason": "replaced"}
         payload = {
@@ -233,6 +207,183 @@ class SemanticAuditTest(unittest.TestCase):
             "repetition_penalty": 1.0,
             "chat_template_kwargs": {"enable_thinking": True},
         })
+
+    def test_joint_schema_requires_order_and_known_nodes(self) -> None:
+        view = build_formal_view(_parse_blueprint(LEAN, "root"))
+        payload = _joint_payload(view)
+        parsed = parse_joint_whole_cot_audit(json.dumps(payload), view=view)
+        self.assertTrue(parsed[-1])
+        reversed_payload = {
+            "whole_cot_comparator": payload["whole_cot_comparator"],
+            "formal_decompiler": payload["formal_decompiler"],
+        }
+        with self.assertRaisesRegex(SemanticAuditFormatError, "must be formal_decompiler"):
+            parse_joint_whole_cot_audit(json.dumps(reversed_payload), view=view)
+        payload["whole_cot_comparator"]["dependency_issues"] = [
+            {"node_name": "unknown", "reason": "bad reference"}
+        ]
+        with self.assertRaisesRegex(SemanticAuditFormatError, "unknown node"):
+            parse_joint_whole_cot_audit(json.dumps(payload), view=view)
+
+    def test_joint_normalizes_all_effect_aliases_observed_in_failed_runs(self) -> None:
+        view = build_formal_view(_parse_blueprint(LEAN, "root"))
+        proposition_aliases = {
+            "theoremStatement", "propertyAssertion", "theoremAssertion",
+            "lemmaStatement", "claimAssertion", "statementAssertion",
+            "propositionStatement", "propertyStatement", "propertyClaim",
+            "mathematicalAssertion", "logicalStatement", "logicalClaim",
+            "logicalAssertion", "lemma", "deduction", "claim", "assumption",
+            "assertsProperty", "theoremClaim", "states_property",
+            "mathematicalStatement", "claimStatement", "asserts_property",
+        }
+        object_aliases = {"propertyDefinition", "definition", "defines_constant"}
+        self.assertEqual(
+            set(JOINT_SEMANTIC_EFFECT_ALIASES),
+            {
+                "".join(character for character in alias.lower() if character.isalnum())
+                for alias in proposition_aliases | object_aliases
+            },
+        )
+        for alias in sorted(proposition_aliases):
+            with self.subTest(alias=alias):
+                payload = _joint_payload(view)
+                payload["formal_decompiler"]["nodes"][1]["semantic_effect"] = alias
+                parsed = parse_joint_whole_cot_audit(json.dumps(payload), view=view)
+                self.assertEqual(parsed[0][1].semantic_effect, "proposition")
+        for alias in sorted(object_aliases):
+            with self.subTest(alias=alias):
+                payload = _joint_payload(view)
+                payload["formal_decompiler"]["nodes"][0]["semantic_effect"] = alias
+                parsed = parse_joint_whole_cot_audit(json.dumps(payload), view=view)
+                self.assertEqual(parsed[0][0].semantic_effect, "objectDefinition")
+
+    def test_joint_rejects_unknown_effect_alias(self) -> None:
+        view = build_formal_view(_parse_blueprint(LEAN, "root"))
+        payload = _joint_payload(view)
+        payload["formal_decompiler"]["nodes"][1]["semantic_effect"] = "someNewLabel"
+        with self.assertRaisesRegex(
+            SemanticAuditFormatError, "invalid semantic_effect someNewLabel",
+        ):
+            parse_joint_whole_cot_audit(json.dumps(payload), view=view)
+
+    def test_joint_alias_cannot_hide_obvious_true_shell(self) -> None:
+        lean = LEAN.replace("def sourceValue : Nat := 6", "def sourceValue : Prop := True")
+        view = build_formal_view(_parse_blueprint(lean, "root"))
+        payload = _joint_payload(view)
+        payload["formal_decompiler"]["nodes"][0]["semantic_effect"] = "propertyDefinition"
+        parsed = parse_joint_whole_cot_audit(json.dumps(payload), view=view)
+        self.assertEqual(parsed[0][0].semantic_effect, "vacuous")
+        self.assertFalse(parsed[-1])
+
+    def test_joint_prompt_repeats_closed_enum_and_compact_limits(self) -> None:
+        self.assertIn("closed enum", JOINT_WHOLE_COT_SYSTEM_PROMPT)
+        self.assertIn("`objectDefinition`, `proposition`, or `vacuous`", JOINT_WHOLE_COT_SYSTEM_PROMPT)
+        self.assertIn("Never emit alternatives", JOINT_WHOLE_COT_SYSTEM_PROMPT)
+        self.assertIn("under 40 words", JOINT_WHOLE_COT_SYSTEM_PROMPT)
+
+    def test_joint_pass_is_recomputed_locally(self) -> None:
+        view = build_formal_view(_parse_blueprint(LEAN, "root"))
+        parsed = parse_joint_whole_cot_audit(
+            json.dumps(_joint_payload(view, missing=True)), view=view,
+        )
+        self.assertFalse(parsed[-1])
+
+    def test_joint_uses_one_request_and_forwards_sampling(self) -> None:
+        view = build_formal_view(_parse_blueprint(LEAN, "root"))
+        response = SimpleNamespace(
+            id="joint-request",
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    content=json.dumps(_joint_payload(view)),
+                    reasoning_content="translate then compare",
+                ),
+                finish_reason="stop",
+            )],
+            usage=SimpleNamespace(prompt_tokens=11, completion_tokens=22, total_tokens=33),
+        )
+        with patch("semantic_audit.chat_completion_with_retry", return_value=response) as chat:
+            result = run_joint_whole_cot_audit(
+                object(), "model", informal_statement="problem",
+                informal_proof="cot", claimed_answer="6", view=view,
+                max_tokens=32768, max_attempts=2, enable_thinking=True,
+                temperature=0.6, top_p=0.95, top_k=20, min_p=0.0,
+                presence_penalty=0.0, repetition_penalty=1.0,
+            )
+        self.assertEqual(chat.call_count, 1)
+        self.assertTrue(result.comparator.passed)
+        self.assertEqual(result.total_tokens, 33)
+        self.assertEqual(chat.call_args.kwargs["max_completion_tokens"], 32768)
+        self.assertEqual(
+            chat.call_args.kwargs["extra_body"]["chat_template_kwargs"],
+            {"enable_thinking": True},
+        )
+
+    def test_joint_result_records_effect_normalization(self) -> None:
+        view = build_formal_view(_parse_blueprint(LEAN, "root"))
+        payload = _joint_payload(view)
+        payload["formal_decompiler"]["nodes"][1]["semantic_effect"] = "theoremStatement"
+        response = SimpleNamespace(
+            id="joint-alias",
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content=json.dumps(payload), reasoning_content=""),
+                finish_reason="stop",
+            )],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+        with patch("semantic_audit.chat_completion_with_retry", return_value=response):
+            result = run_joint_whole_cot_audit(
+                object(), "model", informal_statement="problem",
+                informal_proof="cot", claimed_answer="6", view=view,
+                max_tokens=32768, max_attempts=2,
+            )
+        self.assertEqual(result.semantic_effect_normalizations, ({
+            "node_name": "root", "reported": "theoremStatement",
+            "canonical": "proposition",
+        },))
+
+    def test_joint_schema_retry_rebuilds_complete_response(self) -> None:
+        view = build_formal_view(_parse_blueprint(LEAN, "root"))
+        def response(content: str, request_id: str):
+            return SimpleNamespace(
+                id=request_id,
+                choices=[SimpleNamespace(
+                    message=SimpleNamespace(content=content, reasoning_content=""),
+                    finish_reason="stop",
+                )],
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            )
+        with patch(
+            "semantic_audit.chat_completion_with_retry",
+            side_effect=[response("{}", "bad"), response(json.dumps(_joint_payload(view)), "ok")],
+        ) as chat:
+            result = run_joint_whole_cot_audit(
+                object(), "model", informal_statement="problem",
+                informal_proof="cot", claimed_answer="6", view=view,
+                max_tokens=1000, max_attempts=2,
+            )
+        self.assertEqual(chat.call_count, 2)
+        self.assertEqual(len(result.attempts), 2)
+        retry_messages = chat.call_args_list[1].kwargs["messages"]
+        self.assertEqual(retry_messages[0]["role"], "system")
+        self.assertIn("again from the original input", retry_messages[-1]["content"])
+        self.assertIn("formal_decompiler, whole_cot_comparator", retry_messages[-1]["content"])
+
+    def test_joint_cache_key_isolated_by_mode_and_sampling(self) -> None:
+        view = build_formal_view(_parse_blueprint(LEAN, "root"))
+        messages = joint_whole_cot_audit_messages("p", "cot", "6", view)
+        joint = semantic_audit_cache_key(
+            "model", messages, version=JOINT_WHOLE_COT_PROMPT_VERSION,
+            request_params={"temperature": 0.6},
+        )
+        separate = semantic_audit_cache_key(
+            "model", messages, version=WHOLE_COT_PROMPT_VERSION,
+            request_params={"temperature": 0.6},
+        )
+        cold = semantic_audit_cache_key(
+            "model", messages, version=JOINT_WHOLE_COT_PROMPT_VERSION,
+            request_params={"temperature": 0.0},
+        )
+        self.assertEqual(len({joint, separate, cold}), 3)
 
 
 if __name__ == "__main__":

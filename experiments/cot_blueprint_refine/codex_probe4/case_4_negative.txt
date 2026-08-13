@@ -1,0 +1,11 @@
+You are independently testing whether a failed Blueprint node is false. Do not read results.jsonl, review.json, traces, or checkpoints. Read only the Lean file named below and focus on the named node.
+
+Case ID: brumo_2025/6::product_k1_eq
+Task: negative_probe
+Blueprint file:
+/ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong76_phase2_164/robustpa/blueprint/blueprints/qwen3_8b_math_verify/brumo_2025/robustpa_brumo_2025_6/round_00_phase1_seed.lean
+Target node: product_k1_eq
+
+Determine whether the logical negation of the target theorem is provable. Produce a complete Lean `by ...` proof body for that negation if possible. You may use the repository's existing local Lean/Kimina checking mechanisms, but do not edit files. Set `lean_verified=true` only if you actually checked the complete proof and it compiled without `sorry`. Otherwise use `negation_not_proved` and explain the blocker. Do not infer the answer from experiment metadata.
+
+Return only the JSON object required by the output schema.

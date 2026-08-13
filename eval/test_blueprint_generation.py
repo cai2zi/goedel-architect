@@ -11,7 +11,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "experiments"), str(ROOT / "src")]
 
-from blueprint import _parse_blueprint  # noqa: E402
+from blueprint import BlueprintGenerationError, _parse_blueprint  # noqa: E402
 from blueprint_generation import (  # noqa: E402
     BlueprintValidation,
     GenerationRound,
@@ -20,12 +20,20 @@ from blueprint_generation import (  # noqa: E402
     _messages,
     _submitted_code,
     _validate_round,
+    _with_semantic_audit,
+    generate_blueprint,
     generation_request_budget,
     generation_round_classification,
 )
 from blueprint import Phase2StandaloneReport  # noqa: E402
 from kimina_lean_compiler import CompilerResult  # noqa: E402
 from semantic_fidelity import SemanticIssue  # noqa: E402
+from semantic_audit import (  # noqa: E402
+    FormalDecompilerResult,
+    JointWholeCotAuditResult,
+    SemanticAuditFormatError,
+    WholeCotComparatorResult,
+)
 
 
 class _Tokenizer:
@@ -113,14 +121,186 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
                 semantic_audit_temperature=0.6, semantic_audit_top_p=0.95,
                 semantic_audit_top_k=20, semantic_audit_min_p=0.0,
                 semantic_audit_presence_penalty=0.0,
-                semantic_audit_repetition_penalty=1.0, tracer=None,
+                semantic_audit_repetition_penalty=1.0,
+                semantic_audit_mode="separate",
+                joint_semantic_audit_max_tokens=32768,
+                tokenizer_path="unused", model_max_context=40960,
+                context_safety_margin=512, tracer=None,
                 thm_name="id", round_index=1, standalone_cache={},
-                decompiler_cache={}, comparator_cache={},
+                decompiler_cache={}, comparator_cache={}, joint_cache={},
             )
         audit.assert_not_called()
         self.assertEqual(validation.mechanical_failure_stage, "whole_file_lean")
         self.assertTrue(deterministic)
         self.assertFalse(semantic)
+
+    def test_eligible_round_request_counts_differ_by_audit_mode(self) -> None:
+        blueprint = _parse_blueprint(self.MINIMAL, "root")
+        base = BlueprintValidation(
+            lean_result=CompilerResult(True),
+            canonical_lean_result=CompilerResult(True),
+            semantic_issues=[], structural_errors=[],
+            standalone_report=Phase2StandaloneReport((), 2, 0, 1.0),
+            mechanical_stage_reached="static_shadow",
+        )
+        decompiler = FormalDecompilerResult(
+            (), "{}", "", "stop", "d", 1, 1, 2,
+            ({"attempt": 1},),
+        )
+        comparator = WholeCotComparatorResult(
+            {
+                "combined_formal_translation": "x", "missing_clauses": [],
+                "weakened_clauses": [], "unbound_objects": [],
+                "wrong_relations": [], "added_clauses": [],
+            },
+            {
+                "translation": "x", "target_object_preserved": True,
+                "answer_grounded": True, "reasons": [],
+            },
+            (), (), True, "{}", "", "stop", "c", 1, 1, 2,
+            ({"attempt": 1},),
+        )
+        common = dict(
+            client=object(), model="model", informal_statement="problem",
+            informal_proof="cot", claimed_answer="1",
+            formal_decompiler_max_tokens=16384,
+            strict_comparator_max_tokens=16384, format_max_attempts=2,
+            semantic_audit_enable_thinking=True,
+            semantic_audit_temperature=0.6, semantic_audit_top_p=0.95,
+            semantic_audit_top_k=20, semantic_audit_min_p=0.0,
+            semantic_audit_presence_penalty=0.0,
+            semantic_audit_repetition_penalty=1.0,
+            joint_semantic_audit_max_tokens=32768,
+            tokenizer_path="unused", model_max_context=40960,
+            context_safety_margin=512, tracer=None, thm_name="id",
+            round_index=1,
+        )
+        with (
+            patch("blueprint_generation.run_formal_decompiler", return_value=decompiler) as run_d,
+            patch("blueprint_generation.run_whole_cot_comparator", return_value=comparator) as run_c,
+        ):
+            separate = _with_semantic_audit(
+                base, blueprint, semantic_audit_mode="separate",
+                decompiler_cache={}, comparator_cache={}, joint_cache={}, **common,
+            )
+        self.assertEqual(separate.semantic_request_count, 2)
+        run_d.assert_called_once()
+        run_c.assert_called_once()
+
+        joint_value = JointWholeCotAuditResult(
+            decompiler, comparator, "{}", "", "stop", "j", 1, 1, 2,
+            ({"attempt": 1},),
+        )
+        joint_cache = {}
+        with (
+            patch("blueprint_generation.generation_request_budget", return_value=(100, 40000)),
+            patch("blueprint_generation.run_joint_whole_cot_audit", return_value=joint_value) as run_j,
+        ):
+            joint = _with_semantic_audit(
+                base, blueprint, semantic_audit_mode="joint",
+                decompiler_cache={}, comparator_cache={}, joint_cache=joint_cache,
+                **common,
+            )
+            cached = _with_semantic_audit(
+                base, blueprint, semantic_audit_mode="joint",
+                decompiler_cache={}, comparator_cache={}, joint_cache=joint_cache,
+                **common,
+            )
+        self.assertEqual(joint.semantic_request_count, 1)
+        self.assertEqual(joint.semantic_output_budget, 32768)
+        self.assertEqual(cached.semantic_request_count, 0)
+        self.assertTrue(cached.semantic_cache_hits["joint"])
+        run_j.assert_called_once()
+
+    def test_joint_schema_exhaustion_preserves_terminal_request_count(self) -> None:
+        blueprint = _parse_blueprint(self.MINIMAL, "root")
+        validation = BlueprintValidation(
+            lean_result=CompilerResult(True),
+            canonical_lean_result=CompilerResult(True),
+            semantic_issues=[], structural_errors=[],
+            standalone_report=Phase2StandaloneReport((), 2, 0, 1.0),
+            mechanical_stage_reached="static_shadow",
+        )
+        error = SemanticAuditFormatError(
+            "bad joint schema", attempts=({"attempt": 1}, {"attempt": 2}),
+        )
+        with (
+            patch("blueprint_generation.generation_request_budget", return_value=(100, 40000)),
+            patch("blueprint_generation.run_joint_whole_cot_audit", side_effect=error),
+            self.assertRaises(SemanticAuditFormatError),
+        ):
+            _with_semantic_audit(
+                validation, blueprint, client=object(), model="model",
+                informal_statement="problem", informal_proof="cot",
+                claimed_answer="1", formal_decompiler_max_tokens=16384,
+                strict_comparator_max_tokens=16384, format_max_attempts=2,
+                semantic_audit_enable_thinking=True,
+                semantic_audit_temperature=0.6, semantic_audit_top_p=0.95,
+                semantic_audit_top_k=20, semantic_audit_min_p=0.0,
+                semantic_audit_presence_penalty=0.0,
+                semantic_audit_repetition_penalty=1.0,
+                semantic_audit_mode="joint",
+                joint_semantic_audit_max_tokens=32768,
+                tokenizer_path="unused", model_max_context=40960,
+                context_safety_margin=512, decompiler_cache={},
+                comparator_cache={}, joint_cache={}, tracer=None,
+                thm_name="id", round_index=1,
+            )
+        self.assertTrue(validation.semantic_audit_invoked)
+        self.assertEqual(validation.semantic_audit_mode, "joint")
+        self.assertEqual(validation.semantic_request_count, 2)
+        self.assertEqual(validation.semantic_output_budget, 32768)
+
+    def test_semantic_audit_failure_is_terminal_without_regeneration(self) -> None:
+        validation = BlueprintValidation(
+            lean_result=CompilerResult(True),
+            canonical_lean_result=CompilerResult(True),
+            semantic_issues=[], structural_errors=[],
+            standalone_report=Phase2StandaloneReport((), 2, 0, 1.0),
+            mechanical_stage_reached="joint_semantic_audit",
+            semantic_audit_invoked=True, semantic_audit_mode="joint",
+            semantic_request_count=2, semantic_output_budget=32768,
+        )
+        from blueprint_generation import SemanticAuditExecutionError
+        with (
+            patch("blueprint_generation.make_client", return_value=object()),
+            patch("blueprint_generation.generation_request_budget", return_value=(100, 1000)),
+            patch("blueprint_generation.chat_completion_with_retry", return_value=object()) as generate,
+            patch("blueprint_generation._emit_usage"),
+            patch("blueprint_generation._emit_llm_response"),
+            patch("blueprint_generation._submitted_code", return_value=(self.MINIMAL, ())),
+            patch(
+                "blueprint_generation._validate_round",
+                side_effect=SemanticAuditExecutionError("schema failed", validation),
+            ),
+            self.assertRaises(BlueprintGenerationError) as caught,
+        ):
+            generate_blueprint(
+                informal_statement="problem", informal_proof="cot",
+                claimed_answer="1", target_name="root", model="model",
+                compiler=object(), tracer=None, thm_name="id", max_turns=8,
+                tokenizer_path="unused", model_max_context=40960,
+                context_safety_margin=512, enable_thinking=True,
+                temperature=0.6, top_p=0.95, top_k=20, min_p=0.0,
+                presence_penalty=0.0, repetition_penalty=1.0,
+                standalone_concurrency=1, decompiler_max_tokens=16384,
+                comparator_max_tokens=16384, semantic_format_attempts=2,
+                semantic_audit_enable_thinking=True,
+                semantic_audit_temperature=0.6, semantic_audit_top_p=0.95,
+                semantic_audit_top_k=20, semantic_audit_min_p=0.0,
+                semantic_audit_presence_penalty=0.0,
+                semantic_audit_repetition_penalty=1.0,
+                semantic_audit_mode="joint",
+                joint_semantic_audit_max_tokens=32768,
+            )
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(
+            caught.exception.validation_details["classification"],
+            "semanticAuditError",
+        )
+        self.assertEqual(
+            caught.exception.validation_details["semanticActualRequestCount"], 2,
+        )
 
     def test_submission_requires_one_full_lean_compile_call(self) -> None:
         call = SimpleNamespace(function=SimpleNamespace(

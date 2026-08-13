@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "case_id",
+    "task",
+    "verdict",
+    "proof_body",
+    "lean_verified",
+    "evidence",
+    "confidence"
+  ],
+  "properties": {
+    "case_id": {"type": "string"},
+    "task": {"enum": ["semantic_audit", "negative_probe"]},
+    "verdict": {
+      "enum": [
+        "faithful",
+        "reject",
+        "negation_proved",
+        "negation_not_proved"
+      ]
+    },
+    "proof_body": {"type": "string"},
+    "lean_verified": {"type": "boolean"},
+    "evidence": {
+      "type": "array",
+      "items": {"type": "string"},
+      "minItems": 1,
+      "maxItems": 6
+    },
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+  }
+}

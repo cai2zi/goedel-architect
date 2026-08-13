@@ -12,7 +12,7 @@ import sys
 import tempfile
 import time
 import traceback
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from functools import partial
@@ -209,6 +209,10 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
     args.semantic_format_max_attempts = int(
         args.semantic_format_max_attempts
     )
+    args.semantic_audit_mode = str(args.semantic_audit_mode)
+    args.joint_semantic_audit_max_tokens = int(
+        args.joint_semantic_audit_max_tokens
+    )
     args.semantic_audit_enable_thinking = bool(
         args.semantic_audit_enable_thinking
     )
@@ -231,6 +235,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         )
     if args.generation_prompt_profile not in {"whole_cot_minimal", "standard"}:
         raise ValueError("generation_prompt_profile must be whole_cot_minimal or standard")
+    if args.semantic_audit_mode not in {"separate", "joint"}:
+        raise ValueError("semantic_audit_mode must be separate or joint")
     for name in (
         "phase1_concurrency",
         "phase2_blueprint_concurrency",
@@ -246,6 +252,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         "formal_decompiler_max_tokens",
         "strict_comparator_max_tokens",
         "semantic_format_max_attempts",
+        "joint_semantic_audit_max_tokens",
     ):
         if getattr(args, name) <= 0:
             raise ValueError(f"{name} must be positive")
@@ -567,6 +574,8 @@ def _result_row(
         "formal_decompiler_max_tokens": args.formal_decompiler_max_tokens,
         "strict_comparator_max_tokens": args.strict_comparator_max_tokens,
         "semantic_format_max_attempts": args.semantic_format_max_attempts,
+        "semantic_audit_mode": args.semantic_audit_mode,
+        "joint_semantic_audit_max_tokens": args.joint_semantic_audit_max_tokens,
         "semantic_audit_sampling": {
             "enable_thinking": args.semantic_audit_enable_thinking,
             "temperature": args.semantic_audit_temperature,
@@ -899,6 +908,8 @@ async def _run_record(
                         semantic_audit_min_p=args.semantic_audit_min_p,
                         semantic_audit_presence_penalty=args.semantic_audit_presence_penalty,
                         semantic_audit_repetition_penalty=args.semantic_audit_repetition_penalty,
+                        semantic_audit_mode=args.semantic_audit_mode,
+                        joint_semantic_audit_max_tokens=args.joint_semantic_audit_max_tokens,
                         prompt_profile=args.generation_prompt_profile,
                     ),
                 )
@@ -1338,17 +1349,86 @@ def _generation_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     semantic_codes: dict[str, int] = defaultdict(int)
     success_by_round: dict[str, int] = defaultdict(int)
     warning_ids: list[str] = []
+    round_mechanical: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    round_semantic: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    semantic_modes: dict[str, int] = defaultdict(int)
+    finish_reasons: dict[str, int] = defaultdict(int)
+    semantic_eligible_rounds = 0
+    semantic_invoked_rounds = 0
+    semantic_actual_requests = 0
+    semantic_cache_hits = 0
+    semantic_prompt_tokens = 0
+    semantic_completion_tokens = 0
+    semantic_total_tokens = 0
+    semantic_latency_ms = 0.0
+    semantic_schema_retries = 0
+    root_rejected_ids: list[str] = []
+    accepted_root_audits: list[dict[str, Any]] = []
     for row in generation_rows:
         details = row.get("generation_validation") or {}
         warnings = details.get("finalWarnings") or []
         deterministic = details.get("finalDeterministicErrors") or []
         semantic = details.get("finalSemanticErrors") or []
+        source_id = str(row.get("source_id") or row.get("id") or "")
         for item in warnings:
             warning_codes[str(item.get("code") or "unknown")] += 1
         for item in deterministic:
             deterministic_codes[str(item.get("code") or "unknown")] += 1
         for item in semantic:
             semantic_codes[str(item.get("code") or "unknown")] += 1
+        if any(str(item.get("code") or "") in {
+            "rootTargetObject", "rootAnswerGrounding",
+        } for item in semantic):
+            root_rejected_ids.append(source_id)
+        for round_item in details.get("generationRounds") or []:
+            round_key = str(round_item.get("round") or "unknown")
+            for issue in round_item.get("deterministicErrors") or []:
+                round_mechanical[round_key][str(issue.get("code") or "unknown")] += 1
+            for issue in round_item.get("semanticErrors") or []:
+                round_semantic[round_key][str(issue.get("code") or "unknown")] += 1
+            validation = round_item.get("validation") or {}
+            if validation.get("mechanicalPassed"):
+                semantic_eligible_rounds += 1
+            if validation.get("semanticAuditInvoked"):
+                semantic_invoked_rounds += 1
+                semantic_modes[str(
+                    validation.get("semanticAuditMode") or "separate"
+                )] += 1
+            semantic_actual_requests += int(
+                validation.get("semanticActualRequestCount") or 0
+            )
+            semantic_cache_hits += sum(
+                bool(value)
+                for value in (validation.get("semanticCacheHits") or {}).values()
+            )
+            audit = validation.get("semanticAudit") or {}
+            if not audit:
+                continue
+            mode = str(audit.get("mode") or "separate")
+            requests = []
+            if mode == "joint" and audit.get("jointRequest"):
+                requests.append(audit["jointRequest"])
+            else:
+                requests.extend(filter(None, (
+                    audit.get("formalDecompiler"), audit.get("wholeCotComparator"),
+                )))
+            for request in requests:
+                semantic_prompt_tokens += int(request.get("prompt_tokens") or 0)
+                semantic_completion_tokens += int(request.get("completion_tokens") or 0)
+                semantic_total_tokens += int(request.get("total_tokens") or 0)
+                finish_reasons[str(request.get("finish_reason") or "missing")] += 1
+                attempts = request.get("attempts") or []
+                semantic_schema_retries += max(0, len(attempts) - 1)
+                semantic_latency_ms += sum(
+                    float(attempt.get("latencyMs") or 0.0) for attempt in attempts
+                )
+        terminal_audit = details.get("semanticAudit") or {}
+        comparator = terminal_audit.get("wholeCotComparator") or {}
+        if row.get("status") in {"strictAccepted", "acceptedWithWarnings"} and comparator:
+            accepted_root_audits.append({
+                "sourceId": source_id,
+                "root": comparator.get("root") or {},
+            })
         if row.get("status") in {"strictAccepted", "acceptedWithWarnings"}:
             rounds = details.get("generationRounds") or []
             success_by_round[str(len(rounds))] += 1
@@ -1370,6 +1450,39 @@ def _generation_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "finalDeterministicErrorDistribution": dict(sorted(deterministic_codes.items())),
         "finalSemanticErrorCount": sum(semantic_codes.values()),
         "finalSemanticErrorDistribution": dict(sorted(semantic_codes.items())),
+        "terminalStatusDistribution": dict(sorted(Counter(
+            str(row.get("status") or "unknown") for row in generation_rows
+        ).items())),
+        "perRoundMechanicalErrorDistribution": {
+            key: dict(sorted(value.items())) for key, value in sorted(
+                round_mechanical.items(), key=lambda item: int(item[0])
+            )
+        },
+        "perRoundSemanticErrorDistribution": {
+            key: dict(sorted(value.items())) for key, value in sorted(
+                round_semantic.items(), key=lambda item: int(item[0])
+            )
+        },
+        "semanticAudit": {
+            "modeRoundDistribution": dict(sorted(semantic_modes.items())),
+            "eligibleRounds": semantic_eligible_rounds,
+            "invokedRounds": semantic_invoked_rounds,
+            "actualRequests": semantic_actual_requests,
+            "cacheHits": semantic_cache_hits,
+            "promptTokens": semantic_prompt_tokens,
+            "completionTokens": semantic_completion_tokens,
+            "totalTokens": semantic_total_tokens,
+            "latencyMs": round(semantic_latency_ms, 3),
+            "schemaRetries": semantic_schema_retries,
+            "finishReasonDistribution": dict(sorted(finish_reasons.items())),
+            "auditErrors": sum(
+                row.get("status") == "semanticAuditError" for row in generation_rows
+            ),
+        },
+        "rootRejectedSourceIds": sorted(set(root_rejected_ids)),
+        "acceptedRootAudits": sorted(
+            accepted_root_audits, key=lambda item: item["sourceId"],
+        ),
     }
 
 
