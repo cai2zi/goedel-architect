@@ -5,7 +5,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -95,6 +95,17 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
         blueprint = _parse_blueprint(self.MINIMAL, "root")
         self.assertEqual(_contract_errors(blueprint, "root"), [])
 
+    def test_generation_prompt_treats_definitions_as_global_context(self) -> None:
+        messages = _messages(
+            target_name="root", informal_statement="problem",
+            informal_proof="cot", claimed_answer="1",
+            previous_blueprint="", previous_feedback="",
+        )
+        system = " ".join(messages[0]["content"].split())
+        self.assertIn("global context shared by every proof node", system)
+        self.assertIn("if a definition is already listed", system)
+        self.assertIn("mere existence does not ground", system)
+
     def test_static_shadow_errors_do_not_block_acceptance(self) -> None:
         comparator = SimpleNamespace(passed=True)
         validation = BlueprintValidation(
@@ -107,10 +118,11 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
         )
         self.assertTrue(validation.passed)
 
-    def test_whole_file_failure_short_circuits_semantic_audit(self) -> None:
-        compiler = SimpleNamespace(check_blueprint=lambda *_: CompilerResult(
-            False, errors=["bad syntax"], failure_kind="lean"
+    def test_formal_blueprint_failure_uses_one_compile_and_short_circuits_audit(self) -> None:
+        check_blueprint = Mock(return_value=CompilerResult(
+            False, errors=["bad syntax"], failure_kind="lean",
         ))
+        compiler = SimpleNamespace(check_blueprint=check_blueprint)
         with patch("blueprint_generation._with_semantic_audit") as audit:
             _blueprint, validation, deterministic, semantic, _warnings = _validate_round(
                 self.MINIMAL, target_name="root", compiler=compiler,
@@ -131,8 +143,48 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
                 decompiler_cache={}, comparator_cache={}, joint_cache={},
             )
         audit.assert_not_called()
-        self.assertEqual(validation.mechanical_failure_stage, "whole_file_lean")
+        self.assertEqual(check_blueprint.call_count, 1)
+        self.assertEqual(check_blueprint.call_args.args[0], _blueprint.lean_file)
+        self.assertIn("sorry_using [model]", _blueprint.lean_file)
+        self.assertEqual(validation.mechanical_failure_stage, "canonical_lean")
         self.assertTrue(deterministic)
+        self.assertFalse(semantic)
+
+    def test_eligible_round_compiles_whole_formal_blueprint_once(self) -> None:
+        check_blueprint = Mock(return_value=CompilerResult(True))
+        compiler = SimpleNamespace(check_blueprint=check_blueprint)
+        standalone = Phase2StandaloneReport((), 2, 0, 1.0)
+        with (
+            patch(
+                "blueprint_generation.phase2_standalone_contract_report",
+                return_value=standalone,
+            ),
+            patch(
+                "blueprint_generation._with_semantic_audit",
+                side_effect=lambda validation, *_args, **_kwargs: validation,
+            ),
+        ):
+            blueprint, validation, deterministic, semantic, _warnings = _validate_round(
+                self.MINIMAL, target_name="root", compiler=compiler,
+                informal_statement="problem", informal_proof="cot", claimed_answer="1",
+                standalone_concurrency=1, client=object(), model="model",
+                decompiler_max_tokens=16, comparator_max_tokens=16,
+                semantic_format_attempts=2, semantic_audit_enable_thinking=True,
+                semantic_audit_temperature=0.0, semantic_audit_top_p=0.95,
+                semantic_audit_top_k=20, semantic_audit_min_p=0.0,
+                semantic_audit_presence_penalty=0.0,
+                semantic_audit_repetition_penalty=1.0,
+                semantic_audit_mode="direct", node_naming="semantic",
+                joint_semantic_audit_max_tokens=32768,
+                tokenizer_path="unused", model_max_context=40960,
+                context_safety_margin=512, tracer=None,
+                thm_name="id", round_index=1, standalone_cache={},
+                decompiler_cache={}, comparator_cache={}, joint_cache={},
+            )
+        self.assertEqual(check_blueprint.call_count, 1)
+        self.assertEqual(check_blueprint.call_args.args[0], blueprint.lean_file)
+        self.assertIs(validation.lean_result, validation.canonical_lean_result)
+        self.assertFalse(deterministic)
         self.assertFalse(semantic)
 
     def test_eligible_round_request_counts_differ_by_audit_mode(self) -> None:
@@ -277,6 +329,7 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
             semantic_request_count=2, semantic_output_budget=32768,
         )
         from blueprint_generation import SemanticAuditExecutionError
+        formal_blueprint = _parse_blueprint(self.MINIMAL, "root")
         with (
             patch("blueprint_generation.make_client", return_value=object()),
             patch("blueprint_generation.generation_request_budget", return_value=(100, 1000)),
@@ -286,7 +339,9 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
             patch("blueprint_generation._submitted_code", return_value=(self.MINIMAL, ())),
             patch(
                 "blueprint_generation._validate_round",
-                side_effect=SemanticAuditExecutionError("schema failed", validation),
+                side_effect=SemanticAuditExecutionError(
+                    "schema failed", validation, formal_blueprint,
+                ),
             ),
             self.assertRaises(BlueprintGenerationError) as caught,
         ):
@@ -315,6 +370,10 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
         )
         self.assertEqual(
             caught.exception.validation_details["semanticActualRequestCount"], 2,
+        )
+        self.assertEqual(caught.exception.last_candidate, formal_blueprint.lean_file)
+        self.assertEqual(
+            caught.exception.candidate_history[-1], formal_blueprint.lean_file,
         )
 
     def test_submission_requires_one_full_lean_compile_call(self) -> None:

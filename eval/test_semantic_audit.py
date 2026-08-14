@@ -12,7 +12,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from blueprint import _parse_blueprint  # noqa: E402
+from semantic_fidelity import validate_blueprint_fidelity  # noqa: E402
 from semantic_audit import (  # noqa: E402
+    COMPACT_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT,
+    DIRECT_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT,
     FormalDecompilerResult,
     JOINT_SEMANTIC_EFFECT_ALIASES,
     JOINT_WHOLE_COT_SYSTEM_PROMPT,
@@ -32,6 +35,7 @@ from semantic_audit import (  # noqa: E402
     run_formal_decompiler,
     run_joint_whole_cot_audit,
     semantic_audit_cache_key,
+    unreachable_proof_node_names,
     whole_cot_comparator_messages,
 )
 
@@ -121,7 +125,37 @@ class SemanticAuditTest(unittest.TestCase):
         self.assertEqual(declarations["root"], "theorem root : sourceValue = 6")
         self.assertNotIn("blueprint", "\n".join(declarations.values()))
         self.assertNotIn("sorry_using", declarations["root"])
-        self.assertEqual(self.view.root_closure, ("sourceValue", "root"))
+        self.assertEqual(self.view.global_definition_names, ("sourceValue",))
+        self.assertEqual(self.view.root_closure, ("root",))
+        nodes = {node.node_name: node for node in self.view.nodes}
+        self.assertEqual(nodes["sourceValue"].dependencies, ())
+        self.assertEqual(nodes["root"].dependencies, ())
+        self.assertEqual(unreachable_proof_node_names(self.view), ())
+
+    def test_formal_view_uses_global_definitions_and_explicit_proof_edges(self) -> None:
+        lean = LEAN.replace(
+            "theorem root : sourceValue = 6 := by\n  sorry_using [sourceValue]",
+            """lemma orphan : sourceValue = 6 := by sorry_using [sourceValue]
+
+@[blueprint] lemma support : sourceValue = 6 := by sorry_using [sourceValue]
+
+@[blueprint] theorem root : sourceValue = 6 := by
+  sorry_using [sourceValue, support]""",
+        )
+        view = build_formal_view(_parse_blueprint(lean, "root"))
+        nodes = {node.node_name: node for node in view.nodes}
+        self.assertEqual(view.global_definition_names, ("sourceValue",))
+        self.assertEqual(nodes["sourceValue"].dependencies, ())
+        self.assertEqual(nodes["orphan"].dependencies, ())
+        self.assertEqual(nodes["support"].dependencies, ())
+        self.assertEqual(nodes["root"].dependencies, ("support",))
+        self.assertEqual(view.root_closure, ("support", "root"))
+        self.assertEqual(unreachable_proof_node_names(view), ("orphan",))
+        warnings = [
+            issue for issue in validate_blueprint_fidelity(_parse_blueprint(lean, "root"))
+            if issue.code == "nodeNotRootReachable"
+        ]
+        self.assertEqual([issue.node_name for issue in warnings], ["orphan"])
 
     def test_decompiler_requires_exact_ordered_node_inventory(self) -> None:
         decompiler = _decompiler(self.view)
@@ -203,6 +237,21 @@ class SemanticAuditTest(unittest.TestCase):
             "unreachable_nodes", comparator_payload["required_output_shape"],
         )
         self.assertIn("frozen_node_translations", comparator_payload)
+        self.assertEqual(
+            comparator_payload["graph"]["global_definition_names"],
+            ["sourceValue"],
+        )
+        self.assertEqual(
+            comparator_payload["graph"]["proof_dependencies"],
+            {"root": []},
+        )
+        self.assertEqual(
+            comparator_payload["graph"]["proof_root_closure"], ["root"],
+        )
+        self.assertEqual(
+            comparator_payload["required_output_shape"]["dependency_issues"][0]["node_name"],
+            "root",
+        )
 
     def test_compact_pass_ignores_unreachable_shadow_but_keeps_dependencies(self) -> None:
         view = build_formal_view(_parse_blueprint(LEAN, "root"))
@@ -227,7 +276,44 @@ class SemanticAuditTest(unittest.TestCase):
         self.assertIn("formal_view", payload)
         self.assertNotIn("sha256", payload["formal_view"])
         self.assertNotIn("frozen_node_translations", payload)
-        self.assertIn("declaration", payload["formal_view"]["nodes"][0])
+        self.assertIn("declaration", payload["formal_view"]["global_definitions"][0])
+        self.assertIn("declaration", payload["formal_view"]["proof_nodes"][0])
+        self.assertEqual(payload["formal_view"]["proof_root_closure"], ["root"])
+
+    def test_compact_dependency_issue_on_global_definition_is_anchored_at_root(self) -> None:
+        view = build_formal_view(_parse_blueprint(LEAN, "root"))
+        payload = _whole_cot_payload()
+        payload.pop("unreachable_nodes")
+        payload["dependency_issues"] = [
+            {"node_name": "sourceValue", "reason": "not connected"}
+        ]
+        parsed = parse_compact_whole_cot_comparator(json.dumps(payload), view=view)
+        self.assertEqual(
+            parsed[3], ({"node_name": "root", "reason": "not connected"},),
+        )
+        self.assertFalse(parsed[-1])
+
+    def test_compact_dependency_issue_still_rejects_unknown_node_name(self) -> None:
+        view = build_formal_view(_parse_blueprint(LEAN, "root"))
+        payload = _whole_cot_payload()
+        payload.pop("unreachable_nodes")
+        payload["dependency_issues"] = [
+            {"node_name": "not_a_supplied_node", "reason": "not connected"}
+        ]
+        with self.assertRaises(SemanticAuditFormatError):
+            parse_compact_whole_cot_comparator(json.dumps(payload), view=view)
+
+    def test_compact_prompts_treat_definitions_as_global_but_not_grounding(self) -> None:
+        for prompt in (
+            COMPACT_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT,
+            DIRECT_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT,
+        ):
+            with self.subTest(prompt=prompt[:30]):
+                normalized = " ".join(prompt.split())
+                self.assertIn("global context", normalized)
+                self.assertIn("availability gives no semantic credit", normalized)
+                self.assertIn("Verification, abandoned derivations", normalized)
+                self.assertIn("side branches", normalized)
 
     def test_semantic_audit_forwards_thinking_sampling(self) -> None:
         raw = _decompiler(self.view).raw_content

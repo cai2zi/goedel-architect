@@ -161,8 +161,12 @@ def effective_blueprint_dependencies(
     ]))
 
 
-def _root_reachable_names(blueprint: Blueprint) -> set[str]:
+def _root_reachable_proof_names(blueprint: Blueprint) -> set[str]:
+    """Follow only explicit lemma/theorem dependencies from the root."""
     node_map = blueprint.nodes_by_name()
+    proof_names = {
+        node.name for node in blueprint.nodes if node.kind != "definition"
+    }
     reachable: set[str] = set()
     stack = [blueprint.target_theorem]
     while stack:
@@ -170,10 +174,13 @@ def _root_reachable_names(blueprint: Blueprint) -> set[str]:
         if name in reachable:
             continue
         node = node_map.get(name)
-        if node is None:
+        if node is None or name not in proof_names:
             continue
         reachable.add(name)
-        stack.extend(effective_blueprint_dependencies(node, node_map))
+        stack.extend(
+            dependency for dependency in node.dependencies
+            if dependency in proof_names
+        )
     return reachable
 
 
@@ -729,14 +736,17 @@ def validate_blueprint_fidelity(
         ))
         return issues
 
-    reachable = _root_reachable_names(blueprint)
-    node_map = blueprint.nodes_by_name()
+    reachable = _root_reachable_proof_names(blueprint)
     for node in blueprint.nodes:
-        if node.name not in reachable:
+        if (
+            node.kind != "definition"
+            and node.name != blueprint.target_theorem
+            and node.name not in reachable
+        ):
             issues.append(_issue(
                 "nodeNotRootReachable",
-                "Every Blueprint node must be in the root's transitive semantic "
-                "dependency closure.",
+                "Every material proof node should be in the root's transitive "
+                "explicit proof-dependency closure.",
                 node=node,
                 category="binding",
                 contract=contract,
@@ -870,12 +880,6 @@ def validate_blueprint_fidelity(
             category="answerGrounding",
             contract=contract,
         ))
-    proof_ancestors = {
-        name for name in reachable - {root.name}
-        if (candidate := node_map.get(name)) is not None
-        and candidate.kind in {"lemma", "theorem"}
-    }
-    del proof_ancestors
     return issues
 
 

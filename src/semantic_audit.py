@@ -18,8 +18,8 @@ from tracer import TraceEvent
 
 
 WHOLE_COT_PROMPT_VERSION = "whole-cot-comparator-v1"
-COMPACT_WHOLE_COT_PROMPT_VERSION = "whole-cot-compact-separate-v1"
-DIRECT_WHOLE_COT_PROMPT_VERSION = "whole-cot-direct-comparator-v1"
+COMPACT_WHOLE_COT_PROMPT_VERSION = "whole-cot-compact-separate-v2-global-defs"
+DIRECT_WHOLE_COT_PROMPT_VERSION = "whole-cot-direct-comparator-v2-global-defs"
 JOINT_WHOLE_COT_PROMPT_VERSION = "whole-cot-joint-audit-v2"
 SEMANTIC_EFFECTS = {"objectDefinition", "proposition", "vacuous"}
 JOINT_SEMANTIC_EFFECT_ALIASES = {
@@ -118,9 +118,19 @@ unbound objects, wrong relation or direction, answer hard-coding, material
 dependency breaks, and an unrelated root. Identifier names are opaque handles
 and carry no semantic credit.
 
+All supplied definitions are global context available to every proof node.
+Definitions need not occur in `sorry_using`; an existing definition entry in
+`sorry_using` is harmless and is not a proof-graph edge. Never report a
+dependency issue because a definition is absent from `sorry_using`. Mere global
+availability gives no semantic credit: a required source object or relation is
+grounded only when the root or a root-reachable proposition actually references,
+constrains, or relates it.
+
 Audit in this order: probability and quantifiers; target object and relation;
 root grounding; then material dependency use-chains. Do not report a
-dependency issue merely because a node is outside `root_closure`. Report one
+dependency issue merely because a proof node is outside `proof_root_closure`.
+Verification, abandoned derivations, and legitimate side branches need not
+support the root. Report one
 only when the COT materially requires that translated object or proposition to
 support the root and the supplied dependency graph has no path carrying it to
 the root. Do not duplicate one defect across categories.
@@ -134,7 +144,8 @@ be empty when both root booleans are true. Return one JSON object with exactly
 has exactly `clause`, `node_names`, and `reason`. `root` has exactly
 `translation`, `target_object_preserved`, `answer_grounded`, and `reasons`.
 Each dependency issue has exactly `node_name` and `reason`. Use only supplied
-node names. Return JSON only, no Markdown or extra keys. Be terse: at most six
+proof-node names for dependency issues. Return JSON only, no Markdown or extra
+keys. Be terse: at most six
 clause issues total, and keep each clause and reason under 50 words.
 """
 
@@ -151,10 +162,21 @@ objects, wrong relation or direction, answer hard-coding, vacuous True or
 reflexive shells replacing substantive claims, material dependency breaks,
 and an unrelated root. Audit in this order: probability and quantifiers;
 target object and relation; root grounding; then material dependency
-use-chains. Do not report a dependency issue merely because a node is outside
-`root_closure`; report one only when material COT content cannot reach the
-root. Do not infer intended mathematics from names and do not duplicate one
-defect across categories.
+use-chains.
+
+All supplied definitions are global context available to every proof node.
+Definitions need not occur in `sorry_using`; an existing definition entry in
+`sorry_using` is harmless and is not a proof-graph edge. Never report a
+dependency issue because a definition is absent from `sorry_using`. Mere global
+availability gives no semantic credit: a required source object or relation is
+grounded only when the root or a root-reachable proposition actually references,
+constrains, or relates it.
+
+Do not report a dependency issue merely because a proof node is outside
+`proof_root_closure`. Verification, abandoned derivations, and legitimate side
+branches need not support the root. Report one only when material COT content
+cannot reach the root. Do not infer intended mathematics from names and do not
+duplicate one defect across categories.
 
 Return one JSON object with exactly `cot`, `root`, and `dependency_issues`.
 `cot` has exactly `combined_formal_translation`, `missing_clauses`,
@@ -162,8 +184,8 @@ Return one JSON object with exactly `cot`, `root`, and `dependency_issues`.
 Each clause issue has exactly `clause`, `node_names`, and `reason`. `root` has
 exactly `translation`, `target_object_preserved`, `answer_grounded`, and
 `reasons`; reasons must be empty when both booleans are true. Each dependency
-issue has exactly `node_name` and `reason`. Use only supplied node names.
-Return JSON only, no Markdown or extra keys. Be terse: at most six clause
+issue has exactly `node_name` and `reason`. Use only supplied proof-node names
+for dependency issues. Return JSON only, no Markdown or extra keys. Be terse: at most six clause
 issues total, and keep each clause and reason under 50 words.
 """
 
@@ -214,14 +236,15 @@ class FormalView:
     nodes: tuple[FormalNodeView, ...]
     root_name: str
     root_closure: tuple[str, ...]
+    global_definition_names: tuple[str, ...]
     sha256: str
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "nodes": [asdict(node) for node in self.nodes],
             "root_name": self.root_name,
-            "root_closure": list(self.root_closure),
-            "sha256": self.sha256,
+            "global_definition_names": list(self.global_definition_names),
+            "proof_root_closure": list(self.root_closure),
         }
 
 
@@ -362,34 +385,46 @@ def _strip_lean_comments(text: str) -> str:
 
 
 def build_formal_view(blueprint: Any) -> FormalView:
-    node_names = {node.name for node in blueprint.nodes}
+    node_map = {node.name: node for node in blueprint.nodes}
+    proof_names = {
+        node.name for node in blueprint.nodes if node.kind != "definition"
+    }
+    global_definition_names = tuple(
+        node.name for node in blueprint.nodes if node.kind == "definition"
+    )
     declarations: dict[str, str] = {}
-    effective: dict[str, tuple[str, ...]] = {}
+    proof_dependencies: dict[str, tuple[str, ...]] = {}
     for node in blueprint.nodes:
         raw = node.full_declaration() if node.kind == "definition" else node.signature()
         declaration = _strip_lean_comments(raw)
         declarations[node.name] = declaration
-        effective[node.name] = tuple(
-            dep for dep in node.dependencies if dep in node_names
+        proof_dependencies[node.name] = tuple(
+            dep for dep in node.dependencies
+            if dep in proof_names and node_map[dep].kind != "definition"
         )
     closure: set[str] = set()
     stack = [blueprint.target_theorem]
     while stack:
         name = stack.pop()
-        if name in closure or name not in node_names:
+        if name in closure or name not in proof_names:
             continue
         closure.add(name)
-        stack.extend(effective.get(name, ()))
+        stack.extend(proof_dependencies.get(name, ()))
     views = tuple(FormalNodeView(
         node.name,
         node.kind,
-        effective[node.name],
+        proof_dependencies[node.name],
         declarations[node.name],
         node.name == blueprint.target_theorem,
-        node.name in closure,
+        node.kind != "definition" and node.name in closure,
     ) for node in blueprint.nodes)
     payload = json.dumps(
-        {"root": blueprint.target_theorem, "nodes": [asdict(node) for node in views]},
+        {
+            "root": blueprint.target_theorem,
+            "global_definition_names": global_definition_names,
+            "proof_root_closure": sorted(closure),
+            "nodes": [asdict(node) for node in views],
+        },
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -397,22 +432,37 @@ def build_formal_view(blueprint: Any) -> FormalView:
     return FormalView(
         views,
         blueprint.target_theorem,
-        tuple(node.node_name for node in views if node.in_root_closure),
+        tuple(
+            node.node_name for node in views
+            if node.kind != "definition" and node.in_root_closure
+        ),
+        global_definition_names,
         hashlib.sha256(payload.encode()).hexdigest(),
+    )
+
+
+def unreachable_proof_node_names(view: FormalView) -> tuple[str, ...]:
+    """Return only non-root proof nodes outside the explicit proof closure."""
+    return tuple(
+        node.node_name for node in view.nodes
+        if node.kind != "definition" and not node.is_root and not node.in_root_closure
     )
 
 
 def formal_decompiler_messages(view: FormalView) -> list[dict[str, str]]:
     inventory = []
     for node in view.nodes:
-        item = {
+        item: dict[str, Any] = {
             "node_name": node.node_name,
             "kind": node.kind,
-            "dependencies": list(node.dependencies),
             "is_root": node.is_root,
-            "in_root_closure": node.in_root_closure,
             "sanitized_formal_lean": node.declaration,
         }
+        if node.kind == "definition":
+            item["scope"] = "global_definition"
+        else:
+            item["dependencies"] = list(node.dependencies)
+            item["in_root_closure"] = node.in_root_closure
         inventory.append(item)
     return [
         {"role": "system", "content": DECOMPILER_SYSTEM_PROMPT},
@@ -586,7 +636,7 @@ def whole_cot_comparator_messages(
     view: FormalView,
     decompiler: FormalDecompilerResult,
 ) -> list[dict[str, str]]:
-    unreachable = [node.node_name for node in view.nodes if not node.in_root_closure]
+    unreachable = list(unreachable_proof_node_names(view))
     payload = {
         "problem": informal_statement,
         "claimed_answer": claimed_answer,
@@ -619,10 +669,12 @@ def whole_cot_comparator_messages(
 def _compact_graph(view: FormalView) -> dict[str, Any]:
     return {
         "root": view.root_name,
-        "dependencies": {
-            node.node_name: list(node.dependencies) for node in view.nodes
+        "global_definition_names": list(view.global_definition_names),
+        "proof_dependencies": {
+            node.node_name: list(node.dependencies)
+            for node in view.nodes if node.kind != "definition"
         },
-        "root_closure": list(view.root_closure),
+        "proof_root_closure": list(view.root_closure),
     }
 
 
@@ -650,7 +702,7 @@ def compact_whole_cot_comparator_messages(
                 "translation": "...", "target_object_preserved": True,
                 "answer_grounded": True, "reasons": [],
             },
-            "dependency_issues": [{"node_name": "n", "reason": "..."}],
+            "dependency_issues": [{"node_name": view.root_name, "reason": "..."}],
         },
     }
     return [
@@ -667,8 +719,16 @@ def direct_whole_cot_comparator_messages(
 ) -> list[dict[str, str]]:
     formal_view = {
         "root_name": view.root_name,
-        "root_closure": list(view.root_closure),
-        "nodes": [asdict(node) for node in view.nodes],
+        "global_definitions": [
+            {
+                "node_name": node.node_name,
+                "kind": node.kind,
+                "declaration": node.declaration,
+            }
+            for node in view.nodes if node.kind == "definition"
+        ],
+        "proof_nodes": [asdict(node) for node in view.nodes if node.kind != "definition"],
+        "proof_root_closure": list(view.root_closure),
     }
     payload = {
         "problem": informal_statement,
@@ -686,7 +746,7 @@ def direct_whole_cot_comparator_messages(
                 "translation": "...", "target_object_preserved": True,
                 "answer_grounded": True, "reasons": [],
             },
-            "dependency_issues": [{"node_name": "n", "reason": "..."}],
+            "dependency_issues": [{"node_name": view.root_name, "reason": "..."}],
         },
     }
     return [
@@ -707,6 +767,9 @@ def parse_compact_whole_cot_comparator(
             "invalid compact comparator top-level keys", raw_content=content,
         )
     known_nodes = {node.node_name for node in view.nodes}
+    proof_nodes = {
+        node.node_name for node in view.nodes if node.kind != "definition"
+    }
     cot = value["cot"]
     if not isinstance(cot, dict) or set(cot) != _WHOLE_COT_KEYS:
         raise SemanticAuditFormatError("cot has invalid keys", raw_content=content)
@@ -755,8 +818,17 @@ def parse_compact_whole_cot_comparator(
         if not isinstance(item, dict) or set(item) != {"node_name", "reason"}:
             raise SemanticAuditFormatError("dependency issue has invalid keys", raw_content=content)
         node_name = _string(item["node_name"], "dependency node", content)
-        if node_name not in known_nodes:
-            raise SemanticAuditFormatError("dependency issue has unknown node", raw_content=content)
+        if node_name in known_nodes and node_name not in proof_nodes:
+            # A dependency defect is a broken material path into the proof
+            # graph.  Comparators sometimes attach that defect to the global
+            # definition whose semantics failed to reach the proof spine.
+            # Definitions are global context rather than graph vertices, so
+            # retain the rejecting issue but anchor it at the root proof node.
+            node_name = view.root_name
+        if node_name not in proof_nodes:
+            raise SemanticAuditFormatError(
+                "dependency issue must name a proof node", raw_content=content,
+            )
         dependencies.append({
             "node_name": node_name,
             "reason": _string(item["reason"], "dependency reason", content),
@@ -816,7 +888,7 @@ def parse_whole_cot_comparator(
         "reasons": list(_strings(root["reasons"], "root.reasons", content)),
     }
 
-    expected_unreachable = [node.node_name for node in view.nodes if not node.in_root_closure]
+    expected_unreachable = list(unreachable_proof_node_names(view))
     raw_unreachable = value["unreachable_nodes"]
     if not isinstance(raw_unreachable, list):
         raise SemanticAuditFormatError("unreachable_nodes must be an array", raw_content=content)
@@ -874,7 +946,7 @@ def joint_whole_cot_audit_messages(
     claimed_answer: str,
     view: FormalView,
 ) -> list[dict[str, str]]:
-    unreachable = [node.node_name for node in view.nodes if not node.in_root_closure]
+    unreachable = list(unreachable_proof_node_names(view))
     node_shape = {
         "node_name": "n", "kind": "definition", "translation": "...",
         "semantic_effect": "objectDefinition", "introduced_objects": [],
@@ -1078,7 +1150,10 @@ def _run_stage(
                 schema_guidance = (
                     "Top-level keys are exactly cot, root, and dependency_issues. "
                     "Every COT clause issue is exactly {clause,node_names,reason}; "
-                    "use supplied node names only and return at most six clause issues."
+                    "dependency_issues.node_name must be a proof-node name (a key "
+                    "of graph.proof_dependencies for compact input); use the root "
+                    "proof node for a material chain that fails to reach the root. "
+                    "Use supplied node names only and return at most six clause issues."
                 )
             elif operation == "joint_whole_cot_audit":
                 schema_guidance = (
@@ -1534,6 +1609,7 @@ __all__ = [
     "build_formal_view",
     "compact_formal_decompiler_messages", "formal_decompiler_messages",
     "parse_formal_decompiler", "run_formal_decompiler",
+    "unreachable_proof_node_names",
     "compact_whole_cot_comparator_messages",
     "direct_whole_cot_comparator_messages",
     "parse_compact_whole_cot_comparator",

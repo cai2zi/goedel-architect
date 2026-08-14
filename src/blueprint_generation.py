@@ -56,6 +56,7 @@ from semantic_audit import (
     run_joint_whole_cot_audit,
     run_whole_cot_comparator,
     semantic_audit_cache_key,
+    unreachable_proof_node_names,
     whole_cot_comparator_defects,
     whole_cot_comparator_messages,
 )
@@ -74,6 +75,14 @@ proposition must be concrete Lean. Proof bodies remain exactly
 when it is mathematically wrong. Preserve shared objects, relation directions,
 quantifiers, dependencies, and the final target. Do not use `COT_STEP` titles;
 Blueprint `title` metadata is optional and carries no semantic credit.
+
+Every Blueprint definition is global context shared by every proof node.
+Definitions need not be listed in `sorry_using`; if a definition is already
+listed, it may remain and is not a proof-graph dependency. Do not add a
+definition to `sorry_using` merely to make it root-reachable. A definition's
+mere existence does not ground the final theorem: required source objects and
+relations must be referenced, constrained, or related by the root or by a
+root-supporting proposition.
 
 `title`, `statement`, and `proof` metadata are optional. Call `lean_compile`
 exactly once with the entire replacement file. Do not return prose or a partial
@@ -157,9 +166,15 @@ class BlueprintValidation:
 class SemanticAuditExecutionError(RuntimeError):
     """Terminal Decompiler/Comparator failure after its schema retry budget."""
 
-    def __init__(self, message: str, validation: BlueprintValidation):
+    def __init__(
+        self,
+        message: str,
+        validation: BlueprintValidation,
+        blueprint: Blueprint,
+    ):
         super().__init__(message)
         self.validation = validation
+        self.blueprint = blueprint
 
 
 def validation_details(validation: BlueprintValidation) -> dict[str, Any]:
@@ -261,9 +276,7 @@ def _with_semantic_audit(
     round_index: int,
 ) -> BlueprintValidation:
     view = build_formal_view(blueprint)
-    unreachable_shadow = tuple(
-        node.node_name for node in view.nodes if not node.in_root_closure
-    )
+    unreachable_shadow = unreachable_proof_node_names(view)
     validation.graph_shadow_unreachable_nodes = unreachable_shadow
     if tracer:
         tracer.emit(TraceEvent(
@@ -703,8 +716,9 @@ def _messages(
     system = (
         ROBUSTPA_BLUEPRINT_MINIMAL_SYSTEM_PROMPT
         if prompt_profile == "whole_cot_minimal"
-        else ROBUSTPA_BLUEPRINT_SYSTEM_PROMPT + WHOLE_COT_GENERATION_SYSTEM_SUFFIX
+        else ROBUSTPA_BLUEPRINT_SYSTEM_PROMPT
     )
+    system += WHOLE_COT_GENERATION_SYSTEM_SUFFIX
     if node_naming == "anonymous":
         system += ANONYMOUS_NODE_NAMING_SUFFIX
     return [
@@ -894,32 +908,13 @@ def _validate_round(
         )
         return candidate, validation, _deduplicate(deterministic), (), ()
 
-    lean_result = compiler.check_blueprint(code, target_name)
-    if lean_result.failure_kind == "infra":
-        raise KiminaInfrastructureError(
-            "\n".join(lean_result.diagnostics) or lean_result.raw_output[-2000:]
-        )
-    warnings.extend(_non_sorry_warnings(
-        lean_result.warnings, "leanWarning", stage="whole_file_lean",
-    ))
-    if not lean_result.success:
-        deterministic.extend(
-            _issue("wholeFileLean", value, stage="whole_file_lean")
-            for value in lean_result.diagnostics
-        )
-        validation = _mechanical_validation(
-            whole_result=lean_result, stage_reached="whole_file_lean",
-            failure_stage="whole_file_lean",
-            semantic_audit_mode=semantic_audit_mode,
-        )
-        return candidate, validation, _deduplicate(deterministic), (), _deduplicate(warnings)
-
     try:
         formal_blueprint = canonicalize_blueprint(candidate, list(candidate.nodes))
     except ValueError as exc:
         deterministic.append(_issue("canonicalRebuild", str(exc), stage="canonical_rebuild"))
         validation = _mechanical_validation(
-            whole_result=lean_result, stage_reached="canonical_rebuild",
+            whole_result=_failed_compile("formal blueprint Lean not run"),
+            stage_reached="canonical_rebuild",
             failure_stage="canonical_rebuild",
             semantic_audit_mode=semantic_audit_mode,
         )
@@ -932,27 +927,28 @@ def _validate_round(
         ))
     if structural:
         validation = _mechanical_validation(
-            whole_result=lean_result, stage_reached="phase2_contract",
+            whole_result=_failed_compile("formal blueprint Lean not run"),
+            stage_reached="phase2_contract",
             failure_stage="phase2_contract", structural=structural,
             semantic_audit_mode=semantic_audit_mode,
         )
         return formal_blueprint, validation, _deduplicate(deterministic), (), _deduplicate(warnings)
 
-    canonical_result = compiler.check_blueprint(formal_blueprint.lean_file, target_name)
-    if canonical_result.failure_kind == "infra":
+    formal_result = compiler.check_blueprint(formal_blueprint.lean_file, target_name)
+    if formal_result.failure_kind == "infra":
         raise KiminaInfrastructureError(
-            "\n".join(canonical_result.diagnostics) or canonical_result.raw_output[-2000:]
+            "\n".join(formal_result.diagnostics) or formal_result.raw_output[-2000:]
         )
     warnings.extend(_non_sorry_warnings(
-        canonical_result.warnings, "canonicalLeanWarning", stage="canonical_lean",
+        formal_result.warnings, "canonicalLeanWarning", stage="canonical_lean",
     ))
-    if not canonical_result.success:
+    if not formal_result.success:
         deterministic.extend(
             _issue("canonicalLean", value, stage="canonical_lean")
-            for value in canonical_result.diagnostics
+            for value in formal_result.diagnostics
         )
         validation = _mechanical_validation(
-            whole_result=lean_result, canonical_result=canonical_result,
+            whole_result=formal_result, canonical_result=formal_result,
             stage_reached="canonical_lean", failure_stage="canonical_lean",
             semantic_audit_mode=semantic_audit_mode,
         )
@@ -970,7 +966,7 @@ def _validate_round(
         ))
     if standalone.issues:
         validation = _mechanical_validation(
-            whole_result=lean_result, canonical_result=canonical_result,
+            whole_result=formal_result, canonical_result=formal_result,
             stage_reached="phase2_standalone", failure_stage="phase2_standalone",
             structural=structural, standalone=standalone,
             semantic_audit_mode=semantic_audit_mode,
@@ -981,7 +977,7 @@ def _validate_round(
         formal_blueprint, claimed_answer=claimed_answer,
     )
     validation = _mechanical_validation(
-        whole_result=lean_result, canonical_result=canonical_result,
+        whole_result=formal_result, canonical_result=formal_result,
         stage_reached="static_shadow", failure_stage=None,
         structural=structural, standalone=standalone, static_issues=semantic_issues,
         semantic_audit_mode=semantic_audit_mode,
@@ -1025,7 +1021,7 @@ def _validate_round(
             "joint_semantic_audit"
             if semantic_audit_mode == "joint" else "formal_decompiler_or_comparator"
         )
-        raise SemanticAuditExecutionError(str(exc), validation) from exc
+        raise SemanticAuditExecutionError(str(exc), validation, formal_blueprint) from exc
 
     decompiler = validation.formal_decompiler_result
     comparator = validation.strict_comparator_result
@@ -1283,8 +1279,10 @@ def generate_blueprint(
                     joint_cache=joint_cache,
                 )
             except SemanticAuditExecutionError as exc:
-                latest_blueprint = _parse_blueprint(code, target_name)
+                latest_blueprint = exc.blueprint
                 latest_validation = exc.validation
+                previous_code = latest_blueprint.lean_file
+                candidates[-1] = previous_code
                 details = validation_details(latest_validation)
                 audit_error = _issue(
                     "semanticAuditError", exc,
@@ -1296,7 +1294,7 @@ def generate_blueprint(
                 )
                 failed_round = GenerationRound(
                     round_index=round_index,
-                    candidate_hash=hashlib.sha256(code.encode()).hexdigest(),
+                    candidate_hash=hashlib.sha256(previous_code.encode()).hexdigest(),
                     input_tokens=input_tokens,
                     max_completion_tokens=completion_budget,
                     deterministic_errors=(),
@@ -1324,16 +1322,18 @@ def generate_blueprint(
                     ))
                 raise BlueprintGenerationError(
                     "Phase 1 semantic audit exhausted its request/schema retries.",
-                    last_candidate=code, diagnostics=[str(exc)], attempt=round_index,
+                    last_candidate=previous_code, diagnostics=[str(exc)], attempt=round_index,
                     failure_stage="phase1SemanticAuditError",
                     candidate_history=candidates, candidate_labels=labels,
                     validation_details=details,
                     generation_history=[item.to_dict() for item in rounds],
                 ) from exc
+            previous_code = latest_blueprint.lean_file
+            candidates[-1] = previous_code
             previous_feedback = _feedback(
                 latest_deterministic, latest_semantic, latest_warnings,
             )
-            candidate_hash = hashlib.sha256(code.encode()).hexdigest()
+            candidate_hash = hashlib.sha256(previous_code.encode()).hexdigest()
             details = validation_details(latest_validation)
 
         round_row = GenerationRound(

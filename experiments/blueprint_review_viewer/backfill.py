@@ -11,16 +11,28 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "experiments"))
 
 from blueprint_review_viewer.review_schema import index_entry, write_review_artifact  # noqa: E402
+from blueprint_review_viewer.server import DEFAULT_OUTPUT_BASE, experiment_root  # noqa: E402
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Backfill readonly Blueprint review artifacts; never changes Lean candidates.")
-    parser.add_argument("experiment_root", type=Path, help=".../robustpa/blueprint directory containing results.jsonl")
+    parser.add_argument("experiment_name", help="experiment directory name under --output-base")
+    parser.add_argument(
+        "--output-base",
+        type=Path,
+        default=DEFAULT_OUTPUT_BASE,
+        help=f"experiment output base (default: {DEFAULT_OUTPUT_BASE})",
+    )
     args = parser.parse_args()
-    root = args.experiment_root.resolve()
+    try:
+        root = experiment_root(args.experiment_name, args.output_base)
+    except ValueError as error:
+        parser.error(str(error))
     results = root / "results.jsonl"
     if not results.is_file():
-        raise SystemExit(f"results.jsonl not found: {results}")
+        raise SystemExit(
+            f"experiment {args.experiment_name!r} has no Blueprint results: {results}"
+        )
     entries = []
     for line in results.read_text(encoding="utf-8").splitlines():
         if not line.strip():

@@ -16,10 +16,26 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "experiments"))
 
 from blueprint_review_viewer.diff import whole_file_diff  # noqa: E402
+from blueprint_review_viewer import REVIEW_SCHEMA_VERSION  # noqa: E402
 from blueprint_review_viewer.review_schema import build_review_artifact  # noqa: E402
 
 
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+DEFAULT_OUTPUT_BASE = Path("/ssd/czx/czx_work/cot_blueprint_refine")
+
+
+def experiment_root(experiment_name: str, output_base: Path = DEFAULT_OUTPUT_BASE) -> Path:
+    """Resolve an experiment name to its RobustPA Blueprint artifact directory."""
+    name = experiment_name.strip()
+    if not name or name in {".", ".."} or Path(name).name != name:
+        raise ValueError(f"invalid experiment name: {experiment_name!r}")
+    base = output_base.expanduser().resolve()
+    root = (base / name / "robustpa" / "blueprint").resolve()
+    try:
+        root.relative_to(base)
+    except ValueError as error:
+        raise ValueError(f"experiment resolves outside output base: {experiment_name!r}") from error
+    return root
 
 
 class ReviewStore:
@@ -27,16 +43,49 @@ class ReviewStore:
         self.root = experiment_root.resolve()
         self._lock = threading.Lock()
         self._cases: dict[str, dict] = {}
-        self._stamp: tuple[int, int] = (-1, -1)
+        self._stamp: tuple[int, int, int, int] = (-1, -1, -1, -1)
+        self._load_warnings: list[dict[str, object]] = []
 
     def _results_path(self) -> Path:
         return self.root / "results.jsonl"
 
-    def _current_stamp(self) -> tuple[int, int]:
+    def _current_stamp(self) -> tuple[int, int, int, int]:
         results = self._results_path()
         index = self.root / "review_index.jsonl"
-        return (results.stat().st_mtime_ns if results.exists() else -1,
-                index.stat().st_mtime_ns if index.exists() else -1)
+        results_stat = results.stat() if results.exists() else None
+        index_stat = index.stat() if index.exists() else None
+        return (
+            results_stat.st_mtime_ns if results_stat else -1,
+            results_stat.st_size if results_stat else -1,
+            index_stat.st_mtime_ns if index_stat else -1,
+            index_stat.st_size if index_stat else -1,
+        )
+
+    def _result_rows(self, results: Path) -> tuple[list[dict], list[dict[str, object]]]:
+        """Read an append-only JSONL snapshot without failing on an in-flight tail."""
+        data = results.read_bytes()
+        raw_lines = data.splitlines(keepends=True)
+        rows: list[dict] = []
+        warnings: list[dict[str, object]] = []
+        for line_number, raw_line in enumerate(raw_lines, 1):
+            if not raw_line.strip():
+                continue
+            try:
+                row = json.loads(raw_line)
+                if not isinstance(row, dict):
+                    raise ValueError("JSONL row must be an object")
+                rows.append(row)
+            except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as error:
+                is_unterminated_tail = (
+                    line_number == len(raw_lines) and not data.endswith(b"\n")
+                )
+                warnings.append({
+                    "kind": "pendingTail" if is_unterminated_tail else "invalidResultRow",
+                    "line": line_number,
+                    "byteCount": len(raw_line),
+                    "error": f"{type(error).__name__}: {error}",
+                })
+        return rows, warnings
 
     def refresh(self) -> None:
         stamp = self._current_stamp()
@@ -44,22 +93,31 @@ class ReviewStore:
             if stamp == self._stamp:
                 return
             cases: dict[str, dict] = {}
+            warnings: list[dict[str, object]] = []
             results = self._results_path()
             if results.is_file():
-                for line in results.read_text(encoding="utf-8").splitlines():
-                    if not line.strip():
-                        continue
-                    row = json.loads(line)
+                rows, warnings = self._result_rows(results)
+                for row in rows:
                     identifier = str(row.get("id", ""))
                     if not identifier:
                         continue
                     artifact_path = Path(str(row.get("review_artifact_path") or ""))
+                    artifact = None
                     if artifact_path.is_file() and self._inside(artifact_path):
-                        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
-                    else:
+                        loaded = json.loads(artifact_path.read_text(encoding="utf-8"))
+                        if (
+                            isinstance(loaded, dict)
+                            and loaded.get("schemaVersion") == REVIEW_SCHEMA_VERSION
+                        ):
+                            artifact = loaded
+                    if artifact is None:
                         artifact = build_review_artifact(self.root, row)
                     cases[identifier] = artifact
-            self._cases, self._stamp = cases, stamp
+            self._cases = cases
+            self._load_warnings = warnings
+            # Size is part of the stamp, so completion of an in-flight trailing
+            # row invalidates this snapshot even on coarse-mtime filesystems.
+            self._stamp = stamp
 
     def _inside(self, path: Path) -> bool:
         try:
@@ -88,17 +146,54 @@ class ReviewStore:
         with self._lock:
             return self._cases.get(identifier)
 
+    def diagnostics(self) -> list[dict[str, object]]:
+        self.refresh()
+        with self._lock:
+            return [dict(item) for item in self._load_warnings]
+
+
+class ExperimentCatalog:
+    def __init__(self, output_base: Path):
+        self.output_base = output_base.expanduser().resolve()
+        self._lock = threading.Lock()
+        self._stores: dict[str, ReviewStore] = {}
+
+    def experiment_names(self) -> list[str]:
+        if not self.output_base.is_dir():
+            return []
+        names: list[str] = []
+        for path in self.output_base.iterdir():
+            if not path.is_dir():
+                continue
+            try:
+                root = experiment_root(path.name, self.output_base)
+            except ValueError:
+                continue
+            if (root / "results.jsonl").is_file():
+                names.append(path.name)
+        return sorted(names)
+
+    def store(self, experiment_name: str) -> ReviewStore:
+        if experiment_name not in self.experiment_names():
+            raise ValueError(f"unknown or invalid experiment: {experiment_name!r}")
+        with self._lock:
+            store = self._stores.get(experiment_name)
+            if store is None:
+                store = ReviewStore(experiment_root(experiment_name, self.output_base))
+                self._stores[experiment_name] = store
+            return store
+
 
 def _json_bytes(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False).encode("utf-8")
 
 
-def make_handler(store: ReviewStore):
+def make_handler(catalog: ExperimentCatalog):
     static_root = Path(__file__).resolve().parent / "static"
     template = (Path(__file__).resolve().parent / "templates" / "index.html").read_bytes()
 
     class Handler(BaseHTTPRequestHandler):
-        server_version = "BlueprintReview/1"
+        server_version = f"BlueprintReview/{REVIEW_SCHEMA_VERSION}"
 
         def log_message(self, fmt: str, *args: object) -> None:
             print(f"[blueprint-review] {self.address_string()} {fmt % args}")
@@ -114,8 +209,20 @@ def make_handler(store: ReviewStore):
 
         def _api(self, parsed) -> bool:
             query = parse_qs(parsed.query)
+            if parsed.path == "/api/experiments":
+                self._send(200, "application/json; charset=utf-8", _json_bytes({
+                    "outputBase": str(catalog.output_base),
+                    "experiments": catalog.experiment_names(),
+                })); return True
+            experiment_name = query.get("experiment", [""])[0]
+            try:
+                store = catalog.store(experiment_name)
+            except ValueError as error:
+                self._send(400, "application/json; charset=utf-8", _json_bytes({
+                    "error": str(error),
+                })); return True
             if parsed.path == "/api/meta":
-                self._send(200, "application/json; charset=utf-8", _json_bytes({"readOnly": True, "schemaVersion": 1, "experimentRoot": str(store.root)})); return True
+                self._send(200, "application/json; charset=utf-8", _json_bytes({"readOnly": True, "schemaVersion": REVIEW_SCHEMA_VERSION, "experiment": experiment_name, "experimentRoot": str(store.root), "loadWarnings": store.diagnostics()})); return True
             if parsed.path == "/api/cases":
                 self._send(200, "application/json; charset=utf-8", _json_bytes(store.summaries())); return True
             if parsed.path == "/api/case":
@@ -156,21 +263,31 @@ def make_handler(store: ReviewStore):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Read-only Blueprint experiment reviewer (SSH -L by default).")
-    parser.add_argument("experiment_root", type=Path)
+    parser = argparse.ArgumentParser(description="Read-only Blueprint experiment catalog and reviewer.")
+    parser.add_argument(
+        "--output-base",
+        type=Path,
+        default=DEFAULT_OUTPUT_BASE,
+        help=f"experiment output base (default: {DEFAULT_OUTPUT_BASE})",
+    )
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--ssh-target", default="", help="e.g. user@g0065; printed as a copyable SSH -L command")
     parser.add_argument("--unsafe-public", action="store_true", help="explicitly permit a non-loopback listener")
     args = parser.parse_args()
     if args.host not in LOOPBACK_HOSTS and not args.unsafe_public:
         raise SystemExit("Refusing non-loopback listener. Use --unsafe-public only if you intentionally accept network exposure.")
-    root = args.experiment_root.resolve()
-    if not (root / "results.jsonl").is_file():
-        raise SystemExit(f"results.jsonl not found: {root}")
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(ReviewStore(root)))
+    output_base = args.output_base.expanduser().resolve()
+    if not output_base.is_dir():
+        raise SystemExit(f"experiment output base not found: {output_base}")
+    catalog = ExperimentCatalog(output_base)
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(catalog))
     target = args.ssh_target or "<user>@<remote-host>"
     print(f"[blueprint-review] read-only URL: http://127.0.0.1:{args.port}")
+    print(
+        f"[blueprint-review] output base: {output_base} "
+        f"experiments={len(catalog.experiment_names())}"
+    )
     print(f"[blueprint-review] local tunnel: ssh -N -L {args.port}:127.0.0.1:{args.port} {target}")
     try:
         server.serve_forever()

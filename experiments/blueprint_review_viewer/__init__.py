@@ -1,3 +1,3 @@
 """Read-only review artifacts and HTTP viewer for Blueprint experiments."""
 
-REVIEW_SCHEMA_VERSION = 1
+REVIEW_SCHEMA_VERSION = 3

@@ -26,8 +26,33 @@ PROFILES = {
     "qwen3_8b_397b_all646_subtractive_separate_t06": ("separate", 0.6, 512),
 }
 
+GLOBAL_DEFINITION_PROFILES = {
+    "qwen3_8b_397b_wrong76_global_defs_direct_named_t00": "direct",
+    "qwen3_8b_397b_wrong76_global_defs_compact_separate_named_t00": "compact_separate",
+}
+
 
 class SemanticAblationConfigTest(unittest.TestCase):
+    def test_global_definition_named_profiles(self) -> None:
+        script_dir = ROOT / "experiments/cot_blueprint_refine/script"
+        for profile, mode in GLOBAL_DEFINITION_PROFILES.items():
+            with self.subTest(profile=profile):
+                config = load_config(profile, [])
+                blueprint = config.blueprint
+                self.assertEqual(str(config.exp_name), profile)
+                self.assertFalse(config.resume)
+                self.assertEqual(blueprint.semantic_audit_mode, mode)
+                self.assertEqual(blueprint.generation_node_naming, "semantic")
+                self.assertEqual(blueprint.execution_mode, "phase1_only")
+                self.assertEqual(blueprint.phase1_concurrency, 76)
+                self.assertEqual(blueprint.generation_temperature, 0.6)
+                self.assertEqual(blueprint.semantic_audit_temperature, 0.0)
+                self.assertTrue(blueprint.semantic_audit_enable_thinking)
+                self.assertFalse(config.judge.enabled)
+                launcher = (script_dir / f"{profile}.sh").read_text()
+                self.assertIn("run_semantic_ablation_experiment.sh", launcher)
+                self.assertIn(profile, launcher)
+
     def test_five_resolved_configs_match_sampling_matrix(self) -> None:
         for profile, (mode, temperature, concurrency) in PROFILES.items():
             with self.subTest(profile=profile):

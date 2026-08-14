@@ -129,6 +129,283 @@ def _candidate_id(path: Path) -> str:
     return path.stem.replace("_", "-")
 
 
+def _dict_list(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value]
+
+
+def _whole_graph_feedback(
+    validation: dict[str, Any],
+    deterministic_errors: list[dict[str, Any]],
+) -> dict[str, Any]:
+    failure_stage = str(validation.get("mechanicalFailureStage") or "")
+    stage_reached = str(validation.get("mechanicalStageReached") or "")
+    lean_success = validation.get("wholeFileLeanSuccess")
+    canonical_success = validation.get("canonicalLeanSuccess")
+    structural_errors = _string_list(validation.get("phase2StructuralErrors"))
+    lean_errors = _string_list(validation.get("leanErrors"))
+    canonical_errors = _string_list(validation.get("canonicalLeanErrors"))
+    graph_errors = [
+        item for item in deterministic_errors
+        if str(item.get("stage") or "") != "phase2_standalone"
+    ]
+    compile_reached = stage_reached in {
+        "canonical_lean", "phase2_standalone", "static_shadow",
+        "formal_decompiler_or_comparator", "joint_semantic_audit",
+    }
+    if graph_errors or failure_stage in {
+        "parse_basic", "canonical_rebuild", "phase2_contract", "canonical_lean",
+    }:
+        status = "failed"
+    elif compile_reached and lean_success is True:
+        status = "passed"
+    elif not stage_reached:
+        status = "missing"
+    else:
+        status = "notRun"
+    return {
+        "status": status,
+        "stageReached": stage_reached,
+        "failureStage": failure_stage,
+        "compileReached": compile_reached,
+        "wholeFileLeanSuccess": lean_success if isinstance(lean_success, bool) else None,
+        "canonicalLeanSuccess": canonical_success if isinstance(canonical_success, bool) else None,
+        "contractErrors": structural_errors,
+        "leanErrors": lean_errors,
+        "canonicalLeanErrors": canonical_errors,
+        "errors": graph_errors,
+    }
+
+
+def _standalone_feedback(
+    validation: dict[str, Any],
+    deterministic_errors: list[dict[str, Any]],
+) -> dict[str, Any]:
+    summary = validation.get("phase2StandaloneSummary")
+    summary = dict(summary) if isinstance(summary, dict) else {}
+    issues = _dict_list(validation.get("phase2StandaloneErrors"))
+    errors = [
+        item for item in deterministic_errors
+        if str(item.get("stage") or "") == "phase2_standalone"
+    ]
+    not_run_reason = str(summary.get("notRunReason") or "")
+    earlier_failure = next((
+        str(item.get("stage") or "") for item in deterministic_errors
+        if str(item.get("stage") or "") != "phase2_standalone"
+    ), "")
+    if issues or errors:
+        status = "failed"
+    elif not_run_reason or earlier_failure:
+        status = "notRun"
+    elif summary:
+        status = "passed"
+    else:
+        status = "missing"
+    return {
+        "status": status,
+        "notRunReason": not_run_reason or earlier_failure,
+        "checkedNodeCount": summary.get("checkedNodeCount"),
+        "cachedNodeCount": summary.get("cachedNodeCount"),
+        "failedNodeCount": summary.get("failedNodeCount"),
+        "durationMs": summary.get("durationMs"),
+        "issues": issues,
+        "errors": errors,
+    }
+
+
+def _semantic_feedback(
+    validation: dict[str, Any],
+    deterministic_errors: list[dict[str, Any]],
+    semantic_errors: list[dict[str, Any]],
+) -> dict[str, Any]:
+    invoked = bool(validation.get("semanticAuditInvoked"))
+    audit_error = validation.get("semanticAuditError")
+    audit_error = dict(audit_error) if isinstance(audit_error, dict) else None
+    audit = validation.get("semanticAudit")
+    audit = dict(audit) if isinstance(audit, dict) else {}
+    if audit_error is not None:
+        status = "executionError"
+    elif deterministic_errors:
+        status = "notRun"
+    elif invoked and semantic_errors:
+        status = "failed"
+    elif invoked:
+        status = "passed"
+    else:
+        status = "notRun"
+    failure_stage = str(validation.get("mechanicalFailureStage") or "")
+    return {
+        "status": status,
+        "invoked": invoked,
+        "notRunReason": failure_stage if status == "notRun" else "",
+        "errors": semantic_errors,
+        "executionError": audit_error,
+        "audit": {
+            "protocol": audit.get("protocol"),
+            "mode": audit.get("mode", validation.get("semanticAuditMode")),
+            "actualRequestCount": audit.get(
+                "actualRequestCount", validation.get("semanticActualRequestCount")
+            ),
+            "cacheHits": audit.get("cacheHits", validation.get("semanticCacheHits")),
+            "outputBudget": audit.get(
+                "outputBudget", validation.get("semanticOutputBudget")
+            ),
+            "classification": audit.get("classification"),
+        },
+    }
+
+
+def _answer_parts(value: Any) -> dict[str, Any]:
+    payload = dict(value) if isinstance(value, dict) else {}
+    thinking = payload.get("reasoning_content", payload.get("reasoningContent", ""))
+    answer = payload.get("raw_content", payload.get("rawContent", ""))
+    return {
+        "available": bool(thinking or answer),
+        "thinking": str(thinking or ""),
+        "answer": str(answer or ""),
+    }
+
+
+def _builder_responses(events: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    responses: dict[int, dict[str, Any]] = {}
+    for event in events:
+        if event.get("kind") != "llm_response":
+            continue
+        args = event.get("args")
+        if not isinstance(args, dict) or str(args.get("phase") or "") != "phase1":
+            continue
+        try:
+            round_index = int(event.get("turn") or args.get("round"))
+        except (TypeError, ValueError):
+            continue
+        responses[round_index] = {
+            "thinking": str(args.get("reasoning_content") or ""),
+            "finishReason": str(args.get("finish_reason") or ""),
+        }
+    return responses
+
+
+def _generation_rounds(
+    row: dict[str, Any], candidates: list[dict[str, Any]], events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    raw_history = row.get("generation_history")
+    if not isinstance(raw_history, list):
+        validation = row.get("generation_validation")
+        raw_history = validation.get("generationRounds", []) if isinstance(validation, dict) else []
+    candidate_by_round = {
+        int(candidate["round"]): candidate
+        for candidate in candidates
+        if candidate.get("kind") == "generation_round" and isinstance(candidate.get("round"), int)
+    }
+    builder_responses = _builder_responses(events)
+    history_by_round = {
+        int(item["round"]): item for item in raw_history
+        if isinstance(item, dict) and str(item.get("round") or "").isdigit()
+    }
+    rounds: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for raw in raw_history:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            round_index = int(raw.get("round"))
+        except (TypeError, ValueError):
+            continue
+        if round_index <= 0 or round_index in seen:
+            continue
+        seen.add(round_index)
+        validation = raw.get("validation")
+        validation = dict(validation) if isinstance(validation, dict) else {}
+        deterministic_errors = _dict_list(raw.get("deterministicErrors"))
+        semantic_errors = _dict_list(raw.get("semanticErrors"))
+        warnings = _dict_list(raw.get("warnings"))
+        candidate = candidate_by_round.get(round_index)
+        expected_hash = str(raw.get("candidateHash") or "")
+        actual_hash = str(candidate.get("leanSha256") or "") if candidate else ""
+        hash_matches = (
+            actual_hash == expected_hash if candidate and expected_hash else None
+        )
+        whole_graph = _whole_graph_feedback(validation, deterministic_errors)
+        standalone = _standalone_feedback(validation, deterministic_errors)
+        audit = validation.get("semanticAudit")
+        audit = dict(audit) if isinstance(audit, dict) else {}
+        decompile = _answer_parts(audit.get("formalDecompiler"))
+        compact = _answer_parts(audit.get("wholeCotComparator"))
+        previous_history = history_by_round.get(round_index - 1, {})
+        previous_candidates = [
+            item for candidate_round, item in candidate_by_round.items()
+            if candidate_round < round_index
+        ]
+        previous_candidate = max(
+            previous_candidates,
+            key=lambda item: int(item.get("round") or 0),
+            default=None,
+        )
+        builder_trace = builder_responses.get(round_index, {})
+        builder_answer = str(candidate.get("lean") or "") if candidate else ""
+        if deterministic_errors:
+            deterministic_status = "failed"
+        elif whole_graph["status"] == "passed" and standalone["status"] == "passed":
+            deterministic_status = "passed"
+        elif "missing" in {whole_graph["status"], standalone["status"]}:
+            deterministic_status = "missing"
+        else:
+            deterministic_status = "notRun"
+        rounds.append({
+            "round": round_index,
+            "candidateId": candidate.get("candidateId") if candidate else "",
+            "candidateAvailable": candidate is not None,
+            "candidateHash": expected_hash,
+            "candidateHashMatches": hash_matches,
+            "inputTokens": raw.get("inputTokens"),
+            "maxCompletionTokens": raw.get("maxCompletionTokens"),
+            "feedback": {
+                "deterministic": {
+                    "status": deterministic_status,
+                    "errorCount": len(deterministic_errors),
+                    "errors": deterministic_errors,
+                    "wholeGraph": whole_graph,
+                    "phase2Standalone": standalone,
+                },
+                "semantic": _semantic_feedback(
+                    validation, deterministic_errors, semantic_errors,
+                ),
+                "warnings": warnings,
+            },
+            "artifacts": {
+                "decompileAnswer": decompile,
+                "compactAnswer": compact,
+                "builderInput": {
+                    "previousBlueprint": (
+                        str(previous_candidate.get("lean") or "")
+                        if previous_candidate else ""
+                    ),
+                    "deterministicErrors": _dict_list(
+                        previous_history.get("deterministicErrors")
+                    ) if isinstance(previous_history, dict) else [],
+                    "semanticErrors": _dict_list(
+                        previous_history.get("semanticErrors")
+                    ) if isinstance(previous_history, dict) else [],
+                },
+                "builderAnswer": {
+                    "available": bool(builder_trace or builder_answer),
+                    "thinking": str(builder_trace.get("thinking") or ""),
+                    "answer": builder_answer,
+                    "finishReason": str(builder_trace.get("finishReason") or ""),
+                },
+            },
+        })
+    rounds.sort(key=lambda item: item["round"])
+    return rounds
+
+
 def _trace_events(row: dict[str, Any]) -> list[dict[str, Any]]:
     path = Path(str(row.get("trace_path") or ""))
     if not path.is_file():
@@ -168,6 +445,14 @@ def build_review_artifact(experiment_root: Path, row: dict[str, Any]) -> dict[st
             "nodes": _declaration_nodes(text, cot_steps),
         })
     events = _trace_events(row)
+    generation_rounds = _generation_rounds(row, candidates, events)
+    last_round = generation_rounds[-1]["round"] if generation_rounds else None
+    for candidate in candidates:
+        candidate["feedbackRound"] = (
+            candidate.get("round")
+            if candidate.get("kind") == "generation_round"
+            else last_round
+        )
     validation = _validation(row)
     audit = validation.get("semanticAudit") if isinstance(validation, dict) else {}
     return {
@@ -176,6 +461,7 @@ def build_review_artifact(experiment_root: Path, row: dict[str, Any]) -> dict[st
         "result": {key: row.get(key, "") for key in ("status", "phase", "success", "root_proved", "error", "semantic_status")},
         "cotSteps": cot_steps,
         "candidates": candidates,
+        "generationRounds": generation_rounds,
         "validation": validation,
         "semanticAudit": audit if isinstance(audit, dict) else {},
         "traceSummary": {"eventCount": len(events), "tracePath": _safe_relative(Path(str(row.get("trace_path") or "")), experiment_root)},
