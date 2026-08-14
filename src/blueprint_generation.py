@@ -38,9 +38,11 @@ from kimina_lean_compiler import (
     KiminaLeanCompiler,
 )
 from llm_client import chat_completion_with_retry, make_client
+from mathlib_retrieval import MathlibRetrieval
 from semantic_audit import (
     COMPACT_WHOLE_COT_PROMPT_VERSION,
     DIRECT_WHOLE_COT_PROMPT_VERSION,
+    FORMAL_DECOMPILER_PROMPT_VERSION,
     FormalDecompilerResult,
     JointWholeCotAuditResult,
     WholeCotComparatorResult,
@@ -83,6 +85,32 @@ definition to `sorry_using` merely to make it root-reachable. A definition's
 mere existence does not ground the final theorem: required source objects and
 relations must be referenced, constrained, or related by the root or by a
 root-supporting proposition.
+
+Use only these Blueprint declaration forms: `def`, `noncomputable def`,
+`abbrev`, `lemma`, and `theorem`. The pipeline rejects `axiom`, `structure`,
+`instance`, `class`, `inductive`, `variable`, `section`,
+`noncomputable section`, `namespace`, `notation`, `macro`, `syntax`, and
+`partial def`. Replace a structure with a tuple or type alias plus accessor
+definitions; replace an instance with an explicit Bool predicate or a decision
+procedure inside a definition; replace an axiom with theorem binders or a
+Blueprint lemma; put variables in each declaration's explicit binders; and use
+`noncomputable def` on each affected declaration instead of a noncomputable
+section. `sorry_using` may name only local `@[blueprint]` nodes, never Mathlib
+declarations.
+
+For bounded operators use `∑ x ∈ s, f x`, `∏ x ∈ s, f x`,
+`Finset.sum s (fun x => f x)`, or `Finset.prod s (fun x => f x)`. Never use
+`∑ x in s, f x` or `∏ x in s, f x`: `open scoped BigOperators` is supplied by
+the pipeline but does not make that binder syntax valid.
+
+`ℝ × ℝ` and `ℚ × ℚ` are coordinate carriers. Their default product `dist` and
+`norm` use the max/sup metric, not the Euclidean metric. Do not use unqualified
+product `dist` or `norm` to formalize Euclidean length, circles, or angles.
+Prefer `ℚ` and squared lengths when the COT permits, with explicit definitions
+such as `(P.1 - Q.1)^2 + (P.2 - Q.2)^2` for squared Euclidean distance and
+`u.1 * v.1 + u.2 * v.2` for the dot product. Use
+`Real.sqrt (sqEuclideanDist2 P Q)` only when ordinary Euclidean distance is
+required.
 
 `title`, `statement`, and `proof` metadata are optional. Call `lean_compile`
 exactly once with the entire replacement file. Do not return prose or a partial
@@ -439,7 +467,8 @@ def _with_semantic_audit(
     validation.semantic_audit_protocol = (
         COMPACT_WHOLE_COT_PROMPT_VERSION if compact else WHOLE_COT_PROMPT_VERSION
     )
-    decompiler = decompiler_cache.get(view.sha256)
+    decompiler_cache_key = f"{FORMAL_DECOMPILER_PROMPT_VERSION}:{view.sha256}"
+    decompiler = decompiler_cache.get(decompiler_cache_key)
     decompiler_hit = decompiler is not None
     validation.semantic_cache_hits = {"formalDecompiler": decompiler_hit}
     if decompiler is None:
@@ -467,7 +496,7 @@ def _with_semantic_audit(
                 1, len(getattr(exc, "attempts", ()) or ()),
             )
             raise
-        decompiler_cache[view.sha256] = decompiler
+        decompiler_cache[decompiler_cache_key] = decompiler
         validation.semantic_request_count = len(decompiler.attempts)
     messages = (
         compact_whole_cot_comparator_messages(
@@ -664,6 +693,9 @@ def _feedback(
     deterministic: Sequence[dict[str, Any]],
     semantic: Sequence[dict[str, Any]],
     warnings: Sequence[dict[str, Any]],
+    *,
+    blueprint: Blueprint | None = None,
+    mathlib_search_context: Sequence[dict[str, Any]] = (),
 ) -> str:
     del warnings
     sections: list[str] = []
@@ -681,7 +713,200 @@ def _feedback(
                     f"node={item.get('nodeName') or '<none>'}: {item.get('message')}"
                 )
         sections.append("\n".join(lines))
+    contract_context = _validated_contract_context(deterministic, blueprint)
+    if contract_context:
+        sections.append(
+            "VALIDATED_CONTRACT_CONTEXT\n"
+            + "\n".join(f"- {line}" for line in contract_context)
+        )
+    if mathlib_search_context:
+        lines = [
+            "MATHLIB_SEARCH_CONTEXT",
+            "These search hits are candidates, not a repair conclusion. Use only a name "
+            "whose displayed type fits, never add a Mathlib name to `sorry_using`, and "
+            "submit a complete Blueprint that passes formal compilation again.",
+        ]
+        for item in mathlib_search_context:
+            lines.append(f"- Compiler-reported symbol `{item['symbol']}`:")
+            results = item.get("results") or []
+            if not results:
+                lines.append("  - no candidate returned")
+            for result in results:
+                lines.append(
+                    f"  - `{result['name']}` : `{result.get('type') or '<type unavailable>'}`"
+                )
+        sections.append("\n".join(lines))
     return "\n\n".join(sections)
+
+
+_FORBIDDEN_REPLACEMENTS = {
+    "structure": "Use a tuple or type alias plus Blueprint accessor definitions.",
+    "instance": "Use an explicit Bool predicate or a decision procedure inside a definition.",
+    "axiom": "Move assumptions into theorem binders or state them as a Blueprint lemma.",
+    "variable": "Put every variable in the explicit binders of each declaration.",
+    "noncomputable section": "Mark each affected declaration individually as `noncomputable def`.",
+    "section": "Remove the section and put parameters in explicit declaration binders.",
+    "class": "Use an explicit tuple/type alias and ordinary definitions instead of a class.",
+    "inductive": "Use an allowed existing type, tuple/type alias, or ordinary definition.",
+    "namespace": "Use top-level Blueprint declarations with unique names.",
+    "notation": "Use the underlying Lean expression directly.",
+    "local notation": "Use the underlying Lean expression directly.",
+    "macro": "Use the expanded Lean expression directly.",
+    "syntax": "Use existing Lean syntax directly.",
+    "partial def": "Use a terminating ordinary `def` or reformulate the finite object.",
+}
+_FORBIDDEN_DIAGNOSTIC_RE = re.compile(
+    r"^Safeguard rejected: forbidden construct `([^`]+)` is not allowed\.$"
+)
+_NONCOMPUTABLE_SUGGESTION = "consider marking it as 'noncomputable'"
+_MATHLIB_DIAGNOSTIC_PATTERNS = (
+    re.compile(r"Unknown constant [`']([^`']+)[`']"),
+    re.compile(r"Unknown identifier [`']([^`']+)[`']"),
+    re.compile(r"Invalid field [`']([^`']+)[`']"),
+)
+
+
+def _diagnostic_json(message: Any) -> dict[str, Any] | None:
+    if not isinstance(message, str):
+        return None
+    try:
+        value = json.loads(message)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _diagnostic_text(message: Any) -> str:
+    payload = _diagnostic_json(message)
+    if payload is None:
+        return str(message or "")
+    return str(payload.get("data") or payload.get("message") or "")
+
+
+def _diagnostic_line(message: Any) -> int | None:
+    payload = _diagnostic_json(message)
+    if payload is None:
+        return None
+    for key in ("pos", "startPos", "position"):
+        position = payload.get(key)
+        if isinstance(position, dict) and isinstance(position.get("line"), int):
+            return int(position["line"])
+    return None
+
+
+def _validated_contract_context(
+    deterministic: Sequence[dict[str, Any]],
+    blueprint: Blueprint | None,
+) -> tuple[str, ...]:
+    """Add guidance only when a validator/compiler proved the exact contract."""
+    context: list[str] = []
+    for item in deterministic:
+        message = str(item.get("message") or "")
+        forbidden = _FORBIDDEN_DIAGNOSTIC_RE.fullmatch(message)
+        if forbidden:
+            construct = forbidden.group(1)
+            replacement = _FORBIDDEN_REPLACEMENTS.get(construct)
+            if replacement:
+                context.append(
+                    f"The safeguard proved that `{construct}` is forbidden. {replacement}"
+                )
+        if item.get("code") == "unannotatedLocalDeclaration":
+            context.append(
+                "Canonicalization keeps only imports, `open`/`open scoped`, `set_option`, "
+                "and annotated Blueprint nodes. Convert each other local declaration into "
+                "an allowed `@[blueprint]` node; replace `noncomputable section` with "
+                "individual `noncomputable def` declarations."
+            )
+        diagnostic = _diagnostic_text(message)
+        line = _diagnostic_line(message)
+        if (
+            blueprint is not None
+            and _NONCOMPUTABLE_SUGGESTION in diagnostic
+            and line is not None
+        ):
+            source_line = line
+            if (
+                "import Architect" in blueprint.lean_file
+                and "import GoedelArch" not in blueprint.lean_file
+            ):
+                # KiminaLeanCompiler.check_blueprint inserts GoedelArch after
+                # Architect before compilation, shifting declaration diagnostics.
+                source_line -= 1
+            node = next((
+                candidate for candidate in blueprint.nodes
+                if candidate.lean_start_line <= source_line <= candidate.lean_end_line
+            ), None)
+            if node is not None:
+                context.append(
+                    f"Lean explicitly recommends marking Blueprint node `{node.name}` "
+                    "as `noncomputable`."
+                )
+    return tuple(dict.fromkeys(context))
+
+
+def _eligible_mathlib_symbols(
+    deterministic: Sequence[dict[str, Any]],
+) -> tuple[str, ...]:
+    symbols: list[str] = []
+    for item in deterministic:
+        if item.get("code") != "canonicalLean" or item.get("stage") != "canonical_lean":
+            continue
+        diagnostic = _diagnostic_text(item.get("message"))
+        for pattern in _MATHLIB_DIAGNOSTIC_PATTERNS:
+            match = pattern.search(diagnostic)
+            if match:
+                symbols.append(match.group(1).strip())
+                break
+    return tuple(dict.fromkeys(symbol for symbol in symbols if symbol))
+
+
+def _search_result_dict(result: Any) -> dict[str, str] | None:
+    name = getattr(result, "name", None)
+    if name is None and isinstance(result, dict):
+        name = result.get("name")
+    if not name:
+        return None
+    type_sig = getattr(result, "type_sig", None)
+    if type_sig is None and isinstance(result, dict):
+        type_sig = result.get("type_sig", result.get("type", ""))
+    return {"name": str(name), "type": str(type_sig or "")}
+
+
+def _run_phase1_mathlib_search(
+    deterministic: Sequence[dict[str, Any]],
+    *,
+    retrieval: Any,
+    cache: dict[str, tuple[dict[str, str], ...]],
+    max_queries: int,
+    k: int,
+) -> tuple[dict[str, Any], ...]:
+    reports: list[dict[str, Any]] = []
+    for symbol in _eligible_mathlib_symbols(deterministic)[:max_queries]:
+        started = time.monotonic()
+        cache_hit = symbol in cache
+        error = ""
+        if cache_hit:
+            results = cache[symbol]
+        else:
+            try:
+                raw_results = retrieval.search(symbol, k=k)
+                results = tuple(
+                    item for raw in raw_results[:k]
+                    if (item := _search_result_dict(raw)) is not None
+                )
+                cache[symbol] = results
+            except Exception as exc:  # Retrieval is optional evidence, never infrastructure.
+                results = ()
+                error = f"{type(exc).__name__}: {exc}"
+        reports.append({
+            "symbol": symbol,
+            "query": symbol,
+            "results": list(results),
+            "latencyMs": (time.monotonic() - started) * 1000,
+            "cacheHit": cache_hit,
+            "error": error,
+        })
+    return tuple(reports)
 
 
 def _messages(
@@ -1099,6 +1324,11 @@ def generate_blueprint(
     joint_semantic_audit_max_tokens: int = 32768,
     prompt_profile: str = "whole_cot_minimal",
     node_naming: str = "semantic",
+    phase1_mathlib_search_enabled: bool = False,
+    phase1_mathlib_search_max_queries_per_round: int = 2,
+    phase1_mathlib_search_k: int = 3,
+    phase1_mathlib_search_timeout_s: float = 15.0,
+    mathlib_retrieval: Any | None = None,
 ) -> Blueprint:
     if max_turns <= 0:
         raise ValueError("generation max_turns must be positive")
@@ -1112,7 +1342,16 @@ def generate_blueprint(
         raise ValueError("node_naming must be semantic or anonymous")
     if joint_semantic_audit_max_tokens <= 0:
         raise ValueError("joint_semantic_audit_max_tokens must be positive")
+    if phase1_mathlib_search_max_queries_per_round <= 0:
+        raise ValueError("phase1_mathlib_search_max_queries_per_round must be positive")
+    if phase1_mathlib_search_k <= 0:
+        raise ValueError("phase1_mathlib_search_k must be positive")
+    if phase1_mathlib_search_timeout_s <= 0:
+        raise ValueError("phase1_mathlib_search_timeout_s must be positive")
     client = make_client(model)
+    phase1_retrieval = mathlib_retrieval
+    if phase1_mathlib_search_enabled and phase1_retrieval is None:
+        phase1_retrieval = MathlibRetrieval(timeout=phase1_mathlib_search_timeout_s)
     previous_code = ""
     previous_feedback = ""
     candidates: list[str] = []
@@ -1122,6 +1361,8 @@ def generate_blueprint(
     decompiler_cache: dict[str, Any] = {}
     comparator_cache: dict[str, Any] = {}
     joint_cache: dict[str, JointWholeCotAuditResult] = {}
+    mathlib_search_cache: dict[str, tuple[dict[str, str], ...]] = {}
+    previous_search_symbols: tuple[str, ...] = ()
     latest_blueprint: Blueprint | None = None
     latest_validation: BlueprintValidation | None = None
     latest_deterministic: tuple[dict[str, Any], ...] = ()
@@ -1239,7 +1480,15 @@ def generate_blueprint(
                 latest_deterministic, latest_semantic, latest_warnings,
             )
             candidate_hash = ""
-            details: dict[str, Any] = {}
+            details: dict[str, Any] = {
+                "phase1MathlibSearch": {
+                    "enabled": phase1_mathlib_search_enabled,
+                    "eligibleSymbols": [],
+                    "queries": [],
+                    "previousDiagnosticStatus": [],
+                    "notRunReason": "generationSubmissionInvalid",
+                },
+            }
         else:
             previous_code = code
             candidates.append(code)
@@ -1330,11 +1579,54 @@ def generate_blueprint(
                 ) from exc
             previous_code = latest_blueprint.lean_file
             candidates[-1] = previous_code
+            eligible_symbols = _eligible_mathlib_symbols(latest_deterministic)
+            search_reports: tuple[dict[str, Any], ...] = ()
+            if phase1_mathlib_search_enabled and phase1_retrieval is not None:
+                search_reports = _run_phase1_mathlib_search(
+                    latest_deterministic,
+                    retrieval=phase1_retrieval,
+                    cache=mathlib_search_cache,
+                    max_queries=phase1_mathlib_search_max_queries_per_round,
+                    k=phase1_mathlib_search_k,
+                )
+            compiler_diagnostic_available = bool(
+                latest_validation.canonical_lean_result is not None
+            )
+            previous_status = [
+                {
+                    "symbol": symbol,
+                    "diagnosticDisappeared": symbol not in eligible_symbols,
+                }
+                for symbol in previous_search_symbols
+            ] if compiler_diagnostic_available else []
+            previous_search_symbols = tuple(
+                str(item["symbol"]) for item in search_reports
+            )
             previous_feedback = _feedback(
                 latest_deterministic, latest_semantic, latest_warnings,
+                blueprint=latest_blueprint,
+                mathlib_search_context=search_reports,
             )
             candidate_hash = hashlib.sha256(previous_code.encode()).hexdigest()
             details = validation_details(latest_validation)
+            details["phase1MathlibSearch"] = {
+                "enabled": phase1_mathlib_search_enabled,
+                "eligibleSymbols": list(eligible_symbols),
+                "queries": list(search_reports),
+                "previousDiagnosticStatus": previous_status,
+                "notRunReason": (
+                    "disabled" if not phase1_mathlib_search_enabled else
+                    "notEligible" if not eligible_symbols else ""
+                ),
+            }
+            if tracer:
+                tracer.emit(TraceEvent(
+                    kind="phase1MathlibSearch",
+                    thm_name=thm_name,
+                    turn=round_index,
+                    args={"round": round_index, **details["phase1MathlibSearch"]},
+                    ok=not any(item.get("error") for item in search_reports),
+                ))
 
         round_row = GenerationRound(
             round_index,

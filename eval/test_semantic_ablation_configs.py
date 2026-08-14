@@ -31,8 +31,35 @@ GLOBAL_DEFINITION_PROFILES = {
     "qwen3_8b_397b_wrong76_global_defs_compact_separate_named_t00": "compact_separate",
 }
 
+MECHANICAL_CONTRACT_PROFILES = {
+    "qwen3_8b_397b_wrong76_mechanical_contract_direct_named_t00": "direct",
+    "qwen3_8b_397b_wrong76_mechanical_contract_compact_separate_named_t00":
+        "compact_separate",
+}
+
 
 class SemanticAblationConfigTest(unittest.TestCase):
+    def test_mechanical_contract_profiles_enable_bounded_retrieval(self) -> None:
+        script_dir = ROOT / "experiments/cot_blueprint_refine/script"
+        for profile, mode in MECHANICAL_CONTRACT_PROFILES.items():
+            with self.subTest(profile=profile):
+                config = load_config(profile, [])
+                blueprint = config.blueprint
+                self.assertEqual(str(config.exp_name), profile)
+                self.assertFalse(config.resume)
+                self.assertEqual(blueprint.semantic_audit_mode, mode)
+                self.assertEqual(blueprint.generation_node_naming, "semantic")
+                self.assertEqual(blueprint.execution_mode, "phase1_only")
+                self.assertEqual(blueprint.phase1_concurrency, 76)
+                self.assertTrue(blueprint.phase1_mathlib_search_enabled)
+                self.assertEqual(blueprint.phase1_mathlib_search_max_queries_per_round, 2)
+                self.assertEqual(blueprint.phase1_mathlib_search_k, 3)
+                self.assertEqual(blueprint.phase1_mathlib_search_timeout_s, 15)
+                self.assertFalse(config.judge.enabled)
+                launcher = (script_dir / f"{profile}.sh").read_text()
+                self.assertIn("run_semantic_ablation_experiment.sh", launcher)
+                self.assertIn(profile, launcher)
+
     def test_global_definition_named_profiles(self) -> None:
         script_dir = ROOT / "experiments/cot_blueprint_refine/script"
         for profile, mode in GLOBAL_DEFINITION_PROFILES.items():

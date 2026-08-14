@@ -18,6 +18,9 @@ from blueprint_generation import (  # noqa: E402
     _accepted_validation_details,
     _contract_errors,
     _messages,
+    _eligible_mathlib_symbols,
+    _feedback,
+    _run_phase1_mathlib_search,
     _submitted_code,
     _validate_round,
     _with_semantic_audit,
@@ -105,6 +108,113 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
         self.assertIn("global context shared by every proof node", system)
         self.assertIn("if a definition is already listed", system)
         self.assertIn("mere existence does not ground", system)
+
+    def test_generation_prompt_contains_mechanical_and_coordinate_contract(self) -> None:
+        messages = _messages(
+            target_name="root", informal_statement="problem", informal_proof="cot",
+            claimed_answer="1", previous_blueprint="", previous_feedback="",
+        )
+        system = messages[0]["content"]
+        self.assertIn("∑ x ∈ s, f x", system)
+        self.assertIn("Never use\n`∑ x in s", system)
+        self.assertIn("structure", system)
+        self.assertIn("tuple or type alias plus accessor", system)
+        self.assertIn("noncomputable def", system)
+        self.assertIn("max/sup metric, not the Euclidean metric", system)
+        self.assertIn("squared Euclidean distance", system)
+
+    def test_narrow_contract_feedback_has_only_validated_guidance(self) -> None:
+        blueprint = _parse_blueprint(self.MINIMAL, "root")
+        root_line = blueprint.nodes_by_name()["root"].lean_start_line
+        explicit_noncomputable = json.dumps({
+            "severity": "error",
+            "pos": {"line": root_line + 1, "column": 1},
+            "data": "failed to compile definition, consider marking it as 'noncomputable'",
+        })
+        deterministic = [
+            {"stage": "canonical_lean", "code": "canonicalLean", "nodeName": "",
+             "message": "Safeguard rejected: forbidden construct `structure` is not allowed."},
+            {"stage": "parse_basic", "code": "unannotatedLocalDeclaration", "nodeName": "",
+             "message": "unannotatedLocalDeclaration: x"},
+            {"stage": "canonical_lean", "code": "canonicalLean", "nodeName": "",
+             "message": explicit_noncomputable},
+            {"stage": "canonical_lean", "code": "canonicalLean", "nodeName": "",
+             "message": '{"data":"type mismatch","pos":{"line":1,"column":1}}'},
+        ]
+        feedback = _feedback(deterministic, (), (), blueprint=blueprint)
+        context = feedback.split("VALIDATED_CONTRACT_CONTEXT", 1)[1]
+        self.assertIn("tuple or type alias", context)
+        self.assertIn("Canonicalization keeps only imports", context)
+        self.assertIn("node `root`", context)
+        self.assertNotIn("type mismatch", context)
+
+    def test_malformed_or_unmapped_noncomputable_diagnostic_adds_no_context(self) -> None:
+        blueprint = _parse_blueprint(self.MINIMAL, "root")
+        for message in (
+            "consider marking it as 'noncomputable'",
+            json.dumps({"data": "consider marking it as 'noncomputable'",
+                        "pos": {"line": 999, "column": 1}}),
+        ):
+            with self.subTest(message=message):
+                feedback = _feedback([{
+                    "stage": "canonical_lean", "code": "canonicalLean",
+                    "nodeName": "", "message": message,
+                }], (), (), blueprint=blueprint)
+                self.assertNotIn("VALIDATED_CONTRACT_CONTEXT", feedback)
+
+    def test_mathlib_retrieval_is_narrow_bounded_cached_and_non_mutating(self) -> None:
+        class FakeRetrieval:
+            def __init__(self):
+                self.calls = []
+
+            def search(self, query, k):
+                self.calls.append((query, k))
+                return [
+                    {"name": f"{query}.candidate{i}", "type": f"Type{i}"}
+                    for i in range(5)
+                ]
+
+        errors = [
+            {"stage": "canonical_lean", "code": "canonicalLean",
+             "message": '{"data":"Unknown constant `Complex.abs`"}'},
+            {"stage": "canonical_lean", "code": "canonicalLean",
+             "message": '{"data":"Invalid field `List.get!`"}'},
+            {"stage": "canonical_lean", "code": "canonicalLean",
+             "message": '{"data":"Unknown identifier `third.symbol`"}'},
+            {"stage": "phase2_contract", "code": "unknownDependencies",
+             "message": "Unknown identifier `must.not.search`"},
+            {"stage": "canonical_lean", "code": "canonicalLean",
+             "message": '{"data":"type mismatch"}'},
+        ]
+        retrieval = FakeRetrieval()
+        cache = {}
+        first = _run_phase1_mathlib_search(
+            errors, retrieval=retrieval, cache=cache, max_queries=2, k=3,
+        )
+        second = _run_phase1_mathlib_search(
+            errors, retrieval=retrieval, cache=cache, max_queries=2, k=3,
+        )
+        self.assertEqual(
+            _eligible_mathlib_symbols(errors),
+            ("Complex.abs", "List.get!", "third.symbol"),
+        )
+        self.assertEqual(retrieval.calls, [("Complex.abs", 3), ("List.get!", 3)])
+        self.assertTrue(all(len(item["results"]) == 3 for item in first))
+        self.assertTrue(all(item["cacheHit"] for item in second))
+        feedback = _feedback((), (), (), mathlib_search_context=first)
+        self.assertIn("candidates, not a repair conclusion", feedback)
+        self.assertIn("never add a Mathlib name to `sorry_using`", feedback)
+
+    def test_mathlib_retrieval_failure_degrades_to_empty_context(self) -> None:
+        retrieval = SimpleNamespace(search=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            TimeoutError("offline")
+        ))
+        reports = _run_phase1_mathlib_search([{
+            "stage": "canonical_lean", "code": "canonicalLean",
+            "message": '{"data":"Unknown identifier `missingApi`"}',
+        }], retrieval=retrieval, cache={}, max_queries=2, k=3)
+        self.assertEqual(reports[0]["results"], [])
+        self.assertIn("TimeoutError", reports[0]["error"])
 
     def test_static_shadow_errors_do_not_block_acceptance(self) -> None:
         comparator = SimpleNamespace(passed=True)

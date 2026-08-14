@@ -13,6 +13,8 @@ from blueprint import (  # noqa: E402
     BlueprintNode,
     _extract_lean_code,
     _parse_blueprint,
+    _unannotated_local_declaration_errors,
+    canonicalize_blueprint,
     extract_blueprint_signature,
     format_phase2_standalone_issues,
     phase2_contract_error_counts,
@@ -36,6 +38,40 @@ lemma mod7_2003_eq_1 :
 
 
 class BlueprintTextHelpersTest(unittest.TestCase):
+    def test_canonical_header_adds_bigoperators_once_and_moves_late_open(self) -> None:
+        lean_code = """import Mathlib
+import Architect
+@[blueprint] def d : Nat := 1
+@[blueprint] theorem root : d = 1 := by sorry_using [d]
+open scoped BigOperators
+"""
+        parsed = _parse_blueprint(lean_code, "root")
+        canonical = canonicalize_blueprint(parsed, list(parsed.nodes))
+
+        self.assertEqual(canonical.lean_file.count("open scoped BigOperators"), 1)
+        self.assertEqual(canonical.lean_file.count("set_option autoImplicit false"), 1)
+        self.assertLess(
+            canonical.lean_file.index("open scoped BigOperators"),
+            canonical.lean_file.index("@[blueprint]"),
+        )
+        self.assertEqual(canonical.phase2_header, parsed.phase2_header)
+        self.assertEqual(_unannotated_local_declaration_errors(parsed), [])
+
+    def test_canonical_header_replaces_autoimplicit_and_deduplicates_scope(self) -> None:
+        lean_code = """import Architect
+set_option autoImplicit true
+open scoped BigOperators
+open scoped BigOperators
+@[blueprint] theorem root : True := by sorry_using []
+"""
+        blueprint = _parse_blueprint(lean_code, "root")
+        self.assertTrue(blueprint.phase2_header.startswith(
+            "import Mathlib\nimport Architect\nset_option autoImplicit false\n"
+            "open scoped BigOperators\n"
+        ))
+        self.assertNotIn("autoImplicit true", blueprint.phase2_header)
+        self.assertEqual(blueprint.phase2_header.count("BigOperators"), 1)
+
     def test_standalone_contract_forwards_batch_concurrency(self) -> None:
         declarations = []
         for index in range(17):

@@ -203,6 +203,12 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
     args.generation_top_k = int(args.generation_top_k)
     args.generation_model_max_context = int(args.generation_model_max_context)
     args.generation_context_safety_margin = int(args.generation_context_safety_margin)
+    args.phase1_mathlib_search_enabled = bool(args.phase1_mathlib_search_enabled)
+    args.phase1_mathlib_search_max_queries_per_round = int(
+        args.phase1_mathlib_search_max_queries_per_round
+    )
+    args.phase1_mathlib_search_k = int(args.phase1_mathlib_search_k)
+    args.phase1_mathlib_search_timeout_s = float(args.phase1_mathlib_search_timeout_s)
     args.tokenizer_path = os.environ.get(
         "GOEDEL_TOKENIZER_PATH", str(getattr(args, "tokenizer_path", ""))
     ).strip()
@@ -261,6 +267,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         "refinement_max_retries",
         "node_max_prove_turns",
         "generation_max_turns",
+        "phase1_mathlib_search_max_queries_per_round",
+        "phase1_mathlib_search_k",
         "formal_decompiler_max_tokens",
         "strict_comparator_max_tokens",
         "semantic_format_max_attempts",
@@ -289,6 +297,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("generation_model_max_context must be positive")
     if args.generation_context_safety_margin < 0:
         raise ValueError("generation_context_safety_margin must be non-negative")
+    if args.phase1_mathlib_search_timeout_s <= 0:
+        raise ValueError("phase1_mathlib_search_timeout_s must be positive")
     if not args.tokenizer_path:
         raise ValueError(
             "tokenizer_path is required for dynamic generation budgeting"
@@ -577,6 +587,12 @@ def _result_row(
         "proof_policy": args.proof_policy,
         "critical_negation_max_turns": args.critical_negation_max_turns,
         "generation_max_turns": args.generation_max_turns,
+        "phase1_mathlib_search": {
+            "enabled": args.phase1_mathlib_search_enabled,
+            "max_queries_per_round": args.phase1_mathlib_search_max_queries_per_round,
+            "k": args.phase1_mathlib_search_k,
+            "timeout_s": args.phase1_mathlib_search_timeout_s,
+        },
         "generation_sampling": {
             "enable_thinking": args.generation_enable_thinking,
             "temperature": args.generation_temperature,
@@ -927,6 +943,12 @@ async def _run_record(
                         joint_semantic_audit_max_tokens=args.joint_semantic_audit_max_tokens,
                         prompt_profile=args.generation_prompt_profile,
                         node_naming=args.generation_node_naming,
+                        phase1_mathlib_search_enabled=args.phase1_mathlib_search_enabled,
+                        phase1_mathlib_search_max_queries_per_round=(
+                            args.phase1_mathlib_search_max_queries_per_round
+                        ),
+                        phase1_mathlib_search_k=args.phase1_mathlib_search_k,
+                        phase1_mathlib_search_timeout_s=args.phase1_mathlib_search_timeout_s,
                     ),
                 )
                 _write_phase1_candidates(

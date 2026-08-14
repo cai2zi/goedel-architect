@@ -89,6 +89,39 @@ theorem live_blueprint_root : True := by sorry_using []
         ])
         self.assertEqual([result.success for result in results], [True, True, True])
 
+    def test_product_metric_and_explicit_squared_euclidean_distance(self) -> None:
+        results = self.compiler.check_many([
+            CompileRequest("""import Mathlib
+example : dist ((0, 0) : ℝ × ℝ) (3, 4) = 4 := by
+  change max (dist (0 : ℝ) 3) (dist (0 : ℝ) 4) = 4
+  norm_num [Real.dist_eq]
+"""),
+            CompileRequest("""import Mathlib
+def sqEuclideanDist2 (P Q : ℝ × ℝ) : ℝ :=
+  (P.1 - Q.1)^2 + (P.2 - Q.2)^2
+example : sqEuclideanDist2 (0, 0) (3, 4) = 25 := by
+  norm_num [sqEuclideanDist2]
+"""),
+        ])
+        self.assertEqual([result.success for result in results], [True, True])
+
+    def test_bounded_operator_contract(self) -> None:
+        results = self.compiler.check_many([
+            CompileRequest("""import Mathlib
+open scoped BigOperators
+example : (∑ x ∈ Finset.range 3, x) = 3 := by norm_num
+"""),
+            CompileRequest("""import Mathlib
+example : Finset.sum (Finset.range 3) (fun x => x) = 3 := by norm_num
+"""),
+            CompileRequest("""import Mathlib
+open scoped BigOperators
+example : (∑ x in Finset.range 3, x) = 3 := by norm_num
+"""),
+        ])
+        self.assertEqual([result.success for result in results], [True, True, False])
+        self.assertIn("unexpected token 'in'", results[2].errors[0])
+
 
 if __name__ == "__main__":
     unittest.main()

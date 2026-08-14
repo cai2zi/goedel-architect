@@ -17,10 +17,11 @@ from llm_client import chat_completion_with_retry
 from tracer import TraceEvent
 
 
-WHOLE_COT_PROMPT_VERSION = "whole-cot-comparator-v1"
-COMPACT_WHOLE_COT_PROMPT_VERSION = "whole-cot-compact-separate-v2-global-defs"
-DIRECT_WHOLE_COT_PROMPT_VERSION = "whole-cot-direct-comparator-v2-global-defs"
-JOINT_WHOLE_COT_PROMPT_VERSION = "whole-cot-joint-audit-v2"
+FORMAL_DECOMPILER_PROMPT_VERSION = "formal-decompiler-v2-product-metric"
+WHOLE_COT_PROMPT_VERSION = "whole-cot-comparator-v2-product-metric"
+COMPACT_WHOLE_COT_PROMPT_VERSION = "whole-cot-compact-separate-v3-product-metric"
+DIRECT_WHOLE_COT_PROMPT_VERSION = "whole-cot-direct-comparator-v3-product-metric"
+JOINT_WHOLE_COT_PROMPT_VERSION = "whole-cot-joint-audit-v3-product-metric"
 SEMANTIC_EFFECTS = {"objectDefinition", "proposition", "vacuous"}
 JOINT_SEMANTIC_EFFECT_ALIASES = {
     "assertsproperty": "proposition",
@@ -79,6 +80,14 @@ dependencies are not formal references. For every implication or quantified
 theorem, explicitly distinguish assumptions from the conclusion using the
 words "Assuming ..., concludes ...". Never promote a hypothesis into the
 conclusion, and never infer a geometric/counting meaning from the node name.
+
+Apply Lean's metric instances literally. For `P Q : α × β`, an unqualified
+`dist P Q` is the maximum of the two component distances, and the default
+product norm is likewise max/sup, not Euclidean. Do not translate it as
+Euclidean because of names, comments, or geometry context. Translate an
+explicit sum of squared coordinate differences as squared Euclidean distance,
+not ordinary distance; only an explicit square root of that sum is ordinary
+Euclidean distance. `EuclideanSpace ℝ (Fin 2)` norm/dist is Euclidean.
 """
 
 
@@ -96,6 +105,14 @@ region, solid, volume, or interior, which normally requires a membership or
 inequality constraint. The root must preserve the target object requested by
 the original problem, not merely repeat a final equation from the COT. Root
 `reasons` list defects only and must be empty when both root booleans are true.
+
+Treat `ℝ × ℝ` and `ℚ × ℚ` as coordinate carriers, which is not itself a defect.
+But their default product `dist`/`norm` is max/sup, not Euclidean. When the COT
+requires Euclidean length, circle, or angle and the formalization uses that
+product metric, report the mismatch in `cot.wrong_relations`; if it affects the
+target/root, set the corresponding root boolean false. Do not equate explicit
+squared Euclidean distance with ordinary distance unless the COT use-chain
+preserves the square relation. `EuclideanSpace ℝ (Fin 2)` uses Euclidean metric.
 
 Return one JSON object with exactly `cot`, `root`, `unreachable_nodes`, and
 `dependency_issues`. `cot` has exactly `combined_formal_translation`,
@@ -125,6 +142,15 @@ dependency issue because a definition is absent from `sorry_using`. Mere global
 availability gives no semantic credit: a required source object or relation is
 grounded only when the root or a root-reachable proposition actually references,
 constrains, or relates it.
+
+Treat `ℝ × ℝ` and `ℚ × ℚ` as valid coordinate carriers. Their default product
+`dist`/`norm`, however, is max/sup rather than Euclidean. If the COT requires
+Euclidean length, circle, or angle and the formalization uses the product
+metric, report it in `cot.wrong_relations` and set an affected root boolean
+false. An explicit coordinate square-sum is squared Euclidean distance, not
+ordinary distance unless the COT use-chain preserves that square relation;
+an explicit square root or `EuclideanSpace ℝ (Fin 2)` may represent Euclidean
+distance.
 
 Audit in this order: probability and quantifiers; target object and relation;
 root grounding; then material dependency use-chains. Do not report a
@@ -172,6 +198,14 @@ availability gives no semantic credit: a required source object or relation is
 grounded only when the root or a root-reachable proposition actually references,
 constrains, or relates it.
 
+Apply Lean's metric instances literally while auditing. A product carrier is
+allowed, but default `dist`/`norm` on `ℝ × ℝ` or `ℚ × ℚ` is max/sup, not
+Euclidean. Report its use for a COT Euclidean length, circle, or angle in
+`cot.wrong_relations`, and set an affected root boolean false. A coordinate
+square-sum is squared Euclidean distance and cannot silently stand for ordinary
+distance; an explicit square root or `EuclideanSpace ℝ (Fin 2)` can be
+Euclidean.
+
 Do not report a dependency issue merely because a proof node is outside
 `proof_root_closure`. Verification, abandoned derivations, and legitimate side
 branches need not support the root. Report one only when material COT content
@@ -202,6 +236,9 @@ decompiler. Complete this part before deciding the comparator part.
 `objectDefinition`, `proposition`, or `vacuous` with identical spelling and
 capitalization. Never emit alternatives such as `theoremStatement`,
 `propertyAssertion`, `lemmaStatement`, `propertyDefinition`, or `definition`.
+For `P Q : α × β`, translate default product `dist`/`norm` as componentwise
+max/sup, never Euclidean. A coordinate square-sum is squared Euclidean distance;
+only an explicit square root (or EuclideanSpace norm/dist) is Euclidean.
 
 For the `whole_cot_comparator` part, treat your completed node translations as
 frozen evidence. A mathematically wrong COT must pass when formalized exactly.
@@ -209,6 +246,10 @@ Reject omissions, weakenings, added claims, object replacement, unbound
 objects, wrong relation/direction, answer hard-coding, dependency breaks, and
 an unrelated root. A boundary equality does not represent an enclosed volume
 or interior. Use only supplied node names. The runner recomputes PASS.
+When a COT requires Euclidean length, circle, or angle but the formalization
+uses product max/sup `dist`/`norm`, report `cot.wrong_relations` and make an
+affected root boolean false. A tuple carrier alone is not a defect, and squared
+distance is not ordinary distance without a preserved square relation.
 
 Return one JSON object and no Markdown. Its top-level keys must occur exactly
 in this order: `formal_decompiler`, then `whole_cot_comparator`. The first value
@@ -1209,7 +1250,9 @@ def run_formal_decompiler(
     if tracer is not None:
         tracer.emit(TraceEvent(
             kind="formalDecompileStart", thm_name=thm_name, turn=round_index,
-            args={"round": round_index, "formalViewHash": view.sha256, "nodeCount": len(view.nodes)},
+            args={"round": round_index, "formalViewHash": view.sha256,
+                  "nodeCount": len(view.nodes),
+                  "protocol": FORMAL_DECOMPILER_PROMPT_VERSION},
         ))
     parsed, content, reasoning, finish, request_id, attempts, usage = _run_stage(
         client, model, messages=(
@@ -1233,12 +1276,14 @@ def run_formal_decompiler(
         tracer.emit(TraceEvent(
             kind="formalDecompileResult", thm_name=thm_name, turn=round_index,
             args={"round": round_index, "formalViewHash": view.sha256,
+                  "protocol": FORMAL_DECOMPILER_PROMPT_VERSION,
                   "vacuousNodes": list(result.vacuous_nodes), "result": result.to_dict()},
             ok=not bool(result.vacuous_nodes),
         ))
         tracer.emit(TraceEvent(
             kind="formalDecompileEnd", thm_name=thm_name, turn=round_index,
             args={"round": round_index, "attemptCount": len(attempts),
+                  "protocol": FORMAL_DECOMPILER_PROMPT_VERSION,
                   "promptTokens": usage[0], "completionTokens": usage[1],
                   "totalTokens": usage[2], "requestId": request_id},
             ok=True,
@@ -1601,7 +1646,8 @@ def whole_cot_comparator_defects(result: WholeCotComparatorResult) -> list[dict[
 
 
 __all__ = [
-    "WHOLE_COT_PROMPT_VERSION", "JOINT_WHOLE_COT_PROMPT_VERSION",
+    "FORMAL_DECOMPILER_PROMPT_VERSION", "WHOLE_COT_PROMPT_VERSION",
+    "JOINT_WHOLE_COT_PROMPT_VERSION",
     "JOINT_SEMANTIC_EFFECT_ALIASES", "JOINT_WHOLE_COT_SYSTEM_PROMPT",
     "COMPACT_WHOLE_COT_PROMPT_VERSION", "DIRECT_WHOLE_COT_PROMPT_VERSION",
     "FormalDecompilerResult", "FormalView", "JointWholeCotAuditResult",

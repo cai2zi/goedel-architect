@@ -438,8 +438,9 @@ def _unannotated_local_declaration_errors(blueprint: Blueprint) -> list[str]:
     preview = "; ".join(unexpected[:8])
     suffix = "" if len(unexpected) <= 8 else f"; ... and {len(unexpected) - 8} more lines"
     return [
-        "unannotatedLocalDeclaration: canonical rebuilding preserves only imports/options and "
-        "@[blueprint] declarations. Convert every local declaration to a Blueprint "
+        "unannotatedLocalDeclaration: canonical rebuilding preserves only imports, open/open "
+        "scoped commands, set_option commands, and @[blueprint] declarations. Convert every "
+        "local declaration to a Blueprint "
         f"node or remove it. Unexpected source: {preview}{suffix}"
     ]
 
@@ -566,25 +567,41 @@ class Blueprint:
         return ordered
 
 
+_TOP_LEVEL_HEADER_COMMAND_RE = re.compile(
+    r"(?:import\s+\S.*|open(?:\s+scoped)?\s+\S.*|set_option\s+\S.*)"
+)
+
+
+def _extract_top_level_header_commands(lean_code: str) -> tuple[str, list[str]]:
+    """Mask safe top-level commands while retaining source offsets and lines."""
+    comment_free_lines = _strip_lean_comments(lean_code).splitlines(keepends=True)
+    source_lines = lean_code.splitlines(keepends=True)
+    masked_lines: list[str] = []
+    commands: list[str] = []
+    for index, raw_line in enumerate(source_lines):
+        visible = comment_free_lines[index] if index < len(comment_free_lines) else raw_line
+        candidate = visible.strip()
+        is_top_level = not visible[: len(visible) - len(visible.lstrip())]
+        if is_top_level and _TOP_LEVEL_HEADER_COMMAND_RE.fullmatch(candidate):
+            commands.append(candidate)
+            masked_lines.append("".join(
+                char if char in "\r\n" else " " for char in raw_line
+            ))
+        else:
+            masked_lines.append(raw_line)
+    return "".join(masked_lines), commands
+
+
 def _safe_phase2_header(lean_code: str) -> str:
-    """Extract the leading commands Phase 2 may safely preserve."""
+    """Normalize safe commands into one deterministic Phase-2 header."""
     imports: list[str] = []
     other: list[str] = []
-    in_block_comment = False
+    seen: set[str] = set()
     for raw_line in lean_code.splitlines():
         stripped = raw_line.strip()
-        if not stripped:
+        if not stripped or stripped in seen:
             continue
-        if in_block_comment:
-            if "-/" in stripped:
-                in_block_comment = False
-            continue
-        if stripped.startswith("/-"):
-            if "-/" not in stripped[2:]:
-                in_block_comment = True
-            continue
-        if stripped.startswith("--"):
-            continue
+        seen.add(stripped)
         if stripped.startswith("import "):
             imports.append(stripped)
             continue
@@ -594,16 +611,24 @@ def _safe_phase2_header(lean_code: str) -> str:
         if stripped.startswith("set_option "):
             other.append(stripped)
             continue
-        break
 
-    if not any(line == "import Mathlib" for line in imports):
-        imports.insert(0, "import Mathlib")
-    if not any(line == "import Architect" for line in imports):
-        insert_at = 1 if imports and imports[0] == "import Mathlib" else len(imports)
-        imports.insert(insert_at, "import Architect")
-    if not any(line.startswith("set_option autoImplicit ") for line in other):
-        other.insert(0, "set_option autoImplicit false")
-    return "\n".join(imports + other).rstrip() + "\n\n"
+    extra_imports = [
+        line for line in imports if line not in {"import Mathlib", "import Architect"}
+    ]
+    extra_commands = [
+        line for line in other
+        if not line.startswith("set_option autoImplicit ")
+        and line != "open scoped BigOperators"
+    ]
+    canonical = [
+        "import Mathlib",
+        "import Architect",
+        *extra_imports,
+        "set_option autoImplicit false",
+        "open scoped BigOperators",
+        *extra_commands,
+    ]
+    return "\n".join(canonical).rstrip() + "\n\n"
 
 
 def _transitive_node_deps(node: BlueprintNode, blueprint: Blueprint) -> set[str]:
@@ -1037,13 +1062,14 @@ def _parse_blueprint(lean_code: str, target_theorem: str) -> Blueprint:
     Extracts node names, kinds, statements, proof sketches, and sorry_using deps.
     """
     nodes: list[BlueprintNode] = []
+    parse_source, header_commands = _extract_top_level_header_commands(lean_code)
     # Match @[blueprint ...] blocks followed by a declaration
     pattern = re.compile(
         rf"@\[blueprint\s*(.*?)\]\s*({_BLUEPRINT_DECL_KW})\s+"
         rf"(\w+)(.*?)(?=@\[blueprint|\Z)",
         re.DOTALL,
     )
-    for m in pattern.finditer(lean_code):
+    for m in pattern.finditer(parse_source):
         attrs_block = m.group(1)
         kind_kw = " ".join(m.group(2).split())
         name = m.group(3)
@@ -1059,24 +1085,26 @@ def _parse_blueprint(lean_code: str, target_theorem: str) -> Blueprint:
         dep_match = re.search(r"sorry_using\s*\[([^\]]*)\]", rest)
         deps = [d.strip() for d in dep_match.group(1).split(",") if d.strip()] if dep_match else []
 
+        declaration = m.group(0).strip()
+        declaration_end = m.start() + len(m.group(0).rstrip())
         nodes.append(BlueprintNode(
             name=name,
             kind=kind,
             statement=statement,
             proof_sketch=proof_sketch,
             dependencies=deps,
-            lean_declaration=m.group(0),
+            lean_declaration=declaration,
             title=title,
             source_step_id="",
             lean_start_line=lean_code.count("\n", 0, m.start()) + 1,
-            lean_end_line=lean_code.count("\n", 0, m.end()) + 1,
+            lean_end_line=lean_code.count("\n", 0, declaration_end) + 1,
         ))
 
     return Blueprint(
         nodes=nodes,
         lean_file=lean_code,
         target_theorem=target_theorem,
-        phase2_header=_safe_phase2_header(lean_code),
+        phase2_header=_safe_phase2_header("\n".join(header_commands)),
     )
 
 

@@ -15,11 +15,13 @@ from blueprint import _parse_blueprint  # noqa: E402
 from semantic_fidelity import validate_blueprint_fidelity  # noqa: E402
 from semantic_audit import (  # noqa: E402
     COMPACT_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT,
+    DECOMPILER_SYSTEM_PROMPT,
     DIRECT_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT,
     FormalDecompilerResult,
     JOINT_SEMANTIC_EFFECT_ALIASES,
     JOINT_WHOLE_COT_SYSTEM_PROMPT,
     JOINT_WHOLE_COT_PROMPT_VERSION,
+    WHOLE_COT_COMPARATOR_SYSTEM_PROMPT,
     SemanticAuditFormatError,
     WHOLE_COT_PROMPT_VERSION,
     build_formal_view,
@@ -116,6 +118,19 @@ def _joint_payload(view, *, missing: bool = False, root_ok: bool = True):
 
 
 class SemanticAuditTest(unittest.TestCase):
+    def test_all_audit_prompts_preserve_product_metric_semantics(self) -> None:
+        for prompt in (
+            DECOMPILER_SYSTEM_PROMPT,
+            WHOLE_COT_COMPARATOR_SYSTEM_PROMPT,
+            COMPACT_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT,
+            DIRECT_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT,
+            JOINT_WHOLE_COT_SYSTEM_PROMPT,
+        ):
+            with self.subTest(prompt=prompt[:30]):
+                self.assertIn("max/sup", prompt)
+                self.assertIn("Euclidean", prompt)
+                self.assertIn("squared Euclidean distance", prompt)
+
     def setUp(self) -> None:
         self.view = build_formal_view(_parse_blueprint(LEAN, "root"))
 
