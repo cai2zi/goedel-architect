@@ -134,6 +134,38 @@ answer aliases such as `shortest_path` or `expected_value`.
 """
 
 
+ANSWER_PREASSIGNED_REPAIR_GUIDANCE = r"""
+
+## Semantic repair pattern: computed object was preassigned
+
+This synthetic example is unrelated to the current problem. Do not copy its
+names or numeric literals. Do not repair `computed := answer` by changing it to
+`computed := 0`. The object to be computed must be an explicit lemma/root
+binder, and the source constraints must occur in the theorem type. The claimed
+answer may occur in a derived conclusion, but not in a definition that fixes
+the computed object. Do not manufacture a reflexive equality by applying a
+parameterized definition directly to the answer value.
+
+```lean
+@[blueprint]
+def demo_relations (unknown target : ℤ) : Prop :=
+  5 * unknown + 3 = 38 ∧ target = 2 * unknown
+
+@[blueprint]
+lemma demo_solve
+    (unknown target : ℤ)
+    (h : demo_relations unknown target) :
+    unknown = 7 := by sorry_using []
+
+@[blueprint]
+theorem {{target_name}}
+    (unknown target : ℤ)
+    (h : demo_relations unknown target) :
+    target = 14 := by sorry_using [demo_solve]
+```
+"""
+
+
 @dataclass(frozen=True)
 class GenerationRound:
     round_index: int
@@ -739,6 +771,31 @@ def _feedback(
     return "\n\n".join(sections)
 
 
+def _active_repair_codes(
+    semantic: Sequence[dict[str, Any]],
+) -> tuple[str, ...]:
+    supported = {"answerPreassigned", "targetCoverageIncomplete"}
+    return tuple(sorted({
+        str(item.get("code")) for item in semantic
+        if item.get("code") in supported
+    }))
+
+
+def _semantic_feedback_state(
+    last_errors: Sequence[dict[str, Any]],
+    last_round: int | None,
+    *,
+    semantic_audit_invoked: bool,
+    current_errors: Sequence[dict[str, Any]],
+    current_round: int,
+) -> tuple[tuple[dict[str, Any], ...], int | None, tuple[str, ...], bool]:
+    if semantic_audit_invoked:
+        errors = tuple(current_errors)
+        return errors, current_round, _active_repair_codes(errors), False
+    errors = tuple(last_errors)
+    return errors, last_round, _active_repair_codes(errors), bool(errors)
+
+
 _FORBIDDEN_REPLACEMENTS = {
     "structure": "Use a tuple or type alias plus Blueprint accessor definitions.",
     "instance": "Use an explicit Bool predicate or a decision procedure inside a definition.",
@@ -917,6 +974,7 @@ def _messages(
     claimed_answer: str,
     previous_blueprint: str,
     previous_feedback: str,
+    active_repair_codes: Sequence[str] = (),
     prompt_profile: str = "whole_cot_minimal",
     node_naming: str = "semantic",
 ) -> list[dict[str, str]]:
@@ -938,6 +996,11 @@ def _messages(
             + "\n```\n\n## Complete previous diagnostics\n"
             + previous_feedback
         )
+        if "answerPreassigned" in active_repair_codes:
+            user += render(
+                ANSWER_PREASSIGNED_REPAIR_GUIDANCE,
+                target_name=target_name,
+            )
     system = (
         ROBUSTPA_BLUEPRINT_MINIMAL_SYSTEM_PROMPT
         if prompt_profile == "whole_cot_minimal"
@@ -1368,6 +1431,9 @@ def generate_blueprint(
     latest_deterministic: tuple[dict[str, Any], ...] = ()
     latest_semantic: tuple[dict[str, Any], ...] = ()
     latest_warnings: tuple[dict[str, Any], ...] = ()
+    last_audited_semantic_errors: tuple[dict[str, Any], ...] = ()
+    last_audited_semantic_round: int | None = None
+    active_repair_codes: tuple[str, ...] = ()
 
     for round_index in range(1, max_turns + 1):
         messages = _messages(
@@ -1377,6 +1443,7 @@ def generate_blueprint(
             claimed_answer=claimed_answer,
             previous_blueprint=previous_code,
             previous_feedback=previous_feedback,
+            active_repair_codes=active_repair_codes,
             prompt_profile=prompt_profile,
             node_naming=node_naming,
         )
@@ -1422,6 +1489,9 @@ def generate_blueprint(
                     "presencePenalty": presence_penalty,
                     "repetitionPenalty": repetition_penalty,
                     "semanticAuditMode": semantic_audit_mode,
+                    "semanticFeedbackSourceRound": last_audited_semantic_round,
+                    "semanticFeedbackRetained": bool(last_audited_semantic_errors),
+                    "activeRepairCodes": list(active_repair_codes),
                     "semanticAuditSampling": {
                         "enableThinking": semantic_audit_enable_thinking,
                         "temperature": semantic_audit_temperature,
@@ -1476,8 +1546,9 @@ def generate_blueprint(
             latest_deterministic = _deduplicate(submission_errors)
             latest_semantic = ()
             latest_warnings = ()
+            latest_validation = None
             previous_feedback = _feedback(
-                latest_deterministic, latest_semantic, latest_warnings,
+                latest_deterministic, last_audited_semantic_errors, latest_warnings,
             )
             candidate_hash = ""
             details: dict[str, Any] = {
@@ -1488,6 +1559,9 @@ def generate_blueprint(
                     "previousDiagnosticStatus": [],
                     "notRunReason": "generationSubmissionInvalid",
                 },
+                "semanticFeedbackSourceRound": last_audited_semantic_round,
+                "semanticFeedbackRetained": bool(last_audited_semantic_errors),
+                "activeRepairCodes": list(active_repair_codes),
             }
         else:
             previous_code = code
@@ -1602,13 +1676,38 @@ def generate_blueprint(
             previous_search_symbols = tuple(
                 str(item["symbol"]) for item in search_reports
             )
+            semantic_invoked_this_round = latest_validation.semantic_audit_invoked
+            (
+                last_audited_semantic_errors,
+                last_audited_semantic_round,
+                active_repair_codes,
+                semantic_feedback_retained,
+            ) = _semantic_feedback_state(
+                last_audited_semantic_errors,
+                last_audited_semantic_round,
+                semantic_audit_invoked=semantic_invoked_this_round,
+                current_errors=latest_semantic,
+                current_round=round_index,
+            )
+            feedback_semantic = (
+                latest_semantic
+                if semantic_invoked_this_round
+                else last_audited_semantic_errors
+            )
             previous_feedback = _feedback(
-                latest_deterministic, latest_semantic, latest_warnings,
+                latest_deterministic, feedback_semantic, latest_warnings,
                 blueprint=latest_blueprint,
                 mathlib_search_context=search_reports,
             )
             candidate_hash = hashlib.sha256(previous_code.encode()).hexdigest()
             details = validation_details(latest_validation)
+            details.update({
+                "semanticFeedbackSourceRound": last_audited_semantic_round,
+                "semanticFeedbackRetained": (
+                    semantic_feedback_retained
+                ),
+                "activeRepairCodes": list(active_repair_codes),
+            })
             details["phase1MathlibSearch"] = {
                 "enabled": phase1_mathlib_search_enabled,
                 "eligibleSymbols": list(eligible_symbols),
@@ -1671,6 +1770,13 @@ def generate_blueprint(
                             latest_validation.semantic_output_budget
                             if latest_validation else None
                         ),
+                        "semanticFeedbackSourceRound": details.get(
+                            "semanticFeedbackSourceRound"
+                        ),
+                        "semanticFeedbackRetained": details.get(
+                            "semanticFeedbackRetained", False
+                        ),
+                        "activeRepairCodes": details.get("activeRepairCodes", []),
                     },
                     ok=ok,
                 ))
@@ -1702,6 +1808,13 @@ def generate_blueprint(
                         latest_validation.semantic_request_count
                         if latest_validation else 0
                     ),
+                    "semanticFeedbackSourceRound": details.get(
+                        "semanticFeedbackSourceRound"
+                    ),
+                    "semanticFeedbackRetained": details.get(
+                        "semanticFeedbackRetained", False
+                    ),
+                    "activeRepairCodes": details.get("activeRepairCodes", []),
                 },
                 ok=not latest_deterministic and not latest_semantic and not latest_warnings,
             ))

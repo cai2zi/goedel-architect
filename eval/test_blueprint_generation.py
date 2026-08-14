@@ -21,6 +21,7 @@ from blueprint_generation import (  # noqa: E402
     _eligible_mathlib_symbols,
     _feedback,
     _run_phase1_mathlib_search,
+    _semantic_feedback_state,
     _submitted_code,
     _validate_round,
     _with_semantic_audit,
@@ -122,6 +123,64 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
         self.assertIn("noncomputable def", system)
         self.assertIn("max/sup metric, not the Euclidean metric", system)
         self.assertIn("squared Euclidean distance", system)
+
+    def test_answer_preassigned_guidance_is_dynamic_and_synthetic(self) -> None:
+        common = dict(
+            target_name="root", informal_statement="problem", informal_proof="cot",
+            claimed_answer="1", previous_blueprint=self.MINIMAL,
+            previous_feedback="semantic defect",
+        )
+        plain = "\n".join(item["content"] for item in _messages(**common))
+        coverage = "\n".join(item["content"] for item in _messages(
+            **common, active_repair_codes=("targetCoverageIncomplete",),
+        ))
+        repaired = "\n".join(item["content"] for item in _messages(
+            **common, active_repair_codes=("answerPreassigned",),
+        ))
+        self.assertNotIn("demo_relations", plain)
+        self.assertNotIn("demo_relations", coverage)
+        self.assertIn("demo_relations", repaired)
+        self.assertIn("theorem root", repaired)
+        for forbidden in ("Wrong76", "prealgebra/874", "26", "115"):
+            self.assertNotIn(forbidden, repaired)
+
+    def test_semantic_feedback_retains_across_mechanical_failures_and_replaces(self) -> None:
+        first = ({"code": "answerPreassigned", "message": "bind unknown"},)
+        errors, source, codes, retained = _semantic_feedback_state(
+            (), None, semantic_audit_invoked=True, current_errors=first,
+            current_round=1,
+        )
+        self.assertEqual(errors, first)
+        self.assertEqual(source, 1)
+        self.assertEqual(codes, ("answerPreassigned",))
+        self.assertFalse(retained)
+        for round_index in (2, 3):
+            errors, source, codes, retained = _semantic_feedback_state(
+                errors, source, semantic_audit_invoked=False, current_errors=(),
+                current_round=round_index,
+            )
+            self.assertEqual(errors, first)
+            self.assertEqual(source, 1)
+            self.assertEqual(codes, ("answerPreassigned",))
+            self.assertTrue(retained)
+        replacement = ({"code": "targetCoverageIncomplete", "message": "all roots"},)
+        errors, source, codes, retained = _semantic_feedback_state(
+            errors, source, semantic_audit_invoked=True,
+            current_errors=replacement, current_round=4,
+        )
+        self.assertEqual(errors, replacement)
+        self.assertEqual(source, 4)
+        self.assertEqual(codes, ("targetCoverageIncomplete",))
+        self.assertFalse(retained)
+
+    def test_new_audit_without_answer_preassigned_stops_guidance(self) -> None:
+        errors, source, codes, _ = _semantic_feedback_state(
+            ({"code": "answerPreassigned"},), 1,
+            semantic_audit_invoked=True, current_errors=(), current_round=2,
+        )
+        self.assertEqual(errors, ())
+        self.assertEqual(source, 2)
+        self.assertEqual(codes, ())
 
     def test_narrow_contract_feedback_has_only_validated_guidance(self) -> None:
         blueprint = _parse_blueprint(self.MINIMAL, "root")
@@ -320,7 +379,7 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
                 "translation": "x", "target_object_preserved": True,
                 "answer_grounded": True, "reasons": [],
             },
-            (), (), True, "{}", "", "stop", "c", 1, 1, 2,
+            (), (), (), True, "{}", "", "stop", "c", 1, 1, 2,
             ({"attempt": 1},),
         )
         common = dict(

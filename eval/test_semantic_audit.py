@@ -18,6 +18,7 @@ from semantic_audit import (  # noqa: E402
     DECOMPILER_SYSTEM_PROMPT,
     DIRECT_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT,
     FormalDecompilerResult,
+    WholeCotComparatorResult,
     JOINT_SEMANTIC_EFFECT_ALIASES,
     JOINT_WHOLE_COT_SYSTEM_PROMPT,
     JOINT_WHOLE_COT_PROMPT_VERSION,
@@ -39,6 +40,7 @@ from semantic_audit import (  # noqa: E402
     semantic_audit_cache_key,
     unreachable_proof_node_names,
     whole_cot_comparator_messages,
+    whole_cot_comparator_defects,
 )
 
 
@@ -104,7 +106,7 @@ def _whole_cot_payload(*, missing: bool = False, root_ok: bool = True):
             "answer_grounded": root_ok,
             "reasons": [] if root_ok else ["target object replaced"],
         },
-        "unreachable_nodes": [], "dependency_issues": [],
+        "unreachable_nodes": [], "dependency_issues": [], "repair_issues": [],
     }
 
 
@@ -202,7 +204,7 @@ class SemanticAuditTest(unittest.TestCase):
                 "target_object_preserved": True, "answer_grounded": True,
                 "reasons": [],
             },
-            "unreachable_nodes": [], "dependency_issues": [],
+            "unreachable_nodes": [], "dependency_issues": [], "repair_issues": [],
         }
         parsed = parse_whole_cot_comparator(
             json.dumps(payload), view=view, decompiler=decompiler,
@@ -227,7 +229,7 @@ class SemanticAuditTest(unittest.TestCase):
             },
             "root": {"translation": "six", "target_object_preserved": False,
                      "answer_grounded": False, "reasons": ["object replaced"]},
-            "unreachable_nodes": [], "dependency_issues": [],
+            "unreachable_nodes": [], "dependency_issues": [], "repair_issues": [],
         }
         self.assertFalse(parse_whole_cot_comparator(
             json.dumps(payload), view=view, decompiler=decompiler,
@@ -282,6 +284,68 @@ class SemanticAuditTest(unittest.TestCase):
         self.assertFalse(parse_compact_whole_cot_comparator(
             json.dumps(payload), view=view, decompiler=decompiler,
         )[-1])
+
+    def test_repair_issue_is_strictly_parsed_rejects_and_maps_to_error(self) -> None:
+        view = build_formal_view(_parse_blueprint(LEAN, "root"))
+        payload = _whole_cot_payload(missing=True, root_ok=False)
+        payload.pop("unreachable_nodes")
+        payload["repair_issues"] = [{
+            "code": "answerPreassigned",
+            "node_names": ["sourceValue", "root"],
+            "reason": "the computed object was fixed before derivation",
+        }]
+        parsed = parse_compact_whole_cot_comparator(
+            json.dumps(payload), view=view,
+        )
+        self.assertFalse(parsed[-1])
+        self.assertEqual(parsed[4][0]["code"], "answerPreassigned")
+        comparator = WholeCotComparatorResult(
+            parsed[0], parsed[1], parsed[2], parsed[3], parsed[4], parsed[5],
+            "{}", "", "stop", "request", 1, 1, 2,
+        )
+        categories = {item["category"] for item in whole_cot_comparator_defects(comparator)}
+        self.assertIn("answerPreassigned", categories)
+
+    def test_target_coverage_repair_issue_and_invalid_code(self) -> None:
+        view = build_formal_view(_parse_blueprint(LEAN, "root"))
+        payload = _whole_cot_payload(missing=True, root_ok=False)
+        payload.pop("unreachable_nodes")
+        payload["repair_issues"] = [{
+            "code": "targetCoverageIncomplete", "node_names": ["root"],
+            "reason": "only one witness is represented",
+        }]
+        self.assertEqual(
+            parse_compact_whole_cot_comparator(json.dumps(payload), view=view)[4][0]["code"],
+            "targetCoverageIncomplete",
+        )
+        payload["repair_issues"][0]["code"] = "unknownRepair"
+        with self.assertRaisesRegex(SemanticAuditFormatError, "unsupported repair"):
+            parse_compact_whole_cot_comparator(json.dumps(payload), view=view)
+
+    def test_repair_issue_requires_ordinary_semantic_evidence(self) -> None:
+        view = build_formal_view(_parse_blueprint(LEAN, "root"))
+        payload = _whole_cot_payload()
+        payload.pop("unreachable_nodes")
+        payload["repair_issues"] = [{
+            "code": "answerPreassigned", "node_names": ["sourceValue"],
+            "reason": "incorrectly labeled a source-given constant",
+        }]
+        with self.assertRaisesRegex(SemanticAuditFormatError, "ordinary cot/root defect"):
+            parse_compact_whole_cot_comparator(json.dumps(payload), view=view)
+
+    def test_repair_prompt_definitions_distinguish_computed_and_given_constants(self) -> None:
+        view = build_formal_view(_parse_blueprint(LEAN, "root"))
+        decompiler = _decompiler(view)
+        for messages in (
+            whole_cot_comparator_messages("p", "c", "6", view, decompiler),
+            compact_whole_cot_comparator_messages("p", "c", "6", view, decompiler),
+            direct_whole_cot_comparator_messages("p", "c", "6", view),
+            joint_whole_cot_audit_messages("p", "c", "6", view),
+        ):
+            prompt = messages[0]["content"]
+            self.assertIn("answerPreassigned", prompt)
+            self.assertIn("Never use it for a constant supplied", prompt)
+            self.assertIn("targetCoverageIncomplete", prompt)
 
     def test_direct_protocol_has_formal_view_without_sha_or_translations(self) -> None:
         view = build_formal_view(_parse_blueprint(LEAN, "root"))

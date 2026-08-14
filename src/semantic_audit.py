@@ -18,10 +18,10 @@ from tracer import TraceEvent
 
 
 FORMAL_DECOMPILER_PROMPT_VERSION = "formal-decompiler-v2-product-metric"
-WHOLE_COT_PROMPT_VERSION = "whole-cot-comparator-v2-product-metric"
-COMPACT_WHOLE_COT_PROMPT_VERSION = "whole-cot-compact-separate-v3-product-metric"
-DIRECT_WHOLE_COT_PROMPT_VERSION = "whole-cot-direct-comparator-v3-product-metric"
-JOINT_WHOLE_COT_PROMPT_VERSION = "whole-cot-joint-audit-v3-product-metric"
+WHOLE_COT_PROMPT_VERSION = "whole-cot-comparator-v3-semantic-repair"
+COMPACT_WHOLE_COT_PROMPT_VERSION = "whole-cot-compact-separate-v4-semantic-repair"
+DIRECT_WHOLE_COT_PROMPT_VERSION = "whole-cot-direct-comparator-v4-semantic-repair"
+JOINT_WHOLE_COT_PROMPT_VERSION = "whole-cot-joint-audit-v4-semantic-repair"
 SEMANTIC_EFFECTS = {"objectDefinition", "proposition", "vacuous"}
 JOINT_SEMANTIC_EFFECT_ALIASES = {
     "assertsproperty": "proposition",
@@ -114,8 +114,8 @@ target/root, set the corresponding root boolean false. Do not equate explicit
 squared Euclidean distance with ordinary distance unless the COT use-chain
 preserves the square relation. `EuclideanSpace ℝ (Fin 2)` uses Euclidean metric.
 
-Return one JSON object with exactly `cot`, `root`, `unreachable_nodes`, and
-`dependency_issues`. `cot` has exactly `combined_formal_translation`,
+Return one JSON object with exactly `cot`, `root`, `unreachable_nodes`,
+`dependency_issues`, and `repair_issues`. `cot` has exactly `combined_formal_translation`,
 `missing_clauses`, `weakened_clauses`, `unbound_objects`, `wrong_relations`,
 and `added_clauses`. Each clause issue has exactly `clause`, `node_names`, and
 `reason`. `root` has exactly `translation`, `target_object_preserved`,
@@ -164,7 +164,7 @@ the root. Do not duplicate one defect across categories.
 The root must preserve the target object requested by the original problem,
 not merely repeat a final equation. Root `reasons` list defects only and must
 be empty when both root booleans are true. Return one JSON object with exactly
-`cot`, `root`, and `dependency_issues`. `cot` has exactly
+`cot`, `root`, `dependency_issues`, and `repair_issues`. `cot` has exactly
 `combined_formal_translation`, `missing_clauses`, `weakened_clauses`,
 `unbound_objects`, `wrong_relations`, and `added_clauses`. Each clause issue
 has exactly `clause`, `node_names`, and `reason`. `root` has exactly
@@ -212,7 +212,8 @@ branches need not support the root. Report one only when material COT content
 cannot reach the root. Do not infer intended mathematics from names and do not
 duplicate one defect across categories.
 
-Return one JSON object with exactly `cot`, `root`, and `dependency_issues`.
+Return one JSON object with exactly `cot`, `root`, `dependency_issues`, and
+`repair_issues`.
 `cot` has exactly `combined_formal_translation`, `missing_clauses`,
 `weakened_clauses`, `unbound_objects`, `wrong_relations`, and `added_clauses`.
 Each clause issue has exactly `clause`, `node_names`, and `reason`. `root` has
@@ -254,11 +255,27 @@ distance is not ordinary distance without a preserved square relation.
 Return one JSON object and no Markdown. Its top-level keys must occur exactly
 in this order: `formal_decompiler`, then `whole_cot_comparator`. The first value
 has exactly `nodes`. The second has exactly `cot`, `root`,
-`unreachable_nodes`, and `dependency_issues`, using the supplied schemas and
+`unreachable_nodes`, `dependency_issues`, and `repair_issues`, using the supplied schemas and
 inventories. Keep each node translation under 40 words, the combined formal
 translation under 60 words, and each clause or reason under 20 words. Do not
 repeat the Lean declarations. Completing valid JSON is more important than
 explanation.
+"""
+
+
+REPAIR_ISSUE_CLASSIFICATION_PROMPT = r"""
+`repair_issues` is an array of actionable labels. Every item has exactly
+`code`, `node_names`, and `reason`; `code` is exactly one of
+`answerPreassigned` or `targetCoverageIncomplete`. Use `answerPreassigned`
+only when an object that the COT must compute is fixed by a definition to the
+claimed answer or to an arbitrary placeholder, making the proof verification,
+tautological, or circular. Never use it for a constant supplied by the source
+problem. Use `targetCoverageIncomplete` only when the task requires all
+solutions, an exact set, an extremum, or exhaustiveness but the formalization
+proves only a witness, one-way inclusion, or one candidate. Every repair issue
+must be supported by at least one ordinary `cot` defect or a false root verdict;
+the repair label does not replace that semantic evidence. Use supplied node
+names only. Return an empty array when neither pattern applies.
 """
 
 
@@ -325,6 +342,7 @@ class WholeCotComparatorResult:
     root: dict[str, Any]
     unreachable_nodes: tuple[dict[str, Any], ...]
     dependency_issues: tuple[dict[str, Any], ...]
+    repair_issues: tuple[dict[str, Any], ...]
     passed: bool
     raw_content: str
     reasoning_content: str
@@ -668,6 +686,56 @@ _WHOLE_COT_KEYS = {
     "combined_formal_translation", "missing_clauses", "weakened_clauses",
     "unbound_objects", "wrong_relations", "added_clauses",
 }
+_REPAIR_ISSUE_KEYS = {"code", "node_names", "reason"}
+_REPAIR_CODES = {"answerPreassigned", "targetCoverageIncomplete"}
+
+
+def _parse_repair_issues(
+    value: Any,
+    *,
+    known_nodes: set[str],
+    raw: str,
+) -> tuple[dict[str, Any], ...]:
+    if not isinstance(value, list):
+        raise SemanticAuditFormatError("repair_issues must be an array", raw_content=raw)
+    parsed = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict) or set(item) != _REPAIR_ISSUE_KEYS:
+            raise SemanticAuditFormatError(
+                f"repair_issues[{index}] has invalid keys", raw_content=raw,
+            )
+        code = _string(item["code"], "repair issue code", raw)
+        if code not in _REPAIR_CODES:
+            raise SemanticAuditFormatError(
+                f"unsupported repair issue code: {code}", raw_content=raw,
+            )
+        node_names = _strings(
+            item["node_names"], "repair issue node_names", raw,
+        )
+        if any(node_name not in known_nodes for node_name in node_names):
+            raise SemanticAuditFormatError(
+                "repair issue references unknown node", raw_content=raw,
+            )
+        parsed.append({
+            "code": code,
+            "node_names": list(node_names),
+            "reason": _string(item["reason"], "repair issue reason", raw),
+        })
+    return tuple(parsed)
+
+
+def _has_ordinary_semantic_defect(
+    cot: Mapping[str, Any], root: Mapping[str, Any],
+) -> bool:
+    return (
+        any(cot[key] for key in (
+            "missing_clauses", "weakened_clauses", "unbound_objects",
+            "wrong_relations", "added_clauses",
+        ))
+        or not root["target_object_preserved"]
+        or not root["answer_grounded"]
+        or bool(root["reasons"])
+    )
 
 
 def whole_cot_comparator_messages(
@@ -699,10 +767,16 @@ def whole_cot_comparator_messages(
                 "node_name": "n", "justified_side_branch": False, "reason": "...",
             }],
             "dependency_issues": [{"node_name": "n", "reason": "..."}],
+            "repair_issues": [{
+                "code": "answerPreassigned", "node_names": ["n"],
+                "reason": "...",
+            }],
         },
     }
     return [
-        {"role": "system", "content": WHOLE_COT_COMPARATOR_SYSTEM_PROMPT},
+        {"role": "system", "content": (
+            WHOLE_COT_COMPARATOR_SYSTEM_PROMPT + REPAIR_ISSUE_CLASSIFICATION_PROMPT
+        )},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
     ]
 
@@ -744,10 +818,17 @@ def compact_whole_cot_comparator_messages(
                 "answer_grounded": True, "reasons": [],
             },
             "dependency_issues": [{"node_name": view.root_name, "reason": "..."}],
+            "repair_issues": [{
+                "code": "answerPreassigned", "node_names": [view.root_name],
+                "reason": "...",
+            }],
         },
     }
     return [
-        {"role": "system", "content": COMPACT_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT},
+        {"role": "system", "content": (
+            COMPACT_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT
+            + REPAIR_ISSUE_CLASSIFICATION_PROMPT
+        )},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
     ]
 
@@ -788,10 +869,17 @@ def direct_whole_cot_comparator_messages(
                 "answer_grounded": True, "reasons": [],
             },
             "dependency_issues": [{"node_name": view.root_name, "reason": "..."}],
+            "repair_issues": [{
+                "code": "answerPreassigned", "node_names": [view.root_name],
+                "reason": "...",
+            }],
         },
     }
     return [
-        {"role": "system", "content": DIRECT_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT},
+        {"role": "system", "content": (
+            DIRECT_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT
+            + REPAIR_ISSUE_CLASSIFICATION_PROMPT
+        )},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
     ]
 
@@ -801,9 +889,12 @@ def parse_compact_whole_cot_comparator(
     *,
     view: FormalView,
     decompiler: FormalDecompilerResult | None = None,
-) -> tuple[dict[str, Any], dict[str, Any], tuple[dict[str, Any], ...], tuple[dict[str, Any], ...], bool]:
+) -> tuple[
+    dict[str, Any], dict[str, Any], tuple[dict[str, Any], ...],
+    tuple[dict[str, Any], ...], tuple[dict[str, Any], ...], bool,
+]:
     value = _json_object(content)
-    if set(value) != {"cot", "root", "dependency_issues"}:
+    if set(value) != {"cot", "root", "dependency_issues", "repair_issues"}:
         raise SemanticAuditFormatError(
             "invalid compact comparator top-level keys", raw_content=content,
         )
@@ -875,6 +966,14 @@ def parse_compact_whole_cot_comparator(
             "reason": _string(item["reason"], "dependency reason", content),
         })
 
+    repair_issues = _parse_repair_issues(
+        value["repair_issues"], known_nodes=known_nodes, raw=content,
+    )
+    if repair_issues and not _has_ordinary_semantic_defect(parsed_cot, parsed_root):
+        raise SemanticAuditFormatError(
+            "repair issue requires an ordinary cot/root defect", raw_content=content,
+        )
+
     passed = (
         not any(parsed_cot[key] for key in (
             "missing_clauses", "weakened_clauses", "unbound_objects",
@@ -884,9 +983,10 @@ def parse_compact_whole_cot_comparator(
         and parsed_root["answer_grounded"]
         and not parsed_root["reasons"]
         and not dependencies
+        and not repair_issues
         and (decompiler is None or not decompiler.vacuous_nodes)
     )
-    return parsed_cot, parsed_root, (), tuple(dependencies), passed
+    return parsed_cot, parsed_root, (), tuple(dependencies), repair_issues, passed
 
 
 def parse_whole_cot_comparator(
@@ -894,9 +994,14 @@ def parse_whole_cot_comparator(
     *,
     view: FormalView,
     decompiler: FormalDecompilerResult,
-) -> tuple[dict[str, Any], dict[str, Any], tuple[dict[str, Any], ...], tuple[dict[str, Any], ...], bool]:
+) -> tuple[
+    dict[str, Any], dict[str, Any], tuple[dict[str, Any], ...],
+    tuple[dict[str, Any], ...], tuple[dict[str, Any], ...], bool,
+]:
     value = _json_object(content)
-    if set(value) != {"cot", "root", "unreachable_nodes", "dependency_issues"}:
+    if set(value) != {
+        "cot", "root", "unreachable_nodes", "dependency_issues", "repair_issues",
+    }:
         raise SemanticAuditFormatError("invalid whole-COT comparator top-level keys", raw_content=content)
     known_nodes = {node.node_name for node in view.nodes}
     cot = value["cot"]
@@ -966,6 +1071,14 @@ def parse_whole_cot_comparator(
             "reason": _string(item["reason"], "dependency reason", content),
         })
 
+    repair_issues = _parse_repair_issues(
+        value["repair_issues"], known_nodes=known_nodes, raw=content,
+    )
+    if repair_issues and not _has_ordinary_semantic_defect(parsed_cot, parsed_root):
+        raise SemanticAuditFormatError(
+            "repair issue requires an ordinary cot/root defect", raw_content=content,
+        )
+
     passed = (
         not any(parsed_cot[key] for key in (
             "missing_clauses", "weakened_clauses", "unbound_objects",
@@ -976,9 +1089,13 @@ def parse_whole_cot_comparator(
         and not parsed_root["reasons"]
         and all(item["justified_side_branch"] for item in unreachable)
         and not dependencies
+        and not repair_issues
         and not decompiler.vacuous_nodes
     )
-    return parsed_cot, parsed_root, tuple(unreachable), tuple(dependencies), passed
+    return (
+        parsed_cot, parsed_root, tuple(unreachable), tuple(dependencies),
+        repair_issues, passed,
+    )
 
 
 def joint_whole_cot_audit_messages(
@@ -1021,11 +1138,17 @@ def joint_whole_cot_audit_messages(
                     "reason": "...",
                 }],
                 "dependency_issues": [{"node_name": "n", "reason": "..."}],
+                "repair_issues": [{
+                    "code": "answerPreassigned", "node_names": ["n"],
+                    "reason": "...",
+                }],
             },
         },
     }
     return [
-        {"role": "system", "content": JOINT_WHOLE_COT_SYSTEM_PROMPT},
+        {"role": "system", "content": (
+            JOINT_WHOLE_COT_SYSTEM_PROMPT + REPAIR_ISSUE_CLASSIFICATION_PROMPT
+        )},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
     ]
 
@@ -1038,6 +1161,7 @@ def parse_joint_whole_cot_audit(
     tuple[FormalNodeTranslation, ...],
     dict[str, Any],
     dict[str, Any],
+    tuple[dict[str, Any], ...],
     tuple[dict[str, Any], ...],
     tuple[dict[str, Any], ...],
     bool,
@@ -1056,12 +1180,12 @@ def parse_joint_whole_cot_audit(
         translations, json.dumps(value["formal_decompiler"], ensure_ascii=False),
         "", None, "", 0, 0, 0,
     )
-    cot, root, unreachable, dependencies, passed = parse_whole_cot_comparator(
+    cot, root, unreachable, dependencies, repair_issues, passed = parse_whole_cot_comparator(
         json.dumps(value["whole_cot_comparator"], ensure_ascii=False),
         view=view,
         decompiler=decompiler,
     )
-    return translations, cot, root, unreachable, dependencies, passed
+    return translations, cot, root, unreachable, dependencies, repair_issues, passed
 
 
 def semantic_audit_cache_key(
@@ -1180,8 +1304,8 @@ def _run_stage(
                 )
             elif operation == "whole_cot_comparator":
                 schema_guidance = (
-                    "Top-level keys are exactly cot, root, unreachable_nodes, and "
-                    "dependency_issues. Every COT clause issue is exactly "
+                    "Top-level keys are exactly cot, root, unreachable_nodes, "
+                    "dependency_issues, and repair_issues. Every COT clause issue is exactly "
                     "{clause,node_names,reason}; copy the required unreachable node "
                     "inventory exactly and use node names only."
                 )
@@ -1189,7 +1313,7 @@ def _run_stage(
                 "compact_whole_cot_comparator", "direct_whole_cot_comparator",
             }:
                 schema_guidance = (
-                    "Top-level keys are exactly cot, root, and dependency_issues. "
+                    "Top-level keys are exactly cot, root, dependency_issues, and repair_issues. "
                     "Every COT clause issue is exactly {clause,node_names,reason}; "
                     "dependency_issues.node_name must be a proof-node name (a key "
                     "of graph.proof_dependencies for compact input); use the root "
@@ -1201,7 +1325,7 @@ def _run_stage(
                     "Top-level keys must occur exactly in this order: "
                     "formal_decompiler, whole_cot_comparator. The first has "
                     "exactly nodes in the supplied order. The second has exactly "
-                    "cot, root, unreachable_nodes, dependency_issues. Clause "
+                    "cot, root, unreachable_nodes, dependency_issues, repair_issues. Clause "
                     "issues are exactly {clause,node_names,reason}; use node names only. "
                     "semantic_effect must be exactly objectDefinition, proposition, "
                     "or vacuous. Keep node translations under 30 words, the combined "
@@ -1334,9 +1458,10 @@ def run_whole_cot_comparator(
         presence_penalty=presence_penalty,
         repetition_penalty=repetition_penalty,
     )
-    cot, root, unreachable, dependencies, passed = parsed
+    cot, root, unreachable, dependencies, repair_issues, passed = parsed
     result = WholeCotComparatorResult(
-        cot, root, unreachable, dependencies, passed, content, reasoning, finish,
+        cot, root, unreachable, dependencies, repair_issues, passed,
+        content, reasoning, finish,
         request_id, usage[0], usage[1], usage[2], attempts,
     )
     if tracer is not None:
@@ -1401,9 +1526,10 @@ def run_compact_whole_cot_comparator(
         presence_penalty=presence_penalty,
         repetition_penalty=repetition_penalty,
     )
-    cot, root, unreachable, dependencies, passed = parsed
+    cot, root, unreachable, dependencies, repair_issues, passed = parsed
     result = WholeCotComparatorResult(
-        cot, root, unreachable, dependencies, passed, content, reasoning, finish,
+        cot, root, unreachable, dependencies, repair_issues, passed,
+        content, reasoning, finish,
         request_id, usage[0], usage[1], usage[2], attempts,
     )
     if tracer is not None:
@@ -1467,9 +1593,10 @@ def run_direct_whole_cot_comparator(
         presence_penalty=presence_penalty,
         repetition_penalty=repetition_penalty,
     )
-    cot, root, unreachable, dependencies, passed = parsed
+    cot, root, unreachable, dependencies, repair_issues, passed = parsed
     result = WholeCotComparatorResult(
-        cot, root, unreachable, dependencies, passed, content, reasoning, finish,
+        cot, root, unreachable, dependencies, repair_issues, passed,
+        content, reasoning, finish,
         request_id, usage[0], usage[1], usage[2], attempts,
     )
     if tracer is not None:
@@ -1544,7 +1671,7 @@ def run_joint_whole_cot_audit(
         presence_penalty=presence_penalty,
         repetition_penalty=repetition_penalty,
     )
-    translations, cot, root, unreachable, dependencies, passed = parsed
+    translations, cot, root, unreachable, dependencies, repair_issues, passed = parsed
     raw_value = _json_object(content)
     raw_nodes = raw_value["formal_decompiler"]["nodes"]
     effect_normalizations = tuple(
@@ -1562,7 +1689,7 @@ def run_joint_whole_cot_audit(
         "", finish, "", 0, 0, 0, (),
     )
     comparator = WholeCotComparatorResult(
-        cot, root, unreachable, dependencies, passed,
+        cot, root, unreachable, dependencies, repair_issues, passed,
         json.dumps(raw_value["whole_cot_comparator"], ensure_ascii=False),
         "", finish, "", 0, 0, 0, (),
     )
@@ -1639,6 +1766,21 @@ def whole_cot_comparator_defects(result: WholeCotComparatorResult) -> list[dict[
         defects.append({
             "category": "dependencyFidelity", "node_names": [item["node_name"]],
             "requirement": "Repair the source use-chain dependency.",
+            "reason": item["reason"],
+        })
+    repair_requirements = {
+        "answerPreassigned": (
+            "Bind the computed object and derive the claimed answer from source constraints."
+        ),
+        "targetCoverageIncomplete": (
+            "Formalize the complete target set, extremum, or exhaustiveness claim."
+        ),
+    }
+    for item in result.repair_issues:
+        defects.append({
+            "category": item["code"],
+            "node_names": list(item["node_names"]),
+            "requirement": repair_requirements[item["code"]],
             "reason": item["reason"],
         })
     return defects
