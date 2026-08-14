@@ -50,6 +50,8 @@ blueprint:
   problem_id: null
   execution_mode: full
   generation_prompt_profile: whole_cot_minimal
+  blueprint_root_name: null
+  generation_node_naming: semantic
   phase1_input_experiment_root: null
   model: Qwen3.5-397B-A17B-FP8
   openai_base_url: http://127.0.0.1:8001/v1

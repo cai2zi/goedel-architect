@@ -18,6 +18,8 @@ from tracer import TraceEvent
 
 
 WHOLE_COT_PROMPT_VERSION = "whole-cot-comparator-v1"
+COMPACT_WHOLE_COT_PROMPT_VERSION = "whole-cot-compact-separate-v1"
+DIRECT_WHOLE_COT_PROMPT_VERSION = "whole-cot-direct-comparator-v1"
 JOINT_WHOLE_COT_PROMPT_VERSION = "whole-cot-joint-audit-v2"
 SEMANTIC_EFFECTS = {"objectDefinition", "proposition", "vacuous"}
 JOINT_SEMANTIC_EFFECT_ALIASES = {
@@ -104,6 +106,65 @@ and `added_clauses`. Each clause issue has exactly `clause`, `node_names`, and
 exactly and in order; each item has `node_name`, `justified_side_branch`, and
 `reason`. Each dependency issue has exactly `node_name` and `reason`. Use only
 supplied node names. Return JSON only, no Markdown or extra keys. Be terse.
+"""
+
+
+COMPACT_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT = r"""You are a strict
+semantic-translation comparator, not a truth judge. Compare the complete
+original chain-of-thought with frozen literal translations produced by a
+blind Lean decompiler. A faithful formalization of a mathematically wrong COT
+must pass. Reject omissions, weakenings, added claims, object replacement,
+unbound objects, wrong relation or direction, answer hard-coding, material
+dependency breaks, and an unrelated root. Identifier names are opaque handles
+and carry no semantic credit.
+
+Audit in this order: probability and quantifiers; target object and relation;
+root grounding; then material dependency use-chains. Do not report a
+dependency issue merely because a node is outside `root_closure`. Report one
+only when the COT materially requires that translated object or proposition to
+support the root and the supplied dependency graph has no path carrying it to
+the root. Do not duplicate one defect across categories.
+
+The root must preserve the target object requested by the original problem,
+not merely repeat a final equation. Root `reasons` list defects only and must
+be empty when both root booleans are true. Return one JSON object with exactly
+`cot`, `root`, and `dependency_issues`. `cot` has exactly
+`combined_formal_translation`, `missing_clauses`, `weakened_clauses`,
+`unbound_objects`, `wrong_relations`, and `added_clauses`. Each clause issue
+has exactly `clause`, `node_names`, and `reason`. `root` has exactly
+`translation`, `target_object_preserved`, `answer_grounded`, and `reasons`.
+Each dependency issue has exactly `node_name` and `reason`. Use only supplied
+node names. Return JSON only, no Markdown or extra keys. Be terse: at most six
+clause issues total, and keep each clause and reason under 50 words.
+"""
+
+
+DIRECT_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT = r"""You are a strict literal Lean
+semantic decompiler and semantic-translation comparator in one request. Read
+only the sanitized Lean declarations for formal meaning; identifier names are
+opaque handles and carry no semantic credit. Then compare that meaning with
+the complete original chain-of-thought. A faithful formalization of a
+mathematically wrong COT must pass.
+
+Reject omissions, weakenings, added claims, object replacement, unbound
+objects, wrong relation or direction, answer hard-coding, vacuous True or
+reflexive shells replacing substantive claims, material dependency breaks,
+and an unrelated root. Audit in this order: probability and quantifiers;
+target object and relation; root grounding; then material dependency
+use-chains. Do not report a dependency issue merely because a node is outside
+`root_closure`; report one only when material COT content cannot reach the
+root. Do not infer intended mathematics from names and do not duplicate one
+defect across categories.
+
+Return one JSON object with exactly `cot`, `root`, and `dependency_issues`.
+`cot` has exactly `combined_formal_translation`, `missing_clauses`,
+`weakened_clauses`, `unbound_objects`, `wrong_relations`, and `added_clauses`.
+Each clause issue has exactly `clause`, `node_names`, and `reason`. `root` has
+exactly `translation`, `target_object_preserved`, `answer_grounded`, and
+`reasons`; reasons must be empty when both booleans are true. Each dependency
+issue has exactly `node_name` and `reason`. Use only supplied node names.
+Return JSON only, no Markdown or extra keys. Be terse: at most six clause
+issues total, and keep each clause and reason under 50 words.
 """
 
 
@@ -356,9 +417,24 @@ def formal_decompiler_messages(view: FormalView) -> list[dict[str, str]]:
     return [
         {"role": "system", "content": DECOMPILER_SYSTEM_PROMPT},
         {"role": "user", "content": (
-            f"Formal View SHA-256: {view.sha256}\n"
-            + json.dumps({"root": view.root_name, "nodes": inventory}, ensure_ascii=False)
+            json.dumps({"root": view.root_name, "nodes": inventory}, ensure_ascii=False)
         )},
+    ]
+
+
+def compact_formal_decompiler_messages(view: FormalView) -> list[dict[str, str]]:
+    """Blind decompiler request without cache identity or graph-only fields."""
+    inventory = [{
+        "node_name": node.node_name,
+        "kind": node.kind,
+        "is_root": node.is_root,
+        "sanitized_formal_lean": node.declaration,
+    } for node in view.nodes]
+    return [
+        {"role": "system", "content": DECOMPILER_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps({
+            "root": view.root_name, "nodes": inventory,
+        }, ensure_ascii=False)},
     ]
 
 
@@ -538,6 +614,166 @@ def whole_cot_comparator_messages(
         {"role": "system", "content": WHOLE_COT_COMPARATOR_SYSTEM_PROMPT},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
     ]
+
+
+def _compact_graph(view: FormalView) -> dict[str, Any]:
+    return {
+        "root": view.root_name,
+        "dependencies": {
+            node.node_name: list(node.dependencies) for node in view.nodes
+        },
+        "root_closure": list(view.root_closure),
+    }
+
+
+def compact_whole_cot_comparator_messages(
+    informal_statement: str,
+    informal_proof: str,
+    claimed_answer: str,
+    view: FormalView,
+    decompiler: FormalDecompilerResult,
+) -> list[dict[str, str]]:
+    payload = {
+        "problem": informal_statement,
+        "claimed_answer": claimed_answer,
+        "complete_original_cot": informal_proof,
+        "frozen_node_translations": [asdict(node) for node in decompiler.nodes],
+        "graph": _compact_graph(view),
+        "required_output_shape": {
+            "cot": {
+                "combined_formal_translation": "...",
+                "missing_clauses": [], "weakened_clauses": [],
+                "unbound_objects": [], "wrong_relations": [],
+                "added_clauses": [],
+            },
+            "root": {
+                "translation": "...", "target_object_preserved": True,
+                "answer_grounded": True, "reasons": [],
+            },
+            "dependency_issues": [{"node_name": "n", "reason": "..."}],
+        },
+    }
+    return [
+        {"role": "system", "content": COMPACT_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ]
+
+
+def direct_whole_cot_comparator_messages(
+    informal_statement: str,
+    informal_proof: str,
+    claimed_answer: str,
+    view: FormalView,
+) -> list[dict[str, str]]:
+    formal_view = {
+        "root_name": view.root_name,
+        "root_closure": list(view.root_closure),
+        "nodes": [asdict(node) for node in view.nodes],
+    }
+    payload = {
+        "problem": informal_statement,
+        "claimed_answer": claimed_answer,
+        "complete_original_cot": informal_proof,
+        "formal_view": formal_view,
+        "required_output_shape": {
+            "cot": {
+                "combined_formal_translation": "...",
+                "missing_clauses": [], "weakened_clauses": [],
+                "unbound_objects": [], "wrong_relations": [],
+                "added_clauses": [],
+            },
+            "root": {
+                "translation": "...", "target_object_preserved": True,
+                "answer_grounded": True, "reasons": [],
+            },
+            "dependency_issues": [{"node_name": "n", "reason": "..."}],
+        },
+    }
+    return [
+        {"role": "system", "content": DIRECT_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ]
+
+
+def parse_compact_whole_cot_comparator(
+    content: str,
+    *,
+    view: FormalView,
+    decompiler: FormalDecompilerResult | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], tuple[dict[str, Any], ...], tuple[dict[str, Any], ...], bool]:
+    value = _json_object(content)
+    if set(value) != {"cot", "root", "dependency_issues"}:
+        raise SemanticAuditFormatError(
+            "invalid compact comparator top-level keys", raw_content=content,
+        )
+    known_nodes = {node.node_name for node in view.nodes}
+    cot = value["cot"]
+    if not isinstance(cot, dict) or set(cot) != _WHOLE_COT_KEYS:
+        raise SemanticAuditFormatError("cot has invalid keys", raw_content=content)
+    parsed_cot: dict[str, Any] = {
+        "combined_formal_translation": _string(
+            cot["combined_formal_translation"],
+            "cot.combined_formal_translation", content,
+        ),
+    }
+    issue_count = 0
+    for key in (
+        "missing_clauses", "weakened_clauses", "unbound_objects",
+        "wrong_relations", "added_clauses",
+    ):
+        parsed_cot[key] = _parse_clause_issues(
+            cot[key], label=f"cot.{key}", known_nodes=known_nodes, raw=content,
+        )
+        issue_count += len(parsed_cot[key])
+    if issue_count > 6:
+        raise SemanticAuditFormatError(
+            "compact comparator returned more than six clause issues",
+            raw_content=content,
+        )
+
+    root = value["root"]
+    if not isinstance(root, dict) or set(root) != {
+        "translation", "target_object_preserved", "answer_grounded", "reasons",
+    }:
+        raise SemanticAuditFormatError("root has invalid keys", raw_content=content)
+    if not isinstance(root["target_object_preserved"], bool) or not isinstance(
+        root["answer_grounded"], bool,
+    ):
+        raise SemanticAuditFormatError("root verdicts must be booleans", raw_content=content)
+    parsed_root = {
+        "translation": _string(root["translation"], "root.translation", content),
+        "target_object_preserved": root["target_object_preserved"],
+        "answer_grounded": root["answer_grounded"],
+        "reasons": list(_strings(root["reasons"], "root.reasons", content)),
+    }
+
+    raw_dependencies = value["dependency_issues"]
+    if not isinstance(raw_dependencies, list):
+        raise SemanticAuditFormatError("dependency_issues must be an array", raw_content=content)
+    dependencies = []
+    for item in raw_dependencies:
+        if not isinstance(item, dict) or set(item) != {"node_name", "reason"}:
+            raise SemanticAuditFormatError("dependency issue has invalid keys", raw_content=content)
+        node_name = _string(item["node_name"], "dependency node", content)
+        if node_name not in known_nodes:
+            raise SemanticAuditFormatError("dependency issue has unknown node", raw_content=content)
+        dependencies.append({
+            "node_name": node_name,
+            "reason": _string(item["reason"], "dependency reason", content),
+        })
+
+    passed = (
+        not any(parsed_cot[key] for key in (
+            "missing_clauses", "weakened_clauses", "unbound_objects",
+            "wrong_relations", "added_clauses",
+        ))
+        and parsed_root["target_object_preserved"]
+        and parsed_root["answer_grounded"]
+        and not parsed_root["reasons"]
+        and not dependencies
+        and (decompiler is None or not decompiler.vacuous_nodes)
+    )
+    return parsed_cot, parsed_root, (), tuple(dependencies), passed
 
 
 def parse_whole_cot_comparator(
@@ -836,6 +1072,14 @@ def _run_stage(
                     "{clause,node_names,reason}; copy the required unreachable node "
                     "inventory exactly and use node names only."
                 )
+            elif operation in {
+                "compact_whole_cot_comparator", "direct_whole_cot_comparator",
+            }:
+                schema_guidance = (
+                    "Top-level keys are exactly cot, root, and dependency_issues. "
+                    "Every COT clause issue is exactly {clause,node_names,reason}; "
+                    "use supplied node names only and return at most six clause issues."
+                )
             elif operation == "joint_whole_cot_audit":
                 schema_guidance = (
                     "Top-level keys must occur exactly in this order: "
@@ -885,6 +1129,7 @@ def run_formal_decompiler(
     tracer=None,
     thm_name: str = "",
     round_index: int = 0,
+    compact: bool = False,
 ) -> FormalDecompilerResult:
     if tracer is not None:
         tracer.emit(TraceEvent(
@@ -892,7 +1137,10 @@ def run_formal_decompiler(
             args={"round": round_index, "formalViewHash": view.sha256, "nodeCount": len(view.nodes)},
         ))
     parsed, content, reasoning, finish, request_id, attempts, usage = _run_stage(
-        client, model, messages=formal_decompiler_messages(view),
+        client, model, messages=(
+            compact_formal_decompiler_messages(view)
+            if compact else formal_decompiler_messages(view)
+        ),
         parser=parse_formal_decompiler, parser_kwargs={"view": view},
         max_tokens=max_tokens, max_attempts=max_attempts, tracer=tracer,
         thm_name=thm_name, round_index=round_index,
@@ -976,6 +1224,139 @@ def run_whole_cot_comparator(
             kind="wholeCotCompareResult", thm_name=thm_name, turn=round_index,
             args={"round": round_index, "formalViewHash": view.sha256,
                   "cacheKey": cache_key, "protocol": WHOLE_COT_PROMPT_VERSION,
+                  "passed": passed, "result": result.to_dict()}, ok=passed,
+        ))
+        tracer.emit(TraceEvent(
+            kind="wholeCotCompareEnd", thm_name=thm_name, turn=round_index,
+            args={"round": round_index, "passed": passed,
+                  "attemptCount": len(attempts), "promptTokens": usage[0],
+                  "completionTokens": usage[1], "totalTokens": usage[2],
+                  "requestId": request_id}, ok=passed,
+        ))
+    return result
+
+
+def run_compact_whole_cot_comparator(
+    client: Any,
+    model: str,
+    *,
+    informal_statement: str,
+    informal_proof: str,
+    claimed_answer: str,
+    view: FormalView,
+    decompiler: FormalDecompilerResult,
+    max_tokens: int,
+    max_attempts: int,
+    enable_thinking: bool = False,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = -1,
+    min_p: float = 0.0,
+    presence_penalty: float = 0.0,
+    repetition_penalty: float = 1.0,
+    tracer=None,
+    thm_name: str = "",
+    round_index: int = 0,
+) -> WholeCotComparatorResult:
+    messages = compact_whole_cot_comparator_messages(
+        informal_statement, informal_proof, claimed_answer, view, decompiler,
+    )
+    cache_key = semantic_audit_cache_key(
+        model, messages, version=COMPACT_WHOLE_COT_PROMPT_VERSION,
+    )
+    if tracer is not None:
+        tracer.emit(TraceEvent(
+            kind="wholeCotCompareStart", thm_name=thm_name, turn=round_index,
+            args={"round": round_index, "formalViewHash": view.sha256,
+                  "cacheKey": cache_key, "protocol": COMPACT_WHOLE_COT_PROMPT_VERSION},
+        ))
+    parsed, content, reasoning, finish, request_id, attempts, usage = _run_stage(
+        client, model, messages=messages, parser=parse_compact_whole_cot_comparator,
+        parser_kwargs={"view": view, "decompiler": decompiler},
+        max_tokens=max_tokens, max_attempts=max_attempts, tracer=tracer,
+        thm_name=thm_name, round_index=round_index,
+        phase="wholeCotComparator", operation="compact_whole_cot_comparator",
+        enable_thinking=enable_thinking, temperature=temperature,
+        top_p=top_p, top_k=top_k, min_p=min_p,
+        presence_penalty=presence_penalty,
+        repetition_penalty=repetition_penalty,
+    )
+    cot, root, unreachable, dependencies, passed = parsed
+    result = WholeCotComparatorResult(
+        cot, root, unreachable, dependencies, passed, content, reasoning, finish,
+        request_id, usage[0], usage[1], usage[2], attempts,
+    )
+    if tracer is not None:
+        tracer.emit(TraceEvent(
+            kind="wholeCotCompareResult", thm_name=thm_name, turn=round_index,
+            args={"round": round_index, "formalViewHash": view.sha256,
+                  "cacheKey": cache_key, "protocol": COMPACT_WHOLE_COT_PROMPT_VERSION,
+                  "passed": passed, "result": result.to_dict()}, ok=passed,
+        ))
+        tracer.emit(TraceEvent(
+            kind="wholeCotCompareEnd", thm_name=thm_name, turn=round_index,
+            args={"round": round_index, "passed": passed,
+                  "attemptCount": len(attempts), "promptTokens": usage[0],
+                  "completionTokens": usage[1], "totalTokens": usage[2],
+                  "requestId": request_id}, ok=passed,
+        ))
+    return result
+
+
+def run_direct_whole_cot_comparator(
+    client: Any,
+    model: str,
+    *,
+    informal_statement: str,
+    informal_proof: str,
+    claimed_answer: str,
+    view: FormalView,
+    max_tokens: int,
+    max_attempts: int,
+    enable_thinking: bool = False,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = -1,
+    min_p: float = 0.0,
+    presence_penalty: float = 0.0,
+    repetition_penalty: float = 1.0,
+    tracer=None,
+    thm_name: str = "",
+    round_index: int = 0,
+) -> WholeCotComparatorResult:
+    messages = direct_whole_cot_comparator_messages(
+        informal_statement, informal_proof, claimed_answer, view,
+    )
+    cache_key = semantic_audit_cache_key(
+        model, messages, version=DIRECT_WHOLE_COT_PROMPT_VERSION,
+    )
+    if tracer is not None:
+        tracer.emit(TraceEvent(
+            kind="wholeCotCompareStart", thm_name=thm_name, turn=round_index,
+            args={"round": round_index, "formalViewHash": view.sha256,
+                  "cacheKey": cache_key, "protocol": DIRECT_WHOLE_COT_PROMPT_VERSION},
+        ))
+    parsed, content, reasoning, finish, request_id, attempts, usage = _run_stage(
+        client, model, messages=messages, parser=parse_compact_whole_cot_comparator,
+        parser_kwargs={"view": view, "decompiler": None},
+        max_tokens=max_tokens, max_attempts=max_attempts, tracer=tracer,
+        thm_name=thm_name, round_index=round_index,
+        phase="wholeCotComparator", operation="direct_whole_cot_comparator",
+        enable_thinking=enable_thinking, temperature=temperature,
+        top_p=top_p, top_k=top_k, min_p=min_p,
+        presence_penalty=presence_penalty,
+        repetition_penalty=repetition_penalty,
+    )
+    cot, root, unreachable, dependencies, passed = parsed
+    result = WholeCotComparatorResult(
+        cot, root, unreachable, dependencies, passed, content, reasoning, finish,
+        request_id, usage[0], usage[1], usage[2], attempts,
+    )
+    if tracer is not None:
+        tracer.emit(TraceEvent(
+            kind="wholeCotCompareResult", thm_name=thm_name, turn=round_index,
+            args={"round": round_index, "formalViewHash": view.sha256,
+                  "cacheKey": cache_key, "protocol": DIRECT_WHOLE_COT_PROMPT_VERSION,
                   "passed": passed, "result": result.to_dict()}, ok=passed,
         ))
         tracer.emit(TraceEvent(
@@ -1147,10 +1528,16 @@ def whole_cot_comparator_defects(result: WholeCotComparatorResult) -> list[dict[
 __all__ = [
     "WHOLE_COT_PROMPT_VERSION", "JOINT_WHOLE_COT_PROMPT_VERSION",
     "JOINT_SEMANTIC_EFFECT_ALIASES", "JOINT_WHOLE_COT_SYSTEM_PROMPT",
+    "COMPACT_WHOLE_COT_PROMPT_VERSION", "DIRECT_WHOLE_COT_PROMPT_VERSION",
     "FormalDecompilerResult", "FormalView", "JointWholeCotAuditResult",
     "SemanticAuditFormatError", "WholeCotComparatorResult",
     "build_formal_view",
-    "formal_decompiler_messages", "parse_formal_decompiler", "run_formal_decompiler",
+    "compact_formal_decompiler_messages", "formal_decompiler_messages",
+    "parse_formal_decompiler", "run_formal_decompiler",
+    "compact_whole_cot_comparator_messages",
+    "direct_whole_cot_comparator_messages",
+    "parse_compact_whole_cot_comparator",
+    "run_compact_whole_cot_comparator", "run_direct_whole_cot_comparator",
     "parse_whole_cot_comparator", "run_whole_cot_comparator",
     "joint_whole_cot_audit_messages", "parse_joint_whole_cot_audit",
     "run_joint_whole_cot_audit",

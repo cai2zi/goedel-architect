@@ -1787,6 +1787,33 @@ lemma codex_dvd_sub_one_mod (a p : ℕ) (ha : 0 < a) (hp : 0 < p) (hd : p ∣ a)
   simpa [Nat.mul_comm] using codex_mul_sub_one_mod k p hk hp
 """
 
+HMMT6_ABSTRACT_PREFIX = HMMT6_DIV_PREFIX + """
+lemma codex_power_remainder_mod_factor (p n : ℕ) (hp : 0 < p) (hn : 0 < n)
+    (hpn : p ∣ n) : (((p^n - 1) % n) % p) = p - 1 := by
+  rw [Nat.mod_mod_of_dvd _ hpn]
+  apply codex_dvd_sub_one_mod
+  · positivity
+  · exact hp
+  · exact dvd_pow_self p hn.ne'
+
+attribute [irreducible] N
+"""
+
+MANUAL_PROOFS.append(proof(
+    "robustpa_hmmt_feb_2025_6", "r_mod_2017", "positive",
+    "by\n"
+    "  have hdN : 2017 ∣ N := by\n"
+    "    rw [N]\n"
+    "    exact Nat.dvd_factorial (by norm_num) (by norm_num)\n"
+    "  have hN : 0 < N := by\n"
+    "    rw [N]\n"
+    "    exact Nat.factorial_pos _\n"
+    "  rw [r]\n"
+    "  exact codex_power_remainder_mod_factor 2017 N (by norm_num) hN hdN",
+    "instantiate_an_abstract_nested_remainder_lemma_while_N_is_irreducible",
+    prefix_code=HMMT6_ABSTRACT_PREFIX,
+))
+
 MANUAL_PROOFS.append(proof(
     "robustpa_hmmt_feb_2025_6", "r_mod_2017", "positive",
     "by\n  have hd : 2017 ∣ N := by\n    rw [N]\n    exact Nat.dvd_factorial (by norm_num) (by norm_num)\n"
@@ -1808,6 +1835,318 @@ MANUAL_PROOFS.append(proof(
     "  exact codex_dvd_sub_one_mod (2017 ^ N) 2017 (by positivity) (by norm_num) hpow",
     "use_divisibility_of_a_positive_power_without_expanding_the_factorial_exponent",
     prefix_code=HMMT6_DIV_PREFIX,
+))
+
+HMMT6_OPAQUE_PREFIX = HMMT6_ABSTRACT_PREFIX.replace(
+    "attribute [irreducible] N",
+    "set_option maxRecDepth 100000 in\n"
+    "lemma codex_r_def : r = (2017 ^ N - 1) % N := rfl\n"
+    "attribute [irreducible] N r",
+)
+
+MANUAL_PROOFS.append(proof(
+    "robustpa_hmmt_feb_2025_6", "r_mod_2017", "positive",
+    "by\n"
+    "  have hdN : 2017 ∣ N := by\n"
+    "    rw [N]\n"
+    "    exact Nat.dvd_factorial (by norm_num) (by norm_num)\n"
+    "  have hN : 0 < N := by\n"
+    "    rw [N]\n"
+    "    exact Nat.factorial_pos _\n"
+    "  rw [codex_r_def]\n"
+    "  exact codex_power_remainder_mod_factor 2017 N (by norm_num) hN hdN",
+    "freeze_both_N_and_r_after_recording_the_shallow_defining_equation",
+    prefix_code=HMMT6_OPAQUE_PREFIX,
+))
+
+INTERMEDIATE_GEO_PREFIX = r"""
+set_option maxHeartbeats 0
+
+lemma codex_geo_summable (x y z : ℝ) (hx0 : 0 ≤ x) (hx1 : x < 1)
+    (hy0 : 0 ≤ y) (hy1 : y < 1) (hz0 : 0 ≤ z) (hz1 : z < 1) :
+    Summable (fun p : (ℕ × ℕ) × ℕ => x^p.1.1 * y^p.1.2 * z^(p.2+1)) := by
+  have hx := summable_geometric_of_lt_one hx0 hx1
+  have hy := summable_geometric_of_lt_one hy0 hy1
+  have hz := (summable_geometric_of_lt_one hz0 hz1).mul_right z
+  have hxy : Summable (fun p : ℕ × ℕ => x^p.1 * y^p.2) :=
+    hx.mul_of_nonneg hy (fun _ => pow_nonneg hx0 _) (fun _ => pow_nonneg hy0 _)
+  have hxyz := hxy.mul_of_nonneg hz
+    (fun _ => mul_nonneg (pow_nonneg hx0 _) (pow_nonneg hy0 _))
+    (fun _ => mul_nonneg (pow_nonneg hz0 _) hz0)
+  convert hxyz using 1
+  funext p
+  rw [pow_succ']
+  ring
+
+lemma codex_geo_tsum (x y z : ℝ) (hx0 : 0 ≤ x) (hx1 : x < 1)
+    (hy0 : 0 ≤ y) (hy1 : y < 1) (hz0 : 0 ≤ z) (hz1 : z < 1) :
+    (∑' p : (ℕ × ℕ) × ℕ, x^p.1.1 * y^p.1.2 * z^(p.2+1)) =
+      (1-x)⁻¹ * (1-y)⁻¹ * (z * (1-z)⁻¹) := by
+  have hx := summable_geometric_of_lt_one hx0 hx1
+  have hy := summable_geometric_of_lt_one hy0 hy1
+  have hz := summable_geometric_of_lt_one hz0 hz1
+  have hxy : Summable (fun p : ℕ × ℕ => x^p.1 * y^p.2) :=
+    hx.mul_of_nonneg hy (fun _ => pow_nonneg hx0 _) (fun _ => pow_nonneg hy0 _)
+  have hz' := hz.mul_left z
+  have hxy_norm : Summable (fun p : ℕ × ℕ => ‖x^p.1 * y^p.2‖) := by
+    simpa [abs_of_nonneg, hx0, hy0] using hxy
+  have hz_norm : Summable (fun w : ℕ => ‖z * z^w‖) := by
+    simpa [abs_of_nonneg, hz0] using hz'
+  have hxy_tsum : (∑' u : ℕ, x^u) * (∑' v : ℕ, y^v) =
+      ∑' p : ℕ × ℕ, x^p.1 * y^p.2 :=
+    tsum_mul_tsum_of_summable_norm
+      (by simpa [abs_of_nonneg, hx0] using hx)
+      (by simpa [abs_of_nonneg, hy0] using hy)
+  calc
+    _ = ∑' p : (ℕ × ℕ) × ℕ,
+        (x^p.1.1 * y^p.1.2) * (z * z^p.2) := by
+          apply tsum_congr
+          intro p
+          rw [pow_succ']
+    _ = (∑' p : ℕ × ℕ, x^p.1 * y^p.2) * (∑' w : ℕ, z * z^w) := by
+      convert (tsum_mul_tsum_of_summable_norm hxy_norm hz_norm).symm using 1
+    _ = ((∑' u : ℕ, x^u) * (∑' v : ℕ, y^v)) * (∑' w : ℕ, z * z^w) := by
+      rw [← hxy_tsum]
+    _ = _ := by
+      rw [tsum_geometric_of_lt_one hx0 hx1, tsum_geometric_of_lt_one hy0 hy1]
+      rw [tsum_mul_left, tsum_geometric_of_lt_one hz0 hz1]
+"""
+
+
+def _intermediate_prefix(tag, predicate, out_a, out_b, out_c, inv_u, inv_v, inv_w, rx, ry):
+    extra_fifteen = (
+        "  rw [show (15 : ℝ) ^ p.1.1 = (3 * 5) ^ p.1.1 by norm_num, mul_pow]\n"
+        if rx == "(1:ℝ)/15" else ""
+    )
+    return INTERMEDIATE_GEO_PREFIX + f"""
+def codexP{tag} (p : (ℕ × ℕ) × ℕ) : Prop :=
+  {predicate} ∧ is_triangle_bool p.1.1 p.1.2 p.2 = true
+
+def codexE{tag} : ((ℕ × ℕ) × ℕ) ≃ {{p : (ℕ × ℕ) × ℕ // codexP{tag} p}} where
+  toFun p := ⟨(({out_a}, {out_b}), {out_c}), by
+      simp only [codexP{tag}, is_triangle_bool, Bool.and_eq_true, decide_eq_true_eq]
+      omega⟩
+  invFun p := (({inv_u}, {inv_v}), {inv_w})
+  left_inv p := by
+    apply Prod.ext
+    · apply Prod.ext <;> simp <;> omega
+    · simp
+      omega
+  right_inv p := by
+    apply Subtype.ext
+    rcases p with ⟨p, hp⟩
+    simp only [codexP{tag}, is_triangle_bool, Bool.and_eq_true, decide_eq_true_eq] at hp
+    apply Prod.ext
+    · apply Prod.ext <;> simp <;> omega
+    · simp
+      omega
+
+lemma codex_{tag}_weight (p : (ℕ × ℕ) × ℕ) :
+    let q := (codexE{tag} p).1
+    (2 : ℝ)^q.1.1 / ((3 : ℝ)^q.1.2 * (5 : ℝ)^q.2) =
+      ({rx})^p.1.1 * ({ry})^p.1.2 * ((2:ℝ)/15)^(p.2+1) := by
+  dsimp [codexE{tag}]
+  simp only [pow_add, pow_one, div_pow]
+  rw [show (15 : ℝ) ^ p.2 = (3 * 5) ^ p.2 by norm_num, mul_pow]
+{extra_fifteen.rstrip()}
+  ring
+"""
+
+
+def _intermediate_value_body(tag, max_bool, rx, ry, answer):
+    return f"""by
+  classical
+  let W : (ℕ × ℕ) × ℕ → ℝ := fun p =>
+    (2 : ℝ)^p.1.1 / ((3 : ℝ)^p.1.2 * (5 : ℝ)^p.2)
+  let F : (ℕ × ℕ) × ℕ → ℝ := fun p =>
+    if {max_bool} && is_triangle_bool p.1.1 p.1.2 p.2 then W p else 0
+  have hg := codex_geo_summable ({rx}) ({ry}) ((2:ℝ)/15)
+    (by norm_num) (by norm_num) (by norm_num) (by norm_num) (by norm_num) (by norm_num)
+  have heq : (fun p => W (codexE{tag} p).1) =
+      (fun p : (ℕ × ℕ) × ℕ => ({rx})^p.1.1 * ({ry})^p.1.2 * ((2:ℝ)/15)^(p.2+1)) := by
+    funext p
+    exact codex_{tag}_weight p
+  have hsub : Summable (fun p : {{p : (ℕ × ℕ) × ℕ // codexP{tag} p}} => W p.1) := by
+    apply (codexE{tag}.summable_iff).mp
+    change Summable (fun p => W (codexE{tag} p).1)
+    rw [heq]
+    exact hg
+  have hFind : F = ({{p | codexP{tag} p}} : Set ((ℕ × ℕ) × ℕ)).indicator W := by
+    funext p
+    by_cases h : codexP{tag} p
+    · have hb : ({max_bool} && is_triangle_bool p.1.1 p.1.2 p.2) = true := by
+        simp only [codexP{tag}, is_triangle_bool, Bool.and_eq_true, decide_eq_true_eq] at h ⊢
+        aesop
+      simp only [F, if_pos hb, Set.indicator_apply, Set.mem_setOf_eq]
+      simp [h]
+    · have hb : ({max_bool} && is_triangle_bool p.1.1 p.1.2 p.2) ≠ true := by
+        intro hb
+        apply h
+        simp only [codexP{tag}, is_triangle_bool, Bool.and_eq_true, decide_eq_true_eq] at hb ⊢
+        aesop
+      simp only [F, if_neg hb, Set.indicator_apply, Set.mem_setOf_eq]
+      simp [h]
+  have hF : Summable F := by
+    rw [hFind]
+    exact summable_subtype_iff_indicator.mp hsub
+  change (∑' a : ℕ, ∑' b : ℕ, ∑' c : ℕ, F ((a,b),c)) = _
+  rw [← (hF.prod).tsum_prod, ← hF.tsum_prod]
+  rw [hFind]
+  rw [← tsum_subtype ({{p | codexP{tag} p}} : Set ((ℕ × ℕ) × ℕ)) W]
+  calc
+    _ = ∑' p : (ℕ × ℕ) × ℕ, W (codexE{tag} p).1 :=
+      (codexE{tag}.tsum_eq (fun q => W q.1)).symm
+    _ = {answer} := by
+      dsimp only [W]
+      simp_rw [codex_{tag}_weight]
+      rw [codex_geo_tsum ({rx}) ({ry}) ((2:ℝ)/15)
+        (by norm_num) (by norm_num) (by norm_num) (by norm_num) (by norm_num) (by norm_num)]
+      norm_num"""
+
+
+_intermediate_specs = [
+    ("A", "p.1.2 ≤ p.1.1 ∧ p.2 ≤ p.1.1",
+     "p.1.1 + p.1.2 + p.2 + 1", "p.1.2 + p.2 + 1", "p.1.1 + p.2 + 1",
+     "p.val.1.1 - p.val.1.2", "p.val.1.1 - p.val.2",
+     "p.val.1.2 + p.val.2 - p.val.1.1 - 1",
+     "p.1.1 ≥ p.1.2 && p.1.1 ≥ p.2", "(2:ℝ)/5", "(2:ℝ)/3", "(10:ℝ)/13", "S_a_value"),
+    ("B", "p.1.1 ≤ p.1.2 ∧ p.2 ≤ p.1.2",
+     "p.1.2 + p.2 + 1", "p.1.1 + p.1.2 + p.2 + 1", "p.1.1 + p.2 + 1",
+     "p.val.1.2 - p.val.1.1", "p.val.1.2 - p.val.2",
+     "p.val.1.1 + p.val.2 - p.val.1.2 - 1",
+     "p.1.2 ≥ p.1.1 && p.1.2 ≥ p.2", "(1:ℝ)/15", "(2:ℝ)/3", "(45:ℝ)/91", "S_b_value"),
+    ("C", "p.1.1 ≤ p.2 ∧ p.1.2 ≤ p.2",
+     "p.1.2 + p.2 + 1", "p.1.1 + p.2 + 1", "p.1.1 + p.1.2 + p.2 + 1",
+     "p.val.2 - p.val.1.1", "p.val.2 - p.val.1.2",
+     "p.val.1.1 + p.val.1.2 - p.val.2 - 1",
+     "p.2 ≥ p.1.1 && p.2 ≥ p.1.2", "(1:ℝ)/15", "(2:ℝ)/5", "(25:ℝ)/91", "S_c_value"),
+]
+for (_tag, _pred, _oa, _ob, _oc, _iu, _iv, _iw,
+     _maxb, _rx, _ry, _ans, _node) in _intermediate_specs:
+    MANUAL_PROOFS.append(proof(
+        "robustpa_MATH_500_test_intermediate_algebra_960_json", _node, "positive",
+        _intermediate_value_body(_tag, _maxb, _rx, _ry, _ans),
+        f"reparameterize_the_{_tag.lower()}_maximal_triangle_region_and_sum_three_geometric_series",
+        prefix_code=_intermediate_prefix(_tag, _pred, _oa, _ob, _oc, _iu, _iv, _iw, _rx, _ry),
+    ))
+
+
+def _intermediate_summable_lemma(tag, max_bool, rx, ry):
+    return f"""
+noncomputable def codexF{tag} : (ℕ × ℕ) × ℕ → ℝ := fun p =>
+  if {max_bool} && is_triangle_bool p.1.1 p.1.2 p.2 then
+    (2 : ℝ)^p.1.1 / ((3 : ℝ)^p.1.2 * (5 : ℝ)^p.2) else 0
+
+lemma codexF{tag}_summable : Summable codexF{tag} := by
+  classical
+  let W : (ℕ × ℕ) × ℕ → ℝ := fun p =>
+    (2 : ℝ)^p.1.1 / ((3 : ℝ)^p.1.2 * (5 : ℝ)^p.2)
+  have hg := codex_geo_summable ({rx}) ({ry}) ((2:ℝ)/15)
+    (by norm_num) (by norm_num) (by norm_num) (by norm_num) (by norm_num) (by norm_num)
+  have heq : (fun p => W (codexE{tag} p).1) =
+      (fun p : (ℕ × ℕ) × ℕ => ({rx})^p.1.1 * ({ry})^p.1.2 * ((2:ℝ)/15)^(p.2+1)) := by
+    funext p
+    exact codex_{tag}_weight p
+  have hsub : Summable (fun p : {{p : (ℕ × ℕ) × ℕ // codexP{tag} p}} => W p.1) := by
+    apply (codexE{tag}.summable_iff).mp
+    change Summable (fun p => W (codexE{tag} p).1)
+    rw [heq]
+    exact hg
+  have hFind : codexF{tag} = ({{p | codexP{tag} p}} : Set ((ℕ × ℕ) × ℕ)).indicator W := by
+    funext p
+    by_cases h : codexP{tag} p
+    · have hb : ({max_bool} && is_triangle_bool p.1.1 p.1.2 p.2) = true := by
+        simp only [codexP{tag}, is_triangle_bool, Bool.and_eq_true, decide_eq_true_eq] at h ⊢
+        aesop
+      simp only [codexF{tag}, if_pos hb, Set.indicator_apply, Set.mem_setOf_eq]
+      simp [h, W]
+    · have hb : ({max_bool} && is_triangle_bool p.1.1 p.1.2 p.2) ≠ true := by
+        intro hb
+        apply h
+        simp only [codexP{tag}, is_triangle_bool, Bool.and_eq_true, decide_eq_true_eq] at hb ⊢
+        aesop
+      simp only [codexF{tag}, if_neg hb, Set.indicator_apply, Set.mem_setOf_eq]
+      simp [h, W]
+  rw [hFind]
+  exact summable_subtype_iff_indicator.mp hsub
+"""
+
+
+_intermediate_combined_prefix = INTERMEDIATE_GEO_PREFIX
+for (_tag, _pred, _oa, _ob, _oc, _iu, _iv, _iw,
+     _maxb, _rx, _ry, _ans, _node) in _intermediate_specs:
+    _intermediate_combined_prefix += _intermediate_prefix(
+        _tag, _pred, _oa, _ob, _oc, _iu, _iv, _iw, _rx, _ry,
+    )[len(INTERMEDIATE_GEO_PREFIX):]
+    _intermediate_combined_prefix += _intermediate_summable_lemma(_tag, _maxb, _rx, _ry)
+
+MANUAL_PROOFS.append(proof(
+    "robustpa_MATH_500_test_intermediate_algebra_960_json", "sum_decomposition", "negative",
+    r"""by
+  intro hbad
+  let T : (ℕ × ℕ) × ℕ → ℝ := fun p =>
+    if is_triangle_bool p.1.1 p.1.2 p.2 then
+      (2 : ℝ)^p.1.1 / ((3 : ℝ)^p.1.2 * (5 : ℝ)^p.2) else 0
+  let H : (ℕ × ℕ) × ℕ → ℝ := fun p => codexFA p + codexFB p + codexFC p
+  have hH : Summable H := (codexFA_summable.add codexFB_summable).add codexFC_summable
+  have hT0 (p : (ℕ × ℕ) × ℕ) : 0 ≤ T p := by
+    simp only [T]
+    split <;> positivity
+  have hle (p : (ℕ × ℕ) × ℕ) : T p ≤ H p := by
+    simp only [T, H, codexFA, codexFB, codexFC]
+    simp only [is_triangle_bool, Bool.and_eq_true, decide_eq_true_eq]
+    split_ifs <;> try positivity
+    all_goals norm_num at *
+    all_goals positivity
+  have hT : Summable T := Summable.of_nonneg_of_le hT0 hle hH
+  let p0 : (ℕ × ℕ) × ℕ := ((1,1),1)
+  have hstrict : T p0 < H p0 := by
+    norm_num [T, H, p0, codexFA, codexFB, codexFC, is_triangle_bool]
+  have hlt := hT.tsum_lt_tsum hle hstrict hH
+  have hTflat : (∑' p : (ℕ × ℕ) × ℕ, T p) = triangle_sum := by
+    rw [triangle_sum]
+    change (∑' p : (ℕ × ℕ) × ℕ, T p) =
+      ∑' a : ℕ, ∑' b : ℕ, ∑' c : ℕ, T ((a,b),c)
+    rw [← (hT.prod).tsum_prod, ← hT.tsum_prod]
+  have hAflat : (∑' p : (ℕ × ℕ) × ℕ, codexFA p) = S_a := by
+    rw [S_a]
+    change (∑' p : (ℕ × ℕ) × ℕ, codexFA p) =
+      ∑' a : ℕ, ∑' b : ℕ, ∑' c : ℕ, codexFA ((a,b),c)
+    rw [← (codexFA_summable.prod).tsum_prod, ← codexFA_summable.tsum_prod]
+  have hBflat : (∑' p : (ℕ × ℕ) × ℕ, codexFB p) = S_b := by
+    rw [S_b]
+    change (∑' p : (ℕ × ℕ) × ℕ, codexFB p) =
+      ∑' a : ℕ, ∑' b : ℕ, ∑' c : ℕ, codexFB ((a,b),c)
+    rw [← (codexFB_summable.prod).tsum_prod, ← codexFB_summable.tsum_prod]
+  have hCflat : (∑' p : (ℕ × ℕ) × ℕ, codexFC p) = S_c := by
+    rw [S_c]
+    change (∑' p : (ℕ × ℕ) × ℕ, codexFC p) =
+      ∑' a : ℕ, ∑' b : ℕ, ∑' c : ℕ, codexFC ((a,b),c)
+    rw [← (codexFC_summable.prod).tsum_prod, ← codexFC_summable.tsum_prod]
+  have hHflat : (∑' p : (ℕ × ℕ) × ℕ, H p) = S_a + S_b + S_c := by
+    rw [show H = fun p => (codexFA p + codexFB p) + codexFC p by rfl]
+    rw [(codexFA_summable.add codexFB_summable).tsum_add codexFC_summable]
+    rw [codexFA_summable.tsum_add codexFB_summable, hAflat, hBflat, hCflat]
+  rw [hTflat, hHflat, hbad] at hlt
+  exact (lt_irrefl _ hlt)""",
+    "compare_the_triangle_indicator_with_the_sum_of_three_maximal_side_indicators_at_the_tied_triple",
+    prefix_code=_intermediate_combined_prefix,
+))
+
+MANUAL_PROOFS.append(proof(
+    "robustpa_hmmt_feb_2025_6", "r_mod_2017", "positive",
+    "by\n"
+    "  set_option maxRecDepth 100000 in\n"
+    "    have hdN : 2017 ∣ N := by\n"
+    "      rw [N]\n"
+    "      exact Nat.dvd_factorial (by norm_num) (by norm_num)\n"
+    "    have hN : 0 < N := by\n"
+    "      rw [N]\n"
+    "      exact Nat.factorial_pos _\n"
+    "    rw [codex_r_def]\n"
+    "    exact codex_power_remainder_mod_factor 2017 N (by norm_num) hN hdN",
+    "raise_recursion_depth_only_around_the_symbolic_factorial_divisibility_proof",
+    prefix_code=HMMT6_OPAQUE_PREFIX,
 ))
 
 MANUAL_PROOFS.append(proof(
@@ -1934,6 +2273,54 @@ MANUAL_PROOFS.append(proof(
     "  rw [hcoef, hp] at hc\n  norm_num at hc",
     "map_to_ZMod_three_factor_by_base_three_Frobenius_and_compute_only_coefficient_nine",
     prefix_code=CMIMC37_PREFIX,
+))
+
+AIME10_ACTION_PREFIX = """
+abbrev codexValidGrid := {g : Grid3x9 // ValidGrid g}
+
+def codexRelabel (σ : Equiv.Perm (Fin 9)) (G : codexValidGrid) : codexValidGrid := by
+  refine ⟨(fun i j => σ (G.val i j)), ?_⟩
+  constructor
+  · intro i
+    simpa [Function.comp_def] using σ.bijective.comp (G.property.1 i)
+  · intro block
+    simpa [Function.comp_def] using σ.bijective.comp (G.property.2 block)
+"""
+
+MANUAL_PROOFS.append(proof(
+    "robustpa_aime_2025_10", "revised_counting_formula", "negative",
+    "by\n  intro hbad\n"
+    "  letI : SMul (Equiv.Perm (Fin 9)) codexValidGrid := ⟨codexRelabel⟩\n"
+    "  letI : MulAction (Equiv.Perm (Fin 9)) codexValidGrid := {\n"
+    "    one_smul := by\n      intro G\n      apply Subtype.ext\n      funext i j\n      rfl\n"
+    "    mul_smul := by\n      intro σ τ G\n      apply Subtype.ext\n      funext i j\n      rfl }\n"
+    "  have hstab (G : codexValidGrid) :\n"
+    "      MulAction.stabilizer (Equiv.Perm (Fin 9)) G = ⊥ := by\n"
+    "    rw [Subgroup.eq_bot_iff_forall]\n"
+    "    intro σ hσ\n"
+    "    have hs : σ • G = G := MulAction.mem_stabilizer_iff.mp hσ\n"
+    "    apply Equiv.ext\n"
+    "    intro y\n"
+    "    rcases (G.property.1 0).2 y with ⟨j, hj⟩\n"
+    "    have hv := congrArg (fun H : codexValidGrid => H.val 0 j) hs\n"
+    "    change σ (G.val 0 j) = G.val 0 j at hv\n"
+    "    simpa [hj] using hv\n"
+    "  letI : Fintype Grid3x9 := Fintype.ofEquiv\n"
+    "    (Fin 3 → Fin 9 → Fin 9) (Equiv.refl (Fin 3 → Fin 9 → Fin 9))\n"
+    "  letI : DecidablePred ValidGrid := Classical.decPred ValidGrid\n"
+    "  letI : Fintype codexValidGrid := inferInstance\n"
+    "  let e := MulAction.selfEquivOrbitsQuotientProd\n"
+    "    (G := Equiv.Perm (Fin 9)) (X := codexValidGrid) hstab\n"
+    "  letI : Fintype (Quotient (MulAction.orbitRel\n"
+    "      (Equiv.Perm (Fin 9)) codexValidGrid)) := Fintype.ofFinite _\n"
+    "  have hc := Fintype.card_congr e\n"
+    "  have hd : Nat.factorial 9 ∣ Nat.card codexValidGrid := by\n"
+    "    rw [Nat.card_eq_fintype_card, hc, Fintype.card_prod, Fintype.card_perm]\n"
+    "    norm_num\n"
+    "  rw [hbad] at hd\n"
+    "  norm_num at hd",
+    "use_the_free_digit_relabeling_action_to_force_divisibility_by_nine_factorial",
+    prefix_code=AIME10_ACTION_PREFIX,
 ))
 
 MANUAL_PROOFS.append(proof(
@@ -2423,6 +2810,330 @@ MANUAL_PROOFS.append(proof(
     "  all_goals norm_num [abs_of_nonneg, abs_of_nonpos]",
     "enumerate_the_six_given_vertices_and_normalize_the_shoelace_area_for_each_injective_ordering",
     prefix_code="lemma codex_cmimc34_option_anchor : True := by trivial\nset_option maxHeartbeats 0",
+))
+
+CMIMC34_FINITE_PREFIX = """
+set_option maxHeartbeats 0
+
+def codexIPoint : Fin 6 → ℤ × ℤ :=
+  ![(0, 0), (10, 0), (10, 10), (0, 10), (3, 4), (6, 2)]
+
+def codexRPoint : Fin 6 → ℝ × ℝ :=
+  ![(0, 0), (10, 0), (10, 10), (0, 10), (3, 4), (6, 2)]
+
+def codexScore (q : Fin 6 → Fin 6) : ℤ :=
+  ∑ i : Fin 6, (
+    (codexIPoint (q i)).1 * (codexIPoint (q (next_index i))).2 -
+    (codexIPoint (q (next_index i))).1 * (codexIPoint (q i)).2)
+
+lemma codex_score_table : ∀ q : Fin 6 → Fin 6,
+    Function.Injective q → |codexScore q| ≤ 178 := by
+  set_option maxHeartbeats 0 in
+  set_option maxRecDepth 100000 in
+    decide
+
+lemma codex_rpoint_fst (i : Fin 6) :
+    (codexRPoint i).1 = ((codexIPoint i).1 : ℝ) := by
+  fin_cases i <;> norm_num [codexRPoint, codexIPoint]
+
+lemma codex_rpoint_snd (i : Fin 6) :
+    (codexRPoint i).2 = ((codexIPoint i).2 : ℝ) := by
+  fin_cases i <;> norm_num [codexRPoint, codexIPoint]
+
+noncomputable def codexPointIndex (p : ℝ × ℝ) : Fin 6 :=
+  if p = (0, 0) then 0 else if p = (10, 0) then 1 else
+  if p = (10, 10) then 2 else if p = (0, 10) then 3 else
+  if p = (3, 4) then 4 else 5
+
+lemma codex_point_index_spec {p : ℝ × ℝ} (hp : p ∈ hexagon_points) :
+    codexRPoint (codexPointIndex p) = p := by
+  simp only [hexagon_points, Set.mem_insert_iff, Set.mem_singleton_iff] at hp
+  rcases hp with rfl | rfl | rfl | rfl | rfl | rfl <;>
+    norm_num [codexPointIndex, codexRPoint, Matrix.cons_val] <;> rfl
+"""
+
+MANUAL_PROOFS.append(proof(
+    "robustpa_cmimc_2025_34", "max_area_bound", "positive",
+    "by\n  intro v hv\n"
+    "  rcases hv with ⟨hrange, hinj, hsimple⟩\n"
+    "  have hmem (i : Fin 6) : v i ∈ hexagon_points := by\n"
+    "    rw [← hrange]\n    exact Set.mem_range_self i\n"
+    "  let q : Fin 6 → Fin 6 := fun i => codexPointIndex (v i)\n"
+    "  have hvq (i : Fin 6) : codexRPoint (q i) = v i :=\n"
+    "    codex_point_index_spec (hmem i)\n"
+    "  have hqinj : Function.Injective q := by\n"
+    "    intro i j hij\n    apply hinj\n"
+    "    rw [← hvq i, ← hvq j, hij]\n"
+    "  have hscore : ((codexScore q : ℤ) : ℝ) =\n"
+    "      ∑ i : Fin 6, ((v i).1 * (v (next_index i)).2 -\n"
+    "        (v (next_index i)).1 * (v i).2) := by\n"
+    "    rw [show ((codexScore q : ℤ) : ℝ) =\n"
+    "      ∑ i : Fin 6, (((codexIPoint (q i)).1 *\n"
+    "        (codexIPoint (q (next_index i))).2 -\n"
+    "        (codexIPoint (q (next_index i))).1 *\n"
+    "        (codexIPoint (q i)).2 : ℤ) : ℝ) by\n"
+    "          simp [codexScore]]\n"
+    "    apply Fintype.sum_congr\n    intro i\n"
+    "    rw [← hvq i, ← hvq (next_index i)]\n"
+    "    rw [codex_rpoint_fst, codex_rpoint_snd, codex_rpoint_fst, codex_rpoint_snd]\n"
+    "    norm_num\n"
+    "  have hsZ := codex_score_table q hqinj\n"
+    "  have hsR : abs (((codexScore q : ℤ) : ℝ)) ≤ 178 := by\n"
+    "    exact_mod_cast hsZ\n"
+    "  rw [hscore] at hsR\n"
+    "  unfold shoelace_area\n"
+    "  nlinarith [hsR]",
+    "encode_the_vertex_order_as_a_permutation_and_check_the_720_integer_scores",
+    prefix_code=CMIMC34_FINITE_PREFIX,
+))
+
+MANUAL_PROOFS.append(proof(
+    "robustpa_MATH_500_test_prealgebra_378_json", "first_triangle_area", "positive",
+    "by\n"
+    "  have hset : first_triangle = MeasureTheory.regionBetween\n"
+    "      (fun _x : ℝ => 0) (fun x : ℝ => 4 - 2*x) (Set.Icc 0 2) := by\n"
+    "    ext p\n"
+    "    simp only [first_triangle, MeasureTheory.regionBetween, Set.mem_setOf_eq,\n"
+    "      Set.mem_Icc, Pi.zero_apply]\n"
+    "    constructor <;> rintro ⟨h1,h2,h3⟩\n"
+    "    · constructor\n      · constructor <;> linarith\n      · constructor <;> linarith\n"
+    "    · constructor\n      · linarith\n      · constructor <;> linarith\n"
+    "  have hf : MeasureTheory.IntegrableOn (fun _x : ℝ => 0) (Set.Icc 0 2) :=\n"
+    "    Continuous.integrableOn_Icc continuous_const\n"
+    "  have hg : MeasureTheory.IntegrableOn (fun x : ℝ => 4 - 2*x) (Set.Icc 0 2) :=\n"
+    "    Continuous.integrableOn_Icc (continuous_const.sub (continuous_const.mul continuous_id))\n"
+    "  have hi : (∫ x in Set.Icc (0 : ℝ) 2,\n"
+    "      ((fun x : ℝ => 4 - 2*x) - (fun _x : ℝ => 0)) x) = 4 := by\n"
+    "    rw [MeasureTheory.integral_Icc_eq_integral_Ioc]\n"
+    "    rw [← intervalIntegral.integral_of_le (by norm_num : (0 : ℝ) ≤ 2)]\n"
+    "    norm_num\n"
+    "  rw [hset, MeasureTheory.volume_eq_prod,\n"
+    "    MeasureTheory.volume_regionBetween_eq_integral hf hg measurableSet_Icc, hi]\n"
+    "  norm_num",
+    "identify_the_triangle_as_a_region_between_two_affine_functions_and_integrate",
+))
+
+MANUAL_PROOFS.append(proof(
+    "robustpa_MATH_500_test_prealgebra_378_json", "second_triangle_area", "positive",
+    "by\n"
+    "  have hset : second_triangle = MeasureTheory.regionBetween\n"
+    "      (fun x : ℝ => 4 - (4/3)*x) (fun _x : ℝ => 4) (Set.Icc 0 3) := by\n"
+    "    ext p\n"
+    "    simp only [second_triangle, MeasureTheory.regionBetween, Set.mem_setOf_eq, Set.mem_Icc]\n"
+    "    constructor <;> rintro ⟨h1,h2,h3,h4⟩\n"
+    "    · constructor\n      · constructor <;> linarith\n      · constructor <;> linarith\n"
+    "    · constructor\n      · linarith\n      · constructor\n        · linarith\n        · constructor <;> linarith\n"
+    "  have hf : MeasureTheory.IntegrableOn (fun x : ℝ => 4 - (4/3)*x) (Set.Icc 0 3) :=\n"
+    "    Continuous.integrableOn_Icc (continuous_const.sub (continuous_const.mul continuous_id))\n"
+    "  have hg : MeasureTheory.IntegrableOn (fun _x : ℝ => 4) (Set.Icc 0 3) :=\n"
+    "    Continuous.integrableOn_Icc continuous_const\n"
+    "  have hi : (∫ x in Set.Icc (0 : ℝ) 3,\n"
+    "      ((fun _x : ℝ => 4) - (fun x : ℝ => 4 - (4/3)*x)) x) = 6 := by\n"
+    "    rw [MeasureTheory.integral_Icc_eq_integral_Ioc]\n"
+    "    rw [← intervalIntegral.integral_of_le (by norm_num : (0 : ℝ) ≤ 3)]\n"
+    "    norm_num\n"
+    "  rw [hset, MeasureTheory.volume_eq_prod,\n"
+    "    MeasureTheory.volume_regionBetween_eq_integral hf hg measurableSet_Icc, hi]\n"
+    "  norm_num",
+    "identify_the_second_triangle_as_an_affine_vertical_region_and_integrate",
+))
+
+MANUAL_PROOFS.append(proof(
+    "robustpa_MATH_500_test_prealgebra_378_json", "first_triangle_area", "positive",
+    "by\n"
+    "  let R := regionBetween (fun _x : ℝ => (0 : ℝ)) (fun x : ℝ => 4 - 2*x) (Set.Icc 0 2)\n"
+    "  have hm : MeasurableSet first_triangle := by\n"
+    "    unfold first_triangle\n    measurability\n"
+    "  have hmR : MeasurableSet R := by\n"
+    "    exact measurableSet_regionBetween measurable_const\n"
+    "      (measurable_const.sub (measurable_const.mul measurable_id)) measurableSet_Icc\n"
+    "  have hvol : MeasureTheory.volume first_triangle = MeasureTheory.volume R := by\n"
+    "    rw [MeasureTheory.Measure.volume_eq_prod, MeasureTheory.Measure.prod_apply hm,\n"
+    "      MeasureTheory.Measure.prod_apply hmR]\n"
+    "    apply MeasureTheory.lintegral_congr\n    intro x\n"
+    "    by_cases hx : x ∈ Set.Icc (0 : ℝ) 2\n"
+    "    · have hs1 : Prod.mk x ⁻¹' first_triangle = Set.Icc 0 (4-2*x) := by\n"
+    "        ext y\n        simp only [Set.mem_preimage, first_triangle, Set.mem_setOf_eq, Set.mem_Icc]\n"
+    "        constructor\n"
+    "        · rintro ⟨h1,h2,h3⟩\n          constructor <;> linarith\n"
+    "        · rintro ⟨h1,h2⟩\n          rcases hx with ⟨hx0,hx2⟩\n"
+    "          exact ⟨hx0, h1, by linarith⟩\n"
+    "      have hs2 : Prod.mk x ⁻¹' R = Set.Ioo 0 (4-2*x) := by\n"
+    "        rcases hx with ⟨hx0,hx2⟩\n"
+    "        ext y\n        simp [R, regionBetween, hx0, hx2]\n"
+    "      rw [hs1, hs2, Real.volume_Icc, Real.volume_Ioo]\n"
+    "    · have hx' : x < 0 ∨ 2 < x := by\n"
+    "        simp only [Set.mem_Icc, not_and_or, not_le] at hx\n        exact hx\n"
+    "      have hs1 : Prod.mk x ⁻¹' first_triangle = ∅ := by\n"
+    "        ext y\n        simp only [Set.mem_preimage, first_triangle, Set.mem_setOf_eq,\n"
+    "          Set.mem_empty_iff_false, iff_false]\n        intro h\n        rcases h with ⟨h1,h2,h3⟩\n"
+    "        rcases hx' with hx' | hx' <;> linarith\n"
+    "      have hs2 : Prod.mk x ⁻¹' R = ∅ := by\n"
+    "        ext y\n        simp only [R, regionBetween, Set.mem_preimage, Set.mem_setOf_eq,\n"
+    "          Set.mem_Icc, Set.mem_Ioo, Set.mem_empty_iff_false, iff_false]\n"
+    "        intro h\n        exact hx h.1\n"
+    "      rw [hs1, hs2]\n"
+    "  have hf : MeasureTheory.IntegrableOn (fun _x : ℝ => (0 : ℝ)) (Set.Icc 0 2) :=\n"
+    "    Continuous.integrableOn_Icc continuous_const\n"
+    "  have hg : MeasureTheory.IntegrableOn (fun x : ℝ => 4 - 2*x) (Set.Icc 0 2) :=\n"
+    "    Continuous.integrableOn_Icc (continuous_const.sub (continuous_const.mul continuous_id))\n"
+    "  have hi : (∫ x in Set.Icc (0 : ℝ) 2,\n"
+    "      ((fun x : ℝ => 4 - 2*x) - (fun _x : ℝ => (0 : ℝ))) x) = 4 := by\n"
+    "    rw [MeasureTheory.integral_Icc_eq_integral_Ioc]\n"
+    "    rw [← intervalIntegral.integral_of_le (by norm_num : (0 : ℝ) ≤ 2)]\n"
+    "    simp only [Pi.sub_apply, sub_zero]\n"
+    "    have hint : IntervalIntegrable (fun x : ℝ => 4 - 2*x)\n"
+    "        MeasureTheory.volume 0 2 :=\n"
+    "      (continuous_const.sub (continuous_const.mul continuous_id)).intervalIntegrable 0 2\n"
+    "    rw [intervalIntegral.integral_eq_sub_of_hasDerivAt\n"
+    "      (f := fun x : ℝ => 4*x - x^2) (f' := fun x : ℝ => 4 - 2*x)\n"
+    "      (by intro x hx\n"
+    "          convert (((hasDerivAt_id x).const_mul 4).sub ((hasDerivAt_id x).pow 2)) using 1\n"
+    "          · funext y\n            simp [Pi.sub_apply, Pi.pow_apply, mul_comm]\n"
+    "          · simp) hint]\n"
+    "    norm_num\n"
+    "  rw [hvol]\n"
+    "  change MeasureTheory.volume (regionBetween (fun _x : ℝ => (0 : ℝ))\n"
+    "    (fun x : ℝ => 4 - 2*x) (Set.Icc 0 2)) = 4\n"
+    "  rw [MeasureTheory.Measure.volume_eq_prod,\n"
+    "    volume_regionBetween_eq_integral hf hg measurableSet_Icc\n"
+    "      (by intro x hx; simp at hx ⊢; linarith), hi]\n"
+    "  norm_num",
+    "compare_closed_and_open_vertical_sections_then_apply_region_between_integration",
+))
+
+PREALGEBRA_REGION_PREFIX = """
+lemma codex_volume_region_cc (f g : ℝ → ℝ) (s : Set ℝ)
+    (hf : Measurable f) (hg : Measurable g) (hs : MeasurableSet s) :
+    MeasureTheory.volume {p : ℝ × ℝ | p.1 ∈ s ∧ p.2 ∈ Set.Icc (f p.1) (g p.1)} =
+      MeasureTheory.volume (regionBetween f g s) := by
+  rw [MeasureTheory.Measure.volume_eq_prod,
+    MeasureTheory.Measure.prod_apply (measurableSet_region_between_cc hf hg hs),
+    MeasureTheory.Measure.prod_apply (measurableSet_regionBetween hf hg hs)]
+  apply MeasureTheory.lintegral_congr
+  intro x
+  by_cases hx : x ∈ s
+  · have hcc : Prod.mk x ⁻¹'
+        {p : ℝ × ℝ | p.1 ∈ s ∧ p.2 ∈ Set.Icc (f p.1) (g p.1)} =
+        Set.Icc (f x) (g x) := by
+      ext y
+      simp [hx]
+    have hoo : Prod.mk x ⁻¹' regionBetween f g s = Set.Ioo (f x) (g x) := by
+      ext y
+      simp [regionBetween, hx]
+    rw [hcc, hoo, Real.volume_Icc, Real.volume_Ioo]
+  · have hcc : Prod.mk x ⁻¹'
+        {p : ℝ × ℝ | p.1 ∈ s ∧ p.2 ∈ Set.Icc (f p.1) (g p.1)} = ∅ := by
+      ext y
+      simp [hx]
+    have hoo : Prod.mk x ⁻¹' regionBetween f g s = ∅ := by
+      ext y
+      simp [regionBetween, hx]
+    rw [hcc, hoo]
+"""
+
+MANUAL_PROOFS.append(proof(
+    "robustpa_MATH_500_test_prealgebra_378_json", "second_triangle_area", "positive",
+    "by\n"
+    "  let f : ℝ → ℝ := fun x => 4 - (4/3)*x\n"
+    "  let g : ℝ → ℝ := fun _x => 4\n"
+    "  have hset : second_triangle =\n"
+    "      {p : ℝ × ℝ | p.1 ∈ Set.Icc (0 : ℝ) 3 ∧ p.2 ∈ Set.Icc (f p.1) (g p.1)} := by\n"
+    "    ext p\n"
+    "    simp only [second_triangle, Set.mem_setOf_eq, Set.mem_Icc, f, g]\n"
+    "    constructor\n"
+    "    · rintro ⟨h1,h2,h3,h4⟩\n      constructor\n"
+    "      · exact ⟨h1,h3⟩\n      · constructor <;> linarith\n"
+    "    · rintro ⟨⟨h1,h3⟩,h4,h2⟩\n      exact ⟨h1,h2,h3,by linarith⟩\n"
+    "  have hf : Measurable f :=\n"
+    "    measurable_const.sub (measurable_const.mul measurable_id)\n"
+    "  have hg : Measurable g := measurable_const\n"
+    "  rw [hset, codex_volume_region_cc f g (Set.Icc 0 3) hf hg measurableSet_Icc]\n"
+    "  change MeasureTheory.volume (regionBetween f g (Set.Icc 0 3)) = 6\n"
+    "  have hfi : MeasureTheory.IntegrableOn f (Set.Icc 0 3) :=\n"
+    "    Continuous.integrableOn_Icc (continuous_const.sub (continuous_const.mul continuous_id))\n"
+    "  have hgi : MeasureTheory.IntegrableOn g (Set.Icc 0 3) :=\n"
+    "    Continuous.integrableOn_Icc continuous_const\n"
+    "  have hi : (∫ x in Set.Icc (0 : ℝ) 3, (g-f) x) = 6 := by\n"
+    "    rw [MeasureTheory.integral_Icc_eq_integral_Ioc]\n"
+    "    rw [← intervalIntegral.integral_of_le (by norm_num : (0 : ℝ) ≤ 3)]\n"
+    "    simp only [g, f, Pi.sub_apply]\n"
+    "    have hint : IntervalIntegrable (fun x : ℝ => 4 - (4 - (4/3)*x))\n"
+    "        MeasureTheory.volume 0 3 :=\n"
+    "      (continuous_const.sub (continuous_const.sub\n"
+    "        (continuous_const.mul continuous_id))).intervalIntegrable 0 3\n"
+    "    rw [intervalIntegral.integral_eq_sub_of_hasDerivAt\n"
+    "      (f := fun x : ℝ => (2/3)*x^2)\n"
+    "      (f' := fun x : ℝ => 4 - (4 - (4/3)*x))\n"
+    "      (by intro x hx\n"
+    "          have hraw := (hasDerivAt_const (x := x) (2/3 : ℝ)).mul\n"
+    "            ((hasDerivAt_id x).pow 2)\n"
+    "          have hfun : ((fun _y : ℝ => (2/3 : ℝ)) * id^2) =\n"
+    "              (fun y : ℝ => (2/3)*y^2) := by\n"
+    "            funext y\n            simp [Pi.mul_apply, Pi.pow_apply]\n"
+    "          rw [hfun] at hraw\n"
+    "          apply hraw.congr_deriv\n"
+    "          simp only [id_eq]\n          ring) hint]\n"
+    "    norm_num\n"
+    "  rw [MeasureTheory.Measure.volume_eq_prod,\n"
+    "    volume_regionBetween_eq_integral hfi hgi measurableSet_Icc\n"
+    "      (by intro x hx; simp only [f,g,Set.mem_Icc] at hx ⊢; linarith), hi]\n"
+    "  norm_num",
+    "use_closed_region_section_measure_and_integrate_the_affine_height",
+    prefix_code=PREALGEBRA_REGION_PREFIX,
+))
+
+_cmimc34_slow_table = """lemma codex_score_table : ∀ q : Fin 6 → Fin 6,
+    Function.Injective q → |codexScore q| ≤ 178 := by
+  set_option maxHeartbeats 0 in
+  set_option maxRecDepth 100000 in
+    decide
+"""
+_cmimc34_case_table = """lemma codex_score_table : ∀ q : Fin 6 → Fin 6,
+    Function.Injective q → |codexScore q| ≤ 178 := by
+  intro q hq
+  have h01 : q 0 ≠ q 1 := hq.ne (by decide)
+  have h02 : q 0 ≠ q 2 := hq.ne (by decide)
+  have h03 : q 0 ≠ q 3 := hq.ne (by decide)
+  have h04 : q 0 ≠ q 4 := hq.ne (by decide)
+  have h05 : q 0 ≠ q 5 := hq.ne (by decide)
+  have h12 : q 1 ≠ q 2 := hq.ne (by decide)
+  have h13 : q 1 ≠ q 3 := hq.ne (by decide)
+  have h14 : q 1 ≠ q 4 := hq.ne (by decide)
+  have h15 : q 1 ≠ q 5 := hq.ne (by decide)
+  have h23 : q 2 ≠ q 3 := hq.ne (by decide)
+  have h24 : q 2 ≠ q 4 := hq.ne (by decide)
+  have h25 : q 2 ≠ q 5 := hq.ne (by decide)
+  have h34 : q 3 ≠ q 4 := hq.ne (by decide)
+  have h35 : q 3 ≠ q 5 := hq.ne (by decide)
+  have h45 : q 4 ≠ q 5 := hq.ne (by decide)
+  generalize h0 : q 0 = x0
+  fin_cases x0
+  all_goals generalize h1 : q 1 = x1
+  all_goals fin_cases x1 <;> simp_all only
+  all_goals generalize h2 : q 2 = x2
+  all_goals fin_cases x2 <;> simp_all only
+  all_goals generalize h3 : q 3 = x3
+  all_goals fin_cases x3 <;> simp_all only
+  all_goals generalize h4 : q 4 = x4
+  all_goals fin_cases x4 <;> simp_all only
+  all_goals generalize h5 : q 5 = x5
+  all_goals fin_cases x5 <;> simp_all only
+  all_goals norm_num [codexScore, next_index, codexIPoint, Fin.sum_univ_succ,
+    Matrix.cons_val, abs_of_nonneg, abs_of_nonpos]
+"""
+CMIMC34_CASE_PREFIX = CMIMC34_FINITE_PREFIX.replace(
+    _cmimc34_slow_table, _cmimc34_case_table,
+)
+_cmimc34_case_body = next(
+    e["proof_body"] for e in MANUAL_PROOFS
+    if e["reasoning"] == "encode_the_vertex_order_as_a_permutation_and_check_the_720_integer_scores"
+)
+MANUAL_PROOFS.append(proof(
+    "robustpa_cmimc_2025_34", "max_area_bound", "positive",
+    _cmimc34_case_body,
+    "prune_the_six_vertex_assignments_by_injectivity_before_computing_each_score",
+    prefix_code=CMIMC34_CASE_PREFIX,
 ))
 
 CMIMC35_SUM_PREFIX = """

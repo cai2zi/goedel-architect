@@ -336,7 +336,8 @@ def main() -> None:
     args = parser.parse_args()
     records = load_records()
     compiler = KiminaLeanCompiler(
-        api_url="http://127.0.0.1:8000", timeout_s=86400, reuse=True,
+        api_url=os.environ.get("BLUEPRINT_LABEL_LEAN_API", "http://127.0.0.1:8000"),
+        timeout_s=86400, reuse=True,
         max_inflight_snippets=48, batch_size=8, global_batching=True,
         parallel_batches=6, batch_wait_ms=10,
     )

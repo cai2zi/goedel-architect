@@ -197,6 +197,8 @@ def run_blueprint(
         f"phase1_source_results_path={phase1_source_results_path or 'null'}",
         f"phase1_source_experiment_root={phase1_source_root or 'null'}",
         f"generation_prompt_profile={blueprint.get('generation_prompt_profile', 'whole_cot_minimal')}",
+        f"blueprint_root_name={blueprint.get('blueprint_root_name', 'null') or 'null'}",
+        f"generation_node_naming={blueprint.get('generation_node_naming', 'semantic')}",
         f"max_refinement_iterations={blueprint.max_refinement_iterations}",
         f"refinement_max_retries={blueprint.refinement_max_retries}",
         f"generation_max_turns={blueprint.generation_max_turns}",

@@ -386,6 +386,11 @@ class KiminaLeanCompiler:
                 )
                 continue
             request_id = request.request_id or f"goedel-{uuid.uuid4().hex}"
+            # Global batching combines requests submitted by independent caller
+            # threads.  Their caller-supplied ids are only locally unique, so
+            # namespace every queued request before it enters the shared queue.
+            if self.global_batching and request.request_id:
+                request_id = f"{request_id}-{uuid.uuid4().hex}"
             while request_id in seen_ids:
                 request_id = f"{request_id}-{uuid.uuid4().hex[:8]}"
             seen_ids.add(request_id)

@@ -39,14 +39,20 @@ from kimina_lean_compiler import (
 )
 from llm_client import chat_completion_with_retry, make_client
 from semantic_audit import (
+    COMPACT_WHOLE_COT_PROMPT_VERSION,
+    DIRECT_WHOLE_COT_PROMPT_VERSION,
     FormalDecompilerResult,
     JointWholeCotAuditResult,
     WholeCotComparatorResult,
     JOINT_WHOLE_COT_PROMPT_VERSION,
     WHOLE_COT_PROMPT_VERSION,
     build_formal_view,
+    compact_whole_cot_comparator_messages,
+    direct_whole_cot_comparator_messages,
     joint_whole_cot_audit_messages,
     run_formal_decompiler,
+    run_compact_whole_cot_comparator,
+    run_direct_whole_cot_comparator,
     run_joint_whole_cot_audit,
     run_whole_cot_comparator,
     semantic_audit_cache_key,
@@ -72,6 +78,22 @@ Blueprint `title` metadata is optional and carries no semantic credit.
 `title`, `statement`, and `proof` metadata are optional. Call `lean_compile`
 exactly once with the entire replacement file. Do not return prose or a partial
 declaration.
+"""
+
+
+ANONYMOUS_NODE_NAMING_SUFFIX = r"""
+
+## Opaque Blueprint node naming contract
+
+Top-level declaration names are opaque identifiers and must not describe
+their mathematical meaning. Name definitions and abbrevs consecutively
+`d1`, `d2`, ... in source order. Name every non-root lemma/theorem
+consecutively `n1`, `n2`, ... in source order. The unique root theorem is
+`n_final`. Use these same opaque names in every declaration reference and
+`sorry_using` dependency. Do not add semantic namespaces or semantic
+`title`/`statement`/`proof` metadata. Ordinary mathematical binders such as
+`x`, `n`, `A`, or `B` are allowed, but do not introduce descriptive local
+answer aliases such as `shortest_path` or `expected_value`.
 """
 
 
@@ -117,6 +139,7 @@ class BlueprintValidation:
     strict_comparator_result: WholeCotComparatorResult | None = None
     joint_audit_result: JointWholeCotAuditResult | None = None
     semantic_audit_protocol: str = WHOLE_COT_PROMPT_VERSION
+    graph_shadow_unreachable_nodes: tuple[str, ...] = ()
 
     @property
     def passed(self) -> bool:
@@ -142,9 +165,8 @@ class SemanticAuditExecutionError(RuntimeError):
 def validation_details(validation: BlueprintValidation) -> dict[str, Any]:
     standalone = validation.standalone_report
     audit = None
-    if validation.formal_decompiler_result and validation.strict_comparator_result:
+    if validation.strict_comparator_result:
         audit = {
-            "formalDecompiler": validation.formal_decompiler_result.to_dict(),
             "protocol": validation.semantic_audit_protocol,
             "mode": validation.semantic_audit_mode,
             "actualRequestCount": validation.semantic_request_count,
@@ -152,6 +174,8 @@ def validation_details(validation: BlueprintValidation) -> dict[str, Any]:
             "outputBudget": validation.semantic_output_budget,
             "classification": "strictAccepted" if validation.passed else "semanticRejected",
         }
+        if validation.formal_decompiler_result is not None:
+            audit["formalDecompiler"] = validation.formal_decompiler_result.to_dict()
         audit["wholeCotComparator"] = validation.strict_comparator_result.to_dict()
         if validation.joint_audit_result is not None:
             audit["jointRequest"] = validation.joint_audit_result.to_dict()
@@ -198,6 +222,10 @@ def validation_details(validation: BlueprintValidation) -> dict[str, Any]:
         "semanticCacheHits": dict(validation.semantic_cache_hits or {}),
         "semanticOutputBudget": validation.semantic_output_budget,
         "semanticAudit": audit,
+        "graphShadow": {
+            "unreachableNodeNames": list(validation.graph_shadow_unreachable_nodes),
+            "hasUnreachableNodes": bool(validation.graph_shadow_unreachable_nodes),
+        },
     }
 
 
@@ -233,6 +261,76 @@ def _with_semantic_audit(
     round_index: int,
 ) -> BlueprintValidation:
     view = build_formal_view(blueprint)
+    unreachable_shadow = tuple(
+        node.node_name for node in view.nodes if not node.in_root_closure
+    )
+    validation.graph_shadow_unreachable_nodes = unreachable_shadow
+    if tracer:
+        tracer.emit(TraceEvent(
+            kind="phase1GraphShadow", thm_name=thm_name, turn=round_index,
+            args={
+                "round": round_index,
+                "unreachableNodeNames": list(unreachable_shadow),
+                "hasUnreachableNodes": bool(unreachable_shadow),
+            },
+            ok=not bool(unreachable_shadow),
+        ))
+
+    if semantic_audit_mode == "direct":
+        messages = direct_whole_cot_comparator_messages(
+            informal_statement, informal_proof, claimed_answer, view,
+        )
+        cache_key = semantic_audit_cache_key(
+            model, messages, version=DIRECT_WHOLE_COT_PROMPT_VERSION,
+        )
+        comparator = comparator_cache.get(cache_key)
+        comparator_hit = comparator is not None
+        validation.semantic_audit_invoked = True
+        validation.semantic_audit_mode = "direct"
+        validation.semantic_audit_protocol = DIRECT_WHOLE_COT_PROMPT_VERSION
+        validation.semantic_cache_hits = {"wholeCotComparator": comparator_hit}
+        if comparator is None:
+            try:
+                comparator = run_direct_whole_cot_comparator(
+                    client, model,
+                    informal_statement=informal_statement,
+                    informal_proof=informal_proof,
+                    claimed_answer=claimed_answer,
+                    view=view, max_tokens=strict_comparator_max_tokens,
+                    max_attempts=format_max_attempts, tracer=tracer,
+                    enable_thinking=semantic_audit_enable_thinking,
+                    temperature=semantic_audit_temperature,
+                    top_p=semantic_audit_top_p, top_k=semantic_audit_top_k,
+                    min_p=semantic_audit_min_p,
+                    presence_penalty=semantic_audit_presence_penalty,
+                    repetition_penalty=semantic_audit_repetition_penalty,
+                    thm_name=thm_name, round_index=round_index,
+                )
+            except Exception as exc:
+                validation.semantic_request_count = max(
+                    1, len(getattr(exc, "attempts", ()) or ()),
+                )
+                raise
+            comparator_cache[cache_key] = comparator
+        return BlueprintValidation(
+            lean_result=validation.lean_result,
+            semantic_issues=validation.semantic_issues,
+            structural_errors=validation.structural_errors,
+            standalone_report=validation.standalone_report,
+            canonical_lean_result=validation.canonical_lean_result,
+            mechanical_stage_reached=validation.mechanical_stage_reached,
+            mechanical_failure_stage=validation.mechanical_failure_stage,
+            semantic_audit_invoked=True,
+            semantic_audit_mode="direct",
+            semantic_request_count=0 if comparator_hit else len(comparator.attempts),
+            semantic_cache_hits={"wholeCotComparator": comparator_hit},
+            semantic_output_budget=None,
+            formal_decompiler_result=None,
+            strict_comparator_result=comparator,
+            semantic_audit_protocol=DIRECT_WHOLE_COT_PROMPT_VERSION,
+            graph_shadow_unreachable_nodes=unreachable_shadow,
+        )
+
     if semantic_audit_mode == "joint":
         messages = joint_whole_cot_audit_messages(
             informal_statement, informal_proof, claimed_answer, view,
@@ -319,11 +417,15 @@ def _with_semantic_audit(
             strict_comparator_result=joint.comparator,
             joint_audit_result=joint,
             semantic_audit_protocol=JOINT_WHOLE_COT_PROMPT_VERSION,
+            graph_shadow_unreachable_nodes=unreachable_shadow,
         )
 
     validation.semantic_audit_invoked = True
-    validation.semantic_audit_mode = "separate"
-    validation.semantic_audit_protocol = WHOLE_COT_PROMPT_VERSION
+    compact = semantic_audit_mode == "compact_separate"
+    validation.semantic_audit_mode = semantic_audit_mode
+    validation.semantic_audit_protocol = (
+        COMPACT_WHOLE_COT_PROMPT_VERSION if compact else WHOLE_COT_PROMPT_VERSION
+    )
     decompiler = decompiler_cache.get(view.sha256)
     decompiler_hit = decompiler is not None
     validation.semantic_cache_hits = {"formalDecompiler": decompiler_hit}
@@ -345,6 +447,7 @@ def _with_semantic_audit(
                 tracer=tracer,
                 thm_name=thm_name,
                 round_index=round_index,
+                compact=compact,
             )
         except Exception as exc:
             validation.semantic_request_count = max(
@@ -353,18 +456,30 @@ def _with_semantic_audit(
             raise
         decompiler_cache[view.sha256] = decompiler
         validation.semantic_request_count = len(decompiler.attempts)
-    messages = whole_cot_comparator_messages(
-        informal_statement, informal_proof, claimed_answer, view, decompiler,
+    messages = (
+        compact_whole_cot_comparator_messages(
+            informal_statement, informal_proof, claimed_answer, view, decompiler,
+        )
+        if compact else whole_cot_comparator_messages(
+            informal_statement, informal_proof, claimed_answer, view, decompiler,
+        )
+    )
+    protocol = (
+        COMPACT_WHOLE_COT_PROMPT_VERSION if compact else WHOLE_COT_PROMPT_VERSION
     )
     cache_key = semantic_audit_cache_key(
-        model, messages, version=WHOLE_COT_PROMPT_VERSION,
+        model, messages, version=protocol,
     )
     comparator = comparator_cache.get(cache_key)
     comparator_hit = comparator is not None
     validation.semantic_cache_hits["wholeCotComparator"] = comparator_hit
     if comparator is None:
         try:
-            comparator = run_whole_cot_comparator(
+            comparator_runner = (
+                run_compact_whole_cot_comparator if compact
+                else run_whole_cot_comparator
+            )
+            comparator = comparator_runner(
                 client, model, informal_statement=informal_statement,
                 informal_proof=informal_proof, claimed_answer=claimed_answer,
                 view=view, decompiler=decompiler,
@@ -394,7 +509,7 @@ def _with_semantic_audit(
         mechanical_stage_reached=validation.mechanical_stage_reached,
         mechanical_failure_stage=validation.mechanical_failure_stage,
         semantic_audit_invoked=True,
-        semantic_audit_mode="separate",
+        semantic_audit_mode=semantic_audit_mode,
         semantic_request_count=(
             (0 if decompiler_hit else len(decompiler.attempts))
             + (0 if comparator_hit else len(comparator.attempts))
@@ -406,7 +521,8 @@ def _with_semantic_audit(
         semantic_output_budget=None,
         formal_decompiler_result=decompiler,
         strict_comparator_result=comparator,
-        semantic_audit_protocol=WHOLE_COT_PROMPT_VERSION,
+        semantic_audit_protocol=protocol,
+        graph_shadow_unreachable_nodes=unreachable_shadow,
     )
 
 
@@ -564,6 +680,7 @@ def _messages(
     previous_blueprint: str,
     previous_feedback: str,
     prompt_profile: str = "whole_cot_minimal",
+    node_naming: str = "semantic",
 ) -> list[dict[str, str]]:
     user = render(
         ROBUSTPA_BLUEPRINT_USER_TEMPLATE,
@@ -583,11 +700,16 @@ def _messages(
             + "\n```\n\n## Complete previous diagnostics\n"
             + previous_feedback
         )
+    system = (
+        ROBUSTPA_BLUEPRINT_MINIMAL_SYSTEM_PROMPT
+        if prompt_profile == "whole_cot_minimal"
+        else ROBUSTPA_BLUEPRINT_SYSTEM_PROMPT + WHOLE_COT_GENERATION_SYSTEM_SUFFIX
+    )
+    if node_naming == "anonymous":
+        system += ANONYMOUS_NODE_NAMING_SUFFIX
     return [
         {"role": "system", "content": (
-            ROBUSTPA_BLUEPRINT_MINIMAL_SYSTEM_PROMPT
-            if prompt_profile == "whole_cot_minimal"
-            else ROBUSTPA_BLUEPRINT_SYSTEM_PROMPT + WHOLE_COT_GENERATION_SYSTEM_SUFFIX
+            system
         )},
         {"role": "user", "content": user},
     ]
@@ -626,7 +748,12 @@ def _submitted_code(response: Any) -> tuple[str, list[dict[str, Any]]]:
     return code.strip() + "\n", problems
 
 
-def _contract_errors(blueprint: Blueprint, target_name: str) -> list[dict[str, Any]]:
+def _contract_errors(
+    blueprint: Blueprint,
+    target_name: str,
+    *,
+    node_naming: str = "semantic",
+) -> list[dict[str, Any]]:
     errors: list[dict[str, Any]] = []
     if not blueprint.nodes:
         errors.append(_issue(
@@ -643,6 +770,33 @@ def _contract_errors(blueprint: Blueprint, target_name: str) -> list[dict[str, A
             "forbiddenPendingClaim", "Phase 1 forbids PendingBlueprintClaim everywhere",
             stage="parse_basic",
         ))
+    if node_naming == "anonymous":
+        definitions = [node.name for node in blueprint.nodes if node.kind == "definition"]
+        expected_definitions = [f"d{index}" for index in range(1, len(definitions) + 1)]
+        if definitions != expected_definitions:
+            errors.append(_issue(
+                "anonymousDefinitionNames",
+                f"definition names must be consecutive in source order: {expected_definitions}",
+                stage="parse_basic",
+            ))
+        proof_nodes = [
+            node.name for node in blueprint.nodes
+            if node.kind != "definition" and node.name != target_name
+        ]
+        expected_proofs = [f"n{index}" for index in range(1, len(proof_nodes) + 1)]
+        if proof_nodes != expected_proofs:
+            errors.append(_issue(
+                "anonymousProofNames",
+                f"non-root proof names must be consecutive in source order: {expected_proofs}",
+                stage="parse_basic",
+            ))
+        root = blueprint.nodes_by_name().get(target_name)
+        if target_name != "n_final" or root is None or root.kind != "theorem":
+            errors.append(_issue(
+                "anonymousRootName",
+                "anonymous generation requires one theorem root named n_final",
+                stage="parse_basic",
+            ))
     for raw in _unannotated_local_declaration_errors(blueprint):
         errors.append(_issue(raw.split(":", 1)[0], raw, stage="parse_basic"))
     return errors
@@ -713,6 +867,7 @@ def _validate_round(
     semantic_audit_presence_penalty: float,
     semantic_audit_repetition_penalty: float,
     semantic_audit_mode: str,
+    node_naming: str,
     joint_semantic_audit_max_tokens: int,
     tokenizer_path: str,
     model_max_context: int,
@@ -727,7 +882,9 @@ def _validate_round(
 ) -> tuple[Blueprint, BlueprintValidation, tuple[dict[str, Any], ...], tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
     """Validate one candidate with strict mechanical short-circuiting."""
     candidate = _parse_blueprint(code, target_name)
-    deterministic: list[dict[str, Any]] = _contract_errors(candidate, target_name)
+    deterministic: list[dict[str, Any]] = _contract_errors(
+        candidate, target_name, node_naming=node_naming,
+    )
     warnings: list[dict[str, Any]] = []
     if deterministic:
         validation = _mechanical_validation(
@@ -945,13 +1102,18 @@ def generate_blueprint(
     semantic_audit_mode: str = "separate",
     joint_semantic_audit_max_tokens: int = 32768,
     prompt_profile: str = "whole_cot_minimal",
+    node_naming: str = "semantic",
 ) -> Blueprint:
     if max_turns <= 0:
         raise ValueError("generation max_turns must be positive")
     if prompt_profile not in {"whole_cot_minimal", "standard"}:
         raise ValueError("prompt_profile must be whole_cot_minimal or standard")
-    if semantic_audit_mode not in {"separate", "joint"}:
-        raise ValueError("semantic_audit_mode must be separate or joint")
+    if semantic_audit_mode not in {"separate", "compact_separate", "direct", "joint"}:
+        raise ValueError(
+            "semantic_audit_mode must be separate, compact_separate, direct, or joint"
+        )
+    if node_naming not in {"semantic", "anonymous"}:
+        raise ValueError("node_naming must be semantic or anonymous")
     if joint_semantic_audit_max_tokens <= 0:
         raise ValueError("joint_semantic_audit_max_tokens must be positive")
     client = make_client(model)
@@ -979,6 +1141,7 @@ def generate_blueprint(
             previous_blueprint=previous_code,
             previous_feedback=previous_feedback,
             prompt_profile=prompt_profile,
+            node_naming=node_naming,
         )
         input_tokens, completion_budget = generation_request_budget(
             messages,
@@ -1108,6 +1271,7 @@ def generate_blueprint(
                     semantic_audit_presence_penalty=semantic_audit_presence_penalty,
                     semantic_audit_repetition_penalty=semantic_audit_repetition_penalty,
                     semantic_audit_mode=semantic_audit_mode,
+                    node_naming=node_naming,
                     joint_semantic_audit_max_tokens=joint_semantic_audit_max_tokens,
                     tokenizer_path=tokenizer_path,
                     model_max_context=model_max_context,

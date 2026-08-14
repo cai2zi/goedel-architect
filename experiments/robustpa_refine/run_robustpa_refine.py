@@ -189,6 +189,11 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
     args.max_tool_calls_per_turn = int(args.max_tool_calls_per_turn)
     args.generation_max_turns = int(args.generation_max_turns)
     args.generation_prompt_profile = str(args.generation_prompt_profile)
+    root_name = getattr(args, "blueprint_root_name", None)
+    args.blueprint_root_name = str(root_name).strip() if root_name else None
+    args.generation_node_naming = str(
+        getattr(args, "generation_node_naming", "semantic")
+    )
     args.generation_enable_thinking = bool(args.generation_enable_thinking)
     for name in (
         "generation_temperature", "generation_top_p", "generation_min_p",
@@ -236,8 +241,14 @@ def _validate_args(args: argparse.Namespace) -> None:
         )
     if args.generation_prompt_profile not in {"whole_cot_minimal", "standard"}:
         raise ValueError("generation_prompt_profile must be whole_cot_minimal or standard")
-    if args.semantic_audit_mode not in {"separate", "joint"}:
-        raise ValueError("semantic_audit_mode must be separate or joint")
+    if args.generation_node_naming not in {"semantic", "anonymous"}:
+        raise ValueError("generation_node_naming must be semantic or anonymous")
+    if args.semantic_audit_mode not in {
+        "separate", "compact_separate", "direct", "joint",
+    }:
+        raise ValueError(
+            "semantic_audit_mode must be separate, compact_separate, direct, or joint"
+        )
     for name in (
         "phase1_concurrency",
         "phase2_blueprint_concurrency",
@@ -548,6 +559,8 @@ def _result_row(
         "theorem_name": record.theorem_name,
         "claimed_answer": record.claimed_answer,
         "generation_prompt_profile": args.generation_prompt_profile,
+        "blueprint_root_name": args.blueprint_root_name,
+        "generation_node_naming": args.generation_node_naming,
         "status": status,
         "phase": phase,
         "success": bool(score["root_proved"]),
@@ -883,7 +896,7 @@ async def _run_record(
                         informal_statement=record.informal_statement,
                         informal_proof=record.informal_proof,
                         claimed_answer=record.claimed_answer,
-                        target_name=record.theorem_name,
+                        target_name=args.blueprint_root_name or record.theorem_name,
                         model=args.model,
                         compiler=runtime.compiler,
                         tracer=phase1_tracer,
@@ -913,6 +926,7 @@ async def _run_record(
                         semantic_audit_mode=args.semantic_audit_mode,
                         joint_semantic_audit_max_tokens=args.joint_semantic_audit_max_tokens,
                         prompt_profile=args.generation_prompt_profile,
+                        node_naming=args.generation_node_naming,
                     ),
                 )
                 _write_phase1_candidates(

@@ -17,6 +17,8 @@ retry_error_results: false
 # checkpoints, proves their nodes once, and requires zero refinement rounds.
 execution_mode: full
 generation_prompt_profile: whole_cot_minimal
+blueprint_root_name: null
+generation_node_naming: semantic
 phase1_seed_root: null
 phase1_source_results_path: null
 phase1_source_experiment_root: null

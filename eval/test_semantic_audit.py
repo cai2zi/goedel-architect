@@ -20,9 +20,13 @@ from semantic_audit import (  # noqa: E402
     SemanticAuditFormatError,
     WHOLE_COT_PROMPT_VERSION,
     build_formal_view,
+    compact_formal_decompiler_messages,
+    compact_whole_cot_comparator_messages,
+    direct_whole_cot_comparator_messages,
     joint_whole_cot_audit_messages,
     parse_formal_decompiler,
     parse_joint_whole_cot_audit,
+    parse_compact_whole_cot_comparator,
     parse_whole_cot_comparator,
     _response_parts,
     run_formal_decompiler,
@@ -179,6 +183,51 @@ class SemanticAuditTest(unittest.TestCase):
         self.assertFalse(parse_whole_cot_comparator(
             json.dumps(payload), view=view, decompiler=decompiler,
         )[-1])
+
+    def test_compact_protocol_omits_sha_lean_and_unreachable_schema(self) -> None:
+        view = build_formal_view(_parse_blueprint(LEAN, "root"))
+        decompiler = _decompiler(view)
+        decompiler_payload = json.loads(
+            compact_formal_decompiler_messages(view)[1]["content"]
+        )
+        self.assertNotIn("sha256", decompiler_payload)
+        self.assertNotIn("dependencies", decompiler_payload["nodes"][0])
+        comparator_payload = json.loads(
+            compact_whole_cot_comparator_messages(
+                "problem", "cot", "6", view, decompiler,
+            )[1]["content"]
+        )
+        self.assertNotIn("formal_view", comparator_payload)
+        self.assertNotIn("required_unreachable_node_names", comparator_payload)
+        self.assertNotIn(
+            "unreachable_nodes", comparator_payload["required_output_shape"],
+        )
+        self.assertIn("frozen_node_translations", comparator_payload)
+
+    def test_compact_pass_ignores_unreachable_shadow_but_keeps_dependencies(self) -> None:
+        view = build_formal_view(_parse_blueprint(LEAN, "root"))
+        decompiler = _decompiler(view)
+        payload = _whole_cot_payload()
+        payload.pop("unreachable_nodes")
+        self.assertTrue(parse_compact_whole_cot_comparator(
+            json.dumps(payload), view=view, decompiler=decompiler,
+        )[-1])
+        payload["dependency_issues"] = [
+            {"node_name": "root", "reason": "material use-chain is broken"}
+        ]
+        self.assertFalse(parse_compact_whole_cot_comparator(
+            json.dumps(payload), view=view, decompiler=decompiler,
+        )[-1])
+
+    def test_direct_protocol_has_formal_view_without_sha_or_translations(self) -> None:
+        view = build_formal_view(_parse_blueprint(LEAN, "root"))
+        payload = json.loads(direct_whole_cot_comparator_messages(
+            "problem", "cot", "6", view,
+        )[1]["content"])
+        self.assertIn("formal_view", payload)
+        self.assertNotIn("sha256", payload["formal_view"])
+        self.assertNotIn("frozen_node_translations", payload)
+        self.assertIn("declaration", payload["formal_view"]["nodes"][0])
 
     def test_semantic_audit_forwards_thinking_sampling(self) -> None:
         raw = _decompiler(self.view).raw_content

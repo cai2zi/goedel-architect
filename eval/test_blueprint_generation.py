@@ -123,6 +123,7 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
                 semantic_audit_presence_penalty=0.0,
                 semantic_audit_repetition_penalty=1.0,
                 semantic_audit_mode="separate",
+                node_naming="semantic",
                 joint_semantic_audit_max_tokens=32768,
                 tokenizer_path="unused", model_max_context=40960,
                 context_safety_margin=512, tracer=None,
@@ -186,6 +187,20 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
         self.assertEqual(separate.semantic_request_count, 2)
         run_d.assert_called_once()
         run_c.assert_called_once()
+
+        with (
+            patch(
+                "blueprint_generation.run_direct_whole_cot_comparator",
+                return_value=comparator,
+            ) as run_direct,
+        ):
+            direct = _with_semantic_audit(
+                base, blueprint, semantic_audit_mode="direct",
+                decompiler_cache={}, comparator_cache={}, joint_cache={}, **common,
+            )
+        self.assertEqual(direct.semantic_request_count, 1)
+        self.assertIsNone(direct.formal_decompiler_result)
+        run_direct.assert_called_once()
 
         joint_value = JointWholeCotAuditResult(
             decompiler, comparator, "{}", "", "stop", "j", 1, 1, 2,
@@ -348,6 +363,34 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
         self.assertIn("raw complete cot", rendered)
         self.assertNotIn("COT_STEP:Snnn", rendered)
         self.assertIn("metadata are optional", rendered)
+
+    def test_anonymous_generation_prompt_and_contract(self) -> None:
+        messages = _messages(
+            target_name="n_final", informal_statement="problem",
+            informal_proof="cot", claimed_answer="6",
+            previous_blueprint="", previous_feedback="",
+            prompt_profile="whole_cot_minimal", node_naming="anonymous",
+        )
+        rendered = "\n".join(item["content"] for item in messages)
+        self.assertIn("`d1`, `d2`", rendered)
+        self.assertIn("`n_final`", rendered)
+        valid = _parse_blueprint('''import Mathlib
+import Architect
+@[blueprint] def d1 : Nat := 6
+@[blueprint] lemma n1 : d1 = 6 := by sorry_using [d1]
+@[blueprint] theorem n_final : d1 = 6 := by sorry_using [d1, n1]
+''', "n_final")
+        self.assertEqual(
+            _contract_errors(valid, "n_final", node_naming="anonymous"), [],
+        )
+        invalid = _parse_blueprint(self.MINIMAL, "root")
+        codes = {
+            item["code"] for item in _contract_errors(
+                invalid, "root", node_naming="anonymous",
+            )
+        }
+        self.assertIn("anonymousDefinitionNames", codes)
+        self.assertIn("anonymousRootName", codes)
 
 
 if __name__ == "__main__":

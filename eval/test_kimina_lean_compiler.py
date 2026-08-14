@@ -86,6 +86,36 @@ class ConcurrentClient:
 
 
 class KiminaLeanCompilerTest(unittest.TestCase):
+    def test_global_batcher_namespaces_duplicate_explicit_ids(self) -> None:
+        client = ConcurrentClient(delay_s=0.01)
+        compiler = KiminaLeanCompiler(
+            _client=client,
+            batch_size=8,
+            global_batching=True,
+            batch_wait_ms=20,
+        )
+        try:
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                results = list(executor.map(
+                    lambda index: compiler.check_many([
+                        CompileRequest(
+                            f"example : {index} = {index} := by rfl",
+                            request_id="phase2-contract-1-0-n1",
+                        ),
+                    ])[0],
+                    range(8),
+                ))
+        finally:
+            compiler.close()
+
+        self.assertTrue(all(result.success for result in results))
+        self.assertEqual(len(client.payloads), 1)
+        ids = [item["id"] for item in client.payloads[0]["snippets"]]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertTrue(all(
+            item.startswith("phase2-contract-1-0-n1-") for item in ids
+        ))
+
     def test_global_batcher_combines_cross_thread_singletons(self) -> None:
         client = ConcurrentClient(delay_s=0.01)
         compiler = KiminaLeanCompiler(
