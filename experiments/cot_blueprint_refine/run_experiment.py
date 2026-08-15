@@ -219,6 +219,7 @@ def run_blueprint(
         f"strict_comparator_max_tokens={blueprint.strict_comparator_max_tokens}",
         f"semantic_format_max_attempts={blueprint.semantic_format_max_attempts}",
         f"semantic_audit_mode={blueprint.get('semantic_audit_mode', 'separate')}",
+        f"semantic_comparator_protocol={blueprint.get('semantic_comparator_protocol', 'legacy_v1')}",
         f"joint_semantic_audit_max_tokens={blueprint.get('joint_semantic_audit_max_tokens', 32768)}",
         f"semantic_audit_enable_thinking={str(bool(blueprint.semantic_audit_enable_thinking)).lower()}",
         f"semantic_audit_temperature={blueprint.semantic_audit_temperature}",

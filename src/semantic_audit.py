@@ -22,6 +22,8 @@ WHOLE_COT_PROMPT_VERSION = "whole-cot-comparator-v3-semantic-repair"
 COMPACT_WHOLE_COT_PROMPT_VERSION = "whole-cot-compact-separate-v4-semantic-repair"
 DIRECT_WHOLE_COT_PROMPT_VERSION = "whole-cot-direct-comparator-v4-semantic-repair"
 JOINT_WHOLE_COT_PROMPT_VERSION = "whole-cot-joint-audit-v4-semantic-repair"
+CANONICAL_COMPACT_WHOLE_COT_PROMPT_VERSION = "whole-cot-compact-separate-canonical-v2-r4"
+CANONICAL_DIRECT_WHOLE_COT_PROMPT_VERSION = "whole-cot-direct-canonical-v2-r4"
 SEMANTIC_EFFECTS = {"objectDefinition", "proposition", "vacuous"}
 JOINT_SEMANTIC_EFFECT_ALIASES = {
     "assertsproperty": "proposition",
@@ -279,6 +281,109 @@ names only. Return an empty array when neither pattern applies.
 """
 
 
+CANONICAL_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT = r"""You are a strict semantic
+translation comparator, not a truth judge. A faithful formalization of a
+mathematically wrong source COT must pass. Identifier names and comments carry
+no semantic credit. Compare the complete source requirement with the literal
+formal meaning and report independent material root causes, not every affected
+node and not the same defect under multiple labels.
+
+Use exactly three issue families:
+- `semanticMismatch`: source content is omitted, weakened, strengthened,
+  quantified incorrectly, attached to the wrong object, uses the wrong
+  relation/direction, or fails the requested answer scope.
+- `derivationShortcut`: an object that the source must derive is encoded
+  upstream so the formal derivation becomes verification, circular, or
+  vacuous. Its `shortcut` is exactly
+  {"pattern":"preassigned|derivedAssumption|vacuous",
+  "object_role":"target|materialIntermediate"}.
+- `dependencyBreak`: the required formal propositions exist, but the explicit
+  proof dependency graph does not carry a material source use-chain to root.
+
+`derivationShortcut` applies to the target or any materially required
+intermediate. Do not use it for source-given constants, source-given
+relations, ordinary object definitions, or a claimed answer appearing only in
+a theorem conclusion. `preassigned` means a computed object is fixed to its
+answer or placeholder by a definition. `derivedAssumption` means a required
+derived conclusion is moved into an explicit hypothesis/binder or a relation
+that the root assumes instead of derives. A proposition node is itself the
+formal representation of a COT claim: never call it `derivedAssumption` merely
+because its explicit proof dependency list is empty or its proof body is not
+shown. A definition may faithfully encode a source-given functional relation
+such as y = 2*x; that is not `preassigned` unless the source must compute y as
+an answer or derived intermediate. Source-given constraints may be explicit
+root or lemma binders; a conditional theorem deriving the target from those
+constraints is faithful and need not separately prove their existence. Only a
+conclusion that the COT itself derives, when moved into a hypothesis, is a
+`derivedAssumption`. `vacuous`
+means a substantive step is replaced by True, reflexivity, an unconstrained
+witness, or an equivalent shell.
+
+Definitions are global context and are not proof-graph vertices. A definition
+need not appear in `sorry_using`; its availability alone gives no semantic
+credit. Do not reject an unreachable proof node unless a material source
+use-chain is actually broken. Verification or abandoned side branches may be
+irrelevant and never need to reach root merely because the COT mentions a
+check. Use `dependencyBreak` only when required propositions are already
+represented faithfully, but an explicit proof-to-proof edge needed to carry
+them into an otherwise faithful downstream conclusion is absent. Never use it
+for a missing edge from a definition, and never emit it when the same root
+cause is already a `semanticMismatch` or `derivationShortcut`.
+
+Important binder pattern: if a source asks to compute `u` from stated data and
+relations, a formal root of the form `(u) (h : source_constraints u) : u = k`
+is faithful when `source_constraints` expresses those data and relations. Do
+not demand an existential theorem, do not label `h` a `derivedAssumption`, and
+do not require optional verification nodes to support root. If a separate
+intermediate theorem incorrectly claims the relation for every `u`, report
+that quantifier error alone; do not duplicate it as a shortcut or dependency
+break at root. This remains true when the COT obtains the bound equation by
+applying a general principle to source data: binding that resulting equation
+is the accepted formal interface for the source constraints, while separate
+proposition nodes may preserve the explanatory derivation.
+
+Set `source_contract.answer_scope` to exactly one of `single`, `witness`,
+`exhaustive`, `extremum`, or `proof`. Then state the source target object and
+required relation. Scope describes the whole semantic obligation, not merely
+the final output cardinality: use `exhaustive` when every solution or object
+must be covered before computing a single aggregate such as a sum. One issue
+represents one independent root cause and may
+name multiple affected nodes. If fixing issue A would remove apparent issue B,
+merge them; if B would remain, emit a separate issue. At most six issues.
+
+Return JSON only with exactly `source_contract`, `formal_root`, and `issues`.
+`source_contract` has exactly `answer_scope`, `target_object`, and
+`required_relation`. `formal_root` has exactly `translation`. Every issue has
+exactly `issue_id`, `family`, `shortcut`, `node_names`, `source_requirement`,
+`observed_formal_behavior`, and `reason`. IDs are unique contiguous I1..In.
+Use supplied node names only; `semanticMismatch` may use an empty node list
+when required source content is wholly absent. `shortcut` is non-null only for
+`derivationShortcut`; it is null for the other families. Every text field is
+required and at most 50 words. Return an empty `issues` array only for a full
+semantic match.
+
+Mandatory scope scan before inspecting the formalization: find source phrases
+such as `all solutions`, `every`, `exactly the set`, `only solutions`, or a sum
+over `all` intersections/objects. These require exhaustive coverage even when
+the requested final answer is one scalar aggregate. A finite hardcoded list
+plus proofs that each listed item is valid gives only one-way membership; it
+is a `semanticMismatch` unless the formal propositions also say every valid
+item belongs to that list. Do not relabel this omission as `preassigned`.
+
+Apply Lean semantics literally. Product `dist`/`norm` on `R x R` is max/sup,
+not Euclidean; a coordinate square-sum is squared Euclidean distance. Audit in
+this order: source answer scope and quantifiers; target object and relation;
+derivation grounding; material dependency use-chain. In reasoning, make one
+linear pass: write a short source contract, inspect root and declarations
+once, create a provisional root-cause ledger, merge counterfactually dependent
+entries once, then emit JSON. Do not restate the full problem, COT,
+declaration inventory, or schema. Do not reopen an issue after classifying it
+unless a directly conflicting declaration is found. Keep all internal
+reasoning under 1200 words; spend tokens on final decisions, not repeated
+self-questioning or mathematical truth-checking of the source COT.
+"""
+
+
 @dataclass(frozen=True)
 class FormalNodeView:
     node_name: str
@@ -352,6 +457,30 @@ class WholeCotComparatorResult:
     completion_tokens: int
     total_tokens: int
     attempts: tuple[dict[str, Any], ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class CanonicalWholeCotComparatorResult:
+    source_contract: dict[str, Any]
+    formal_root: dict[str, Any]
+    issues: tuple[dict[str, Any], ...]
+    passed: bool
+    raw_content: str
+    reasoning_content: str
+    finish_reason: str | None
+    request_id: str
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    attempts: tuple[dict[str, Any], ...] = ()
+
+    @property
+    def unreachable_nodes(self) -> tuple[dict[str, Any], ...]:
+        """Compatibility shim for generation warning handling."""
+        return ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -884,6 +1013,191 @@ def direct_whole_cot_comparator_messages(
     ]
 
 
+def _canonical_required_output_shape(root_name: str) -> dict[str, Any]:
+    return {
+        "source_contract": {
+            "answer_scope": "single",
+            "target_object": "...",
+            "required_relation": "...",
+        },
+        "formal_root": {"translation": "..."},
+        "issues": [{
+            "issue_id": "I1",
+            "family": "semanticMismatch",
+            "shortcut": None,
+            "node_names": [root_name],
+            "source_requirement": "...",
+            "observed_formal_behavior": "...",
+            "reason": "...",
+        }],
+    }
+
+
+def canonical_compact_whole_cot_comparator_messages(
+    informal_statement: str,
+    informal_proof: str,
+    claimed_answer: str,
+    view: FormalView,
+    decompiler: FormalDecompilerResult,
+) -> list[dict[str, str]]:
+    payload = {
+        "problem": informal_statement,
+        "claimed_answer": claimed_answer,
+        "complete_original_cot": informal_proof,
+        "frozen_node_translations": [asdict(node) for node in decompiler.nodes],
+        "graph": _compact_graph(view),
+        "required_output_shape": _canonical_required_output_shape(view.root_name),
+    }
+    return [
+        {"role": "system", "content": CANONICAL_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ]
+
+
+def canonical_direct_whole_cot_comparator_messages(
+    informal_statement: str,
+    informal_proof: str,
+    claimed_answer: str,
+    view: FormalView,
+) -> list[dict[str, str]]:
+    formal_view = {
+        "root_name": view.root_name,
+        "global_definitions": [{
+            "node_name": node.node_name,
+            "kind": node.kind,
+            "declaration": node.declaration,
+        } for node in view.nodes if node.kind == "definition"],
+        "proof_nodes": [asdict(node) for node in view.nodes if node.kind != "definition"],
+        "proof_root_closure": list(view.root_closure),
+    }
+    payload = {
+        "problem": informal_statement,
+        "claimed_answer": claimed_answer,
+        "complete_original_cot": informal_proof,
+        "formal_view": formal_view,
+        "required_output_shape": _canonical_required_output_shape(view.root_name),
+    }
+    return [
+        {"role": "system", "content": CANONICAL_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ]
+
+
+_CANONICAL_SOURCE_CONTRACT_KEYS = {
+    "answer_scope", "target_object", "required_relation",
+}
+_CANONICAL_ISSUE_KEYS = {
+    "issue_id", "family", "shortcut", "node_names", "source_requirement",
+    "observed_formal_behavior", "reason",
+}
+_CANONICAL_FAMILIES = {
+    "semanticMismatch", "derivationShortcut", "dependencyBreak",
+}
+_CANONICAL_ANSWER_SCOPES = {"single", "witness", "exhaustive", "extremum", "proof"}
+_CANONICAL_SHORTCUT_PATTERNS = {"preassigned", "derivedAssumption", "vacuous"}
+_CANONICAL_OBJECT_ROLES = {"target", "materialIntermediate"}
+
+
+def _canonical_text(value: Any, label: str, raw: str) -> str:
+    text = _string(value, label, raw)
+    if len(text.split()) > 50:
+        raise SemanticAuditFormatError(
+            f"{label} must contain at most 50 words", raw_content=raw,
+        )
+    return text
+
+
+def parse_canonical_whole_cot_comparator(
+    content: str,
+    *,
+    view: FormalView,
+    decompiler: FormalDecompilerResult | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], tuple[dict[str, Any], ...], bool]:
+    value = _json_object(content)
+    if set(value) != {"source_contract", "formal_root", "issues"}:
+        raise SemanticAuditFormatError(
+            "canonical comparator top-level keys must be exactly source_contract, "
+            "formal_root, and issues", raw_content=content,
+        )
+    source = value["source_contract"]
+    if not isinstance(source, dict) or set(source) != _CANONICAL_SOURCE_CONTRACT_KEYS:
+        raise SemanticAuditFormatError("source_contract has invalid keys", raw_content=content)
+    answer_scope = _string(source["answer_scope"], "source_contract.answer_scope", content)
+    if answer_scope not in _CANONICAL_ANSWER_SCOPES:
+        raise SemanticAuditFormatError("invalid answer_scope", raw_content=content)
+    parsed_source = {
+        "answer_scope": answer_scope,
+        "target_object": _canonical_text(
+            source["target_object"], "source_contract.target_object", content,
+        ),
+        "required_relation": _canonical_text(
+            source["required_relation"], "source_contract.required_relation", content,
+        ),
+    }
+    formal_root = value["formal_root"]
+    if not isinstance(formal_root, dict) or set(formal_root) != {"translation"}:
+        raise SemanticAuditFormatError("formal_root has invalid keys", raw_content=content)
+    parsed_root = {
+        "translation": _canonical_text(
+            formal_root["translation"], "formal_root.translation", content,
+        ),
+    }
+    raw_issues = value["issues"]
+    if not isinstance(raw_issues, list):
+        raise SemanticAuditFormatError("issues must be an array", raw_content=content)
+    if len(raw_issues) > 6:
+        raise SemanticAuditFormatError("canonical comparator returned more than six issues", raw_content=content)
+    known_nodes = {node.node_name for node in view.nodes}
+    parsed_issues: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_issues, start=1):
+        if not isinstance(item, dict) or set(item) != _CANONICAL_ISSUE_KEYS:
+            raise SemanticAuditFormatError(f"issues[{index - 1}] has invalid keys", raw_content=content)
+        issue_id = _string(item["issue_id"], "issue_id", content)
+        if issue_id != f"I{index}":
+            raise SemanticAuditFormatError("issue IDs must be contiguous I1..In", raw_content=content)
+        family = _string(item["family"], "issue family", content)
+        if family not in _CANONICAL_FAMILIES:
+            raise SemanticAuditFormatError("invalid issue family", raw_content=content)
+        node_names = _strings(item["node_names"], "issue node_names", content)
+        if len(set(node_names)) != len(node_names) or any(
+            node_name not in known_nodes for node_name in node_names
+        ):
+            raise SemanticAuditFormatError("issue contains duplicate or unknown node", raw_content=content)
+        if family != "semanticMismatch" and not node_names:
+            raise SemanticAuditFormatError(
+                f"{family} must name at least one node", raw_content=content,
+            )
+        shortcut = item["shortcut"]
+        parsed_shortcut = None
+        if family == "derivationShortcut":
+            if not isinstance(shortcut, dict) or set(shortcut) != {"pattern", "object_role"}:
+                raise SemanticAuditFormatError("derivationShortcut requires shortcut", raw_content=content)
+            pattern = _string(shortcut["pattern"], "shortcut.pattern", content)
+            object_role = _string(shortcut["object_role"], "shortcut.object_role", content)
+            if pattern not in _CANONICAL_SHORTCUT_PATTERNS or object_role not in _CANONICAL_OBJECT_ROLES:
+                raise SemanticAuditFormatError("invalid shortcut pattern or object_role", raw_content=content)
+            parsed_shortcut = {"pattern": pattern, "object_role": object_role}
+        elif shortcut is not None:
+            raise SemanticAuditFormatError(
+                "shortcut must be null outside derivationShortcut", raw_content=content,
+            )
+        parsed_issues.append({
+            "issue_id": issue_id,
+            "family": family,
+            "shortcut": parsed_shortcut,
+            "node_names": list(node_names),
+            "source_requirement": _canonical_text(
+                item["source_requirement"], "issue.source_requirement", content,
+            ),
+            "observed_formal_behavior": _canonical_text(
+                item["observed_formal_behavior"], "issue.observed_formal_behavior", content,
+            ),
+            "reason": _canonical_text(item["reason"], "issue.reason", content),
+        })
+    passed = not parsed_issues and (decompiler is None or not decompiler.vacuous_nodes)
+    return parsed_source, parsed_root, tuple(parsed_issues), passed
+
+
 def parse_compact_whole_cot_comparator(
     content: str,
     *,
@@ -1320,6 +1634,19 @@ def _run_stage(
                     "proof node for a material chain that fails to reach the root. "
                     "Use supplied node names only and return at most six clause issues."
                 )
+            elif operation in {
+                "canonical_compact_whole_cot_comparator",
+                "canonical_direct_whole_cot_comparator",
+            }:
+                schema_guidance = (
+                    "Top-level keys are exactly source_contract, formal_root, and issues. "
+                    "source_contract is exactly {answer_scope,target_object,required_relation}; "
+                    "formal_root is exactly {translation}. Every issue is exactly "
+                    "{issue_id,family,shortcut,node_names,source_requirement," 
+                    "observed_formal_behavior,reason}; IDs must be contiguous I1..In and "
+                    "there may be at most six issues. shortcut is null except for "
+                    "derivationShortcut, where it is exactly {pattern,object_role}."
+                )
             elif operation == "joint_whole_cot_audit":
                 schema_guidance = (
                     "Top-level keys must occur exactly in this order: "
@@ -1616,6 +1943,122 @@ def run_direct_whole_cot_comparator(
     return result
 
 
+def _run_canonical_whole_cot_comparator(
+    client: Any,
+    model: str,
+    *,
+    messages: list[dict[str, str]],
+    protocol: str,
+    operation: str,
+    view: FormalView,
+    decompiler: FormalDecompilerResult | None,
+    max_tokens: int,
+    max_attempts: int,
+    enable_thinking: bool,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    min_p: float,
+    presence_penalty: float,
+    repetition_penalty: float,
+    tracer: Any,
+    thm_name: str,
+    round_index: int,
+) -> CanonicalWholeCotComparatorResult:
+    cache_key = semantic_audit_cache_key(model, messages, version=protocol)
+    if tracer is not None:
+        tracer.emit(TraceEvent(
+            kind="wholeCotCompareStart", thm_name=thm_name, turn=round_index,
+            args={
+                "round": round_index, "formalViewHash": view.sha256,
+                "cacheKey": cache_key, "protocol": protocol,
+            },
+        ))
+    parsed, content, reasoning, finish, request_id, attempts, usage = _run_stage(
+        client, model, messages=messages, parser=parse_canonical_whole_cot_comparator,
+        parser_kwargs={"view": view, "decompiler": decompiler},
+        max_tokens=max_tokens, max_attempts=max_attempts, tracer=tracer,
+        thm_name=thm_name, round_index=round_index,
+        phase="wholeCotComparator", operation=operation,
+        enable_thinking=enable_thinking, temperature=temperature,
+        top_p=top_p, top_k=top_k, min_p=min_p,
+        presence_penalty=presence_penalty,
+        repetition_penalty=repetition_penalty,
+    )
+    source_contract, formal_root, issues, passed = parsed
+    result = CanonicalWholeCotComparatorResult(
+        source_contract, formal_root, issues, passed, content, reasoning, finish,
+        request_id, usage[0], usage[1], usage[2], attempts,
+    )
+    if tracer is not None:
+        tracer.emit(TraceEvent(
+            kind="wholeCotCompareResult", thm_name=thm_name, turn=round_index,
+            args={
+                "round": round_index, "formalViewHash": view.sha256,
+                "cacheKey": cache_key, "protocol": protocol,
+                "passed": passed, "sourceContract": source_contract,
+                "canonicalIssues": list(issues), "result": result.to_dict(),
+            }, ok=passed,
+        ))
+        tracer.emit(TraceEvent(
+            kind="wholeCotCompareEnd", thm_name=thm_name, turn=round_index,
+            args={
+                "round": round_index, "passed": passed,
+                "attemptCount": len(attempts), "promptTokens": usage[0],
+                "completionTokens": usage[1], "totalTokens": usage[2],
+                "requestId": request_id,
+            }, ok=passed,
+        ))
+    return result
+
+
+def run_canonical_compact_whole_cot_comparator(
+    client: Any, model: str, *, informal_statement: str, informal_proof: str,
+    claimed_answer: str, view: FormalView, decompiler: FormalDecompilerResult,
+    max_tokens: int, max_attempts: int, enable_thinking: bool = False,
+    temperature: float = 0.0, top_p: float = 1.0, top_k: int = -1,
+    min_p: float = 0.0, presence_penalty: float = 0.0,
+    repetition_penalty: float = 1.0, tracer=None, thm_name: str = "",
+    round_index: int = 0,
+) -> CanonicalWholeCotComparatorResult:
+    return _run_canonical_whole_cot_comparator(
+        client, model,
+        messages=canonical_compact_whole_cot_comparator_messages(
+            informal_statement, informal_proof, claimed_answer, view, decompiler,
+        ),
+        protocol=CANONICAL_COMPACT_WHOLE_COT_PROMPT_VERSION,
+        operation="canonical_compact_whole_cot_comparator", view=view,
+        decompiler=decompiler, max_tokens=max_tokens, max_attempts=max_attempts,
+        enable_thinking=enable_thinking, temperature=temperature, top_p=top_p,
+        top_k=top_k, min_p=min_p, presence_penalty=presence_penalty,
+        repetition_penalty=repetition_penalty, tracer=tracer,
+        thm_name=thm_name, round_index=round_index,
+    )
+
+
+def run_canonical_direct_whole_cot_comparator(
+    client: Any, model: str, *, informal_statement: str, informal_proof: str,
+    claimed_answer: str, view: FormalView, max_tokens: int, max_attempts: int,
+    enable_thinking: bool = False, temperature: float = 0.0,
+    top_p: float = 1.0, top_k: int = -1, min_p: float = 0.0,
+    presence_penalty: float = 0.0, repetition_penalty: float = 1.0,
+    tracer=None, thm_name: str = "", round_index: int = 0,
+) -> CanonicalWholeCotComparatorResult:
+    return _run_canonical_whole_cot_comparator(
+        client, model,
+        messages=canonical_direct_whole_cot_comparator_messages(
+            informal_statement, informal_proof, claimed_answer, view,
+        ),
+        protocol=CANONICAL_DIRECT_WHOLE_COT_PROMPT_VERSION,
+        operation="canonical_direct_whole_cot_comparator", view=view,
+        decompiler=None, max_tokens=max_tokens, max_attempts=max_attempts,
+        enable_thinking=enable_thinking, temperature=temperature, top_p=top_p,
+        top_k=top_k, min_p=min_p, presence_penalty=presence_penalty,
+        repetition_penalty=repetition_penalty, tracer=tracer,
+        thm_name=thm_name, round_index=round_index,
+    )
+
+
 def run_joint_whole_cot_audit(
     client: Any,
     model: str,
@@ -1724,7 +2167,19 @@ def run_joint_whole_cot_audit(
     return result
 
 
-def whole_cot_comparator_defects(result: WholeCotComparatorResult) -> list[dict[str, Any]]:
+def whole_cot_comparator_defects(
+    result: WholeCotComparatorResult | CanonicalWholeCotComparatorResult,
+) -> list[dict[str, Any]]:
+    if isinstance(result, CanonicalWholeCotComparatorResult):
+        return [{
+            "category": item["family"],
+            "node_names": list(item["node_names"]),
+            "requirement": item["source_requirement"],
+            "observed_formal_behavior": item["observed_formal_behavior"],
+            "reason": item["reason"],
+            "issue_id": item["issue_id"],
+            "shortcut": item["shortcut"],
+        } for item in result.issues]
     defects: list[dict[str, Any]] = []
     for category in (
         "missing_clauses", "weakened_clauses", "unbound_objects",
@@ -1792,6 +2247,10 @@ __all__ = [
     "JOINT_WHOLE_COT_PROMPT_VERSION",
     "JOINT_SEMANTIC_EFFECT_ALIASES", "JOINT_WHOLE_COT_SYSTEM_PROMPT",
     "COMPACT_WHOLE_COT_PROMPT_VERSION", "DIRECT_WHOLE_COT_PROMPT_VERSION",
+    "CANONICAL_COMPACT_WHOLE_COT_PROMPT_VERSION",
+    "CANONICAL_DIRECT_WHOLE_COT_PROMPT_VERSION",
+    "CANONICAL_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT",
+    "CanonicalWholeCotComparatorResult",
     "FormalDecompilerResult", "FormalView", "JointWholeCotAuditResult",
     "SemanticAuditFormatError", "WholeCotComparatorResult",
     "build_formal_view",
@@ -1800,8 +2259,13 @@ __all__ = [
     "unreachable_proof_node_names",
     "compact_whole_cot_comparator_messages",
     "direct_whole_cot_comparator_messages",
+    "canonical_compact_whole_cot_comparator_messages",
+    "canonical_direct_whole_cot_comparator_messages",
+    "parse_canonical_whole_cot_comparator",
     "parse_compact_whole_cot_comparator",
     "run_compact_whole_cot_comparator", "run_direct_whole_cot_comparator",
+    "run_canonical_compact_whole_cot_comparator",
+    "run_canonical_direct_whole_cot_comparator",
     "parse_whole_cot_comparator", "run_whole_cot_comparator",
     "joint_whole_cot_audit_messages", "parse_joint_whole_cot_audit",
     "run_joint_whole_cot_audit",

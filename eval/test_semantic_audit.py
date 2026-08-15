@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from blueprint import _parse_blueprint  # noqa: E402
 from semantic_fidelity import validate_blueprint_fidelity  # noqa: E402
 from semantic_audit import (  # noqa: E402
+    CANONICAL_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT,
     COMPACT_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT,
     DECOMPILER_SYSTEM_PROMPT,
     DIRECT_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT,
@@ -28,11 +29,14 @@ from semantic_audit import (  # noqa: E402
     build_formal_view,
     compact_formal_decompiler_messages,
     compact_whole_cot_comparator_messages,
+    canonical_compact_whole_cot_comparator_messages,
+    canonical_direct_whole_cot_comparator_messages,
     direct_whole_cot_comparator_messages,
     joint_whole_cot_audit_messages,
     parse_formal_decompiler,
     parse_joint_whole_cot_audit,
     parse_compact_whole_cot_comparator,
+    parse_canonical_whole_cot_comparator,
     parse_whole_cot_comparator,
     _response_parts,
     run_formal_decompiler,
@@ -127,11 +131,80 @@ class SemanticAuditTest(unittest.TestCase):
             COMPACT_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT,
             DIRECT_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT,
             JOINT_WHOLE_COT_SYSTEM_PROMPT,
+            CANONICAL_WHOLE_COT_COMPARATOR_SYSTEM_PROMPT,
         ):
             with self.subTest(prompt=prompt[:30]):
                 self.assertIn("max/sup", prompt)
                 self.assertIn("Euclidean", prompt)
                 self.assertIn("squared Euclidean distance", prompt)
+
+    def test_canonical_v2_messages_use_only_new_schema(self) -> None:
+        view = build_formal_view(_parse_blueprint(LEAN, "root"))
+        decompiler = _decompiler(view)
+        for messages in (
+            canonical_direct_whole_cot_comparator_messages(
+                "problem", "cot", "6", view,
+            ),
+            canonical_compact_whole_cot_comparator_messages(
+                "problem", "cot", "6", view, decompiler,
+            ),
+        ):
+            payload = json.loads(messages[1]["content"])
+            shape = payload["required_output_shape"]
+            self.assertEqual(set(shape), {"source_contract", "formal_root", "issues"})
+            serialized = json.dumps(shape)
+            self.assertNotIn("missing_clauses", serialized)
+            self.assertNotIn("root_effects", serialized)
+            self.assertNotIn("must_remove", serialized)
+            self.assertNotIn("unreachable_nodes", serialized)
+
+    def test_canonical_v2_parses_grouped_issue_and_rejects(self) -> None:
+        view = build_formal_view(_parse_blueprint(LEAN, "root"))
+        payload = {
+            "source_contract": {
+                "answer_scope": "single",
+                "target_object": "the requested natural number",
+                "required_relation": "derive that number from the supplied constraint",
+            },
+            "formal_root": {"translation": "Concludes sourceValue equals six."},
+            "issues": [{
+                "issue_id": "I1",
+                "family": "derivationShortcut",
+                "shortcut": {"pattern": "preassigned", "object_role": "target"},
+                "node_names": ["sourceValue", "root"],
+                "source_requirement": "Derive the requested number.",
+                "observed_formal_behavior": "The definition fixes it to six.",
+                "reason": "The theorem only verifies the preassigned value.",
+            }],
+        }
+        parsed = parse_canonical_whole_cot_comparator(
+            json.dumps(payload), view=view,
+        )
+        self.assertFalse(parsed[-1])
+        self.assertEqual(parsed[2][0]["node_names"], ["sourceValue", "root"])
+
+    def test_canonical_v2_strict_schema_and_shortcut_rules(self) -> None:
+        view = build_formal_view(_parse_blueprint(LEAN, "root"))
+        base = {
+            "source_contract": {
+                "answer_scope": "proof", "target_object": "claim",
+                "required_relation": "prove the claim",
+            },
+            "formal_root": {"translation": "The claim."},
+            "issues": [],
+        }
+        self.assertTrue(parse_canonical_whole_cot_comparator(
+            json.dumps(base), view=view,
+        )[-1])
+        bad = json.loads(json.dumps(base))
+        bad["issues"] = [{
+            "issue_id": "I2", "family": "semanticMismatch",
+            "shortcut": {"pattern": "vacuous", "object_role": "target"},
+            "node_names": [], "source_requirement": "required claim",
+            "observed_formal_behavior": "missing", "reason": "omitted",
+        }]
+        with self.assertRaises(SemanticAuditFormatError):
+            parse_canonical_whole_cot_comparator(json.dumps(bad), view=view)
 
     def setUp(self) -> None:
         self.view = build_formal_view(_parse_blueprint(LEAN, "root"))

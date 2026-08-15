@@ -43,6 +43,7 @@ formal_decompiler_max_tokens: 4096
 strict_comparator_max_tokens: 4096
 semantic_format_max_attempts: 2
 semantic_audit_mode: separate
+semantic_comparator_protocol: legacy_v1
 joint_semantic_audit_max_tokens: 32768
 semantic_audit_enable_thinking: false
 semantic_audit_temperature: 0.0

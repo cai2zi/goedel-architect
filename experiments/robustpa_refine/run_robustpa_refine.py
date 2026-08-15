@@ -222,6 +222,9 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
         args.semantic_format_max_attempts
     )
     args.semantic_audit_mode = str(args.semantic_audit_mode)
+    args.semantic_comparator_protocol = str(
+        getattr(args, "semantic_comparator_protocol", "legacy_v1")
+    )
     args.joint_semantic_audit_max_tokens = int(
         args.joint_semantic_audit_max_tokens
     )
@@ -254,6 +257,17 @@ def _validate_args(args: argparse.Namespace) -> None:
     }:
         raise ValueError(
             "semantic_audit_mode must be separate, compact_separate, direct, or joint"
+        )
+    if args.semantic_comparator_protocol not in {"legacy_v1", "canonical_v2"}:
+        raise ValueError(
+            "semantic_comparator_protocol must be legacy_v1 or canonical_v2"
+        )
+    if (
+        args.semantic_comparator_protocol == "canonical_v2"
+        and args.semantic_audit_mode not in {"direct", "compact_separate"}
+    ):
+        raise ValueError(
+            "canonical_v2 is supported only for direct and compact_separate"
         )
     for name in (
         "phase1_concurrency",
@@ -606,6 +620,7 @@ def _result_row(
         "strict_comparator_max_tokens": args.strict_comparator_max_tokens,
         "semantic_format_max_attempts": args.semantic_format_max_attempts,
         "semantic_audit_mode": args.semantic_audit_mode,
+        "semantic_comparator_protocol": args.semantic_comparator_protocol,
         "joint_semantic_audit_max_tokens": args.joint_semantic_audit_max_tokens,
         "semantic_audit_sampling": {
             "enable_thinking": args.semantic_audit_enable_thinking,
@@ -940,6 +955,7 @@ async def _run_record(
                         semantic_audit_presence_penalty=args.semantic_audit_presence_penalty,
                         semantic_audit_repetition_penalty=args.semantic_audit_repetition_penalty,
                         semantic_audit_mode=args.semantic_audit_mode,
+                        semantic_comparator_protocol=args.semantic_comparator_protocol,
                         joint_semantic_audit_max_tokens=args.joint_semantic_audit_max_tokens,
                         prompt_profile=args.generation_prompt_profile,
                         node_naming=args.generation_node_naming,

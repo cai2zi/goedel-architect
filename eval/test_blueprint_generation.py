@@ -304,6 +304,7 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
                 semantic_audit_presence_penalty=0.0,
                 semantic_audit_repetition_penalty=1.0,
                 semantic_audit_mode="separate",
+                semantic_comparator_protocol="legacy_v1",
                 node_naming="semantic",
                 joint_semantic_audit_max_tokens=32768,
                 tokenizer_path="unused", model_max_context=40960,
@@ -344,6 +345,7 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
                 semantic_audit_presence_penalty=0.0,
                 semantic_audit_repetition_penalty=1.0,
                 semantic_audit_mode="direct", node_naming="semantic",
+                semantic_comparator_protocol="legacy_v1",
                 joint_semantic_audit_max_tokens=32768,
                 tokenizer_path="unused", model_max_context=40960,
                 context_safety_margin=512, tracer=None,
@@ -403,6 +405,7 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
         ):
             separate = _with_semantic_audit(
                 base, blueprint, semantic_audit_mode="separate",
+                semantic_comparator_protocol="legacy_v1",
                 decompiler_cache={}, comparator_cache={}, joint_cache={}, **common,
             )
         self.assertEqual(separate.semantic_request_count, 2)
@@ -417,6 +420,7 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
         ):
             direct = _with_semantic_audit(
                 base, blueprint, semantic_audit_mode="direct",
+                semantic_comparator_protocol="legacy_v1",
                 decompiler_cache={}, comparator_cache={}, joint_cache={}, **common,
             )
         self.assertEqual(direct.semantic_request_count, 1)
@@ -434,11 +438,13 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
         ):
             joint = _with_semantic_audit(
                 base, blueprint, semantic_audit_mode="joint",
+                semantic_comparator_protocol="legacy_v1",
                 decompiler_cache={}, comparator_cache={}, joint_cache=joint_cache,
                 **common,
             )
             cached = _with_semantic_audit(
                 base, blueprint, semantic_audit_mode="joint",
+                semantic_comparator_protocol="legacy_v1",
                 decompiler_cache={}, comparator_cache={}, joint_cache=joint_cache,
                 **common,
             )
@@ -476,6 +482,7 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
                 semantic_audit_presence_penalty=0.0,
                 semantic_audit_repetition_penalty=1.0,
                 semantic_audit_mode="joint",
+                semantic_comparator_protocol="legacy_v1",
                 joint_semantic_audit_max_tokens=32768,
                 tokenizer_path="unused", model_max_context=40960,
                 context_safety_margin=512, decompiler_cache={},

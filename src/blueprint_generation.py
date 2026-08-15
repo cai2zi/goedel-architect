@@ -40,20 +40,27 @@ from kimina_lean_compiler import (
 from llm_client import chat_completion_with_retry, make_client
 from mathlib_retrieval import MathlibRetrieval
 from semantic_audit import (
+    CANONICAL_COMPACT_WHOLE_COT_PROMPT_VERSION,
+    CANONICAL_DIRECT_WHOLE_COT_PROMPT_VERSION,
     COMPACT_WHOLE_COT_PROMPT_VERSION,
     DIRECT_WHOLE_COT_PROMPT_VERSION,
     FORMAL_DECOMPILER_PROMPT_VERSION,
     FormalDecompilerResult,
+    CanonicalWholeCotComparatorResult,
     JointWholeCotAuditResult,
     WholeCotComparatorResult,
     JOINT_WHOLE_COT_PROMPT_VERSION,
     WHOLE_COT_PROMPT_VERSION,
     build_formal_view,
     compact_whole_cot_comparator_messages,
+    canonical_compact_whole_cot_comparator_messages,
+    canonical_direct_whole_cot_comparator_messages,
     direct_whole_cot_comparator_messages,
     joint_whole_cot_audit_messages,
     run_formal_decompiler,
     run_compact_whole_cot_comparator,
+    run_canonical_compact_whole_cot_comparator,
+    run_canonical_direct_whole_cot_comparator,
     run_direct_whole_cot_comparator,
     run_joint_whole_cot_audit,
     run_whole_cot_comparator,
@@ -205,7 +212,7 @@ class BlueprintValidation:
     semantic_cache_hits: dict[str, bool] | None = None
     semantic_output_budget: int | None = None
     formal_decompiler_result: FormalDecompilerResult | None = None
-    strict_comparator_result: WholeCotComparatorResult | None = None
+    strict_comparator_result: WholeCotComparatorResult | CanonicalWholeCotComparatorResult | None = None
     joint_audit_result: JointWholeCotAuditResult | None = None
     semantic_audit_protocol: str = WHOLE_COT_PROMPT_VERSION
     graph_shadow_unreachable_nodes: tuple[str, ...] = ()
@@ -324,6 +331,7 @@ def _with_semantic_audit(
     semantic_audit_presence_penalty: float,
     semantic_audit_repetition_penalty: float,
     semantic_audit_mode: str,
+    semantic_comparator_protocol: str,
     joint_semantic_audit_max_tokens: int,
     tokenizer_path: str,
     model_max_context: int,
@@ -350,21 +358,34 @@ def _with_semantic_audit(
         ))
 
     if semantic_audit_mode == "direct":
-        messages = direct_whole_cot_comparator_messages(
-            informal_statement, informal_proof, claimed_answer, view,
+        canonical_v2 = semantic_comparator_protocol == "canonical_v2"
+        messages = (
+            canonical_direct_whole_cot_comparator_messages(
+                informal_statement, informal_proof, claimed_answer, view,
+            ) if canonical_v2 else direct_whole_cot_comparator_messages(
+                informal_statement, informal_proof, claimed_answer, view,
+            )
+        )
+        protocol = (
+            CANONICAL_DIRECT_WHOLE_COT_PROMPT_VERSION
+            if canonical_v2 else DIRECT_WHOLE_COT_PROMPT_VERSION
         )
         cache_key = semantic_audit_cache_key(
-            model, messages, version=DIRECT_WHOLE_COT_PROMPT_VERSION,
+            model, messages, version=protocol,
         )
         comparator = comparator_cache.get(cache_key)
         comparator_hit = comparator is not None
         validation.semantic_audit_invoked = True
         validation.semantic_audit_mode = "direct"
-        validation.semantic_audit_protocol = DIRECT_WHOLE_COT_PROMPT_VERSION
+        validation.semantic_audit_protocol = protocol
         validation.semantic_cache_hits = {"wholeCotComparator": comparator_hit}
         if comparator is None:
             try:
-                comparator = run_direct_whole_cot_comparator(
+                comparator_runner = (
+                    run_canonical_direct_whole_cot_comparator
+                    if canonical_v2 else run_direct_whole_cot_comparator
+                )
+                comparator = comparator_runner(
                     client, model,
                     informal_statement=informal_statement,
                     informal_proof=informal_proof,
@@ -400,7 +421,7 @@ def _with_semantic_audit(
             semantic_output_budget=None,
             formal_decompiler_result=None,
             strict_comparator_result=comparator,
-            semantic_audit_protocol=DIRECT_WHOLE_COT_PROMPT_VERSION,
+            semantic_audit_protocol=protocol,
             graph_shadow_unreachable_nodes=unreachable_shadow,
         )
 
@@ -495,6 +516,7 @@ def _with_semantic_audit(
 
     validation.semantic_audit_invoked = True
     compact = semantic_audit_mode == "compact_separate"
+    canonical_v2 = compact and semantic_comparator_protocol == "canonical_v2"
     validation.semantic_audit_mode = semantic_audit_mode
     validation.semantic_audit_protocol = (
         COMPACT_WHOLE_COT_PROMPT_VERSION if compact else WHOLE_COT_PROMPT_VERSION
@@ -531,7 +553,9 @@ def _with_semantic_audit(
         decompiler_cache[decompiler_cache_key] = decompiler
         validation.semantic_request_count = len(decompiler.attempts)
     messages = (
-        compact_whole_cot_comparator_messages(
+        canonical_compact_whole_cot_comparator_messages(
+            informal_statement, informal_proof, claimed_answer, view, decompiler,
+        ) if canonical_v2 else compact_whole_cot_comparator_messages(
             informal_statement, informal_proof, claimed_answer, view, decompiler,
         )
         if compact else whole_cot_comparator_messages(
@@ -539,6 +563,7 @@ def _with_semantic_audit(
         )
     )
     protocol = (
+        CANONICAL_COMPACT_WHOLE_COT_PROMPT_VERSION if canonical_v2 else
         COMPACT_WHOLE_COT_PROMPT_VERSION if compact else WHOLE_COT_PROMPT_VERSION
     )
     cache_key = semantic_audit_cache_key(
@@ -550,8 +575,9 @@ def _with_semantic_audit(
     if comparator is None:
         try:
             comparator_runner = (
-                run_compact_whole_cot_comparator if compact
-                else run_whole_cot_comparator
+                run_canonical_compact_whole_cot_comparator if canonical_v2 else
+                run_compact_whole_cot_comparator if compact else
+                run_whole_cot_comparator
             )
             comparator = comparator_runner(
                 client, model, informal_statement=informal_statement,
@@ -775,10 +801,20 @@ def _active_repair_codes(
     semantic: Sequence[dict[str, Any]],
 ) -> tuple[str, ...]:
     supported = {"answerPreassigned", "targetCoverageIncomplete"}
-    return tuple(sorted({
+    codes = {
         str(item.get("code")) for item in semantic
         if item.get("code") in supported
-    }))
+    }
+    for item in semantic:
+        shortcut = item.get("shortcut")
+        if (
+            item.get("code") == "derivationShortcut"
+            and isinstance(shortcut, dict)
+            and shortcut.get("pattern") == "preassigned"
+            and shortcut.get("object_role") == "target"
+        ):
+            codes.add("derivationShortcut:preassigned:target")
+    return tuple(sorted(codes))
 
 
 def _semantic_feedback_state(
@@ -996,7 +1032,10 @@ def _messages(
             + "\n```\n\n## Complete previous diagnostics\n"
             + previous_feedback
         )
-        if "answerPreassigned" in active_repair_codes:
+        if (
+            "answerPreassigned" in active_repair_codes
+            or "derivationShortcut:preassigned:target" in active_repair_codes
+        ):
             user += render(
                 ANSWER_PREASSIGNED_REPAIR_GUIDANCE,
                 target_name=target_name,
@@ -1169,6 +1208,7 @@ def _validate_round(
     semantic_audit_presence_penalty: float,
     semantic_audit_repetition_penalty: float,
     semantic_audit_mode: str,
+    semantic_comparator_protocol: str,
     node_naming: str,
     joint_semantic_audit_max_tokens: int,
     tokenizer_path: str,
@@ -1291,6 +1331,7 @@ def _validate_round(
             semantic_audit_presence_penalty=semantic_audit_presence_penalty,
             semantic_audit_repetition_penalty=semantic_audit_repetition_penalty,
             semantic_audit_mode=semantic_audit_mode,
+            semantic_comparator_protocol=semantic_comparator_protocol,
             joint_semantic_audit_max_tokens=joint_semantic_audit_max_tokens,
             tokenizer_path=tokenizer_path,
             model_max_context=model_max_context,
@@ -1323,11 +1364,21 @@ def _validate_round(
     if comparator is not None:
         for defect in whole_cot_comparator_defects(comparator):
             names = list(defect.get("node_names") or ())
-            semantic.append(_issue(
+            observed = str(defect.get("observed_formal_behavior") or "").strip()
+            message = f"{defect.get('requirement')}"
+            if observed:
+                message += f" Observed formal behavior: {observed}."
+            message += f" Reason: {defect.get('reason')}"
+            issue = _issue(
                 str(defect.get("category") or "semanticDefect"),
-                f"{defect.get('requirement')} Reason: {defect.get('reason')}",
+                message,
                 stage="whole_cot_comparator", node_name=",".join(names),
-            ))
+            )
+            if defect.get("issue_id") is not None:
+                issue["canonicalIssueId"] = defect["issue_id"]
+            if defect.get("shortcut") is not None:
+                issue["shortcut"] = defect["shortcut"]
+            semantic.append(issue)
         if not comparator.passed and not semantic:
             semantic.append(_issue(
                 "semanticComparatorRejected",
@@ -1384,6 +1435,7 @@ def generate_blueprint(
     semantic_audit_presence_penalty: float = 0.0,
     semantic_audit_repetition_penalty: float = 1.0,
     semantic_audit_mode: str = "separate",
+    semantic_comparator_protocol: str = "legacy_v1",
     joint_semantic_audit_max_tokens: int = 32768,
     prompt_profile: str = "whole_cot_minimal",
     node_naming: str = "semantic",
@@ -1400,6 +1452,16 @@ def generate_blueprint(
     if semantic_audit_mode not in {"separate", "compact_separate", "direct", "joint"}:
         raise ValueError(
             "semantic_audit_mode must be separate, compact_separate, direct, or joint"
+        )
+    if semantic_comparator_protocol not in {"legacy_v1", "canonical_v2"}:
+        raise ValueError(
+            "semantic_comparator_protocol must be legacy_v1 or canonical_v2"
+        )
+    if semantic_comparator_protocol == "canonical_v2" and semantic_audit_mode not in {
+        "direct", "compact_separate",
+    }:
+        raise ValueError(
+            "canonical_v2 is supported only for direct and compact_separate"
         )
     if node_naming not in {"semantic", "anonymous"}:
         raise ValueError("node_naming must be semantic or anonymous")
@@ -1590,6 +1652,7 @@ def generate_blueprint(
                     semantic_audit_presence_penalty=semantic_audit_presence_penalty,
                     semantic_audit_repetition_penalty=semantic_audit_repetition_penalty,
                     semantic_audit_mode=semantic_audit_mode,
+                    semantic_comparator_protocol=semantic_comparator_protocol,
                     node_naming=node_naming,
                     joint_semantic_audit_max_tokens=joint_semantic_audit_max_tokens,
                     tokenizer_path=tokenizer_path,

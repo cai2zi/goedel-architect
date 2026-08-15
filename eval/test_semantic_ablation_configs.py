@@ -46,8 +46,38 @@ MECHANICAL_CONTRACT_PROFILES = {
         "compact_separate",
 }
 
+CANONICAL_V2_PROFILES = {
+    "qwen3_8b_397b_wrong76_global_defs_direct_canonical_v2_t00": "direct",
+    "qwen3_8b_397b_wrong76_global_defs_compact_separate_canonical_v2_t00":
+        "compact_separate",
+}
+
 
 class SemanticAblationConfigTest(unittest.TestCase):
+    def test_canonical_v2_profiles_are_full_isolated_wrong76_runs(self) -> None:
+        script_dir = ROOT / "experiments/cot_blueprint_refine/script"
+        for profile, mode in CANONICAL_V2_PROFILES.items():
+            with self.subTest(profile=profile):
+                config = load_config(profile, [])
+                blueprint = config.blueprint
+                self.assertEqual(str(config.exp_name), profile)
+                self.assertFalse(config.resume)
+                self.assertEqual(list(config.include_ids), [])
+                self.assertEqual(blueprint.semantic_audit_mode, mode)
+                self.assertEqual(blueprint.semantic_comparator_protocol, "canonical_v2")
+                self.assertEqual(blueprint.generation_node_naming, "semantic")
+                self.assertEqual(blueprint.generation_temperature, 0.6)
+                self.assertEqual(blueprint.semantic_audit_temperature, 0.0)
+                self.assertTrue(blueprint.generation_enable_thinking)
+                self.assertTrue(blueprint.semantic_audit_enable_thinking)
+                self.assertEqual(blueprint.generation_max_turns, 8)
+                self.assertEqual(blueprint.phase1_concurrency, 76)
+                self.assertEqual(blueprint.execution_mode, "phase1_only")
+                self.assertFalse(config.judge.enabled)
+                launcher = (script_dir / f"{profile}.sh").read_text()
+                self.assertIn("run_semantic_ablation_experiment.sh", launcher)
+                self.assertIn(profile, launcher)
+
     def test_semantic_repair_v1_profiles_are_isolated_targeted_runs(self) -> None:
         script_dir = ROOT / "experiments/cot_blueprint_refine/script"
         for profile, (mode, expected_count) in SEMANTIC_REPAIR_V1_PROFILES.items():

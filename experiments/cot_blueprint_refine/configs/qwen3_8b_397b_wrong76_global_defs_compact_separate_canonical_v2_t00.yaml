@@ -1,0 +1,37 @@
+input_predictions: /ssd/czx/czx_work/cot_blueprint_refine/subsets/qwen3_8b_original_answer_incorrect/predictions.jsonl
+output_base: /ssd/czx/czx_work/cot_blueprint_refine
+exp_name: qwen3_8b_397b_wrong76_global_defs_compact_separate_canonical_v2_t00
+resume: false
+include_ids: []
+vllm: {use_existing: true, auto_start: false, auto_destroy: false}
+shared_vllm_397b: {reasoning_parser: qwen3}
+kimina: {use_existing: true, auto_start: false, auto_destroy: false}
+blueprint:
+  generation_prompt_profile: whole_cot_minimal
+  blueprint_root_name: n_final
+  generation_node_naming: semantic
+  execution_mode: phase1_only
+  generation_max_turns: 8
+  generation_enable_thinking: true
+  generation_temperature: 0.6
+  generation_top_p: 0.95
+  generation_top_k: 20
+  generation_min_p: 0.0
+  generation_presence_penalty: 0.0
+  generation_repetition_penalty: 1.0
+  semantic_audit_mode: compact_separate
+  semantic_comparator_protocol: canonical_v2
+  semantic_audit_enable_thinking: true
+  semantic_audit_temperature: 0.0
+  semantic_audit_top_p: 0.95
+  semantic_audit_top_k: 20
+  semantic_audit_min_p: 0.0
+  semantic_audit_presence_penalty: 0.0
+  semantic_audit_repetition_penalty: 1.0
+  formal_decompiler_max_tokens: 16384
+  strict_comparator_max_tokens: 16384
+  joint_semantic_audit_max_tokens: 32768
+  semantic_format_max_attempts: 2
+  phase1_concurrency: 76
+  max_refinement_iterations: 0
+judge: {enabled: false}
