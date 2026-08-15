@@ -38,13 +38,15 @@ feedback classes:
   Phase 2 standalone preflight;
 - semantic validation from the Formal Decompiler and Whole-COT Comparator.
 
-The right pane also has four large, collapsed-by-default sections for the
-selected generation: Decompile response, Compact response, Builder input, and
-Builder response. Think and non-think output are separated. Builder input is
-reconstructed from the previous generation's persisted Blueprint and its
-deterministic/semantic errors. The Builder non-think panel displays the
-persisted, canonicalized generation Blueprint because raw tool-call arguments
-are redacted in current traces.
+Within deterministic validation, schema v5 groups every Builder attempt in the
+selected semantic stage into a collapsed-by-default card. Each card binds the
+actual semantic anchor and latest structural feedback to Builder thinking,
+ordinary message content, the submitted tool-call Blueprint, and the canonical
+persisted Blueprint. Decompile and Compact responses remain separate panels for
+the attempt that actually ran semantic audit. Older runs without submitted
+Blueprint artifacts use the same-round persisted Lean file as a visibly labeled
+fallback, because legacy tool-call traces redact `lean_code` and cannot recover
+the byte-exact raw argument.
 
 The viewer does not interpret the removed Phase 1A/1B edit lifecycle format.
 Existing older-schema `review.json` files are rebuilt in memory from

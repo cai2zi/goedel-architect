@@ -89,6 +89,24 @@ Outputs are isolated under
 `/ssd/czx/czx_work/cot_blueprint_refine/<exp_name>/`. A per-experiment lock
 prevents concurrent writers from interleaving checkpoints or JSONL results.
 
+## Independent semantic-review bundle
+
+Export the problem, complete source COT, and hash-verified final Blueprint for
+every `semanticRejected` result into one Parquet file:
+
+```bash
+python experiments/cot_blueprint_refine/export_semantic_review_bundle.py \
+  <exp_name>
+```
+
+The default output directory is
+`/ssd/czx/czx_work/cot_blueprint_refine/<exp_name>/semantic_review_bundle/` and
+contains `semantic_review_inputs.parquet`, `CHATGPT_PROMPT.md`, and
+`manifest.json`. Upload the Parquet file to ChatGPT and use the generated
+prompt. Existing comparator diagnostics are intentionally excluded so the
+model independently derives the failure taxonomy. Use `--statuses all` or a
+comma-separated `--statuses` value to export a different result subset.
+
 Phase 2 proving and Phase 3 COT refinement remain separate downstream stages.
 Mathlib search remains available to the node prover; it is intentionally not
 part of Blueprint generation.

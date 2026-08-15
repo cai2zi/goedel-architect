@@ -141,6 +141,25 @@ def _resolve_path(value: Any, original_cwd: Path) -> Path:
     return path if path.is_absolute() else original_cwd / path
 
 
+def _resolve_semantic_audit_budget_args(args: argparse.Namespace) -> int:
+    current_budget = getattr(args, "generation_max_semantic_audits", None)
+    legacy_budget = getattr(args, "generation_max_turns", None)
+    if (
+        current_budget is not None
+        and legacy_budget is not None
+        and int(current_budget) != int(legacy_budget)
+    ):
+        raise ValueError(
+            "generation_max_semantic_audits and deprecated generation_max_turns "
+            "must match when both are set"
+        )
+    resolved_budget = current_budget if current_budget is not None else legacy_budget
+    if resolved_budget is None:
+        raise ValueError("generation_max_semantic_audits is required")
+    args.generation_max_semantic_audits = int(resolved_budget)
+    return args.generation_max_semantic_audits
+
+
 def parse_args(cfg: DictConfig) -> argparse.Namespace:
     config = OmegaConf.to_container(cfg, resolve=True)
     if not isinstance(config, dict):
@@ -187,7 +206,7 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
     args.node_max_negation_probe_turns = int(args.node_max_negation_probe_turns)
     args.critical_negation_max_turns = int(args.critical_negation_max_turns)
     args.max_tool_calls_per_turn = int(args.max_tool_calls_per_turn)
-    args.generation_max_turns = int(args.generation_max_turns)
+    _resolve_semantic_audit_budget_args(args)
     args.generation_prompt_profile = str(args.generation_prompt_profile)
     root_name = getattr(args, "blueprint_root_name", None)
     args.blueprint_root_name = str(root_name).strip() if root_name else None
@@ -244,6 +263,7 @@ def parse_args(cfg: DictConfig) -> argparse.Namespace:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    _resolve_semantic_audit_budget_args(args)
     if args.execution_mode not in {"full", "phase1_only", "phase2_only"}:
         raise ValueError(
             "execution_mode must be one of: full, phase1_only, phase2_only"
@@ -280,7 +300,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         "lean_parallel_batches",
         "refinement_max_retries",
         "node_max_prove_turns",
-        "generation_max_turns",
+        "generation_max_semantic_audits",
         "phase1_mathlib_search_max_queries_per_round",
         "phase1_mathlib_search_k",
         "formal_decompiler_max_tokens",
@@ -600,7 +620,7 @@ def _result_row(
         "max_tool_calls_per_turn": args.max_tool_calls_per_turn,
         "proof_policy": args.proof_policy,
         "critical_negation_max_turns": args.critical_negation_max_turns,
-        "generation_max_turns": args.generation_max_turns,
+        "generation_max_semantic_audits": args.generation_max_semantic_audits,
         "phase1_mathlib_search": {
             "enabled": args.phase1_mathlib_search_enabled,
             "max_queries_per_round": args.phase1_mathlib_search_max_queries_per_round,
@@ -932,7 +952,7 @@ async def _run_record(
                         compiler=runtime.compiler,
                         tracer=phase1_tracer,
                         thm_name=record.unique_id,
-                        max_turns=args.generation_max_turns,
+                        max_semantic_audits=args.generation_max_semantic_audits,
                         tokenizer_path=args.tokenizer_path,
                         model_max_context=args.generation_model_max_context,
                         context_safety_margin=args.generation_context_safety_margin,

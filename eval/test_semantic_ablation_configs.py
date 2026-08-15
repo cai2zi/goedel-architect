@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "experiments"), str(ROOT / "src")]
 
 from cot_blueprint_refine.common import load_config  # noqa: E402
+from cot_blueprint_refine.run_experiment import _semantic_audit_budget  # noqa: E402
 from cot_blueprint_refine.run_semantic_ablation_suite import (  # noqa: E402
     BATCHES,
     SUITE_EXP_NAME,
@@ -52,8 +53,49 @@ CANONICAL_V2_PROFILES = {
         "compact_separate",
 }
 
+SEMANTIC_ANCHOR_V3_PROFILES = {
+    "qwen3_8b_397b_wrong76_global_defs_direct_semantic_anchor_v3_t00": "direct",
+    "qwen3_8b_397b_wrong76_global_defs_compact_separate_semantic_anchor_v3_t00":
+        "compact_separate",
+}
+
 
 class SemanticAblationConfigTest(unittest.TestCase):
+    def test_semantic_anchor_v3_profiles_are_full_wrong76_launchers(self) -> None:
+        script_dir = ROOT / "experiments/cot_blueprint_refine/script"
+        for profile, mode in SEMANTIC_ANCHOR_V3_PROFILES.items():
+            with self.subTest(profile=profile):
+                config = load_config(profile, [])
+                blueprint = config.blueprint
+                self.assertEqual(str(config.exp_name), profile)
+                self.assertFalse(config.resume)
+                self.assertEqual(list(config.include_ids), [])
+                self.assertEqual(blueprint.semantic_audit_mode, mode)
+                self.assertEqual(blueprint.semantic_comparator_protocol, "canonical_v2")
+                self.assertEqual(blueprint.generation_max_semantic_audits, 8)
+                self.assertEqual(_semantic_audit_budget(blueprint), 8)
+                self.assertEqual(blueprint.phase1_concurrency, 76)
+                self.assertEqual(blueprint.execution_mode, "phase1_only")
+                self.assertTrue(blueprint.generation_enable_thinking)
+                self.assertTrue(blueprint.semantic_audit_enable_thinking)
+                self.assertFalse(config.judge.enabled)
+                launcher = (script_dir / f"{profile}.sh").read_text()
+                self.assertIn("run_semantic_ablation_experiment.sh", launcher)
+                self.assertIn(profile, launcher)
+
+    def test_semantic_budget_legacy_fallback_and_conflict(self) -> None:
+        legacy = load_config("base", [
+            "blueprint.generation_max_semantic_audits=null",
+            "blueprint.generation_max_turns=5",
+        ])
+        self.assertEqual(_semantic_audit_budget(legacy.blueprint), 5)
+        conflicting = load_config("base", [
+            "blueprint.generation_max_semantic_audits=7",
+            "blueprint.generation_max_turns=8",
+        ])
+        with self.assertRaises(ValueError):
+            _semantic_audit_budget(conflicting.blueprint)
+
     def test_canonical_v2_profiles_are_full_isolated_wrong76_runs(self) -> None:
         script_dir = ROOT / "experiments/cot_blueprint_refine/script"
         for profile, mode in CANONICAL_V2_PROFILES.items():

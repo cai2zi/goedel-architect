@@ -53,6 +53,48 @@ import Architect
 @[blueprint] theorem root : model = 1 := by sorry_using [model]
 '''
 
+    def _generation_kwargs(self, *, max_semantic_audits: int = 8) -> dict:
+        return {
+            "informal_statement": "problem", "informal_proof": "cot",
+            "claimed_answer": "1", "target_name": "root", "model": "model",
+            "compiler": object(), "tracer": None, "thm_name": "id",
+            "max_semantic_audits": max_semantic_audits,
+            "tokenizer_path": "unused", "model_max_context": 40960,
+            "context_safety_margin": 512, "enable_thinking": True,
+            "temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0,
+            "presence_penalty": 0.0, "repetition_penalty": 1.0,
+            "standalone_concurrency": 1, "decompiler_max_tokens": 16384,
+            "comparator_max_tokens": 16384, "semantic_format_attempts": 2,
+            "semantic_audit_enable_thinking": True,
+            "semantic_audit_temperature": 0.0, "semantic_audit_top_p": 0.95,
+            "semantic_audit_top_k": 20, "semantic_audit_min_p": 0.0,
+            "semantic_audit_presence_penalty": 0.0,
+            "semantic_audit_repetition_penalty": 1.0,
+            "semantic_audit_mode": "direct",
+            "semantic_comparator_protocol": "canonical_v2",
+            "joint_semantic_audit_max_tokens": 32768,
+        }
+
+    @staticmethod
+    def _generation_response(content: str = "") -> SimpleNamespace:
+        return SimpleNamespace(choices=[SimpleNamespace(
+            finish_reason="tool_calls",
+            message=SimpleNamespace(content=content, tool_calls=[]),
+        )])
+
+    @staticmethod
+    def _mock_validation(*, semantic_invoked: bool, structural: bool = False) -> BlueprintValidation:
+        return BlueprintValidation(
+            lean_result=CompilerResult(not structural),
+            canonical_lean_result=CompilerResult(not structural),
+            semantic_issues=[], structural_errors=[],
+            standalone_report=Phase2StandaloneReport((), 2, 0, 1.0),
+            mechanical_stage_reached="canonical_lean" if structural else "static_shadow",
+            mechanical_failure_stage="canonical_lean" if structural else None,
+            semantic_audit_invoked=semantic_invoked,
+            semantic_audit_mode="direct",
+        )
+
     def test_accepted_terminal_details_are_json_serializable(self) -> None:
         details = {"semanticAudit": {"strictComparator": {"passed": True}}}
         current_round = GenerationRound(
@@ -509,7 +551,10 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
         with (
             patch("blueprint_generation.make_client", return_value=object()),
             patch("blueprint_generation.generation_request_budget", return_value=(100, 1000)),
-            patch("blueprint_generation.chat_completion_with_retry", return_value=object()) as generate,
+            patch(
+                "blueprint_generation.chat_completion_with_retry",
+                return_value=self._generation_response(),
+            ) as generate,
             patch("blueprint_generation._emit_usage"),
             patch("blueprint_generation._emit_llm_response"),
             patch("blueprint_generation._submitted_code", return_value=(self.MINIMAL, ())),
@@ -524,7 +569,7 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
             generate_blueprint(
                 informal_statement="problem", informal_proof="cot",
                 claimed_answer="1", target_name="root", model="model",
-                compiler=object(), tracer=None, thm_name="id", max_turns=8,
+                compiler=object(), tracer=None, thm_name="id", max_semantic_audits=8,
                 tokenizer_path="unused", model_max_context=40960,
                 context_safety_margin=512, enable_thinking=True,
                 temperature=0.6, top_p=0.95, top_k=20, min_p=0.0,
@@ -552,6 +597,197 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
             caught.exception.candidate_history[-1], formal_blueprint.lean_file,
         )
 
+    def test_structural_retries_preserve_semantic_anchor_and_do_not_consume_budget(self) -> None:
+        codes = [
+            self.MINIMAL.replace("model : Nat := 1", f"model : Nat := {value}")
+            for value in (1, 2, 3, 4)
+        ]
+        blueprints = [_parse_blueprint(code, "root") for code in codes]
+        semantic_error = ({
+            "stage": "whole_cot_comparator", "code": "derivationShortcut",
+            "nodeName": "root", "message": "derive the unknown",
+        },)
+        deterministic_2 = ({
+            "stage": "canonical_lean", "code": "canonicalLean",
+            "nodeName": "", "message": "unknown declaration two",
+        },)
+        deterministic_3 = ({
+            "stage": "phase2_standalone", "code": "phase2StandaloneFailed",
+            "nodeName": "root", "message": "unknown declaration three",
+        },)
+        validations = [
+            (blueprints[0], self._mock_validation(semantic_invoked=True), (), semantic_error, ()),
+            (blueprints[1], self._mock_validation(semantic_invoked=False, structural=True), deterministic_2, (), ()),
+            (blueprints[2], self._mock_validation(semantic_invoked=False, structural=True), deterministic_3, (), ()),
+            (blueprints[3], self._mock_validation(semantic_invoked=True), (), (), ()),
+        ]
+        with (
+            patch("blueprint_generation.make_client", return_value=object()),
+            patch("blueprint_generation.generation_request_budget", return_value=(100, 1000)),
+            patch(
+                "blueprint_generation.chat_completion_with_retry",
+                side_effect=[self._generation_response() for _ in codes],
+            ) as generate,
+            patch("blueprint_generation._emit_usage"),
+            patch("blueprint_generation._emit_llm_response"),
+            patch("blueprint_generation._submitted_code", side_effect=[(code, ()) for code in codes]),
+            patch("blueprint_generation._validate_round", side_effect=validations),
+        ):
+            accepted = generate_blueprint(**self._generation_kwargs(max_semantic_audits=2))
+
+        self.assertEqual(generate.call_count, 4)
+        history = accepted.generation_history
+        self.assertEqual([item["semanticStage"] for item in history], [1, 2, 2, 2])
+        self.assertEqual(
+            [item["semanticAuditOrdinal"] for item in history], [1, None, None, 2],
+        )
+        self.assertEqual(
+            [item["semanticAnchorRound"] for item in history], [None, 1, 1, 1],
+        )
+        self.assertEqual(
+            [item["structuralInputRound"] for item in history], [None, None, 2, 3],
+        )
+        self.assertEqual(
+            [item["attemptRole"] for item in history],
+            ["semanticAudited", "structuralRetry", "structuralRetry", "semanticAudited"],
+        )
+        self.assertEqual(accepted.generation_validation["semanticAuditCount"], 2)
+        self.assertIn("generation_round_2_submitted", accepted.candidate_labels)
+        self.assertIn("generation_round_4_canonical", accepted.candidate_labels)
+
+    def test_eighth_semantic_reject_terminates_with_audited_anchor(self) -> None:
+        blueprint = _parse_blueprint(self.MINIMAL, "root")
+        semantic_error = ({
+            "stage": "whole_cot_comparator", "code": "targetMismatch",
+            "nodeName": "root", "message": "wrong target",
+        },)
+        with (
+            patch("blueprint_generation.make_client", return_value=object()),
+            patch("blueprint_generation.generation_request_budget", return_value=(100, 1000)),
+            patch(
+                "blueprint_generation.chat_completion_with_retry",
+                side_effect=[self._generation_response() for _ in range(8)],
+            ),
+            patch("blueprint_generation._emit_usage"),
+            patch("blueprint_generation._emit_llm_response"),
+            patch(
+                "blueprint_generation._submitted_code",
+                side_effect=[(self.MINIMAL, ()) for _ in range(8)],
+            ),
+            patch(
+                "blueprint_generation._validate_round",
+                side_effect=[(
+                    blueprint, self._mock_validation(semantic_invoked=True),
+                    (), semantic_error, (),
+                ) for _ in range(8)],
+            ),
+            self.assertRaises(BlueprintGenerationError) as caught,
+        ):
+            generate_blueprint(**self._generation_kwargs(max_semantic_audits=8))
+        error = caught.exception
+        self.assertEqual(error.validation_details["classification"], "semanticRejected")
+        self.assertEqual(error.validation_details["semanticAuditCount"], 8)
+        self.assertEqual(error.last_candidate, blueprint.lean_file)
+        self.assertEqual(error.generation_history[-1]["semanticAuditOrdinal"], 8)
+        self.assertFalse(error.validation_details["finalDeterministicErrors"])
+
+    def test_context_fallback_omits_only_latest_structural_body(self) -> None:
+        anchor_code = self.MINIMAL
+        structural_code = self.MINIMAL.replace("model : Nat := 1", "model : Nat := 2")
+        accepted_code = self.MINIMAL.replace("model : Nat := 1", "model : Nat := 3")
+        anchor = _parse_blueprint(anchor_code, "root")
+        structural = _parse_blueprint(structural_code, "root")
+        accepted = _parse_blueprint(accepted_code, "root")
+        semantic_error = ({
+            "stage": "whole_cot_comparator", "code": "answerShortcut",
+            "nodeName": "root", "message": "retain this semantic issue",
+        },)
+        structural_error = ({
+            "stage": "canonical_lean", "code": "canonicalLean",
+            "nodeName": "", "message": "repair this structure",
+        },)
+
+        def budget(messages, **_kwargs):
+            rendered = "\n".join(message["content"] for message in messages)
+            if "Latest structurally rejected Blueprint" in rendered:
+                return 50000, -100
+            return 100, 1000
+
+        validations = [
+            (anchor, self._mock_validation(semantic_invoked=True), (), semantic_error, ()),
+            (structural, self._mock_validation(semantic_invoked=False, structural=True), structural_error, (), ()),
+            (accepted, self._mock_validation(semantic_invoked=True), (), (), ()),
+        ]
+        with (
+            patch("blueprint_generation.make_client", return_value=object()),
+            patch("blueprint_generation.generation_request_budget", side_effect=budget),
+            patch(
+                "blueprint_generation.chat_completion_with_retry",
+                side_effect=[self._generation_response() for _ in range(3)],
+            ) as generate,
+            patch("blueprint_generation._emit_usage"),
+            patch("blueprint_generation._emit_llm_response"),
+            patch(
+                "blueprint_generation._submitted_code",
+                side_effect=[(anchor_code, ()), (structural_code, ()), (accepted_code, ())],
+            ),
+            patch("blueprint_generation._validate_round", side_effect=validations),
+        ):
+            result = generate_blueprint(**self._generation_kwargs(max_semantic_audits=2))
+        third = result.generation_history[2]
+        self.assertTrue(third["contextFallbackApplied"])
+        rendered = "\n".join(
+            item["content"] for item in generate.call_args_list[2].kwargs["messages"]
+        )
+        self.assertIn("Last semantically audited Blueprint", rendered)
+        self.assertIn("retain this semantic issue", rendered)
+        self.assertIn("repair this structure", rendered)
+        self.assertNotIn("Latest structurally rejected Blueprint\n```lean", rendered)
+        self.assertIn("was omitted because", rendered)
+
+    def test_invalid_tool_submission_is_an_unbudgeted_structural_retry(self) -> None:
+        anchor = _parse_blueprint(self.MINIMAL, "root")
+        accepted_code = self.MINIMAL.replace("model : Nat := 1", "model : Nat := 4")
+        accepted = _parse_blueprint(accepted_code, "root")
+        semantic_error = ({
+            "stage": "whole_cot_comparator", "code": "semanticMismatch",
+            "nodeName": "root", "message": "retain semantic anchor",
+        },)
+        submission_error = ({
+            "stage": "parse_basic", "code": "phase1ToolCallCount",
+            "nodeName": "", "message": "expected one tool call",
+        },)
+        with (
+            patch("blueprint_generation.make_client", return_value=object()),
+            patch("blueprint_generation.generation_request_budget", return_value=(100, 1000)),
+            patch(
+                "blueprint_generation.chat_completion_with_retry",
+                side_effect=[self._generation_response() for _ in range(3)],
+            ) as generate,
+            patch("blueprint_generation._emit_usage"),
+            patch("blueprint_generation._emit_llm_response"),
+            patch(
+                "blueprint_generation._submitted_code",
+                side_effect=[(self.MINIMAL, ()), ("", submission_error), (accepted_code, ())],
+            ),
+            patch("blueprint_generation._validate_round", side_effect=[
+                (anchor, self._mock_validation(semantic_invoked=True), (), semantic_error, ()),
+                (accepted, self._mock_validation(semantic_invoked=True), (), (), ()),
+            ]),
+        ):
+            result = generate_blueprint(**self._generation_kwargs(max_semantic_audits=2))
+        history = result.generation_history
+        self.assertEqual([item["semanticAuditOrdinal"] for item in history], [1, None, 2])
+        self.assertEqual(history[1]["attemptRole"], "structuralRetry")
+        self.assertEqual(history[2]["semanticAnchorRound"], 1)
+        self.assertEqual(history[2]["structuralInputRound"], 2)
+        rendered = "\n".join(
+            item["content"] for item in generate.call_args_list[2].kwargs["messages"]
+        )
+        self.assertIn("retain semantic anchor", rendered)
+        self.assertIn("expected one tool call", rendered)
+        self.assertNotIn("Latest structurally rejected Blueprint\n```lean", rendered)
+
     def test_submission_requires_one_full_lean_compile_call(self) -> None:
         call = SimpleNamespace(function=SimpleNamespace(
             name="lean_compile", arguments=json.dumps({"lean_code": "theorem root : True := by trivial"}),
@@ -578,10 +814,10 @@ theorem root : PendingBlueprintClaim "root" := by sorry_using []
             round_index=1, max_turns=8, deterministic_error_count=0,
             semantic_error_count=0, warning_count=0,
         ), "strictAccepted")
-        self.assertEqual(generation_round_classification(
+        self.assertIsNone(generation_round_classification(
             round_index=8, max_turns=8, deterministic_error_count=1,
             semantic_error_count=2, warning_count=0,
-        ), "structuralRejected")
+        ))
         self.assertEqual(generation_round_classification(
             round_index=8, max_turns=8, deterministic_error_count=0,
             semantic_error_count=2, warning_count=0,

@@ -25,6 +25,9 @@ phase1_source_experiment_root: null
 max_refinement_iterations: 4
 refinement_max_retries: 4
 
+# Canonical Phase-1 budget.  Structural retries do not consume it.
+generation_max_semantic_audits: null
+# Deprecated input alias retained for existing profiles.
 generation_max_turns: 8
 generation_enable_thinking: true
 generation_temperature: 0.6

@@ -38,6 +38,20 @@ STAGE_SEQUENCES = {
 }
 
 
+def _semantic_audit_budget(blueprint: DictConfig) -> int:
+    current = blueprint.get("generation_max_semantic_audits")
+    legacy = blueprint.get("generation_max_turns")
+    if current is not None and legacy is not None and int(current) != int(legacy):
+        raise ValueError(
+            "blueprint.generation_max_semantic_audits and deprecated "
+            "blueprint.generation_max_turns must match when both are set"
+        )
+    value = current if current is not None else legacy
+    if value is None or int(value) <= 0:
+        raise ValueError("blueprint.generation_max_semantic_audits must be positive")
+    return int(value)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Blueprint-guided COT refinement experiment")
     parser.add_argument("--profile", default="base", help="Config profile under configs/")
@@ -179,6 +193,7 @@ def run_blueprint(
                 raise FileNotFoundError(f"Phase 1 input artifact is missing: {required}")
     else:
         robustpa_data_root = prepared_dir(config) / "data"
+    semantic_audit_budget = _semantic_audit_budget(blueprint)
     overrides = [
         "exp_name=blueprint",
         f"data_root={robustpa_data_root}",
@@ -201,7 +216,8 @@ def run_blueprint(
         f"generation_node_naming={blueprint.get('generation_node_naming', 'semantic')}",
         f"max_refinement_iterations={blueprint.max_refinement_iterations}",
         f"refinement_max_retries={blueprint.refinement_max_retries}",
-        f"generation_max_turns={blueprint.generation_max_turns}",
+        f"generation_max_semantic_audits={semantic_audit_budget}",
+        f"generation_max_turns={semantic_audit_budget}",
         f"generation_enable_thinking={str(bool(blueprint.generation_enable_thinking)).lower()}",
         f"generation_temperature={blueprint.generation_temperature}",
         f"generation_top_p={blueprint.generation_top_p}",

@@ -183,6 +183,17 @@ class GenerationRound:
     semantic_errors: tuple[dict[str, Any], ...]
     warnings: tuple[dict[str, Any], ...]
     validation: dict[str, Any]
+    semantic_stage: int = 1
+    semantic_audit_ordinal: int | None = None
+    semantic_audit_invoked: bool = False
+    semantic_anchor_round: int | None = None
+    structural_input_round: int | None = None
+    attempt_role: str = "initial"
+    submitted_candidate_hash: str = ""
+    canonical_candidate_hash: str = ""
+    context_fallback_applied: bool = False
+    builder_message_content: str = ""
+    finish_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -194,6 +205,17 @@ class GenerationRound:
             "semanticErrors": list(self.semantic_errors),
             "warnings": list(self.warnings),
             "validation": self.validation,
+            "semanticStage": self.semantic_stage,
+            "semanticAuditOrdinal": self.semantic_audit_ordinal,
+            "semanticAuditInvoked": self.semantic_audit_invoked,
+            "semanticAnchorRound": self.semantic_anchor_round,
+            "structuralInputRound": self.structural_input_round,
+            "attemptRole": self.attempt_role,
+            "submittedCandidateHash": self.submitted_candidate_hash,
+            "canonicalCandidateHash": self.canonical_candidate_hash,
+            "contextFallbackApplied": self.context_fallback_applied,
+            "builderMessageContent": self.builder_message_content,
+            "finishReason": self.finish_reason,
         }
 
 
@@ -659,9 +681,9 @@ def generation_round_classification(
     semantic_error_count: int,
     warning_count: int,
 ) -> str | None:
-    """Return a terminal generation classification, or None when another round is due."""
+    """Classify an audited candidate; structural failures are never terminal here."""
     if deterministic_error_count:
-        return "structuralRejected" if round_index >= max_turns else None
+        return None
     if semantic_error_count:
         return "semanticRejected" if round_index >= max_turns else None
     del warning_count
@@ -1010,6 +1032,9 @@ def _messages(
     claimed_answer: str,
     previous_blueprint: str,
     previous_feedback: str,
+    latest_structural_blueprint: str = "",
+    latest_structural_feedback: str = "",
+    structural_context_omitted: bool = False,
     active_repair_codes: Sequence[str] = (),
     prompt_profile: str = "whole_cot_minimal",
     node_naming: str = "semantic",
@@ -1027,9 +1052,9 @@ def _messages(
     )
     if previous_blueprint:
         user += (
-            "\n\n## Previous complete Blueprint\n```lean\n"
+            "\n\n## Last semantically audited Blueprint\n```lean\n"
             + previous_blueprint.rstrip()
-            + "\n```\n\n## Complete previous diagnostics\n"
+            + "\n```\n\n## Unresolved semantic diagnostics\n"
             + previous_feedback
         )
         if (
@@ -1039,6 +1064,20 @@ def _messages(
             user += render(
                 ANSWER_PREASSIGNED_REPAIR_GUIDANCE,
                 target_name=target_name,
+            )
+    if latest_structural_feedback:
+        user += "\n\n## Latest structural diagnostics\n" + latest_structural_feedback
+        if latest_structural_blueprint:
+            user += (
+                "\n\n## Latest structurally rejected Blueprint\n```lean\n"
+                + latest_structural_blueprint.rstrip()
+                + "\n```"
+            )
+        elif structural_context_omitted:
+            user += (
+                "\n\nThe latest structurally rejected Blueprint body was omitted because "
+                "the full repair context exceeded the model context budget. Repair from "
+                "the semantic anchor and both diagnostic inventories."
             )
     system = (
         ROBUSTPA_BLUEPRINT_MINIMAL_SYSTEM_PROMPT
@@ -1412,7 +1451,7 @@ def generate_blueprint(
     compiler: KiminaLeanCompiler,
     tracer,
     thm_name: str,
-    max_turns: int,
+    max_semantic_audits: int,
     tokenizer_path: str,
     model_max_context: int,
     context_safety_margin: int,
@@ -1445,8 +1484,8 @@ def generate_blueprint(
     phase1_mathlib_search_timeout_s: float = 15.0,
     mathlib_retrieval: Any | None = None,
 ) -> Blueprint:
-    if max_turns <= 0:
-        raise ValueError("generation max_turns must be positive")
+    if max_semantic_audits <= 0:
+        raise ValueError("generation max_semantic_audits must be positive")
     if prompt_profile not in {"whole_cot_minimal", "standard"}:
         raise ValueError("prompt_profile must be whole_cot_minimal or standard")
     if semantic_audit_mode not in {"separate", "compact_separate", "direct", "joint"}:
@@ -1477,8 +1516,7 @@ def generate_blueprint(
     phase1_retrieval = mathlib_retrieval
     if phase1_mathlib_search_enabled and phase1_retrieval is None:
         phase1_retrieval = MathlibRetrieval(timeout=phase1_mathlib_search_timeout_s)
-    previous_code = ""
-    previous_feedback = ""
+
     candidates: list[str] = []
     labels: list[str] = []
     rounds: list[GenerationRound] = []
@@ -1488,38 +1526,90 @@ def generate_blueprint(
     joint_cache: dict[str, JointWholeCotAuditResult] = {}
     mathlib_search_cache: dict[str, tuple[dict[str, str], ...]] = {}
     previous_search_symbols: tuple[str, ...] = ()
-    latest_blueprint: Blueprint | None = None
-    latest_validation: BlueprintValidation | None = None
-    latest_deterministic: tuple[dict[str, Any], ...] = ()
-    latest_semantic: tuple[dict[str, Any], ...] = ()
-    latest_warnings: tuple[dict[str, Any], ...] = ()
-    last_audited_semantic_errors: tuple[dict[str, Any], ...] = ()
-    last_audited_semantic_round: int | None = None
-    active_repair_codes: tuple[str, ...] = ()
 
-    for round_index in range(1, max_turns + 1):
+    generation_attempt_index = 0
+    semantic_audit_count = 0
+    semantic_anchor_blueprint: Blueprint | None = None
+    semantic_anchor_validation: BlueprintValidation | None = None
+    semantic_anchor_errors: tuple[dict[str, Any], ...] = ()
+    semantic_anchor_warnings: tuple[dict[str, Any], ...] = ()
+    semantic_anchor_round: int | None = None
+    semantic_anchor_details: dict[str, Any] = {}
+    latest_structural_blueprint = ""
+    latest_structural_errors: tuple[dict[str, Any], ...] = ()
+    latest_structural_warnings: tuple[dict[str, Any], ...] = ()
+    latest_structural_round: int | None = None
+    latest_structural_search: tuple[dict[str, Any], ...] = ()
+
+    while semantic_audit_count < max_semantic_audits:
+        generation_attempt_index += 1
+        round_index = generation_attempt_index
+        semantic_stage = semantic_audit_count + 1
+        input_anchor_round = semantic_anchor_round
+        input_structural_round = latest_structural_round
+        active_repair_codes = _active_repair_codes(semantic_anchor_errors)
+        anchor_feedback = _feedback(
+            (), semantic_anchor_errors, semantic_anchor_warnings,
+            blueprint=semantic_anchor_blueprint,
+        ) if semantic_anchor_blueprint is not None else ""
+        structural_feedback = _feedback(
+            latest_structural_errors, (), latest_structural_warnings,
+            mathlib_search_context=latest_structural_search,
+        ) if latest_structural_round is not None else ""
         messages = _messages(
             target_name=target_name,
             informal_statement=informal_statement,
             informal_proof=informal_proof,
             claimed_answer=claimed_answer,
-            previous_blueprint=previous_code,
-            previous_feedback=previous_feedback,
+            previous_blueprint=(
+                semantic_anchor_blueprint.lean_file
+                if semantic_anchor_blueprint is not None else ""
+            ),
+            previous_feedback=anchor_feedback,
+            latest_structural_blueprint=latest_structural_blueprint,
+            latest_structural_feedback=structural_feedback,
             active_repair_codes=active_repair_codes,
             prompt_profile=prompt_profile,
             node_naming=node_naming,
         )
         input_tokens, completion_budget = generation_request_budget(
-            messages,
-            tokenizer_path=tokenizer_path,
+            messages, tokenizer_path=tokenizer_path,
             model_max_context=model_max_context,
-            safety_margin=context_safety_margin,
-            tools=[LEAN_COMPILE_TOOL],
+            safety_margin=context_safety_margin, tools=[LEAN_COMPILE_TOOL],
         )
+        context_fallback_applied = False
+        if completion_budget <= 0 and latest_structural_blueprint:
+            context_fallback_applied = True
+            messages = _messages(
+                target_name=target_name,
+                informal_statement=informal_statement,
+                informal_proof=informal_proof,
+                claimed_answer=claimed_answer,
+                previous_blueprint=(
+                    semantic_anchor_blueprint.lean_file
+                    if semantic_anchor_blueprint is not None else ""
+                ),
+                previous_feedback=anchor_feedback,
+                latest_structural_blueprint="",
+                latest_structural_feedback=structural_feedback,
+                structural_context_omitted=True,
+                active_repair_codes=active_repair_codes,
+                prompt_profile=prompt_profile,
+                node_naming=node_naming,
+            )
+            input_tokens, completion_budget = generation_request_budget(
+                messages, tokenizer_path=tokenizer_path,
+                model_max_context=model_max_context,
+                safety_margin=context_safety_margin, tools=[LEAN_COMPILE_TOOL],
+            )
         if completion_budget <= 0:
+            last_candidate = (
+                semantic_anchor_blueprint.lean_file
+                if semantic_anchor_blueprint is not None else latest_structural_blueprint
+            )
             raise BlueprintGenerationError(
                 "Phase 1 input exhausts the model context window.",
-                last_candidate=previous_code,
+                last_candidate=last_candidate,
                 diagnostics=[
                     f"inputTokens={input_tokens} modelContext={model_max_context} "
                     f"safetyMargin={context_safety_margin}"
@@ -1528,31 +1618,40 @@ def generate_blueprint(
                 failure_stage="phase1ContextBudgetExceeded",
                 candidate_history=candidates,
                 candidate_labels=labels,
-                validation_details={"generationRounds": [item.to_dict() for item in rounds]},
+                validation_details={
+                    "semanticAuditCount": semantic_audit_count,
+                    "generationRounds": [item.to_dict() for item in rounds],
+                },
+                generation_history=[item.to_dict() for item in rounds],
             )
+
         span_id = uuid.uuid4().hex
         started_ns = time.monotonic_ns()
         if tracer:
             tracer.emit(TraceEvent(
-                kind="phase1GenerationStart",
-                thm_name=thm_name,
-                turn=round_index,
-                span_id=span_id,
+                kind="phase1GenerationStart", thm_name=thm_name,
+                turn=round_index, span_id=span_id,
                 args={
                     "round": round_index,
+                    "semanticStage": semantic_stage,
+                    "semanticAuditCount": semantic_audit_count,
+                    "generationMaxSemanticAudits": max_semantic_audits,
+                    "semanticAnchorRound": input_anchor_round,
+                    "structuralInputRound": input_structural_round,
+                    "contextFallbackApplied": context_fallback_applied,
                     "promptProfile": prompt_profile,
                     "inputTokens": input_tokens,
                     "maxCompletionTokens": completion_budget,
                     "enableThinking": enable_thinking,
                     "temperature": temperature,
-                    "topP": top_p,
-                    "topK": top_k,
-                    "minP": min_p,
+                    "topP": top_p, "topK": top_k, "minP": min_p,
                     "presencePenalty": presence_penalty,
                     "repetitionPenalty": repetition_penalty,
                     "semanticAuditMode": semantic_audit_mode,
-                    "semanticFeedbackSourceRound": last_audited_semantic_round,
-                    "semanticFeedbackRetained": bool(last_audited_semantic_errors),
+                    "semanticFeedbackSourceRound": input_anchor_round,
+                    "semanticFeedbackRetained": bool(
+                        input_anchor_round is not None and input_structural_round is not None
+                    ),
                     "activeRepairCodes": list(active_repair_codes),
                     "semanticAuditSampling": {
                         "enableThinking": semantic_audit_enable_thinking,
@@ -1569,73 +1668,62 @@ def generate_blueprint(
             f"blueprint-generation|{thm_name}|{round_index}".encode()
         ).digest()[:4], "big")
         response = chat_completion_with_retry(
-            client,
-            tracer=tracer,
-            thm_name=thm_name,
-            phase="phase1",
-            model_id=model,
-            operation="blueprint_generation",
-            trace_args={"round": round_index, "max_completion_tokens": completion_budget},
-            model=model,
-            messages=messages,
-            tools=[LEAN_COMPILE_TOOL],
-            tool_choice="required",
-            parallel_tool_calls=False,
-            temperature=temperature,
-            top_p=top_p,
-            presence_penalty=presence_penalty,
-            seed=seed,
+            client, tracer=tracer, thm_name=thm_name, phase="phase1",
+            model_id=model, operation="blueprint_generation",
+            trace_args={
+                "round": round_index,
+                "semantic_stage": semantic_stage,
+                "max_completion_tokens": completion_budget,
+            },
+            model=model, messages=messages, tools=[LEAN_COMPILE_TOOL],
+            tool_choice="required", parallel_tool_calls=False,
+            temperature=temperature, top_p=top_p,
+            presence_penalty=presence_penalty, seed=seed,
             max_completion_tokens=completion_budget,
             extra_body={
-                "top_k": top_k,
-                "min_p": min_p,
+                "top_k": top_k, "min_p": min_p,
                 "repetition_penalty": repetition_penalty,
                 "chat_template_kwargs": {"enable_thinking": enable_thinking},
             },
         )
         _emit_usage(tracer, thm_name, "phase1", model, response)
         _emit_llm_response(
-            tracer,
-            thm_name=thm_name,
-            phase="phase1",
-            model=model,
-            response=response,
-            attempt=1,
-            turn=round_index,
+            tracer, thm_name=thm_name, phase="phase1", model=model,
+            response=response, attempt=1, turn=round_index,
         )
+        choice = response.choices[0]
+        builder_message_content = str(getattr(choice.message, "content", None) or "")
+        finish_reason = str(getattr(choice, "finish_reason", None) or "")
         code, submission_errors = _submitted_code(response)
+        submitted_hash = hashlib.sha256(code.encode()).hexdigest() if code else ""
+
+        current_blueprint: Blueprint | None = None
+        current_validation: BlueprintValidation | None = None
+        current_deterministic: tuple[dict[str, Any], ...] = ()
+        current_semantic: tuple[dict[str, Any], ...] = ()
+        current_warnings: tuple[dict[str, Any], ...] = ()
+        canonical_hash = ""
+        candidate_hash = ""
+        search_reports: tuple[dict[str, Any], ...] = ()
+        previous_status: list[dict[str, Any]] = []
+
         if submission_errors:
-            latest_deterministic = _deduplicate(submission_errors)
-            latest_semantic = ()
-            latest_warnings = ()
-            latest_validation = None
-            previous_feedback = _feedback(
-                latest_deterministic, last_audited_semantic_errors, latest_warnings,
-            )
-            candidate_hash = ""
+            current_deterministic = _deduplicate(submission_errors)
             details: dict[str, Any] = {
                 "phase1MathlibSearch": {
                     "enabled": phase1_mathlib_search_enabled,
-                    "eligibleSymbols": [],
-                    "queries": [],
+                    "eligibleSymbols": [], "queries": [],
                     "previousDiagnosticStatus": [],
                     "notRunReason": "generationSubmissionInvalid",
-                },
-                "semanticFeedbackSourceRound": last_audited_semantic_round,
-                "semanticFeedbackRetained": bool(last_audited_semantic_errors),
-                "activeRepairCodes": list(active_repair_codes),
+                }
             }
         else:
-            previous_code = code
             candidates.append(code)
-            labels.append(f"generation_round_{round_index}")
+            labels.append(f"generation_round_{round_index}_submitted")
             try:
                 (
-                    latest_blueprint,
-                    latest_validation,
-                    latest_deterministic,
-                    latest_semantic,
-                    latest_warnings,
+                    current_blueprint, current_validation, current_deterministic,
+                    current_semantic, current_warnings,
                 ) = _validate_round(
                     code, target_name=target_name, compiler=compiler,
                     informal_statement=informal_statement,
@@ -1661,116 +1749,103 @@ def generate_blueprint(
                     tracer=tracer, thm_name=thm_name, round_index=round_index,
                     standalone_cache=standalone_cache,
                     decompiler_cache=decompiler_cache,
-                    comparator_cache=comparator_cache,
-                    joint_cache=joint_cache,
+                    comparator_cache=comparator_cache, joint_cache=joint_cache,
                 )
             except SemanticAuditExecutionError as exc:
-                latest_blueprint = exc.blueprint
-                latest_validation = exc.validation
-                previous_code = latest_blueprint.lean_file
-                candidates[-1] = previous_code
-                details = validation_details(latest_validation)
+                current_blueprint = exc.blueprint
+                current_validation = exc.validation
+                canonical_code = current_blueprint.lean_file
+                canonical_hash = hashlib.sha256(canonical_code.encode()).hexdigest()
+                candidate_hash = canonical_hash
+                candidates.extend([canonical_code, canonical_code])
+                labels.extend([
+                    f"generation_round_{round_index}_canonical",
+                    f"generation_round_{round_index}",
+                ])
+                details = validation_details(current_validation)
                 audit_error = _issue(
                     "semanticAuditError", exc,
                     stage=(
-                        "joint_semantic_audit"
-                        if semantic_audit_mode == "joint"
+                        "joint_semantic_audit" if semantic_audit_mode == "joint"
                         else "formal_decompiler_or_comparator"
                     ),
                 )
-                failed_round = GenerationRound(
-                    round_index=round_index,
-                    candidate_hash=hashlib.sha256(previous_code.encode()).hexdigest(),
+                details.update({
+                    "semanticAuditError": audit_error,
+                    "semanticAuditCount": semantic_audit_count,
+                    "generationMaxSemanticAudits": max_semantic_audits,
+                    "semanticFeedbackInputRound": input_anchor_round,
+                    "structuralInputRound": input_structural_round,
+                    "contextFallbackApplied": context_fallback_applied,
+                })
+                rounds.append(GenerationRound(
+                    round_index=round_index, candidate_hash=candidate_hash,
                     input_tokens=input_tokens,
                     max_completion_tokens=completion_budget,
-                    deterministic_errors=(),
-                    semantic_errors=(),
-                    warnings=(),
-                    validation={**details, "semanticAuditError": audit_error},
-                )
-                rounds.append(failed_round)
+                    deterministic_errors=(), semantic_errors=(), warnings=(),
+                    validation=dict(details), semantic_stage=semantic_stage,
+                    semantic_audit_invoked=True,
+                    semantic_anchor_round=input_anchor_round,
+                    structural_input_round=input_structural_round,
+                    attempt_role="semanticAuditError",
+                    submitted_candidate_hash=submitted_hash,
+                    canonical_candidate_hash=canonical_hash,
+                    context_fallback_applied=context_fallback_applied,
+                    builder_message_content=builder_message_content,
+                    finish_reason=finish_reason,
+                ))
                 details.update({
                     "classification": "semanticAuditError",
                     "terminalCategory": "semanticAuditError",
-                    "semanticAuditError": audit_error,
                     "generationRounds": [item.to_dict() for item in rounds],
                 })
                 if tracer:
                     tracer.emit(TraceEvent(
-                        kind="phase1FinalClassification",
-                        thm_name=thm_name,
+                        kind="phase1FinalClassification", thm_name=thm_name,
                         turn=round_index,
-                        args={
-                            "classification": "semanticAuditError",
-                            "error": audit_error,
-                        },
+                        args={"classification": "semanticAuditError", "error": audit_error},
                         ok=False,
                     ))
                 raise BlueprintGenerationError(
                     "Phase 1 semantic audit exhausted its request/schema retries.",
-                    last_candidate=previous_code, diagnostics=[str(exc)], attempt=round_index,
-                    failure_stage="phase1SemanticAuditError",
+                    last_candidate=canonical_code, diagnostics=[str(exc)],
+                    attempt=round_index, failure_stage="phase1SemanticAuditError",
                     candidate_history=candidates, candidate_labels=labels,
                     validation_details=details,
                     generation_history=[item.to_dict() for item in rounds],
                 ) from exc
-            previous_code = latest_blueprint.lean_file
-            candidates[-1] = previous_code
-            eligible_symbols = _eligible_mathlib_symbols(latest_deterministic)
-            search_reports: tuple[dict[str, Any], ...] = ()
+
+            canonical_available = current_validation.mechanical_stage_reached not in {
+                "parse_basic", "canonical_rebuild",
+            }
+            persisted_code = current_blueprint.lean_file
+            if canonical_available:
+                canonical_hash = hashlib.sha256(persisted_code.encode()).hexdigest()
+                candidates.append(persisted_code)
+                labels.append(f"generation_round_{round_index}_canonical")
+            candidate_hash = hashlib.sha256(persisted_code.encode()).hexdigest()
+            candidates.append(persisted_code)
+            labels.append(f"generation_round_{round_index}")
+
+            eligible_symbols = _eligible_mathlib_symbols(current_deterministic)
             if phase1_mathlib_search_enabled and phase1_retrieval is not None:
                 search_reports = _run_phase1_mathlib_search(
-                    latest_deterministic,
-                    retrieval=phase1_retrieval,
+                    current_deterministic, retrieval=phase1_retrieval,
                     cache=mathlib_search_cache,
                     max_queries=phase1_mathlib_search_max_queries_per_round,
                     k=phase1_mathlib_search_k,
                 )
             compiler_diagnostic_available = bool(
-                latest_validation.canonical_lean_result is not None
+                current_validation.canonical_lean_result is not None
             )
-            previous_status = [
-                {
-                    "symbol": symbol,
-                    "diagnosticDisappeared": symbol not in eligible_symbols,
-                }
-                for symbol in previous_search_symbols
-            ] if compiler_diagnostic_available else []
+            previous_status = [{
+                "symbol": symbol,
+                "diagnosticDisappeared": symbol not in eligible_symbols,
+            } for symbol in previous_search_symbols] if compiler_diagnostic_available else []
             previous_search_symbols = tuple(
                 str(item["symbol"]) for item in search_reports
             )
-            semantic_invoked_this_round = latest_validation.semantic_audit_invoked
-            (
-                last_audited_semantic_errors,
-                last_audited_semantic_round,
-                active_repair_codes,
-                semantic_feedback_retained,
-            ) = _semantic_feedback_state(
-                last_audited_semantic_errors,
-                last_audited_semantic_round,
-                semantic_audit_invoked=semantic_invoked_this_round,
-                current_errors=latest_semantic,
-                current_round=round_index,
-            )
-            feedback_semantic = (
-                latest_semantic
-                if semantic_invoked_this_round
-                else last_audited_semantic_errors
-            )
-            previous_feedback = _feedback(
-                latest_deterministic, feedback_semantic, latest_warnings,
-                blueprint=latest_blueprint,
-                mathlib_search_context=search_reports,
-            )
-            candidate_hash = hashlib.sha256(previous_code.encode()).hexdigest()
-            details = validation_details(latest_validation)
-            details.update({
-                "semanticFeedbackSourceRound": last_audited_semantic_round,
-                "semanticFeedbackRetained": (
-                    semantic_feedback_retained
-                ),
-                "activeRepairCodes": list(active_repair_codes),
-            })
+            details = validation_details(current_validation)
             details["phase1MathlibSearch"] = {
                 "enabled": phase1_mathlib_search_enabled,
                 "eligibleSymbols": list(eligible_symbols),
@@ -1783,55 +1858,108 @@ def generate_blueprint(
             }
             if tracer:
                 tracer.emit(TraceEvent(
-                    kind="phase1MathlibSearch",
-                    thm_name=thm_name,
+                    kind="phase1MathlibSearch", thm_name=thm_name,
                     turn=round_index,
                     args={"round": round_index, **details["phase1MathlibSearch"]},
                     ok=not any(item.get("error") for item in search_reports),
                 ))
 
+        semantic_invoked = bool(
+            current_validation and current_validation.semantic_audit_invoked
+        )
+        semantic_audit_ordinal: int | None = None
+        if semantic_invoked:
+            semantic_audit_ordinal = semantic_stage
+            semantic_audit_count += 1
+            active_repair_codes = _active_repair_codes(current_semantic)
+            semantic_anchor_blueprint = current_blueprint
+            semantic_anchor_validation = current_validation
+            semantic_anchor_errors = current_semantic
+            semantic_anchor_warnings = current_warnings
+            semantic_anchor_round = round_index
+            latest_structural_blueprint = ""
+            latest_structural_errors = ()
+            latest_structural_warnings = ()
+            latest_structural_round = None
+            latest_structural_search = ()
+            attempt_role = "semanticAudited"
+        else:
+            if current_blueprint is not None:
+                latest_structural_blueprint = current_blueprint.lean_file
+            else:
+                latest_structural_blueprint = ""
+            latest_structural_errors = current_deterministic
+            latest_structural_warnings = current_warnings
+            latest_structural_round = round_index
+            latest_structural_search = search_reports
+            attempt_role = "initial" if round_index == 1 else "structuralRetry"
+
+        details.update({
+            "semanticAuditCount": semantic_audit_count,
+            "generationMaxSemanticAudits": max_semantic_audits,
+            "semanticStage": semantic_stage,
+            "semanticAuditOrdinal": semantic_audit_ordinal,
+            "semanticFeedbackInputRound": input_anchor_round,
+            "semanticFeedbackSourceRound": (
+                semantic_anchor_round if semantic_invoked else input_anchor_round
+            ),
+            "semanticFeedbackRetained": bool(
+                not semantic_invoked and input_anchor_round is not None
+            ),
+            "structuralInputRound": input_structural_round,
+            "activeRepairCodes": list(active_repair_codes),
+            "contextFallbackApplied": context_fallback_applied,
+        })
         round_row = GenerationRound(
-            round_index,
-            candidate_hash,
-            input_tokens,
-            completion_budget,
-            latest_deterministic,
-            latest_semantic,
-            latest_warnings,
-            details,
+            round_index=round_index, candidate_hash=candidate_hash,
+            input_tokens=input_tokens, max_completion_tokens=completion_budget,
+            deterministic_errors=current_deterministic,
+            semantic_errors=current_semantic, warnings=current_warnings,
+            validation=details, semantic_stage=semantic_stage,
+            semantic_audit_ordinal=semantic_audit_ordinal,
+            semantic_audit_invoked=semantic_invoked,
+            semantic_anchor_round=input_anchor_round,
+            structural_input_round=input_structural_round,
+            attempt_role=attempt_role,
+            submitted_candidate_hash=submitted_hash,
+            canonical_candidate_hash=canonical_hash,
+            context_fallback_applied=context_fallback_applied,
+            builder_message_content=builder_message_content,
+            finish_reason=finish_reason,
         )
         rounds.append(round_row)
-        semantic_invoked = bool(
-            latest_validation and latest_validation.semantic_audit_invoked
-        )
+        if semantic_invoked:
+            semantic_anchor_details = dict(details)
+
         for kind, inventory, ok in (
-            ("phase1DeterministicValidation", latest_deterministic, not latest_deterministic),
+            ("phase1DeterministicValidation", current_deterministic, not current_deterministic),
             (
                 "phase1SemanticAudit" if semantic_invoked else "phase1SemanticAuditSkipped",
-                latest_semantic,
-                not latest_semantic if semantic_invoked else True,
+                current_semantic,
+                not current_semantic if semantic_invoked else True,
             ),
-            ("phase1WarningInventory", latest_warnings, not latest_warnings),
+            ("phase1WarningInventory", current_warnings, not current_warnings),
         ):
             if tracer:
                 tracer.emit(TraceEvent(
-                    kind=kind,
-                    thm_name=thm_name,
-                    turn=round_index,
+                    kind=kind, thm_name=thm_name, turn=round_index,
                     args={
-                        "round": round_index, "invoked": semantic_invoked,
-                        "count": len(inventory), "issues": list(inventory),
+                        "round": round_index, "semanticStage": semantic_stage,
+                        "semanticAuditOrdinal": semantic_audit_ordinal,
+                        "semanticAuditCount": semantic_audit_count,
+                        "invoked": semantic_invoked, "count": len(inventory),
+                        "issues": list(inventory),
                         "semanticAuditMode": semantic_audit_mode,
                         "actualRequestCount": (
-                            latest_validation.semantic_request_count
-                            if latest_validation else 0
+                            current_validation.semantic_request_count
+                            if current_validation else 0
                         ),
                         "cacheHits": dict(
-                            latest_validation.semantic_cache_hits or {}
-                        ) if latest_validation else {},
+                            current_validation.semantic_cache_hits or {}
+                        ) if current_validation else {},
                         "outputBudget": (
-                            latest_validation.semantic_output_budget
-                            if latest_validation else None
+                            current_validation.semantic_output_budget
+                            if current_validation else None
                         ),
                         "semanticFeedbackSourceRound": details.get(
                             "semanticFeedbackSourceRound"
@@ -1840,37 +1968,42 @@ def generate_blueprint(
                             "semanticFeedbackRetained", False
                         ),
                         "activeRepairCodes": details.get("activeRepairCodes", []),
-                    },
-                    ok=ok,
+                    }, ok=ok,
                 ))
         if tracer:
             tracer.emit(TraceEvent(
-                kind="phase1RoundAssessment",
-                thm_name=thm_name,
-                turn=round_index,
+                kind="phase1RoundAssessment", thm_name=thm_name, turn=round_index,
                 args={
-                    "round": round_index,
-                    "deterministicErrorCount": len(latest_deterministic),
-                    "semanticErrorCount": len(latest_semantic),
-                    "warningCount": len(latest_warnings),
+                    "round": round_index, "semanticStage": semantic_stage,
+                    "semanticAuditOrdinal": semantic_audit_ordinal,
+                    "semanticAuditCount": semantic_audit_count,
+                    "generationMaxSemanticAudits": max_semantic_audits,
+                    "attemptRole": attempt_role,
+                    "deterministicErrorCount": len(current_deterministic),
+                    "semanticErrorCount": len(current_semantic),
+                    "warningCount": len(current_warnings),
                     "mechanicalStageReached": (
-                        latest_validation.mechanical_stage_reached
-                        if latest_validation else "submission"
+                        current_validation.mechanical_stage_reached
+                        if current_validation else "submission"
                     ),
                     "mechanicalFailureStage": (
-                        latest_validation.mechanical_failure_stage
-                        if latest_validation else "submission"
+                        current_validation.mechanical_failure_stage
+                        if current_validation else "submission"
                     ),
                     "semanticEligible": bool(
-                        latest_validation
-                        and latest_validation.mechanical_failure_stage is None
+                        current_validation
+                        and current_validation.mechanical_failure_stage is None
                     ),
                     "semanticAuditMode": semantic_audit_mode,
                     "semanticAuditInvoked": semantic_invoked,
                     "semanticRequestCount": (
-                        latest_validation.semantic_request_count
-                        if latest_validation else 0
+                        current_validation.semantic_request_count
+                        if current_validation else 0
                     ),
+                    "semanticAnchorRound": input_anchor_round,
+                    "resultingSemanticAnchorRound": semantic_anchor_round,
+                    "structuralInputRound": input_structural_round,
+                    "contextFallbackApplied": context_fallback_applied,
                     "semanticFeedbackSourceRound": details.get(
                         "semanticFeedbackSourceRound"
                     ),
@@ -1879,116 +2012,98 @@ def generate_blueprint(
                     ),
                     "activeRepairCodes": details.get("activeRepairCodes", []),
                 },
-                ok=not latest_deterministic and not latest_semantic and not latest_warnings,
+                ok=not current_deterministic and not current_semantic,
             ))
             tracer.emit(TraceEvent(
-                kind="phase1GenerationEnd",
-                thm_name=thm_name,
-                turn=round_index,
-                span_id=span_id,
-                args={"round": round_index, "candidateHash": candidate_hash},
+                kind="phase1GenerationEnd", thm_name=thm_name,
+                turn=round_index, span_id=span_id,
+                args={
+                    "round": round_index, "candidateHash": candidate_hash,
+                    "submittedCandidateHash": submitted_hash,
+                    "canonicalCandidateHash": canonical_hash,
+                    "semanticAuditCount": semantic_audit_count,
+                },
                 ok=bool(candidate_hash),
                 duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
             ))
 
-        classification = generation_round_classification(
-            round_index=round_index,
-            max_turns=max_turns,
-            deterministic_error_count=len(latest_deterministic),
-            semantic_error_count=len(latest_semantic),
-            warning_count=len(latest_warnings),
-        )
-        if latest_blueprint is not None and classification in {
-            "strictAccepted", "acceptedWithWarnings",
-        }:
-            # ``details`` is also retained by the current GenerationRound.  Do not
-            # add the round history back to that same object: the current
-            # round's ``validation`` would then point at a dictionary which
-            # contains the current round again, making the terminal result
-            # impossible to JSON-serialize ("Circular reference detected").
+        if semantic_invoked and not current_semantic and current_blueprint is not None:
+            classification = "strictAccepted"
             final_details = _accepted_validation_details(
-                details,
-                rounds,
-                classification=classification,
-                deterministic_errors=latest_deterministic,
-                semantic_errors=latest_semantic,
-                warnings=latest_warnings,
+                details, rounds, classification=classification,
+                deterministic_errors=current_deterministic,
+                semantic_errors=current_semantic, warnings=current_warnings,
             )
-            final_details["staticGateMode"] = "shadow"
-            final_details["semanticStaticGate"] = False
-            final_details["semanticAuditMode"] = semantic_audit_mode
-            latest_blueprint.generation_validation = final_details
-            latest_blueprint.generation_history = [item.to_dict() for item in rounds]
-            latest_blueprint.candidate_history = list(candidates)
-            latest_blueprint.candidate_labels = list(labels)
-            latest_blueprint.semantic_gate_results.append({
-                "stage": "generation",
-                "passed": True,
+            final_details.update({
+                "staticGateMode": "shadow", "semanticStaticGate": False,
+                "semanticAuditMode": semantic_audit_mode,
+                "semanticAuditCount": semantic_audit_count,
+                "generationMaxSemanticAudits": max_semantic_audits,
+            })
+            current_blueprint.generation_validation = final_details
+            current_blueprint.generation_history = [item.to_dict() for item in rounds]
+            current_blueprint.candidate_history = list(candidates)
+            current_blueprint.candidate_labels = list(labels)
+            current_blueprint.semantic_gate_results.append({
+                "stage": "generation", "passed": True,
                 "classification": classification,
                 "issues": [
-                    {**item, "severity": "warning"} for item in latest_warnings
+                    {**item, "severity": "warning"} for item in current_warnings
                 ],
             })
             if tracer:
                 tracer.emit(TraceEvent(
-                    kind="phase1FinalClassification",
-                    thm_name=thm_name,
+                    kind="phase1FinalClassification", thm_name=thm_name,
                     turn=round_index,
-                    args={"classification": classification, "warningCount": len(latest_warnings)},
-                    ok=True,
+                    args={
+                        "classification": classification,
+                        "warningCount": len(current_warnings),
+                        "semanticAuditCount": semantic_audit_count,
+                    }, ok=True,
                 ))
-            return latest_blueprint
+            return current_blueprint
 
-    deterministic_failed = bool(latest_deterministic)
-    semantic_failed = bool(latest_semantic)
-    failure_stage = (
-        "phase1DeterministicAndSemantic"
-        if deterministic_failed and semantic_failed else
-        "phase1Deterministic"
-        if deterministic_failed else
-        "phase1Semantic"
-    )
-    final_details = validation_details(latest_validation) if latest_validation else {}
+    if semantic_anchor_blueprint is None or semantic_anchor_validation is None:
+        raise RuntimeError("semantic audit budget exhausted without an audited candidate")
+    final_details = dict(semantic_anchor_details)
+    audit = dict(final_details.get("semanticAudit") or {})
+    audit["classification"] = "semanticRejected"
     final_details.update({
-        "classification": "structuralRejected" if deterministic_failed else "semanticRejected",
-        "terminalCategory": "mechanicalRejected" if deterministic_failed else "semanticRejected",
-        "terminalMechanicalStage": (
-            latest_validation.mechanical_failure_stage
-            if deterministic_failed and latest_validation else None
-        ),
-        "staticGateMode": "shadow",
-        "semanticStaticGate": False,
+        "semanticAudit": audit,
+        "classification": "semanticRejected",
+        "terminalCategory": "semanticRejected",
+        "terminalMechanicalStage": None,
+        "staticGateMode": "shadow", "semanticStaticGate": False,
         "semanticAuditMode": semantic_audit_mode,
-        "finalErrorKinds": [
-            name for name, present in (
-                ("deterministic", deterministic_failed), ("semantic", semantic_failed),
-            ) if present
-        ],
+        "semanticAuditCount": semantic_audit_count,
+        "generationMaxSemanticAudits": max_semantic_audits,
+        "finalErrorKinds": ["semantic"],
         "generationRounds": [item.to_dict() for item in rounds],
-        "finalDeterministicErrors": list(latest_deterministic),
-        "finalSemanticErrors": list(latest_semantic),
-        "finalWarnings": list(latest_warnings),
+        "finalDeterministicErrors": [],
+        "finalSemanticErrors": list(semantic_anchor_errors),
+        "finalWarnings": list(semantic_anchor_warnings),
     })
     if tracer:
         tracer.emit(TraceEvent(
-            kind="phase1FinalClassification",
-            thm_name=thm_name,
-            turn=max_turns,
+            kind="phase1FinalClassification", thm_name=thm_name,
+            turn=generation_attempt_index,
             args={
-                "classification": final_details["classification"],
-                "finalErrorKinds": final_details["finalErrorKinds"],
-                "warningCount": len(latest_warnings),
-            },
-            ok=False,
+                "classification": "semanticRejected",
+                "finalErrorKinds": ["semantic"],
+                "warningCount": len(semantic_anchor_warnings),
+                "semanticAuditCount": semantic_audit_count,
+            }, ok=False,
         ))
     raise BlueprintGenerationError(
-        "Phase 1 exhausted its full-regeneration turns.",
-        last_candidate=previous_code,
-        diagnostics=[previous_feedback],
-        attempt=max_turns,
-        failure_stage=failure_stage,
-        candidate_history=candidates,
-        candidate_labels=labels,
+        "Phase 1 exhausted its semantic-audit budget.",
+        last_candidate=semantic_anchor_blueprint.lean_file,
+        diagnostics=[_feedback(
+            (), semantic_anchor_errors, semantic_anchor_warnings,
+            blueprint=semantic_anchor_blueprint,
+        )],
+        attempt=generation_attempt_index,
+        failure_stage="phase1Semantic",
+        candidate_history=candidates, candidate_labels=labels,
         validation_details=final_details,
         generation_history=[item.to_dict() for item in rounds],
     )

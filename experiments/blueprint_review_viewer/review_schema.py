@@ -13,7 +13,8 @@ from . import REVIEW_SCHEMA_VERSION
 
 
 _CANDIDATE_RE = re.compile(
-    r"^(?P<kind>generation_round|phase1_failed_last)(?:_(?P<round>\d+))?\.lean$"
+    r"^(?P<kind>generation_round|phase1_failed_last)(?:_(?P<round>\d+))?"
+    r"(?:_(?P<variant>submitted|canonical))?\.lean$"
 )
 
 
@@ -287,6 +288,7 @@ def _builder_responses(events: list[dict[str, Any]]) -> dict[int, dict[str, Any]
             continue
         responses[round_index] = {
             "thinking": str(args.get("reasoning_content") or ""),
+            "messageContent": str(event.get("result") or ""),
             "finishReason": str(args.get("finish_reason") or ""),
         }
     return responses
@@ -299,10 +301,22 @@ def _generation_rounds(
     if not isinstance(raw_history, list):
         validation = row.get("generation_validation")
         raw_history = validation.get("generationRounds", []) if isinstance(validation, dict) else []
+    generation_candidates = [
+        candidate for candidate in candidates
+        if candidate.get("kind") == "generation_round"
+        and isinstance(candidate.get("round"), int)
+    ]
     candidate_by_round = {
-        int(candidate["round"]): candidate
-        for candidate in candidates
-        if candidate.get("kind") == "generation_round" and isinstance(candidate.get("round"), int)
+        int(candidate["round"]): candidate for candidate in generation_candidates
+        if not candidate.get("variant")
+    }
+    submitted_by_round = {
+        int(candidate["round"]): candidate for candidate in generation_candidates
+        if candidate.get("variant") == "submitted"
+    }
+    canonical_by_round = {
+        int(candidate["round"]): candidate for candidate in generation_candidates
+        if candidate.get("variant") == "canonical"
     }
     builder_responses = _builder_responses(events)
     history_by_round = {
@@ -338,18 +352,53 @@ def _generation_rounds(
         audit = dict(audit) if isinstance(audit, dict) else {}
         decompile = _answer_parts(audit.get("formalDecompiler"))
         compact = _answer_parts(audit.get("wholeCotComparator"))
-        previous_history = history_by_round.get(round_index - 1, {})
-        previous_candidates = [
-            item for candidate_round, item in candidate_by_round.items()
-            if candidate_round < round_index
-        ]
-        previous_candidate = max(
-            previous_candidates,
-            key=lambda item: int(item.get("round") or 0),
-            default=None,
+        try:
+            anchor_round = int(raw.get("semanticAnchorRound"))
+        except (TypeError, ValueError):
+            anchor_round = None
+        try:
+            structural_round = int(raw.get("structuralInputRound"))
+        except (TypeError, ValueError):
+            structural_round = None
+        anchor_history = history_by_round.get(anchor_round, {}) if anchor_round else {}
+        structural_history = (
+            history_by_round.get(structural_round, {}) if structural_round else {}
+        )
+        anchor_candidate = candidate_by_round.get(anchor_round) if anchor_round else None
+        structural_candidate = (
+            candidate_by_round.get(structural_round) if structural_round else None
         )
         builder_trace = builder_responses.get(round_index, {})
+        submitted_candidate = submitted_by_round.get(round_index)
+        canonical_candidate = canonical_by_round.get(round_index)
         builder_answer = str(candidate.get("lean") or "") if candidate else ""
+        submitted_blueprint = (
+            str(submitted_candidate.get("lean") or "") if submitted_candidate else ""
+        )
+        canonical_blueprint = (
+            str(canonical_candidate.get("lean") or "") if canonical_candidate else ""
+        )
+        if submitted_blueprint:
+            displayed_submission = submitted_blueprint
+            displayed_submission_source = "submittedArtifact"
+            displayed_submission_exact = True
+        elif builder_answer:
+            # Legacy tool-call traces redact lean_code.  The same-round persisted
+            # artifact is still the best reviewable representation of that
+            # submission, although it may already be canonicalized.
+            displayed_submission = builder_answer
+            displayed_submission_source = "persistedArtifactFallback"
+            displayed_submission_exact = False
+        elif canonical_blueprint:
+            displayed_submission = canonical_blueprint
+            displayed_submission_source = "canonicalArtifactFallback"
+            displayed_submission_exact = False
+        else:
+            displayed_submission = ""
+            displayed_submission_source = "unavailable"
+            displayed_submission_exact = False
+        submitted_expected_hash = str(raw.get("submittedCandidateHash") or "")
+        canonical_expected_hash = str(raw.get("canonicalCandidateHash") or "")
         if deterministic_errors:
             deterministic_status = "failed"
         elif whole_graph["status"] == "passed" and standalone["status"] == "passed":
@@ -364,6 +413,13 @@ def _generation_rounds(
             "candidateAvailable": candidate is not None,
             "candidateHash": expected_hash,
             "candidateHashMatches": hash_matches,
+            "semanticStage": int(raw.get("semanticStage") or round_index),
+            "semanticAuditOrdinal": raw.get("semanticAuditOrdinal"),
+            "semanticAuditInvoked": bool(raw.get("semanticAuditInvoked")),
+            "semanticAnchorRound": anchor_round,
+            "structuralInputRound": structural_round,
+            "attemptRole": str(raw.get("attemptRole") or "legacy"),
+            "contextFallbackApplied": bool(raw.get("contextFallbackApplied")),
             "inputTokens": raw.get("inputTokens"),
             "maxCompletionTokens": raw.get("maxCompletionTokens"),
             "feedback": {
@@ -383,26 +439,79 @@ def _generation_rounds(
                 "decompileAnswer": decompile,
                 "compactAnswer": compact,
                 "builderInput": {
-                    "previousBlueprint": (
-                        str(previous_candidate.get("lean") or "")
-                        if previous_candidate else ""
+                    "semanticAnchorRound": anchor_round,
+                    "semanticAnchorBlueprint": (
+                        str(anchor_candidate.get("lean") or "")
+                        if anchor_candidate else ""
                     ),
-                    "deterministicErrors": _dict_list(
-                        previous_history.get("deterministicErrors")
-                    ) if isinstance(previous_history, dict) else [],
-                    "semanticErrors": _dict_list(
-                        previous_history.get("semanticErrors")
-                    ) if isinstance(previous_history, dict) else [],
+                    "semanticErrors": _dict_list(anchor_history.get("semanticErrors")),
+                    "structuralInputRound": structural_round,
+                    "structuralBlueprint": (
+                        str(structural_candidate.get("lean") or "")
+                        if structural_candidate else ""
+                    ),
+                    "structuralErrors": _dict_list(
+                        structural_history.get("deterministicErrors")
+                    ),
+                    "contextFallbackApplied": bool(raw.get("contextFallbackApplied")),
                 },
                 "builderAnswer": {
-                    "available": bool(builder_trace or builder_answer),
+                    "available": bool(
+                        builder_trace or displayed_submission or canonical_blueprint
+                        or builder_answer
+                    ),
                     "thinking": str(builder_trace.get("thinking") or ""),
+                    "messageContent": str(
+                        builder_trace.get("messageContent")
+                        or raw.get("builderMessageContent") or ""
+                    ),
+                    "submittedBlueprint": displayed_submission,
+                    "submittedAvailable": bool(displayed_submission),
+                    "submittedExact": displayed_submission_exact,
+                    "submittedSource": displayed_submission_source,
+                    "submittedHash": submitted_expected_hash,
+                    "submittedHashMatches": (
+                        str(submitted_candidate.get("leanSha256") or "")
+                        == submitted_expected_hash
+                        if submitted_candidate and submitted_expected_hash else None
+                    ),
+                    "canonicalBlueprint": canonical_blueprint,
+                    "canonicalAvailable": canonical_candidate is not None,
+                    "canonicalHash": canonical_expected_hash,
+                    "canonicalHashMatches": (
+                        str(canonical_candidate.get("leanSha256") or "")
+                        == canonical_expected_hash
+                        if canonical_candidate and canonical_expected_hash else None
+                    ),
+                    "persistedBlueprint": builder_answer,
                     "answer": builder_answer,
-                    "finishReason": str(builder_trace.get("finishReason") or ""),
+                    "finishReason": str(
+                        builder_trace.get("finishReason") or raw.get("finishReason") or ""
+                    ),
                 },
             },
         })
     rounds.sort(key=lambda item: item["round"])
+    for selected in rounds:
+        stage = selected["semanticStage"]
+        selected["semanticStageAttempts"] = [{
+            "round": attempt["round"],
+            "semanticStage": attempt["semanticStage"],
+            "semanticAuditOrdinal": attempt["semanticAuditOrdinal"],
+            "semanticAuditInvoked": attempt["semanticAuditInvoked"],
+            "attemptRole": attempt["attemptRole"],
+            "contextFallbackApplied": attempt["contextFallbackApplied"],
+            "candidateHash": attempt["candidateHash"],
+            "candidateHashMatches": attempt["candidateHashMatches"],
+            "feedback": {"deterministic": attempt["feedback"]["deterministic"]},
+            "artifacts": {
+                "builderInput": attempt["artifacts"]["builderInput"],
+                "builderAnswer": attempt["artifacts"]["builderAnswer"],
+            },
+        } for attempt in rounds if (
+            attempt["semanticStage"] == stage
+            and attempt["round"] <= selected["round"]
+        )]
     return rounds
 
 
@@ -440,6 +549,7 @@ def build_review_artifact(experiment_root: Path, row: dict[str, Any]) -> dict[st
         candidates.append({
             "candidateId": _candidate_id(path), "kind": match.group("kind") if match else "snapshot",
             "round": int(match.group("round")) if match and match.group("round") else None,
+            "variant": str(match.group("variant") or "") if match else "",
             "availability": "available", "leanPath": _safe_relative(path, experiment_root),
             "leanSha256": _sha256(text), "lean": text,
             "nodes": _declaration_nodes(text, cot_steps),

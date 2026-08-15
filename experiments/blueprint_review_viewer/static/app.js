@@ -250,6 +250,55 @@ function errorsText(errors) {
   return errors?.length ? JSON.stringify(errors, null, 2) : '';
 }
 
+function builderAttemptCards(round) {
+  const attempts = round.semanticStageAttempts || [];
+  if (!attempts.length) return '<div class="emptyState">当前 semantic stage 没有 Builder attempt 记录。</div>';
+  const cards = attempts.map(attempt => {
+    const deterministic = attempt.feedback?.deterministic || {};
+    const input = attempt.artifacts?.builderInput || {};
+    const answer = attempt.artifacts?.builderAnswer || {};
+    const auditLabel = attempt.semanticAuditOrdinal
+      ? ` · Semantic Audit #${esc(attempt.semanticAuditOrdinal)}` : ' · S—';
+    const failure = deterministic.wholeGraph?.failureStage || deterministic.phase2Standalone?.failureStage || '';
+    const hashWarnings = [
+      attempt.candidateHashMatches === false ? 'persisted candidate hash mismatch' : '',
+      answer.submittedHashMatches === false ? 'submitted hash mismatch' : '',
+      answer.canonicalHashMatches === false ? 'canonical hash mismatch' : '',
+    ].filter(Boolean);
+    const submissionSourceLabels = {
+      submittedArtifact: '原始 submitted artifact',
+      persistedArtifactFallback: 'generation_round_N.lean 回退；可能已 canonicalize',
+      canonicalArtifactFallback: 'canonical artifact 回退',
+      unavailable: '不可用',
+    };
+    const submissionSource = submissionSourceLabels[answer.submittedSource] || answer.submittedSource || '未知来源';
+    const visibleBuilderContent = answer.messageContent || answer.submittedBlueprint;
+    const visibleBuilderContentTitle = answer.messageContent
+      ? 'Think 外内容'
+      : `Think 外内容 / Tool-call Lean code（${submissionSource}）`;
+    const submissionTitle = answer.submittedExact
+      ? '原始提交 Blueprint'
+      : `Tool-call Blueprint（${submissionSource}）`;
+    return `<details class="builderAttemptCard">
+      <summary>Attempt ${esc(attempt.round)} · ${esc(attempt.attemptRole || 'unknown')} · D${esc(deterministic.errorCount ?? 0)}${auditLabel}</summary>
+      <div class="builderAttemptMeta">stage=${esc(attempt.semanticStage)}${failure ? ` · failed=${esc(failure)}` : ''}${attempt.contextFallbackApplied ? ' · structural body omitted by context fallback' : ''}</div>
+      ${hashWarnings.length ? `<div class="issue executionIssue">${esc(hashWarnings.join('; '))}</div>` : ''}
+      <div class="artifactGrid">
+        ${artifactSubbox(`Semantic anchor Blueprint${input.semanticAnchorRound ? ` · Attempt ${input.semanticAnchorRound}` : ''}`, input.semanticAnchorBlueprint, '本轮没有 semantic anchor')}
+        ${artifactSubbox('Retained semantic errors', errorsText(input.semanticErrors), '没有 retained semantic errors')}
+        ${artifactSubbox(`Latest structural Blueprint${input.structuralInputRound ? ` · Attempt ${input.structuralInputRound}` : ''}`, input.structuralBlueprint, input.contextFallbackApplied ? '正文因 context fallback 被省略' : '本轮没有 structural input')}
+        ${artifactSubbox('Structural errors', errorsText(input.structuralErrors), '没有 structural errors')}
+        ${artifactSubbox('Think', answer.thinking, '无 think 内容')}
+        ${artifactSubbox(visibleBuilderContentTitle, visibleBuilderContent, '无普通 assistant content，且无可回退的 Lean artifact')}
+        ${artifactSubbox(submissionTitle, answer.submittedBlueprint, 'Tool-call Blueprint 不可用')}
+        ${artifactSubbox('Canonical / persisted Blueprint', answer.canonicalBlueprint || answer.persistedBlueprint, answer.canonicalAvailable ? 'Canonical Blueprint 为空' : 'Canonical Blueprint 不可用')}
+      </div>
+      ${answer.finishReason ? `<div class="artifactMeta">finish_reason=${esc(answer.finishReason)}</div>` : ''}
+    </details>`;
+  }).join('');
+  return `<div class="builderStage"><div class="builderStageTitle">Builder attempts for Semantic Stage ${esc(round.semanticStage)}</div>${cards}</div>`;
+}
+
 function renderRoundArtifacts(round) {
   if (!round) {
     $('roundArtifacts').innerHTML = '';
@@ -258,8 +307,6 @@ function renderRoundArtifacts(round) {
   const artifacts = round.artifacts || {};
   const decompile = artifacts.decompileAnswer || {};
   const compact = artifacts.compactAnswer || {};
-  const builderInput = artifacts.builderInput || {};
-  const builderAnswer = artifacts.builderAnswer || {};
   $('roundArtifacts').innerHTML = `
     <details class="artifactPanel">
       <summary>本轮 Decompile 回答${decompile.available ? '' : '（未运行/无记录）'}</summary>
@@ -268,15 +315,6 @@ function renderRoundArtifacts(round) {
     <details class="artifactPanel">
       <summary>本轮 Compact 回答${compact.available ? '' : '（未运行/无记录）'}</summary>
       <div class="artifactGrid">${artifactSubbox('Think', compact.thinking, '无 think 内容')}${artifactSubbox('Think 外的回答', compact.answer, '无回答内容')}</div>
-    </details>
-    <details class="artifactPanel">
-      <summary>本轮 Builder 输入</summary>
-      <div class="artifactGrid">${artifactSubbox('上一轮 Blueprint', builderInput.previousBlueprint, round.round === 1 ? '首轮没有上一轮 Blueprint' : '上一轮没有有效 Blueprint')}${artifactSubbox('结构性错误', errorsText(builderInput.deterministicErrors), round.round === 1 ? '首轮没有上一轮错误' : '上一轮无结构性错误')}${artifactSubbox('语义错误', errorsText(builderInput.semanticErrors), round.round === 1 ? '首轮没有上一轮错误' : '上一轮无语义错误')}</div>
-    </details>
-    <details class="artifactPanel">
-      <summary>本轮 Builder 回答${builderAnswer.available ? '' : '（无记录）'}</summary>
-      <div class="artifactGrid">${artifactSubbox('Think', builderAnswer.thinking, '无 think 内容')}${artifactSubbox('Think 外的回答（提交并规范化后的 Blueprint）', builderAnswer.answer, '本轮没有有效 Blueprint 回答')}</div>
-      ${builderAnswer.finishReason ? `<div class="artifactMeta">finish_reason=${esc(builderAnswer.finishReason)}</div>` : ''}
     </details>`;
 }
 
@@ -310,6 +348,7 @@ function renderFeedback(roundNumber) {
       <div class="feedbackHeading"><h3>确定性检验</h3><span class="status ${statusClass(deterministic.status)}">${statusLabel(deterministic.status)} · ${deterministic.errorCount}</span></div>
       <div class="subcheck"><div class="subcheckTitle"><b>整图 / 编译</b><span class="status ${statusClass(whole.status)}">${statusLabel(whole.status)}</span></div><div class="checkMeta">reached=${esc(whole.stageReached || 'unknown')}${whole.failureStage ? ` · failed=${esc(whole.failureStage)}` : ''}</div>${wholeBody}</div>
       <div class="subcheck"><div class="subcheckTitle"><b>Phase 2 standalone</b><span class="status ${statusClass(standalone.status)}">${statusLabel(standalone.status)}</span></div><div class="checkMeta">checked=${esc(standalone.checkedNodeCount ?? '—')} · cached=${esc(standalone.cachedNodeCount ?? '—')} · failed=${esc(standalone.failedNodeCount ?? '—')}${standalone.durationMs !== undefined && standalone.durationMs !== null ? ` · ${esc(Number(standalone.durationMs).toFixed(1))} ms` : ''}</div>${standaloneCards(standalone)}</div>
+      ${builderAttemptCards(round)}
     </section>
     <section class="feedbackGroup">
       <div class="feedbackHeading"><h3>语义检验</h3><span class="status ${statusClass(semantic.status)}">${statusLabel(semantic.status)} · ${semantic.errors?.length || 0}</span></div>

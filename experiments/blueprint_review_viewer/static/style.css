@@ -106,6 +106,13 @@ details pre { font-size: 11px; max-height: 260px; }
 .artifactSubbox pre { margin: 0; min-height: 54px; max-height: 420px; font-size: 11px; background: #fbfcfe; }
 .artifactEmpty { color: #7b8798; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
 .artifactMeta { font-size: 11px; color: #637188; padding: 0 9px 9px; }
+.builderStage { margin-top: 10px; padding-top: 9px; border-top: 1px solid #e4e9f0; }
+.builderStageTitle { font-weight: 700; color: #31577f; margin-bottom: 6px; }
+.builderAttemptCard { border: 1px solid #cbd6e4; border-radius: 5px; background: #fbfcfe; overflow: hidden; }
+.builderAttemptCard > summary { cursor: pointer; padding: 8px 9px; font-weight: 650; color: #244c74; background: #f4f7fb; }
+.builderAttemptCard[open] > summary { border-bottom: 1px solid #d7dee9; }
+.builderAttemptMeta { padding: 7px 9px 0; color: #637188; font-size: 11px; }
+.builderAttemptCard .artifactGrid { grid-template-columns: 1fr; }
 .error { color: #a51622; }
 .loading { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center; background: rgba(36,48,68,.2); backdrop-filter: blur(1px); }
 .loadingCard { display: flex; gap: 12px; align-items: center; padding: 18px 22px; background: #fff; border: 1px solid #cbd6e4; box-shadow: 0 14px 40px rgba(22,37,58,.2); border-radius: 8px; color: #1d2a3d; }
