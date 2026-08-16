@@ -1,0 +1,45 @@
+defaults:
+  - override hydra/job_logging: disabled
+  - _self_
+
+experiment_name: qwen3_397b_semantic_ir_v0_math500_counting_probability_731
+source_id: MATH-500/test/counting_and_probability/731.json
+data_path: /ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong76_global_defs_compact_separate_canonical_v2_t00/prepared/data/qwen3_8b_math_verify/MATH_500-00000-of-00001.parquet
+output_root: /ssd/czx/czx_work/cot_blueprint_refine
+
+model: Qwen3.5-397B-A17B-FP8
+target_theorem: n_final
+openai_base_url: http://127.0.0.1:8001/v1
+openai_api_key_env: GOEDEL_OPENAI_API_KEY
+llm_timeout_seconds: 600
+tokenizer_path: /ssd/czx/models/Qwen3.5-397B-A17B-FP8
+model_max_context: 40960
+context_safety_margin: 256
+
+source_split:
+  enable_thinking: true
+  temperature: 0.0
+
+semantic_ir:
+  enable_thinking: true
+  temperature: 0.6
+  top_p: 0.95
+  top_k: 20
+
+blueprint:
+  enable_thinking: true
+  temperature: 0.6
+  top_p: 0.95
+  top_k: 20
+
+kimina:
+  api_url: http://127.0.0.1:8000
+  timeout_seconds: 300
+  reuse: true
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false
