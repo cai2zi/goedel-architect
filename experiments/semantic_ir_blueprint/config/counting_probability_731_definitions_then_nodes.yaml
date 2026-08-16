@@ -2,7 +2,7 @@ defaults:
   - override hydra/job_logging: disabled
   - _self_
 
-experiment_name: qwen3_397b_semantic_ir_v0_math500_counting_probability_731
+experiment_name: qwen3_397b_semantic_ir_v0_math500_counting_probability_731_definitions_then_nodes
 source_id: MATH-500/test/counting_and_probability/731.json
 data_path: /ssd/czx/czx_work/cot_blueprint_refine/qwen3_8b_397b_wrong76_global_defs_compact_separate_canonical_v2_t00/prepared/data/qwen3_8b_math_verify/MATH_500-00000-of-00001.parquet
 output_root: /ssd/czx/czx_work/semantic_ir_blueprint
@@ -22,11 +22,17 @@ source_split:
   max_units: 9
 
 semantic_ir:
-  generation_mode: combined
-  enable_thinking: true
-  temperature: 0.6
-  top_p: 0.95
-  top_k: 20
+  generation_mode: definitions_then_nodes
+  definitions:
+    enable_thinking: true
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+  nodes:
+    enable_thinking: true
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
 
 blueprint:
   enable_thinking: true

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the isolated three-request Semantic IR V0 experiment."""
+"""Run the configurable combined or Definition-then-Node Semantic IR experiment."""
 from __future__ import annotations
 
 import json
@@ -39,8 +39,11 @@ from experiments.semantic_ir_blueprint.conversation import (  # noqa: E402
     write_text,
 )
 from experiments.semantic_ir_blueprint.semantic_ir import (  # noqa: E402
+    DefinitionsPayload,
+    NodesPayload,
     SemanticIR,
     extract_json_object,
+    validate_definition_source_unit_references,
     validate_source_unit_references,
 )
 from experiments.semantic_ir_blueprint.source_units import (  # noqa: E402
@@ -58,6 +61,12 @@ TERMINAL_STATUSES = {
     "semantic_ir_request_failed",
     "semantic_ir_parse_failed",
     "semantic_ir_validation_failed",
+    "definitions_request_failed",
+    "definitions_parse_failed",
+    "definitions_validation_failed",
+    "nodes_request_failed",
+    "nodes_parse_failed",
+    "nodes_validation_failed",
     "blueprint_request_failed",
     "blueprint_extract_failed",
     "lean_compile_failed",
@@ -67,6 +76,18 @@ TERMINAL_STATUSES = {
 
 def _load_prompt(name: str) -> str:
     return (PROMPT_DIR / f"{name}.md").read_text(encoding="utf-8")
+
+
+def _semantic_ir_generation_mode(config: Mapping[str, Any]) -> str:
+    semantic_config = config.get("semantic_ir")
+    if not isinstance(semantic_config, Mapping):
+        raise ValueError("semantic_ir config must be a mapping")
+    mode = str(semantic_config.get("generation_mode", "combined"))
+    if mode not in {"combined", "definitions_then_nodes"}:
+        raise ValueError(
+            "semantic_ir.generation_mode must be 'combined' or 'definitions_then_nodes'"
+        )
+    return mode
 
 
 def _config_dict(value: Any) -> dict[str, Any]:
@@ -239,6 +260,7 @@ def run_record(
     source_id = str(record["name"])
     cot = str(record["informal_proof"])
     target_theorem = str(cfg["target_theorem"])
+    semantic_ir_generation_mode = _semantic_ir_generation_mode(cfg)
     if record_dir.exists() and any(record_dir.iterdir()):
         raise FileExistsError(f"refusing to overwrite non-empty record directory: {record_dir}")
     record_dir.mkdir(parents=True, exist_ok=True)
@@ -248,6 +270,7 @@ def run_record(
         "source_id": source_id,
         "model": cfg["model"],
         "target_theorem": target_theorem,
+        "semantic_ir_generation_mode": semantic_ir_generation_mode,
         "started_at": started_at,
         "status": "running",
         "llm_requests_completed": 0,
@@ -262,6 +285,7 @@ def run_record(
         "claimed_answer": record["claimed_answer"],
         "cot": cot,
         "target_theorem": target_theorem,
+        "semantic_ir_generation_mode": semantic_ir_generation_mode,
     }
     input_path = record_dir / "input.json"
     write_json(input_path, input_payload)
@@ -286,6 +310,7 @@ def run_record(
             "content": render(
                 _load_prompt("source_split_system"),
                 final_boundary=anchors[-1]["anchor_id"],
+                max_units=int(cfg["source_split"]["max_units"]),
             ),
         },
         {
@@ -294,6 +319,7 @@ def run_record(
                 _load_prompt("source_split_user"),
                 boundary_count=len(anchors),
                 boundary_inventory=split_inventory,
+                max_units=int(cfg["source_split"]["max_units"]),
             ),
         },
     ]
@@ -319,7 +345,11 @@ def run_record(
         )
     result["llm_requests_completed"] += 1
     try:
-        boundaries = parse_boundaries(_assistant_content(split_response), anchors)
+        boundaries = parse_boundaries(
+            _assistant_content(split_response),
+            anchors,
+            max_units=int(cfg["source_split"]["max_units"]),
+        )
         source_units = source_units_from_boundaries(cot, anchors, boundaries)
     except Exception as exc:
         _complete_conversation(
@@ -335,79 +365,254 @@ def run_record(
         parse_status="parsed", artifact_path=units_path,
     )
 
-    # Phase A1: Definitions and proof Nodes in one response.
-    semantic_messages = [
-        {"role": "system", "content": _load_prompt("semantic_ir_system")},
-        {
-            "role": "user",
-            "content": render(
-                _load_prompt("semantic_ir_user"),
-                problem=record["problem"],
-                claimed_answer=record["claimed_answer"],
-                target_theorem=target_theorem,
-                source_units_json=json.dumps(
-                    {"source_units": source_units}, ensure_ascii=False, indent=2,
+    source_unit_ids = [unit["unit_id"] for unit in source_units]
+    if semantic_ir_generation_mode == "combined":
+        # Phase A1: Definitions and proof Nodes in one response.
+        semantic_messages = [
+            {"role": "system", "content": _load_prompt("semantic_ir_system")},
+            {
+                "role": "user",
+                "content": render(
+                    _load_prompt("semantic_ir_user"),
+                    problem=record["problem"],
+                    claimed_answer=record["claimed_answer"],
+                    target_theorem=target_theorem,
+                    source_units_json=json.dumps(
+                        {"source_units": source_units}, ensure_ascii=False, indent=2,
+                    ),
                 ),
-            ),
-        },
-    ]
-    try:
-        semantic_sampling, semantic_budget = _dynamic_sampling(
-            cfg["semantic_ir"], semantic_messages, cfg=cfg, budgeter=budgeter,
-        )
-    except ValueError as exc:
-        return _finish(record_dir, result, "semantic_ir_request_failed", error=str(exc))
-    semantic_request = _chat_request(
-        model=cfg["model"], messages=semantic_messages, sampling=semantic_sampling,
-    )
-    semantic_response, semantic_conversation = capture_chat_once(
-        client, "semantic_ir", semantic_request,
-    )
-    semantic_conversation["token_budget"] = semantic_budget
-    semantic_raw_path = record_dir / "semantic_ir" / "raw_response.txt"
-    if semantic_response is None:
-        _complete_conversation(
-            record_dir=record_dir, stage_dir="semantic_ir", conversation=semantic_conversation,
-            parse_status="not_attempted", parse_error="request failed",
-        )
-        return _finish(
-            record_dir, result, "semantic_ir_request_failed",
-            error=semantic_conversation["exception"]["message"],
-        )
-    result["llm_requests_completed"] += 1
-    semantic_content = _assistant_content(semantic_response)
-    write_text(semantic_raw_path, semantic_content)
-    result["artifacts"]["semantic_ir_raw"] = str(semantic_raw_path.relative_to(record_dir))
-    try:
-        semantic_payload = extract_json_object(semantic_content)
-    except Exception as exc:
-        _complete_conversation(
-            record_dir=record_dir, stage_dir="semantic_ir", conversation=semantic_conversation,
-            parse_status="failed", parse_error=str(exc),
-        )
-        return _finish(record_dir, result, "semantic_ir_parse_failed", error=str(exc))
-    try:
-        semantic_ir = SemanticIR.model_validate(semantic_payload, strict=True)
-        validate_source_unit_references(
-            semantic_ir, [unit["unit_id"] for unit in source_units],
-        )
-        if semantic_ir.nodes[-1].id != target_theorem:
-            raise ValueError(
-                f"final theorem id must be configured target {target_theorem!r}"
+            },
+        ]
+        try:
+            semantic_sampling, semantic_budget = _dynamic_sampling(
+                cfg["semantic_ir"], semantic_messages, cfg=cfg, budgeter=budgeter,
             )
-    except (ValidationError, ValueError) as exc:
-        _complete_conversation(
-            record_dir=record_dir, stage_dir="semantic_ir", conversation=semantic_conversation,
-            parse_status="validation_failed", parse_error=str(exc),
+        except ValueError as exc:
+            return _finish(record_dir, result, "semantic_ir_request_failed", error=str(exc))
+        semantic_request = _chat_request(
+            model=cfg["model"], messages=semantic_messages, sampling=semantic_sampling,
         )
-        return _finish(record_dir, result, "semantic_ir_validation_failed", error=str(exc))
-    ir_path = record_dir / "semantic_ir" / "semantic_ir.json"
-    write_json(ir_path, semantic_ir.model_dump(mode="json"))
-    result["artifacts"]["semantic_ir"] = str(ir_path.relative_to(record_dir))
-    _complete_conversation(
-        record_dir=record_dir, stage_dir="semantic_ir", conversation=semantic_conversation,
-        parse_status="parsed", artifact_path=ir_path,
-    )
+        semantic_response, semantic_conversation = capture_chat_once(
+            client, "semantic_ir", semantic_request,
+        )
+        semantic_conversation["token_budget"] = semantic_budget
+        semantic_raw_path = record_dir / "semantic_ir" / "raw_response.txt"
+        if semantic_response is None:
+            _complete_conversation(
+                record_dir=record_dir, stage_dir="semantic_ir",
+                conversation=semantic_conversation,
+                parse_status="not_attempted", parse_error="request failed",
+            )
+            return _finish(
+                record_dir, result, "semantic_ir_request_failed",
+                error=semantic_conversation["exception"]["message"],
+            )
+        result["llm_requests_completed"] += 1
+        semantic_content = _assistant_content(semantic_response)
+        write_text(semantic_raw_path, semantic_content)
+        result["artifacts"]["semantic_ir_raw"] = str(
+            semantic_raw_path.relative_to(record_dir)
+        )
+        try:
+            semantic_payload = extract_json_object(semantic_content)
+        except Exception as exc:
+            _complete_conversation(
+                record_dir=record_dir, stage_dir="semantic_ir",
+                conversation=semantic_conversation,
+                parse_status="failed", parse_error=str(exc),
+            )
+            return _finish(record_dir, result, "semantic_ir_parse_failed", error=str(exc))
+        try:
+            semantic_ir = SemanticIR.model_validate(semantic_payload, strict=True)
+            validate_source_unit_references(semantic_ir, source_unit_ids)
+            if semantic_ir.nodes[-1].id != target_theorem:
+                raise ValueError(
+                    f"final theorem id must be configured target {target_theorem!r}"
+                )
+        except (ValidationError, ValueError) as exc:
+            _complete_conversation(
+                record_dir=record_dir, stage_dir="semantic_ir",
+                conversation=semantic_conversation,
+                parse_status="validation_failed", parse_error=str(exc),
+            )
+            return _finish(
+                record_dir, result, "semantic_ir_validation_failed", error=str(exc),
+            )
+        ir_path = record_dir / "semantic_ir" / "semantic_ir.json"
+        write_json(ir_path, semantic_ir.model_dump(mode="json"))
+        result["artifacts"]["semantic_ir"] = str(ir_path.relative_to(record_dir))
+        _complete_conversation(
+            record_dir=record_dir, stage_dir="semantic_ir",
+            conversation=semantic_conversation,
+            parse_status="parsed", artifact_path=ir_path,
+        )
+    else:
+        # Phase A1a: generate and validate only the Definition Registry.
+        separate_cfg = cfg["semantic_ir"]
+        definitions_messages = [
+            {"role": "system", "content": _load_prompt("definitions_system")},
+            {
+                "role": "user",
+                "content": render(
+                    _load_prompt("definitions_user"),
+                    problem=record["problem"],
+                    claimed_answer=record["claimed_answer"],
+                    source_units_json=json.dumps(
+                        {"source_units": source_units}, ensure_ascii=False, indent=2,
+                    ),
+                ),
+            },
+        ]
+        try:
+            definitions_sampling, definitions_budget = _dynamic_sampling(
+                separate_cfg["definitions"], definitions_messages,
+                cfg=cfg, budgeter=budgeter,
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            return _finish(record_dir, result, "definitions_request_failed", error=str(exc))
+        definitions_request = _chat_request(
+            model=cfg["model"], messages=definitions_messages,
+            sampling=definitions_sampling,
+        )
+        definitions_response, definitions_conversation = capture_chat_once(
+            client, "definitions", definitions_request,
+        )
+        definitions_conversation["token_budget"] = definitions_budget
+        definitions_raw_path = record_dir / "definitions" / "raw_response.txt"
+        if definitions_response is None:
+            _complete_conversation(
+                record_dir=record_dir, stage_dir="definitions",
+                conversation=definitions_conversation,
+                parse_status="not_attempted", parse_error="request failed",
+            )
+            return _finish(
+                record_dir, result, "definitions_request_failed",
+                error=definitions_conversation["exception"]["message"],
+            )
+        result["llm_requests_completed"] += 1
+        definitions_content = _assistant_content(definitions_response)
+        write_text(definitions_raw_path, definitions_content)
+        result["artifacts"]["definitions_raw"] = str(
+            definitions_raw_path.relative_to(record_dir)
+        )
+        try:
+            definitions_json = extract_json_object(definitions_content)
+        except Exception as exc:
+            _complete_conversation(
+                record_dir=record_dir, stage_dir="definitions",
+                conversation=definitions_conversation,
+                parse_status="failed", parse_error=str(exc),
+            )
+            return _finish(record_dir, result, "definitions_parse_failed", error=str(exc))
+        try:
+            definitions_payload = DefinitionsPayload.model_validate(
+                definitions_json, strict=True,
+            )
+            validate_definition_source_unit_references(
+                definitions_payload.definitions, source_unit_ids,
+            )
+        except (ValidationError, ValueError) as exc:
+            _complete_conversation(
+                record_dir=record_dir, stage_dir="definitions",
+                conversation=definitions_conversation,
+                parse_status="validation_failed", parse_error=str(exc),
+            )
+            return _finish(
+                record_dir, result, "definitions_validation_failed", error=str(exc),
+            )
+        definitions_path = record_dir / "definitions" / "definitions.json"
+        write_json(definitions_path, definitions_payload.model_dump(mode="json"))
+        result["artifacts"]["definitions"] = str(
+            definitions_path.relative_to(record_dir)
+        )
+        _complete_conversation(
+            record_dir=record_dir, stage_dir="definitions",
+            conversation=definitions_conversation,
+            parse_status="parsed", artifact_path=definitions_path,
+        )
+
+        # Phase A1b: generate proof Nodes using the frozen Definition Registry.
+        nodes_messages = [
+            {"role": "system", "content": _load_prompt("nodes_system")},
+            {
+                "role": "user",
+                "content": render(
+                    _load_prompt("nodes_user"),
+                    problem=record["problem"],
+                    claimed_answer=record["claimed_answer"],
+                    target_theorem=target_theorem,
+                    source_units_json=json.dumps(
+                        {"source_units": source_units}, ensure_ascii=False, indent=2,
+                    ),
+                    definitions_json=json.dumps(
+                        definitions_payload.model_dump(mode="json"),
+                        ensure_ascii=False, indent=2,
+                    ),
+                ),
+            },
+        ]
+        try:
+            nodes_sampling, nodes_budget = _dynamic_sampling(
+                separate_cfg["nodes"], nodes_messages, cfg=cfg, budgeter=budgeter,
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            return _finish(record_dir, result, "nodes_request_failed", error=str(exc))
+        nodes_request = _chat_request(
+            model=cfg["model"], messages=nodes_messages, sampling=nodes_sampling,
+        )
+        nodes_response, nodes_conversation = capture_chat_once(
+            client, "nodes", nodes_request,
+        )
+        nodes_conversation["token_budget"] = nodes_budget
+        nodes_raw_path = record_dir / "nodes" / "raw_response.txt"
+        if nodes_response is None:
+            _complete_conversation(
+                record_dir=record_dir, stage_dir="nodes", conversation=nodes_conversation,
+                parse_status="not_attempted", parse_error="request failed",
+            )
+            return _finish(
+                record_dir, result, "nodes_request_failed",
+                error=nodes_conversation["exception"]["message"],
+            )
+        result["llm_requests_completed"] += 1
+        nodes_content = _assistant_content(nodes_response)
+        write_text(nodes_raw_path, nodes_content)
+        result["artifacts"]["nodes_raw"] = str(nodes_raw_path.relative_to(record_dir))
+        try:
+            nodes_json = extract_json_object(nodes_content)
+        except Exception as exc:
+            _complete_conversation(
+                record_dir=record_dir, stage_dir="nodes", conversation=nodes_conversation,
+                parse_status="failed", parse_error=str(exc),
+            )
+            return _finish(record_dir, result, "nodes_parse_failed", error=str(exc))
+        try:
+            nodes_payload = NodesPayload.model_validate(nodes_json, strict=True)
+            semantic_ir = SemanticIR(
+                definitions=definitions_payload.definitions,
+                nodes=nodes_payload.nodes,
+            )
+            validate_source_unit_references(semantic_ir, source_unit_ids)
+            if semantic_ir.nodes[-1].id != target_theorem:
+                raise ValueError(
+                    f"final theorem id must be configured target {target_theorem!r}"
+                )
+        except (ValidationError, ValueError) as exc:
+            _complete_conversation(
+                record_dir=record_dir, stage_dir="nodes", conversation=nodes_conversation,
+                parse_status="validation_failed", parse_error=str(exc),
+            )
+            return _finish(record_dir, result, "nodes_validation_failed", error=str(exc))
+        nodes_path = record_dir / "nodes" / "nodes.json"
+        write_json(nodes_path, nodes_payload.model_dump(mode="json"))
+        result["artifacts"]["nodes"] = str(nodes_path.relative_to(record_dir))
+        ir_path = record_dir / "semantic_ir" / "semantic_ir.json"
+        write_json(ir_path, semantic_ir.model_dump(mode="json"))
+        result["artifacts"]["semantic_ir"] = str(ir_path.relative_to(record_dir))
+        _complete_conversation(
+            record_dir=record_dir, stage_dir="nodes", conversation=nodes_conversation,
+            parse_status="parsed", artifact_path=nodes_path,
+        )
 
     # Phase B: only the target identifier and Semantic IR are model-visible.
     blueprint_messages = [

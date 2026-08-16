@@ -13,8 +13,8 @@ Return exactly one complete `lean` code block and no other text. Do not return J
 - The proof body of every Node must be exactly `:= by sorry_using [...]`. Its bracketed list must contain exactly the Node IDs in that IR Node's `depends_on` field, in the same order. Never put Definition IDs or Mathlib names in `sorry_using`.
 - There must be exactly one theorem. It must be the final Node and its ID must equal the target theorem identifier supplied by the user.
 - Do not weaken a difficult or false claim to `True`, a reflexive equality, an unconstrained existential, a tautological implication, or any easier proposition.
-- Do not preassign the probability, answer, or another computed object to the claimed answer inside a Definition. The root theorem must constrain the original probability object using the original sampling domain and favorable-event relation represented by the IR.
-- Coordinate types such as `ℝ × ℝ` carry a max metric by default. When the IR means Euclidean geometry, define squared Euclidean distance or another faithful Euclidean representation explicitly.
+- Do not preassign an unknown, computed, optimized, measured, or otherwise sought object to the claimed answer inside a Definition. The root theorem must retain the source constraints that characterize that object.
+- Do not rely on an ambient Lean operation when its standard semantics differ from the operation described by the IR. Define the intended operation or representation explicitly when needed.
 - Use only top-level `def`, `noncomputable def`, `abbrev`, `lemma`, and `theorem` declarations. Do not use namespace, section, variable, axiom, structure, class, instance, inductive, notation, macro, syntax, or partial def.
 
 The output will be compiled exactly once. Compiler errors will not be returned to you.

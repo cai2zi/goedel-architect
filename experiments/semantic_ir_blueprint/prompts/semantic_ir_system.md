@@ -8,12 +8,12 @@ Use this exact record shape:
 
 ```json
 {
-  "id": "target_region",
-  "params": [{"name": "k", "type": "positive real number"}],
-  "type": "set of points in the plane",
-  "definition": "the intersection of rectangle(k) and global_closer_region(k)",
-  "source_units": ["S002"],
-  "source_description": "A semantic paraphrase of the relevant source."
+  "id": "index_collection",
+  "params": [{"name": "n", "type": "positive integer"}],
+  "type": "finite collection of integers",
+  "definition": "the integers i satisfying 0 <= i and i < n",
+  "source_units": ["S004"],
+  "source_description": "The source introduces a constrained collection used by later claims."
 }
 ```
 
@@ -26,7 +26,9 @@ Requirements:
 - Definitions never have `depends_on`. They are shared mathematical context and do not correspond to `sorry_using` dependencies.
 - `source_units` contains one or more supplied source-unit IDs.
 - `source_description` may be a semantic paraphrase. It does not need to be a verbatim source substring.
-- Preserve domains and constraints inside the definitions. For a probability problem, distinguish the sampling domain, the favorable region, and any global geometric region instead of silently identifying them.
+- Build a comprehensive registry of every reusable object required to state the source reasoning: relevant domains, structured inputs, functions, collections, operations, auxiliary constructions, distinguished quantities, intermediate objects, and the sought object. Review every source unit and do not leave gaps that would force Nodes to invent objects.
+- Definitions introduce objects and constructions. Nodes state and validate relationships, properties, equalities, inequalities, implications, and other claims about them. A named predicate or relation may be defined, but the assertion that it holds belongs in a Node.
+- Preserve distinctions among differently constrained source objects. Do not preassign a computed or sought object to the claimed answer.
 
 ## Nodes
 
@@ -34,19 +36,19 @@ Use this exact record shape:
 
 ```json
 {
-  "id": "n_target_region_is_diamond",
+  "id": "n_rewrite_preserves_value",
   "kind": "lemma",
-  "depends_on": ["n_global_closer_is_diamond"],
+  "depends_on": ["n_initial_evaluation"],
   "claim": {
     "form": "relation",
-    "binders": [],
-    "assumptions": [],
-    "lhs": "target_region(k)",
+    "binders": [{"name": "n", "type": "positive integer"}],
+    "assumptions": ["n satisfies the source constraints"],
+    "lhs": "transformed_expression(n)",
     "relation": "equals",
-    "rhs": "diamond_region(k)"
+    "rhs": "reference_value(n)"
   },
-  "source_units": ["S003"],
-  "source_description": "The COT asserts that the target region is a rhombus."
+  "source_units": ["S006"],
+  "source_description": "The source asserts that the transformation preserves the evaluated value."
 }
 ```
 
@@ -84,8 +86,8 @@ Each `claim` uses exactly one of these open forms:
   "form": "predicate",
   "binders": [],
   "assumptions": [],
-  "predicate": "is_a_rhombus",
-  "arguments": ["diamond_region(k)"]
+  "predicate": "is_minimal",
+  "arguments": ["candidate(n)", "admissible_collection(n)"]
 }
 ```
 
@@ -94,9 +96,9 @@ Each `claim` uses exactly one of these open forms:
 ```json
 {
   "form": "proposition",
-  "binders": [{"name": "x", "type": "point in the rectangle"}],
+  "binders": [{"name": "i", "type": "finite index"}],
   "assumptions": [],
-  "proposition": "if x is in the favorable region, then x is closer to O than to every vertex"
+  "proposition": "if i is admissible, then term(i) belongs to selected_collection(n)"
 }
 ```
 

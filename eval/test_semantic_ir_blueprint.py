@@ -10,7 +10,11 @@ from pydantic import ValidationError
 
 from experiments.semantic_ir_blueprint.conversation import capture_chat_once
 from experiments.semantic_ir_blueprint.run_experiment import run_record
-from experiments.semantic_ir_blueprint.semantic_ir import SemanticIR
+from experiments.semantic_ir_blueprint.semantic_ir import (
+    DefinitionsPayload,
+    NodesPayload,
+    SemanticIR,
+)
 from experiments.semantic_ir_blueprint.source_units import (
     CLOSE_MARKER,
     OPEN_MARKER,
@@ -143,7 +147,24 @@ class FakeCompiler:
         return self.result
 
 
-def config() -> dict:
+def config(generation_mode: str = "combined") -> dict:
+    semantic_config = {
+        "generation_mode": generation_mode,
+        "enable_thinking": True, "temperature": 0.6,
+        "top_p": 0.95, "top_k": 20, "max_completion_tokens": 16384,
+    }
+    if generation_mode == "definitions_then_nodes":
+        semantic_config = {
+            "generation_mode": generation_mode,
+            "definitions": {
+                "enable_thinking": True, "temperature": 0.6,
+                "top_p": 0.95, "top_k": 20,
+            },
+            "nodes": {
+                "enable_thinking": True, "temperature": 0.6,
+                "top_p": 0.95, "top_k": 20,
+            },
+        }
     return {
         "experiment_name": "test",
         "model": "fake-model",
@@ -153,12 +174,9 @@ def config() -> dict:
         "context_safety_margin": 512,
         "source_split": {
             "enable_thinking": True, "temperature": 0.0,
-            "max_completion_tokens": 2048,
+            "max_completion_tokens": 2048, "max_units": 9,
         },
-        "semantic_ir": {
-            "enable_thinking": True, "temperature": 0.6,
-            "top_p": 0.95, "top_k": 20, "max_completion_tokens": 16384,
-        },
+        "semantic_ir": semantic_config,
         "blueprint": {
             "enable_thinking": True, "temperature": 0.6,
             "top_p": 0.95, "top_k": 20,
@@ -226,6 +244,18 @@ class SourceUnitTests(unittest.TestCase):
         with self.assertRaises(SourceUnitError):
             parse_boundaries(response, anchors)
 
+    def test_rejects_ten_or_more_source_units(self):
+        source = " ".join(f"Claim {number}." for number in range(1, 11))
+        anchors = make_boundary_anchors(source)
+        self.assertEqual(10, len(anchors))
+        response = (
+            OPEN_MARKER + "\n"
+            + "\n".join(anchor["anchor_id"] for anchor in anchors)
+            + "\n" + CLOSE_MARKER
+        )
+        with self.assertRaisesRegex(SourceUnitError, "at most 9"):
+            parse_boundaries(response, anchors, max_units=9)
+
 
 class SemanticIRTests(unittest.TestCase):
     def test_all_claim_forms_and_open_relation_are_valid(self):
@@ -234,6 +264,18 @@ class SemanticIRTests(unittest.TestCase):
         self.assertEqual(["relation", "predicate", "proposition"], [
             node.claim.form for node in ir.nodes
         ])
+        self.assertEqual(
+            "sample_space",
+            DefinitionsPayload.model_validate(
+                {"definitions": valid_ir()["definitions"]}, strict=True,
+            ).definitions[0].id,
+        )
+        self.assertEqual(
+            "n_final",
+            NodesPayload.model_validate(
+                {"nodes": valid_ir()["nodes"]}, strict=True,
+            ).nodes[-1].id,
+        )
 
     def test_rejects_duplicate_ids_forward_deps_definition_deps_and_bad_theorem(self):
         variants = []
@@ -295,6 +337,31 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual("qwen thinking", artifact["assistant_reasoning_content"])
 
 
+class PromptTests(unittest.TestCase):
+    def test_system_prompts_do_not_embed_the_731_example(self):
+        prompt_dir = Path("experiments/semantic_ir_blueprint/prompts")
+        system_text = "\n".join(
+            path.read_text(encoding="utf-8").lower()
+            for path in prompt_dir.glob("*_system.md")
+        )
+        forbidden = (
+            "target_region", "rectangle", "diamond", "rhombus", "probability",
+            "sampling domain", "closer to", "vertex", "euclidean",
+        )
+        for phrase in forbidden:
+            with self.subTest(phrase=phrase):
+                self.assertNotIn(phrase, system_text)
+
+    def test_definition_prompt_requires_complete_object_inventory(self):
+        text = Path(
+            "experiments/semantic_ir_blueprint/prompts/definitions_system.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("comprehensive inventory", text)
+        self.assertIn("Do not omit an object", text)
+        self.assertIn("must not leave gaps", text)
+        self.assertIn("Nodes—not Definitions—must state and validate", text)
+
+
 class PipelineTests(unittest.TestCase):
     def outcomes(self):
         return [
@@ -303,7 +370,16 @@ class PipelineTests(unittest.TestCase):
             FakeResponse(LEAN),
         ]
 
-    def run_case(self, outcomes, compiler_result=None):
+    def separate_outcomes(self):
+        payload = valid_ir()
+        return [
+            FakeResponse(f"{OPEN_MARKER}\nB0002\n{CLOSE_MARKER}"),
+            FakeResponse(json.dumps({"definitions": payload["definitions"]})),
+            FakeResponse(json.dumps({"nodes": payload["nodes"]})),
+            FakeResponse(LEAN),
+        ]
+
+    def run_case(self, outcomes, compiler_result=None, generation_mode="combined"):
         client = FakeClient(outcomes)
         compiler = FakeCompiler(
             compiler_result or CompilerResult(success=True, timings={"code_sha256": "forbidden"})
@@ -312,7 +388,8 @@ class PipelineTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         record_dir = Path(temp.name) / "record"
         result = run_record(
-            RECORD, config(), record_dir, client=client, compiler=compiler,
+            RECORD, config(generation_mode), record_dir,
+            client=client, compiler=compiler,
             budgeter=budgeter,
         )
         return result, client, compiler, record_dir
@@ -330,6 +407,7 @@ class PipelineTests(unittest.TestCase):
             request["extra_body"]["chat_template_kwargs"]["enable_thinking"]
             for request in client.calls
         ])
+        self.assertIn(RECORD["informal_proof"], client.calls[1]["messages"][1]["content"])
         self.assertNotIn("Problem", client.calls[2]["messages"][1]["content"])
         self.assertNotIn(RECORD["informal_proof"], client.calls[2]["messages"][1]["content"])
         expected = [
@@ -348,6 +426,43 @@ class PipelineTests(unittest.TestCase):
             for path in record_dir.rglob("*") if path.is_file()
         )
         self.assertNotIn("sha256", all_artifacts.lower())
+
+    def test_definitions_then_nodes_is_exactly_four_calls_and_one_compile(self):
+        result, client, compiler, record_dir = self.run_case(
+            self.separate_outcomes(), generation_mode="definitions_then_nodes",
+        )
+        self.assertEqual("completed", result["status"])
+        self.assertEqual("definitions_then_nodes", result["semantic_ir_generation_mode"])
+        self.assertEqual(4, len(client.calls))
+        self.assertEqual(1, len(compiler.calls))
+        self.assertTrue(all("tools" not in request for request in client.calls))
+        self.assertEqual([12000, 12000, 12000, 12000], [
+            request["max_completion_tokens"] for request in client.calls
+        ])
+        self.assertIn(RECORD["informal_proof"], client.calls[1]["messages"][1]["content"])
+        self.assertIn("sample_space", client.calls[2]["messages"][1]["content"])
+        self.assertIn(RECORD["informal_proof"], client.calls[2]["messages"][1]["content"])
+        self.assertNotIn("## Problem", client.calls[3]["messages"][1]["content"])
+        self.assertNotIn(RECORD["informal_proof"], client.calls[3]["messages"][1]["content"])
+        expected = [
+            "definitions/conversation.json", "definitions/raw_response.txt",
+            "definitions/definitions.json", "nodes/conversation.json",
+            "nodes/raw_response.txt", "nodes/nodes.json",
+            "semantic_ir/semantic_ir.json", "blueprint/conversation.json",
+            "blueprint/blueprint.lean", "blueprint/lean_result.json",
+            "conversations.jsonl", "result.json",
+        ]
+        for relative in expected:
+            self.assertTrue((record_dir / relative).is_file(), relative)
+        self.assertFalse((record_dir / "semantic_ir/conversation.json").exists())
+        conversations = [
+            json.loads(line)
+            for line in (record_dir / "conversations.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(
+            ["source_split", "definitions", "nodes", "blueprint"],
+            [item["stage"] for item in conversations],
+        )
 
     def test_each_stage_failure_stops_immediately_without_retry(self):
         cases = [
@@ -383,6 +498,51 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(expected, result["status"])
                 self.assertEqual(calls, len(client.calls))
                 self.assertEqual(compile_calls, len(compiler.calls))
+
+    def test_separate_stage_failures_stop_immediately_without_retry(self):
+        success = self.separate_outcomes()
+        duplicate_definitions = valid_ir()["definitions"] * 2
+        cases = [
+            (
+                "definitions_request_failed",
+                [success[0], RuntimeError("definitions request")], 2,
+            ),
+            (
+                "definitions_parse_failed",
+                [success[0], FakeResponse("not json")], 2,
+            ),
+            (
+                "definitions_validation_failed",
+                [success[0], FakeResponse(json.dumps({
+                    "definitions": duplicate_definitions,
+                }))], 2,
+            ),
+            (
+                "nodes_request_failed",
+                [success[0], success[1], RuntimeError("nodes request")], 3,
+            ),
+            (
+                "nodes_parse_failed",
+                [success[0], success[1], FakeResponse("not json")], 3,
+            ),
+            (
+                "nodes_validation_failed",
+                [success[0], success[1], FakeResponse(json.dumps({"nodes": []}))], 3,
+            ),
+            (
+                "blueprint_request_failed",
+                [success[0], success[1], success[2], RuntimeError("blueprint request")],
+                4,
+            ),
+        ]
+        for expected, outcomes, calls in cases:
+            with self.subTest(expected=expected):
+                result, client, compiler, _ = self.run_case(
+                    outcomes, generation_mode="definitions_then_nodes",
+                )
+                self.assertEqual(expected, result["status"])
+                self.assertEqual(calls, len(client.calls))
+                self.assertEqual(0, len(compiler.calls))
 
     def test_compile_failure_is_terminal_and_fully_saved(self):
         failure = CompilerResult(

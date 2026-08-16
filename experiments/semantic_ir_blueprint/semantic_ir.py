@@ -52,6 +52,17 @@ class Definition(StrictModel):
         return self
 
 
+class DefinitionsPayload(StrictModel):
+    definitions: list[Definition]
+
+    @model_validator(mode="after")
+    def validate_definitions(self) -> "DefinitionsPayload":
+        ids = [item.id for item in self.definitions]
+        if len(set(ids)) != len(ids):
+            raise ValueError("definition ids must be unique")
+        return self
+
+
 class ClaimBase(StrictModel):
     binders: list[NamedType] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
@@ -131,6 +142,17 @@ class Node(StrictModel):
         return self
 
 
+class NodesPayload(StrictModel):
+    nodes: list[Node]
+
+    @model_validator(mode="after")
+    def validate_nodes(self) -> "NodesPayload":
+        ids = [item.id for item in self.nodes]
+        if len(set(ids)) != len(ids):
+            raise ValueError("node ids must be unique")
+        return self
+
+
 class SemanticIR(StrictModel):
     definitions: list[Definition]
     nodes: list[Node]
@@ -195,3 +217,15 @@ def validate_source_unit_references(ir: SemanticIR, source_unit_ids: Sequence[st
             unknown = [unit for unit in value.source_units if unit not in valid]
             if unknown:
                 raise ValueError(f"{kind} {value.id!r} references unknown source units: {unknown}")
+
+
+def validate_definition_source_unit_references(
+    definitions: Sequence[Definition], source_unit_ids: Sequence[str],
+) -> None:
+    valid = set(source_unit_ids)
+    for definition in definitions:
+        unknown = [unit for unit in definition.source_units if unit not in valid]
+        if unknown:
+            raise ValueError(
+                f"definition {definition.id!r} references unknown source units: {unknown}"
+            )

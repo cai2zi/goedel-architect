@@ -126,9 +126,14 @@ def make_boundary_anchors(source: str) -> list[dict[str, Any]]:
 
 
 def parse_boundaries(
-    content: str, anchors: Sequence[Mapping[str, Any]],
+    content: str,
+    anchors: Sequence[Mapping[str, Any]],
+    *,
+    max_units: int | None = None,
 ) -> list[str]:
     """Parse one strict marker block containing increasing end boundaries."""
+    if max_units is not None and max_units < 1:
+        raise ValueError("max_units must be positive")
     raw = str(content or "")
     if raw.count(OPEN_MARKER) != 1 or raw.count(CLOSE_MARKER) != 1:
         raise SourceUnitError("response must contain exactly one marker block")
@@ -151,6 +156,10 @@ def parse_boundaries(
         raise SourceUnitError("boundaries must be unique and strictly increasing")
     if values[-1] != ids[-1]:
         raise SourceUnitError(f"final boundary must be {ids[-1]}")
+    if max_units is not None and len(values) > max_units:
+        raise SourceUnitError(
+            f"source unit count must be at most {max_units}; received {len(values)}"
+        )
     for value in values[:-1]:
         anchor = anchors[positions[value]]
         if str(anchor.get("kind")) == "heading":
