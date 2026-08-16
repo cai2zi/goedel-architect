@@ -102,6 +102,7 @@ function resetCaseView(message) {
   $('result').innerHTML = `<div class="box emptyState">${esc(message)}</div>`;
   $('feedback').innerHTML = '';
   $('roundArtifacts').innerHTML = '';
+  $('sourceContext').innerHTML = '';
   $('summary').textContent = message;
   $('code').textContent = '';
   $('viewCandidates').innerHTML = '';
@@ -210,6 +211,41 @@ function leanRenderer(lean) {
 function renderResult() {
   const result = state.current.result || {};
   $('result').innerHTML = `<div class="box resultBox"><b>${esc(result.status || 'unknown')}</b>${result.error ? `<div class="errorMessage">${esc(result.error)}</div>` : ''}<div class="resultMeta">phase=${esc(result.phase || '')} · semantic=${esc(result.semantic_status || '')}</div></div>`;
+}
+
+function sourceProvenanceLabel(value) {
+  return ({
+    results: 'results.jsonl',
+    preparedParquet: 'prepared parquet',
+    inputPredictions: 'input_predictions',
+    missing: 'missing',
+  })[value] || value || 'missing';
+}
+
+function sourceContextPanel(title, content, provenance, open = false, emptyLabel = '数据缺失') {
+  return `<details class="sourceContextPanel"${open ? ' open' : ''}>
+    <summary>${esc(title)} <span>${esc(sourceProvenanceLabel(provenance))}</span></summary>
+    <pre>${artifactText(content, emptyLabel)}</pre>
+  </details>`;
+}
+
+function renderSourceContext() {
+  const context = state.current?.sourceContext || {};
+  const provenance = context.provenance || {};
+  const claimed = context.claimedAnswer || state.current?.source?.claimed_answer || '';
+  const goldPanel = `<details class="sourceContextPanel goldContext" open>
+    <summary>Gold（数据集答案） <span>${esc(sourceProvenanceLabel(provenance.gold))}</span></summary>
+    <pre>${artifactText(context.gold, '源数据没有 gold；没有使用 claimed answer 代替')}</pre>
+    ${claimed ? `<div class="claimedAnswer"><b>模型 claimed answer（不是 Gold）</b><code>${esc(claimed)}</code></div>` : ''}
+  </details>`;
+  $('sourceContext').innerHTML = `<section class="sourceContextBox">
+    <div class="sourceContextHeading"><h2>原始上下文</h2><span>问题与 COT 优先读取本次 Blueprint 的 prepared input</span></div>
+    <div class="sourceContextGrid">
+      ${sourceContextPanel('问题', context.problem, provenance.problem, true, '问题数据缺失')}
+      ${sourceContextPanel('COT（用于 Blueprint）', context.cot, provenance.cot, false, 'COT 数据缺失')}
+      ${goldPanel}
+    </div>
+  </section>`;
 }
 
 function issueCards(items) {
@@ -467,6 +503,7 @@ async function load(id) {
   state.leftId = candidates[0]?.candidateId || '';
   state.rightId = candidates[candidates.length - 1]?.candidateId || '';
   renderCases();
+  renderSourceContext();
   renderResult();
   renderView();
   switchTab(state.tab);

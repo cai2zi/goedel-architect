@@ -43,6 +43,21 @@ button:hover { background: #edf3fb; }
 .tab { border: 0; border-radius: 5px 5px 0 0; }
 .tab.active { background: #dceaff; color: #1455a3; font-weight: 650; border-bottom: 2px solid #2674d9; }
 .panel.hidden, .loading.hidden { display: none; }
+.sourceContextBox { margin: 0 0 12px; padding: 10px; border: 1px solid #cbd6e4; border-radius: 7px; background: #f8fafc; }
+.sourceContextHeading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.sourceContextHeading h2 { margin: 0; }
+.sourceContextHeading > span { color: #637188; font-size: 11px; text-align: right; }
+.sourceContextGrid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(180px, 1fr); gap: 8px; }
+.sourceContextPanel { margin: 8px 0 0; border: 1px solid #d7dee9; border-radius: 5px; background: #fff; overflow: hidden; }
+.sourceContextPanel:nth-child(2) { grid-column: 1 / -1; grid-row: 2; }
+.sourceContextPanel > summary { cursor: pointer; padding: 8px 9px; font-size: 12px; font-weight: 700; color: #244c74; background: #f4f7fb; }
+.sourceContextPanel > summary span { float: right; color: #7b8798; font-size: 10px; font-weight: 400; }
+.sourceContextPanel[open] > summary { border-bottom: 1px solid #d7dee9; }
+.sourceContextPanel pre { margin: 8px; max-height: 280px; font-size: 12px; background: #fbfcfe; }
+.goldContext pre { max-height: 140px; }
+.claimedAnswer { margin: 0 8px 8px; padding: 7px 8px; background: #fff7e8; border-left: 3px solid #d18a18; font-size: 11px; }
+.claimedAnswer b { display: block; color: #765600; margin-bottom: 4px; }
+.claimedAnswer code { white-space: pre-wrap; overflow-wrap: anywhere; }
 .candidateButtons { display: flex; flex-wrap: wrap; gap: 6px; margin: 7px 0 12px; }
 .candidate { font-size: 12px; }
 .candidate.selected { background: #2876d1; border-color: #2876d1; color: #fff; }
@@ -118,5 +133,9 @@ details pre { font-size: 11px; max-height: 260px; }
 .loadingCard { display: flex; gap: 12px; align-items: center; padding: 18px 22px; background: #fff; border: 1px solid #cbd6e4; box-shadow: 0 14px 40px rgba(22,37,58,.2); border-radius: 8px; color: #1d2a3d; }
 .loadingCard small { color: #637188; }
 .spinner { width: 23px; height: 23px; border: 3px solid #d5e2f3; border-top-color: #2876d1; border-radius: 50%; animation: spin .75s linear infinite; }
-@media (max-width: 1250px) { main { grid-template-columns: 260px minmax(460px, 1fr) 470px; } }
+@media (max-width: 1250px) {
+  main { grid-template-columns: 260px minmax(460px, 1fr) 470px; }
+  .sourceContextGrid { grid-template-columns: 1fr; }
+  .sourceContextPanel:nth-child(2) { grid-column: auto; grid-row: auto; }
+}
 @keyframes spin { to { transform: rotate(360deg); } }

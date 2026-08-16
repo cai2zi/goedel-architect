@@ -150,7 +150,7 @@ class BlueprintReviewArtifactTest(unittest.TestCase):
             row = self._row(root)
             path, artifact = write_review_artifact(root, row)
             self.assertTrue(path.is_file())
-            self.assertEqual(artifact["schemaVersion"], 5)
+            self.assertEqual(artifact["schemaVersion"], 6)
             self.assertEqual(len(artifact["candidates"]), 6)
             self.assertNotIn("edits", artifact)
             self.assertEqual(len(artifact["generationRounds"]), 2)
@@ -243,7 +243,66 @@ class BlueprintReviewArtifactTest(unittest.TestCase):
             row["review_artifact_path"] = str(stale)
             (root / "results.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
             artifact = ReviewStore(root).case("case-1")
-            self.assertEqual(artifact["schemaVersion"], 5)
+            self.assertEqual(artifact["schemaVersion"], 6)
+
+    def test_source_context_uses_prepared_input_and_upstream_gold(self) -> None:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        with tempfile.TemporaryDirectory() as temporary:
+            experiment = Path(temporary) / "experiment"
+            root = experiment / "robustpa" / "blueprint"
+            root.mkdir(parents=True)
+            row = self._row(root)
+            prepared = experiment / "prepared"
+            prepared.mkdir()
+            parquet_path = prepared / "fixture.parquet"
+            pq.write_table(pa.Table.from_pylist([{
+                "name": "fixture/1",
+                "problem": "Exact prepared question",
+                "post_think_cot": "Exact prepared COT",
+                "informal_statement": "wrapped question",
+                "informal_proof": "Exact prepared COT",
+                "claimed_answer": "wrong answer",
+            }]), parquet_path)
+            predictions = Path(temporary) / "predictions.jsonl"
+            predictions.write_text(json.dumps({
+                "ID": "fixture/1", "problem": "upstream question",
+                "gold": "gold answer", "raw_cot": "not the prepared COT",
+            }) + "\n", encoding="utf-8")
+            (prepared / "preprocessing_stats.json").write_text(json.dumps({
+                "input_path": str(predictions),
+            }), encoding="utf-8")
+            row.update({
+                "parquet_path": str(parquet_path), "row_index": 1,
+                "claimed_answer": "wrong answer",
+            })
+
+            context = build_review_artifact(root, row)["sourceContext"]
+            self.assertEqual(context["problem"], "Exact prepared question")
+            self.assertEqual(context["cot"], "Exact prepared COT")
+            self.assertEqual(context["gold"], "gold answer")
+            self.assertEqual(context["claimedAnswer"], "wrong answer")
+            self.assertEqual(context["provenance"]["problem"], "preparedParquet")
+            self.assertEqual(context["provenance"]["cot"], "preparedParquet")
+            self.assertEqual(
+                context["provenance"]["gold"], "inputPredictions.gold",
+            )
+
+    def test_missing_gold_is_not_replaced_by_claimed_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            row = self._row(root)
+            row["claimed_answer"] = "model answer"
+            context = build_review_artifact(root, row)["sourceContext"]
+            self.assertEqual(context["gold"], "")
+            self.assertEqual(context["claimedAnswer"], "model answer")
+
+            source = (
+                ROOT / "experiments/blueprint_review_viewer/static/app.js"
+            ).read_text(encoding="utf-8")
+            self.assertIn("Gold（数据集答案）", source)
+            self.assertIn("模型 claimed answer（不是 Gold）", source)
 
     def test_legacy_tool_call_uses_persisted_lean_as_display_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

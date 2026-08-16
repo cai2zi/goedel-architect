@@ -38,7 +38,13 @@ feedback classes:
   Phase 2 standalone preflight;
 - semantic validation from the Formal Decompiler and Whole-COT Comparator.
 
-Within deterministic validation, schema v5 groups every Builder attempt in the
+Schema v6 also shows the selected case's original problem, the exact prepared
+COT supplied to Blueprint generation, and the dataset gold answer. Problem/COT
+are read from the record's prepared parquet row; gold is recovered from the
+experiment's recorded `input_predictions`. The model's `claimed_answer` is
+shown separately and is never substituted for a missing gold value.
+
+Within deterministic validation, schema v6 groups every Builder attempt in the
 selected semantic stage into a collapsed-by-default card. Each card binds the
 actual semantic anchor and latest structural feedback to Builder thinking,
 ordinary message content, the submitted tool-call Blueprint, and the canonical

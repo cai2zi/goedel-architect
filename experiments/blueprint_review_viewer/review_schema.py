@@ -6,6 +6,7 @@ import json
 import os
 import re
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,202 @@ def _json(value: Any, default: Any) -> Any:
         except (ValueError, TypeError):
             return default
     return value if value is not None else default
+
+
+def _display_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    return str(value).strip()
+
+
+def _first_text(*values: Any) -> str:
+    for value in values:
+        text = _display_text(value)
+        if text:
+            return text
+    return ""
+
+
+@lru_cache(maxsize=256)
+def _prepared_source_context(
+    parquet_path: str, one_based_row_index: int, source_id: str,
+) -> dict[str, str]:
+    """Read the exact prepared record used by RobustPA.
+
+    ``results.jsonl`` stores a one-based position in its parquet shard.  The
+    source-id lookup protects review display from a stale/misaligned position.
+    """
+    path = Path(parquet_path)
+    if not path.is_file():
+        return {}
+    try:
+        import pyarrow.parquet as pq
+
+        available = set(pq.read_schema(path).names)
+        wanted = [
+            key for key in (
+                "name", "problem", "post_think_cot", "informal_statement",
+                "informal_proof", "claimed_answer", "gold", "gold_answer",
+                "reference_answer", "ground_truth",
+            )
+            if key in available
+        ]
+        table = pq.read_table(path, columns=wanted)
+        position = one_based_row_index - 1
+        names = table["name"].to_pylist() if "name" in wanted else []
+        if source_id and names and (
+            position < 0 or position >= len(names) or str(names[position]) != source_id
+        ):
+            matches = [index for index, name in enumerate(names) if str(name) == source_id]
+            if matches:
+                position = matches[0]
+        if position < 0 or position >= table.num_rows:
+            return {}
+        return {
+            key: _display_text(table[key][position].as_py())
+            for key in wanted
+        }
+    except (ImportError, OSError, ValueError, IndexError):
+        return {}
+
+
+@lru_cache(maxsize=16)
+def _prediction_context_index(path_text: str) -> dict[str, dict[str, str]]:
+    """Index only review fields, avoiding retention of large raw responses."""
+    path = Path(path_text)
+    if not path.is_file():
+        return {}
+    result: dict[str, dict[str, str]] = {}
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                raw = json.loads(line)
+                if not isinstance(raw, dict):
+                    continue
+                identifier = _display_text(
+                    raw.get("ID") or raw.get("name") or raw.get("id")
+                )
+                if not identifier:
+                    continue
+                gold_field = next((
+                    key for key in (
+                        "gold", "gold_answer", "reference_answer", "ground_truth",
+                    )
+                    if raw.get(key) is not None and _display_text(raw.get(key))
+                ), "")
+                result[identifier] = {
+                    "problem": _display_text(
+                        raw.get("problem") or raw.get("question")
+                    ),
+                    "cot": _display_text(
+                        raw.get("post_think_cot") or raw.get("informal_proof")
+                    ),
+                    "gold": _display_text(raw.get(gold_field)) if gold_field else "",
+                    "goldField": gold_field,
+                }
+    except (OSError, ValueError):
+        return {}
+    return result
+
+
+def _input_predictions_path(experiment_root: Path) -> Path | None:
+    root = experiment_root.resolve()
+    experiment_dir = (
+        root.parents[1]
+        if root.name == "blueprint" and root.parent.name == "robustpa"
+        else root
+    )
+    stats_path = experiment_dir / "prepared" / "preprocessing_stats.json"
+    try:
+        stats = json.loads(stats_path.read_text(encoding="utf-8"))
+        input_path = Path(str(stats.get("input_path") or "")).expanduser()
+        if input_path.is_file():
+            return input_path.resolve()
+    except (OSError, ValueError, AttributeError):
+        pass
+    config_path = experiment_dir / "config_resolved.yaml"
+    try:
+        for line in config_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("input_predictions:"):
+                value = line.split(":", 1)[1].strip().strip("\"'")
+                input_path = Path(value).expanduser()
+                if input_path.is_file():
+                    return input_path.resolve()
+    except OSError:
+        pass
+    return None
+
+
+def _source_context(experiment_root: Path, row: dict[str, Any]) -> dict[str, Any]:
+    source_id = _display_text(row.get("source_id"))
+    try:
+        one_based_row_index = int(row.get("row_index") or 0)
+    except (TypeError, ValueError):
+        one_based_row_index = 0
+    prepared = _prepared_source_context(
+        _display_text(row.get("parquet_path")),
+        one_based_row_index,
+        source_id,
+    )
+    input_path = _input_predictions_path(experiment_root)
+    prepared_source_id = prepared.get("name", "")
+    upstream = {}
+    if input_path:
+        prediction_index = _prediction_context_index(str(input_path))
+        upstream = prediction_index.get(source_id, {}) or prediction_index.get(
+            prepared_source_id, {},
+        )
+
+    direct_problem = _first_text(row.get("problem"), row.get("question"))
+    direct_cot = _first_text(row.get("post_think_cot"), row.get("informal_proof"))
+    direct_gold = _first_text(
+        row.get("gold"), row.get("gold_answer"), row.get("reference_answer"),
+        row.get("ground_truth"),
+    )
+    prepared_gold_field = next((
+        key for key in ("gold", "gold_answer", "reference_answer", "ground_truth")
+        if prepared.get(key)
+    ), "")
+    prepared_gold = prepared.get(prepared_gold_field, "")
+    problem = direct_problem or prepared.get("problem", "") or upstream.get("problem", "")
+    cot = direct_cot or prepared.get("post_think_cot", "") \
+        or prepared.get("informal_proof", "") or upstream.get("cot", "")
+    gold = direct_gold or prepared_gold or upstream.get("gold", "")
+    claimed_answer = _first_text(
+        row.get("claimed_answer"), prepared.get("claimed_answer"),
+    )
+    return {
+        "problem": problem,
+        "cot": cot,
+        "gold": gold,
+        "claimedAnswer": claimed_answer,
+        "available": bool(problem or cot or gold),
+        "provenance": {
+            "problem": (
+                "results" if direct_problem else
+                "preparedParquet" if prepared.get("problem") else
+                "inputPredictions" if upstream.get("problem") else "missing"
+            ),
+            "cot": (
+                "results" if direct_cot else
+                "preparedParquet" if (
+                    prepared.get("post_think_cot") or prepared.get("informal_proof")
+                ) else "inputPredictions" if upstream.get("cot") else "missing"
+            ),
+            "gold": (
+                "results" if direct_gold else
+                f"preparedParquet.{prepared_gold_field}" if prepared_gold else
+                f"inputPredictions.{upstream.get('goldField')}"
+                if upstream.get("gold") else "missing"
+            ),
+        },
+    }
 
 
 def _safe_relative(path: Path, root: Path) -> str:
@@ -568,6 +765,7 @@ def build_review_artifact(experiment_root: Path, row: dict[str, Any]) -> dict[st
     return {
         "schemaVersion": REVIEW_SCHEMA_VERSION,
         "source": {key: row.get(key, "") for key in ("id", "record_id", "source_id", "subset", "split", "theorem_name", "claimed_answer")},
+        "sourceContext": _source_context(experiment_root, row),
         "result": {key: row.get(key, "") for key in ("status", "phase", "success", "root_proved", "error", "semantic_status")},
         "cotSteps": cot_steps,
         "candidates": candidates,
